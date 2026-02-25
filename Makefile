@@ -2,7 +2,7 @@ BINARY := polypod
 VERSION := 0.1.0
 GOFLAGS := -trimpath -ldflags="-s -w -X main.version=$(VERSION)"
 
-.PHONY: build build-linux test clean run ingest
+.PHONY: build build-linux test clean run run-setup ingest
 
 build:
 	go build $(GOFLAGS) -o $(BINARY) .
@@ -18,6 +18,9 @@ clean:
 
 run: build
 	./$(BINARY) config.yaml
+
+run-setup: build
+	./$(BINARY) --setup
 
 ingest:
 	go run ./cmd/ingest/ --config config.yaml --source $(SOURCE)

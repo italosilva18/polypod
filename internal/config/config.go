@@ -176,6 +176,22 @@ func setDefaults(cfg *Config) {
 	}
 }
 
+// DefaultConfig returns a Config with sensible defaults, CLI enabled and tools enabled.
+func DefaultConfig() *Config {
+	cfg := &Config{}
+	cfg.CLI.Enabled = true
+	cfg.AI.Tools = true
+	cfg.AI.Provider = "deepseek"
+	cfg.AI.BaseURL = "https://api.deepseek.com/v1"
+	setDefaults(cfg)
+	return cfg
+}
+
+// Marshal serializes the Config to YAML bytes.
+func (c *Config) Marshal() ([]byte, error) {
+	return yaml.Marshal(c)
+}
+
 func MustParseInt(s string) int {
 	v, _ := strconv.Atoi(s)
 	return v

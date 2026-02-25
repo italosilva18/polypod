@@ -19,7 +19,7 @@ func New() *Adapter { return &Adapter{} }
 func (a *Adapter) Name() string { return "cli" }
 
 func (a *Adapter) Start(ctx context.Context, handler adapter.MessageHandler) error {
-	fmt.Println("\n🤖 Polypod CLI — digite sua mensagem (Ctrl+C para sair)\n")
+	fmt.Println("\nPolypod CLI — digite sua mensagem (Ctrl+C para sair)")
 
 	scanner := bufio.NewScanner(os.Stdin)
 

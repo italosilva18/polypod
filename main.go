@@ -26,16 +26,23 @@ import (
 	"github.com/costa/polypod/internal/observability"
 	"github.com/costa/polypod/internal/ratelimit"
 	"github.com/costa/polypod/internal/router"
+	"github.com/costa/polypod/internal/setup"
 	"github.com/costa/polypod/internal/skill"
 )
 
+const defaultConfigPath = "config.yaml"
+
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "usage: polypod <config.yaml>\n")
-		os.Exit(1)
+	configPath, runSetup := parseArgs()
+
+	if runSetup {
+		if err := setup.Run(configPath); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
 	}
 
-	cfg, err := config.Load(os.Args[1])
+	cfg, err := config.Load(configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error loading config: %v\n", err)
 		os.Exit(1)
@@ -73,6 +80,31 @@ func main() {
 	}
 
 	logger.Info("polypod stopped")
+}
+
+// parseArgs decides the config path and whether to run the setup wizard.
+//
+//	./polypod           → config.yaml exists? yes → use it. no → run wizard
+//	./polypod --setup   → force wizard (overwrites if confirmed)
+//	./polypod config.yaml → legacy behavior
+func parseArgs() (configPath string, runSetup bool) {
+	configPath = defaultConfigPath
+
+	if len(os.Args) < 2 {
+		// No args: check if default config exists
+		if _, err := os.Stat(defaultConfigPath); os.IsNotExist(err) {
+			return configPath, true
+		}
+		return configPath, false
+	}
+
+	arg := os.Args[1]
+	if arg == "--setup" {
+		return configPath, true
+	}
+
+	// Explicit config path
+	return arg, false
 }
 
 func run(ctx context.Context, cfg *config.Config, db *database.DB, logger *slog.Logger) error {
