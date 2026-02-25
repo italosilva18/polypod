@@ -1,0 +1,4 @@
+polypod
+.env
+config.yaml
+*.log

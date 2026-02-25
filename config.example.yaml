@@ -1,0 +1,48 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+database:
+  host: "localhost"
+  port: 5432
+  user: "polypod"
+  password: "CHANGE_ME"
+  name: "polypod"
+  sslmode: "disable"
+  max_conns: 10
+
+ai:
+  provider: "deepseek"
+  base_url: "https://api.deepseek.com/v1"
+  api_key: "sk-your-deepseek-key"
+  model: "deepseek-chat"
+  max_tokens: 2048
+  temperature: 0.3
+
+telegram:
+  enabled: false
+  token: "123456:ABC-DEF"
+
+whatsapp:
+  enabled: false
+  api_url: "https://api.green-api.com"
+  media_url: "https://media.green-api.com"
+  id_instance: "your-instance-id"
+  api_token: "your-api-token"
+
+rest:
+  enabled: true
+  api_keys:
+    - "your-api-key-here"
+
+auth:
+  telegram_allowed_ids: []
+  whatsapp_allowed_numbers: []
+
+rate:
+  requests_per_minute: 20
+  burst_size: 5
+
+log:
+  level: "info"
+  format: "text"

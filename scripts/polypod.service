@@ -1,0 +1,30 @@
+[Unit]
+Description=Polypod - AI Assistant Gateway
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=polypod
+Group=polypod
+WorkingDirectory=/opt/polypod
+ExecStart=/opt/polypod/polypod /opt/polypod/config.yaml
+Restart=on-failure
+RestartSec=5
+
+# Resource limits
+MemoryMax=100M
+CPUQuota=50%
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/polypod
+PrivateTmp=yes
+
+# Environment file for secrets
+EnvironmentFile=-/opt/polypod/.env
+
+[Install]
+WantedBy=multi-user.target

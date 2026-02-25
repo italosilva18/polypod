@@ -1,0 +1,181 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/costa/polypod/internal/adapter"
+	cliAdapter "github.com/costa/polypod/internal/adapter/cli"
+	"github.com/costa/polypod/internal/adapter/rest"
+	"github.com/costa/polypod/internal/adapter/telegram"
+	"github.com/costa/polypod/internal/adapter/whatsapp"
+	"github.com/costa/polypod/internal/agent"
+	"github.com/costa/polypod/internal/ai"
+	"github.com/costa/polypod/internal/auth"
+	"github.com/costa/polypod/internal/config"
+	"github.com/costa/polypod/internal/conversation"
+	"github.com/costa/polypod/internal/database"
+	"github.com/costa/polypod/internal/knowledge"
+	"github.com/costa/polypod/internal/observability"
+	"github.com/costa/polypod/internal/ratelimit"
+	"github.com/costa/polypod/internal/router"
+	"github.com/costa/polypod/internal/skill"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintf(os.Stderr, "usage: polypod <config.yaml>\n")
+		os.Exit(1)
+	}
+
+	cfg, err := config.Load(os.Args[1])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error loading config: %v\n", err)
+		os.Exit(1)
+	}
+
+	logger := observability.NewLogger(cfg.Log.Level, cfg.Log.Format)
+	slog.SetDefault(logger)
+	logger.Info("polypod starting", "version", "0.2.0")
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	// Database is optional — if disabled, runs fully in-memory or JSON files
+	var db *database.DB
+	if cfg.Database.Enabled {
+		var err error
+		db, err = database.New(ctx, cfg.Database.DSN(), cfg.Database.MaxConns, logger)
+		if err != nil {
+			logger.Error("database connection failed", "error", err)
+			os.Exit(1)
+		}
+		defer db.Close()
+
+		if err := db.Migrate(ctx); err != nil {
+			logger.Error("database migration failed", "error", err)
+			os.Exit(1)
+		}
+	} else {
+		logger.Info("database disabled, using JSON file persistence", "data_dir", cfg.Data.Dir)
+	}
+
+	if err := run(ctx, cfg, db, logger); err != nil {
+		logger.Error("fatal error", "error", err)
+		os.Exit(1)
+	}
+
+	logger.Info("polypod stopped")
+}
+
+func run(ctx context.Context, cfg *config.Config, db *database.DB, logger *slog.Logger) error {
+	// Get pool (nil if no database)
+	var pool *pgxpool.Pool
+	if db != nil {
+		pool = db.Pool
+	}
+
+	// Conversation manager with JSON persistence when no DB
+	dataDir := ""
+	if pool == nil {
+		dataDir = cfg.Data.Dir
+	}
+	store := conversation.NewStore(pool, dataDir)
+	convMgr := conversation.NewManager(store, logger)
+
+	if dataDir != "" {
+		sessions := store.ListSessions()
+		if len(sessions) > 0 {
+			logger.Info("loaded conversations from disk", "count", len(sessions))
+		}
+	}
+
+	// Skill registry
+	skills := skill.NewRegistry()
+	logger.Info("skills loaded", "count", len(skills.List()), "skills", skills.List())
+
+	// Agent registry
+	agents := agent.NewRegistry()
+	if err := agents.LoadDir(cfg.Data.AgentsDir); err != nil {
+		logger.Warn("failed to load agents dir", "error", err, "dir", cfg.Data.AgentsDir)
+	}
+	activeAgent := agents.Get("default")
+	logger.Info("agent active", "name", activeAgent.Name, "skills", activeAgent.Skills)
+
+	// Knowledge service (optional — needs database + embedding)
+	var knowledgeSvc ai.KnowledgeSearcher
+	if cfg.Embedding.Enabled && pool != nil {
+		apiKey := cfg.Embedding.APIKey
+		baseURL := cfg.Embedding.BaseURL
+		if apiKey == "" {
+			apiKey = cfg.AI.APIKey
+		}
+		if baseURL == "" {
+			baseURL = cfg.AI.BaseURL
+		}
+		embedder := knowledge.NewEmbeddingProvider(apiKey, baseURL)
+		vectorSearch := knowledge.NewVectorSearch(pool, embedder, logger)
+		dbQuery := knowledge.NewDBQueryService(pool, logger)
+		knowledgeSvc = knowledge.NewService(vectorSearch, dbQuery, nil, logger)
+		logger.Info("knowledge service enabled")
+	}
+
+	// AI client + service (with skill registry and agent)
+	aiClient := ai.NewClient(cfg.AI, skills, activeAgent.Skills)
+	aiSvc := ai.NewService(aiClient, knowledgeSvc, activeAgent, logger)
+
+	// Auth + rate limiter
+	authz := auth.New(cfg)
+	limiter := ratelimit.New(cfg.Rate.RequestsPerMinute, cfg.Rate.BurstSize)
+
+	// Central router
+	rtr := router.New(convMgr, aiSvc, authz, limiter, pool, logger)
+	handler := rtr.Handler()
+
+	// Collect channels to start
+	var channels []adapter.Channel
+
+	if cfg.CLI.Enabled {
+		channels = append(channels, cliAdapter.New())
+	}
+
+	if cfg.REST.Enabled {
+		restAdapter := rest.New(cfg.Server.Host, cfg.Server.Port, authz, logger)
+		channels = append(channels, restAdapter)
+	}
+
+	if cfg.Telegram.Enabled {
+		tgAdapter := telegram.New(cfg.Telegram.Token, logger)
+		channels = append(channels, tgAdapter)
+	}
+
+	if cfg.WhatsApp.Enabled {
+		waAdapter := whatsapp.New(cfg.WhatsApp.IDInstance, cfg.WhatsApp.APIToken, logger)
+		channels = append(channels, waAdapter)
+	}
+
+	if len(channels) == 0 {
+		logger.Warn("no channels enabled, nothing to do")
+		<-ctx.Done()
+		return nil
+	}
+
+	// Start all channels concurrently
+	g, gCtx := errgroup.WithContext(ctx)
+	for _, ch := range channels {
+		ch := ch
+		g.Go(func() error {
+			logger.Info("starting channel", "name", ch.Name())
+			return ch.Start(gCtx, handler)
+		})
+	}
+
+	return g.Wait()
+}

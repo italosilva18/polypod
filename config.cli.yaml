@@ -1,0 +1,33 @@
+database:
+  enabled: false
+
+ai:
+  base_url: "https://api.deepseek.com/v1"
+  api_key: "${DEEPSEEK_API_KEY}"
+  model: "deepseek-chat"
+  max_tokens: 2048
+  temperature: 0.3
+  tools: true
+
+data:
+  dir: "data/conversations"
+  agents_dir: "agents"
+
+cli:
+  enabled: true
+
+rest:
+  enabled: false
+
+embedding:
+  enabled: false
+
+telegram:
+  enabled: false
+
+whatsapp:
+  enabled: false
+
+log:
+  level: "info"
+  format: "text"
