@@ -23,6 +23,7 @@ import (
 	"github.com/costa/polypod/internal/config"
 	"github.com/costa/polypod/internal/conversation"
 	"github.com/costa/polypod/internal/database"
+	"github.com/costa/polypod/internal/iot"
 	"github.com/costa/polypod/internal/knowledge"
 	"github.com/costa/polypod/internal/memory"
 	"github.com/costa/polypod/internal/observability"
@@ -168,6 +169,9 @@ func run(ctx context.Context, cfg *config.Config, pgDB *database.DB, sqliteDB *d
 
 	// Web skills (internet access)
 	web.RegisterSkills(skills)
+
+	// IoT/hardware skills
+	iot.RegisterSkills(skills)
 
 	// Agent registry
 	agents := agent.NewRegistry()
