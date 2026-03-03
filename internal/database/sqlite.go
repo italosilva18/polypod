@@ -74,6 +74,14 @@ func (s *SQLiteDB) Migrate(ctx context.Context) error {
 			created_at DATETIME NOT NULL DEFAULT (datetime('now'))
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_log_user ON usage_log (channel, user_id)`,
+
+		`CREATE TABLE IF NOT EXISTS memories (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			topic TEXT NOT NULL UNIQUE,
+			content TEXT NOT NULL,
+			created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+			updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
+		)`,
 	}
 
 	for _, stmt := range stmts {

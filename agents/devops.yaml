@@ -14,3 +14,9 @@ skills:
   - list_directory
   - run_command
   - search_files
+  - save_memory
+  - recall_memory
+  - list_memories
+  - fetch_url
+  - web_search
+  - list_custom_skills

@@ -24,11 +24,14 @@ import (
 	"github.com/costa/polypod/internal/conversation"
 	"github.com/costa/polypod/internal/database"
 	"github.com/costa/polypod/internal/knowledge"
+	"github.com/costa/polypod/internal/memory"
 	"github.com/costa/polypod/internal/observability"
 	"github.com/costa/polypod/internal/ratelimit"
 	"github.com/costa/polypod/internal/router"
+	"github.com/costa/polypod/internal/selfmod"
 	"github.com/costa/polypod/internal/setup"
 	"github.com/costa/polypod/internal/skill"
+	"github.com/costa/polypod/internal/web"
 )
 
 const defaultConfigPath = "config.yaml"
@@ -158,13 +161,31 @@ func run(ctx context.Context, cfg *config.Config, pgDB *database.DB, sqliteDB *d
 
 	// Skill registry
 	skills := skill.NewRegistry()
-	logger.Info("skills loaded", "count", len(skills.List()), "skills", skills.List())
+
+	// Memory skills
+	memStore := memory.NewStoreFromDB(sqlDB, cfg.Data.Dir)
+	memory.RegisterSkills(skills, memStore)
+
+	// Web skills (internet access)
+	web.RegisterSkills(skills)
 
 	// Agent registry
 	agents := agent.NewRegistry()
 	if err := agents.LoadDir(cfg.Data.AgentsDir); err != nil {
 		logger.Warn("failed to load agents dir", "error", err, "dir", cfg.Data.AgentsDir)
 	}
+
+	// Self-modification skills
+	selfmod.RegisterSkills(skills, agents, cfg.Data.AgentsDir)
+
+	// Custom skills (script-based, loaded from data/skills/)
+	customSkillsDir := "data/skills"
+	os.MkdirAll(customSkillsDir, 0755)
+	skill.LoadAndRegisterCustomSkills(skills, customSkillsDir)
+	skill.RegisterDynamicManagement(skills, customSkillsDir)
+
+	logger.Info("skills loaded", "count", len(skills.List()), "skills", skills.List())
+
 	activeAgent := agents.Get("default")
 	logger.Info("agent active", "name", activeAgent.Name, "skills", activeAgent.Skills)
 
@@ -193,9 +214,9 @@ func run(ctx context.Context, cfg *config.Config, pgDB *database.DB, sqliteDB *d
 		}
 	}
 
-	// AI client + service (with skill registry and agent)
-	aiClient := ai.NewClient(cfg.AI, skills, activeAgent.Skills)
-	aiSvc := ai.NewService(aiClient, knowledgeSvc, activeAgent, logger)
+	// AI client + service (with skill registry and agent registry)
+	aiClient := ai.NewClient(cfg.AI, skills)
+	aiSvc := ai.NewService(aiClient, knowledgeSvc, agents, "default", logger)
 
 	// Auth + rate limiter
 	authz := auth.New(cfg)

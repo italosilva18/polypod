@@ -97,12 +97,18 @@ func (r *Registry) Execute(name string, argsJSON string) (string, error) {
 	return truncate(result), nil
 }
 
-func (r *Registry) register(s *Skill) {
+// Register adds a skill to the registry.
+func (r *Registry) Register(s *Skill) {
 	r.skills[s.Name] = s
 }
 
+// Unregister removes a skill from the registry.
+func (r *Registry) Unregister(name string) {
+	delete(r.skills, name)
+}
+
 func (r *Registry) registerBuiltins() {
-	r.register(&Skill{
+	r.Register(&Skill{
 		Name:        "read_file",
 		Description: "Ler o conteudo de um arquivo no sistema local",
 		Parameters: jsonschema.Definition{
@@ -121,7 +127,7 @@ func (r *Registry) registerBuiltins() {
 		},
 	})
 
-	r.register(&Skill{
+	r.Register(&Skill{
 		Name:        "list_directory",
 		Description: "Listar arquivos e pastas em um diretorio",
 		Parameters: jsonschema.Definition{
@@ -153,7 +159,7 @@ func (r *Registry) registerBuiltins() {
 		},
 	})
 
-	r.register(&Skill{
+	r.Register(&Skill{
 		Name:        "run_command",
 		Description: "Executar um comando shell no sistema local",
 		Parameters: jsonschema.Definition{
@@ -178,7 +184,7 @@ func (r *Registry) registerBuiltins() {
 		},
 	})
 
-	r.register(&Skill{
+	r.Register(&Skill{
 		Name:        "search_files",
 		Description: "Buscar arquivos por glob pattern (ex: *.go, **/*.md)",
 		Parameters: jsonschema.Definition{

@@ -11,20 +11,20 @@ import (
 
 // Client wraps the OpenAI-compatible API client for DeepSeek.
 type Client struct {
-	client  *openai.Client
-	model   string
-	maxTok  int
-	temp    float32
-	tools   []openai.Tool
-	toolsOn bool
-	skills  SkillRegistry
+	client     *openai.Client
+	model      string
+	maxTok     int
+	temp       float32
+	toolsOn    bool
+	skills     SkillRegistry
+	skillNames []string
 }
 
 // NewClient creates a DeepSeek client using OpenAI-compatible API.
-func NewClient(cfg config.AIConfig, skills SkillRegistry, skillNames []string) *Client {
+func NewClient(cfg config.AIConfig, skills SkillRegistry) *Client {
 	ocfg := openai.DefaultConfig(cfg.APIKey)
 	ocfg.BaseURL = cfg.BaseURL
-	c := &Client{
+	return &Client{
 		client:  openai.NewClientWithConfig(ocfg),
 		model:   cfg.Model,
 		maxTok:  cfg.MaxToks,
@@ -32,10 +32,11 @@ func NewClient(cfg config.AIConfig, skills SkillRegistry, skillNames []string) *
 		toolsOn: cfg.Tools,
 		skills:  skills,
 	}
-	if cfg.Tools && skills != nil {
-		c.tools = skills.ToolDefinitions(skillNames)
-	}
-	return c
+}
+
+// SetSkillNames sets the active skill names for tool definitions.
+func (c *Client) SetSkillNames(names []string) {
+	c.skillNames = names
 }
 
 // ChatMessage mirrors openai.ChatCompletionMessage.
@@ -86,7 +87,12 @@ func (c *Client) Complete(ctx context.Context, messages []ChatMessage) (*ChatRes
 
 // CompleteWithTools sends a chat completion with tool calling loop.
 func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, logger *slog.Logger) (*ChatResponse, error) {
-	if !c.toolsOn || len(c.tools) == 0 {
+	// Compute tools dynamically each call so runtime-added skills appear
+	var tools []openai.Tool
+	if c.toolsOn && c.skills != nil {
+		tools = c.skills.ToolDefinitions(c.skillNames)
+	}
+	if !c.toolsOn || len(tools) == 0 {
 		return c.Complete(ctx, messages)
 	}
 
@@ -106,7 +112,7 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 			Messages:    msgs,
 			MaxTokens:   c.maxTok,
 			Temperature: c.temp,
-			Tools:       c.tools,
+			Tools:       tools,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("chat completion (iter %d): %w", iter, err)
