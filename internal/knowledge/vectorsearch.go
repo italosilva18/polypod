@@ -9,6 +9,12 @@ import (
 	pgvector "github.com/pgvector/pgvector-go"
 )
 
+// vectorSearcher is the interface for semantic search backends.
+type vectorSearcher interface {
+	Search(ctx context.Context, query string) ([]Fragment, error)
+	Ingest(ctx context.Context, chunk Chunk, embedding []float32) error
+}
+
 // VectorSearch performs semantic search using pgvector.
 type VectorSearch struct {
 	pool      *pgxpool.Pool

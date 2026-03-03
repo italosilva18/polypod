@@ -32,6 +32,8 @@ type ServerConfig struct {
 
 type DatabaseConfig struct {
 	Enabled  bool   `yaml:"enabled"`
+	Driver   string `yaml:"driver"`   // "sqlite" | "postgres" (default: "postgres" for backwards compat)
+	Path     string `yaml:"path"`     // SQLite file path (only used when driver=sqlite)
 	Host     string `yaml:"host"`
 	Port     int    `yaml:"port"`
 	User     string `yaml:"user"`
@@ -137,6 +139,12 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Server.Port == 0 {
 		cfg.Server.Port = 8080
+	}
+	if cfg.Database.Enabled && cfg.Database.Driver == "" {
+		cfg.Database.Driver = "postgres"
+	}
+	if cfg.Database.Driver == "sqlite" && cfg.Database.Path == "" {
+		cfg.Database.Path = "data/polypod.db"
 	}
 	if cfg.Database.Port == 0 {
 		cfg.Database.Port = 5432

@@ -8,14 +8,14 @@ import (
 
 // Service orchestrates parallel search across multiple knowledge sources.
 type Service struct {
-	vector   *VectorSearch
+	vector   vectorSearcher
 	dbQuery  *DBQueryService
 	apiProxy *APIProxy
 	logger   *slog.Logger
 }
 
 // NewService creates a new knowledge service.
-func NewService(vector *VectorSearch, dbQuery *DBQueryService, apiProxy *APIProxy, logger *slog.Logger) *Service {
+func NewService(vector vectorSearcher, dbQuery *DBQueryService, apiProxy *APIProxy, logger *slog.Logger) *Service {
 	return &Service{
 		vector:   vector,
 		dbQuery:  dbQuery,

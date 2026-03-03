@@ -2,6 +2,7 @@ package conversation
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,23 +14,31 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Store persists sessions. Supports PostgreSQL, YAML file, or in-memory only.
+// Store persists sessions. Supports PostgreSQL, SQLite, YAML file, or in-memory only.
 type Store struct {
 	mu       sync.RWMutex
 	sessions map[string]*Session
 	pool     *pgxpool.Pool // nil = no postgres
+	sqliteDB *sql.DB       // nil = no sqlite
 	dataDir  string        // non-empty = YAML file persistence
 }
 
 // NewStore creates a new session store.
 // - pool != nil → PostgreSQL backend
+// - sqliteDB != nil → SQLite backend
 // - dataDir != "" → YAML file persistence
-// - both nil/empty → in-memory only
-func NewStore(pool *pgxpool.Pool, dataDir string) *Store {
+// - all nil/empty → in-memory only
+func NewStore(pool *pgxpool.Pool, sqliteDB *sql.DB, dataDir string) *Store {
 	s := &Store{
 		sessions: make(map[string]*Session),
 		pool:     pool,
+		sqliteDB: sqliteDB,
 		dataDir:  dataDir,
+	}
+
+	// Load existing sessions from SQLite on startup
+	if sqliteDB != nil {
+		s.loadAllFromSQLite()
 	}
 
 	// Load existing sessions from YAML files on startup
@@ -69,6 +78,20 @@ func (s *Store) Get(ctx context.Context, channel, userID string) (*Session, erro
 		}
 	}
 
+	// Try loading from SQLite
+	if s.sqliteDB != nil {
+		sess, err := s.loadFromSQLite(ctx, key, channel, userID)
+		if err != nil {
+			return nil, err
+		}
+		if sess != nil {
+			s.mu.Lock()
+			s.sessions[key] = sess
+			s.mu.Unlock()
+			return sess, nil
+		}
+	}
+
 	// Create new
 	sess = NewSession(key, channel, userID)
 	s.mu.Lock()
@@ -77,10 +100,16 @@ func (s *Store) Get(ctx context.Context, channel, userID string) (*Session, erro
 	return sess, nil
 }
 
-// Save persists a session (to DB and/or YAML file).
+// Save persists a session (to DB, SQLite, and/or YAML file).
 func (s *Store) Save(ctx context.Context, sess *Session) error {
 	if s.pool != nil {
 		if err := s.saveToDB(ctx, sess); err != nil {
+			return err
+		}
+	}
+
+	if s.sqliteDB != nil {
+		if err := s.saveToSQLite(ctx, sess); err != nil {
 			return err
 		}
 	}
@@ -170,6 +199,68 @@ func (s *Store) saveToDisk(sess *Session) error {
 	}
 
 	return nil
+}
+
+// --- SQLite backend ---
+
+func (s *Store) saveToSQLite(ctx context.Context, sess *Session) error {
+	msgs, err := json.Marshal(sess.Messages)
+	if err != nil {
+		return fmt.Errorf("marshaling messages: %w", err)
+	}
+
+	_, err = s.sqliteDB.ExecContext(ctx, `
+		INSERT INTO sessions (id, channel, user_id, messages, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET
+			messages = excluded.messages,
+			updated_at = excluded.updated_at
+	`, sess.ID, sess.Channel, sess.UserID, string(msgs), sess.CreatedAt, sess.UpdatedAt)
+
+	if err != nil {
+		return fmt.Errorf("saving session to sqlite: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) loadFromSQLite(ctx context.Context, key, channel, userID string) (*Session, error) {
+	var sess Session
+	var msgsJSON string
+
+	err := s.sqliteDB.QueryRowContext(ctx,
+		"SELECT id, channel, user_id, messages, created_at, updated_at FROM sessions WHERE id = ?",
+		key,
+	).Scan(&sess.ID, &sess.Channel, &sess.UserID, &msgsJSON, &sess.CreatedAt, &sess.UpdatedAt)
+
+	if err != nil {
+		return nil, nil // not found
+	}
+
+	if err := json.Unmarshal([]byte(msgsJSON), &sess.Messages); err != nil {
+		return nil, fmt.Errorf("unmarshaling messages: %w", err)
+	}
+
+	return &sess, nil
+}
+
+func (s *Store) loadAllFromSQLite() {
+	rows, err := s.sqliteDB.Query("SELECT id, channel, user_id, messages, created_at, updated_at FROM sessions")
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var sess Session
+		var msgsJSON string
+		if err := rows.Scan(&sess.ID, &sess.Channel, &sess.UserID, &msgsJSON, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
+			continue
+		}
+		if err := json.Unmarshal([]byte(msgsJSON), &sess.Messages); err != nil {
+			continue
+		}
+		s.sessions[sess.ID] = &sess
+	}
 }
 
 func (s *Store) loadAllFromDisk() {

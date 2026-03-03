@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"os"
@@ -56,25 +57,42 @@ func main() {
 	defer cancel()
 
 	// Database is optional — if disabled, runs fully in-memory or JSON files
-	var db *database.DB
+	var pgDB *database.DB
+	var sqliteDB *database.SQLiteDB
 	if cfg.Database.Enabled {
-		var err error
-		db, err = database.New(ctx, cfg.Database.DSN(), cfg.Database.MaxConns, logger)
-		if err != nil {
-			logger.Error("database connection failed", "error", err)
-			os.Exit(1)
-		}
-		defer db.Close()
+		switch cfg.Database.Driver {
+		case "sqlite":
+			var err error
+			sqliteDB, err = database.NewSQLite(cfg.Database.Path, logger)
+			if err != nil {
+				logger.Error("sqlite connection failed", "error", err)
+				os.Exit(1)
+			}
+			defer sqliteDB.Close()
 
-		if err := db.Migrate(ctx); err != nil {
-			logger.Error("database migration failed", "error", err)
-			os.Exit(1)
+			if err := sqliteDB.Migrate(ctx); err != nil {
+				logger.Error("sqlite migration failed", "error", err)
+				os.Exit(1)
+			}
+		default: // "postgres"
+			var err error
+			pgDB, err = database.New(ctx, cfg.Database.DSN(), cfg.Database.MaxConns, logger)
+			if err != nil {
+				logger.Error("database connection failed", "error", err)
+				os.Exit(1)
+			}
+			defer pgDB.Close()
+
+			if err := pgDB.Migrate(ctx); err != nil {
+				logger.Error("database migration failed", "error", err)
+				os.Exit(1)
+			}
 		}
 	} else {
 		logger.Info("database disabled, using JSON file persistence", "data_dir", cfg.Data.Dir)
 	}
 
-	if err := run(ctx, cfg, db, logger); err != nil {
+	if err := run(ctx, cfg, pgDB, sqliteDB, logger); err != nil {
 		logger.Error("fatal error", "error", err)
 		os.Exit(1)
 	}
@@ -107,22 +125,31 @@ func parseArgs() (configPath string, runSetup bool) {
 	return arg, false
 }
 
-func run(ctx context.Context, cfg *config.Config, db *database.DB, logger *slog.Logger) error {
-	// Get pool (nil if no database)
+func run(ctx context.Context, cfg *config.Config, pgDB *database.DB, sqliteDB *database.SQLiteDB, logger *slog.Logger) error {
+	// Get pool and sqlDB (nil if not configured)
 	var pool *pgxpool.Pool
-	if db != nil {
-		pool = db.Pool
+	var sqlDB *sql.DB
+	if pgDB != nil {
+		pool = pgDB.Pool
+	}
+	if sqliteDB != nil {
+		sqlDB = sqliteDB.DB
 	}
 
 	// Conversation manager with JSON persistence when no DB
 	dataDir := ""
-	if pool == nil {
+	if pool == nil && sqlDB == nil {
 		dataDir = cfg.Data.Dir
 	}
-	store := conversation.NewStore(pool, dataDir)
+	store := conversation.NewStore(pool, sqlDB, dataDir)
 	convMgr := conversation.NewManager(store, logger)
 
-	if dataDir != "" {
+	if sqlDB != nil {
+		sessions := store.ListSessions()
+		if len(sessions) > 0 {
+			logger.Info("loaded conversations from sqlite", "count", len(sessions))
+		}
+	} else if dataDir != "" {
 		sessions := store.ListSessions()
 		if len(sessions) > 0 {
 			logger.Info("loaded conversations from disk", "count", len(sessions))
@@ -143,7 +170,7 @@ func run(ctx context.Context, cfg *config.Config, db *database.DB, logger *slog.
 
 	// Knowledge service (optional — needs database + embedding)
 	var knowledgeSvc ai.KnowledgeSearcher
-	if cfg.Embedding.Enabled && pool != nil {
+	if cfg.Embedding.Enabled {
 		apiKey := cfg.Embedding.APIKey
 		baseURL := cfg.Embedding.BaseURL
 		if apiKey == "" {
@@ -153,10 +180,17 @@ func run(ctx context.Context, cfg *config.Config, db *database.DB, logger *slog.
 			baseURL = cfg.AI.BaseURL
 		}
 		embedder := knowledge.NewEmbeddingProvider(apiKey, baseURL)
-		vectorSearch := knowledge.NewVectorSearch(pool, embedder, logger)
-		dbQuery := knowledge.NewDBQueryService(pool, logger)
-		knowledgeSvc = knowledge.NewService(vectorSearch, dbQuery, nil, logger)
-		logger.Info("knowledge service enabled")
+
+		if sqlDB != nil {
+			vs := knowledge.NewSQLiteVectorSearch(sqlDB, embedder, logger)
+			knowledgeSvc = knowledge.NewService(vs, nil, nil, logger)
+			logger.Info("knowledge service enabled", "backend", "sqlite")
+		} else if pool != nil {
+			vs := knowledge.NewVectorSearch(pool, embedder, logger)
+			dbQuery := knowledge.NewDBQueryService(pool, logger)
+			knowledgeSvc = knowledge.NewService(vs, dbQuery, nil, logger)
+			logger.Info("knowledge service enabled", "backend", "postgres")
+		}
 	}
 
 	// AI client + service (with skill registry and agent)
@@ -168,7 +202,7 @@ func run(ctx context.Context, cfg *config.Config, db *database.DB, logger *slog.
 	limiter := ratelimit.New(cfg.Rate.RequestsPerMinute, cfg.Rate.BurstSize)
 
 	// Central router
-	rtr := router.New(convMgr, aiSvc, authz, limiter, pool, logger)
+	rtr := router.New(convMgr, aiSvc, authz, limiter, pool, sqlDB, logger)
 	handler := rtr.Handler()
 
 	// Collect channels to start

@@ -95,9 +95,18 @@ func Run(configPath string) error {
 
 	// --- Database ---
 	fmt.Println()
-	fmt.Println("--- Banco de Dados ---")
-	if askBool(scanner, "Usar PostgreSQL? (sem banco = JSON local)", false) {
+	fmt.Println("--- Armazenamento ---")
+	storageChoices := []string{"SQLite local (recomendado)", "PostgreSQL", "Nenhum (JSON local)"}
+	storageIdx := askChoice(scanner, "Onde guardar conversas e dados?", storageChoices, 1)
+
+	switch storageIdx {
+	case 1: // SQLite
 		cfg.Database.Enabled = true
+		cfg.Database.Driver = "sqlite"
+		cfg.Database.Path = askString(scanner, "Caminho do banco SQLite:", "data/polypod.db")
+	case 2: // PostgreSQL
+		cfg.Database.Enabled = true
+		cfg.Database.Driver = "postgres"
 		cfg.Database.Host = askString(scanner, "Host:", "localhost")
 		portStr := askString(scanner, "Porta:", "5432")
 		cfg.Database.Port, _ = strconv.Atoi(portStr)
@@ -107,6 +116,8 @@ func Run(configPath string) error {
 		cfg.Database.User = askString(scanner, "Usuario:", "polypod")
 		cfg.Database.Password = askSecret(scanner, "Senha:")
 		cfg.Database.Name = askString(scanner, "Nome do banco:", "polypod")
+	case 3: // None
+		cfg.Database.Enabled = false
 	}
 
 	// --- Summary ---
@@ -132,8 +143,10 @@ func Run(configPath string) error {
 	}
 	fmt.Printf("  Canais: %s\n", strings.Join(canais, ", "))
 
-	if cfg.Database.Enabled {
-		fmt.Printf("  Banco: %s@%s:%d/%s\n", cfg.Database.User, cfg.Database.Host, cfg.Database.Port, cfg.Database.Name)
+	if cfg.Database.Enabled && cfg.Database.Driver == "sqlite" {
+		fmt.Printf("  Banco: SQLite (%s)\n", cfg.Database.Path)
+	} else if cfg.Database.Enabled {
+		fmt.Printf("  Banco: PostgreSQL %s@%s:%d/%s\n", cfg.Database.User, cfg.Database.Host, cfg.Database.Port, cfg.Database.Name)
 	} else {
 		fmt.Println("  Banco: desabilitado (JSON local)")
 	}

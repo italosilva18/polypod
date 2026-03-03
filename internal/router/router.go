@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 
@@ -16,12 +17,13 @@ import (
 
 // Router is the central dispatcher that connects adapters to the AI pipeline.
 type Router struct {
-	convMgr *conversation.Manager
-	aiSvc   *ai.Service
-	authz   *auth.Authorizer
-	limiter *ratelimit.Limiter
-	pool    *pgxpool.Pool
-	logger  *slog.Logger
+	convMgr  *conversation.Manager
+	aiSvc    *ai.Service
+	authz    *auth.Authorizer
+	limiter  *ratelimit.Limiter
+	pool     *pgxpool.Pool
+	sqliteDB *sql.DB
+	logger   *slog.Logger
 }
 
 // New creates a new router.
@@ -31,15 +33,17 @@ func New(
 	authz *auth.Authorizer,
 	limiter *ratelimit.Limiter,
 	pool *pgxpool.Pool,
+	sqliteDB *sql.DB,
 	logger *slog.Logger,
 ) *Router {
 	return &Router{
-		convMgr: convMgr,
-		aiSvc:   aiSvc,
-		authz:   authz,
-		limiter: limiter,
-		pool:    pool,
-		logger:  logger,
+		convMgr:  convMgr,
+		aiSvc:    aiSvc,
+		authz:    authz,
+		limiter:  limiter,
+		pool:     pool,
+		sqliteDB: sqliteDB,
+		logger:   logger,
 	}
 }
 
@@ -111,14 +115,24 @@ func (r *Router) Handler() adapter.MessageHandler {
 }
 
 func (r *Router) logUsage(ctx context.Context, channel, userID string, resp *ai.AnswerResponse) {
-	if r.pool == nil {
+	if r.pool != nil {
+		_, err := r.pool.Exec(ctx, `
+			INSERT INTO usage_log (channel, user_id, model, prompt_tokens, completion_tokens, total_tokens)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`, channel, userID, "deepseek-chat", resp.PromptTokens, resp.CompletionTokens, resp.TotalTokens)
+		if err != nil {
+			r.logger.Warn("failed to log usage", "error", err)
+		}
 		return
 	}
-	_, err := r.pool.Exec(ctx, `
-		INSERT INTO usage_log (channel, user_id, model, prompt_tokens, completion_tokens, total_tokens)
-		VALUES ($1, $2, $3, $4, $5, $6)
-	`, channel, userID, "deepseek-chat", resp.PromptTokens, resp.CompletionTokens, resp.TotalTokens)
-	if err != nil {
-		r.logger.Warn("failed to log usage", "error", err)
+
+	if r.sqliteDB != nil {
+		_, err := r.sqliteDB.ExecContext(ctx, `
+			INSERT INTO usage_log (channel, user_id, model, prompt_tokens, completion_tokens, total_tokens)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, channel, userID, "deepseek-chat", resp.PromptTokens, resp.CompletionTokens, resp.TotalTokens)
+		if err != nil {
+			r.logger.Warn("failed to log usage", "error", err)
+		}
 	}
 }
