@@ -12,13 +12,18 @@ import (
 	chimw "github.com/go-chi/chi/v5/middleware"
 
 	"github.com/costa/polypod/internal/adapter"
+	"github.com/costa/polypod/internal/agent"
+	"github.com/costa/polypod/internal/ai"
 	"github.com/costa/polypod/internal/auth"
+	"github.com/costa/polypod/internal/conversation"
+	"github.com/costa/polypod/internal/memory"
+	"github.com/costa/polypod/internal/skill"
 )
 
 // ChatRequest is the JSON body for chat endpoint.
 type ChatRequest struct {
-	Message  string `json:"message"`
-	UserID   string `json:"user_id,omitempty"`
+	Message string `json:"message"`
+	UserID  string `json:"user_id,omitempty"`
 }
 
 // ChatResponse is the JSON response from chat endpoint.
@@ -28,20 +33,43 @@ type ChatResponse struct {
 
 // Adapter implements the REST API channel.
 type Adapter struct {
-	server *http.Server
-	authz  *auth.Authorizer
-	logger *slog.Logger
-	host   string
-	port   int
+	server        *http.Server
+	authz         *auth.Authorizer
+	logger        *slog.Logger
+	host          string
+	port          int
+	memStore      memory.Store
+	agents        *agent.Registry
+	skills        *skill.Registry
+	convMgr       *conversation.Manager
+	aiSvc         *ai.Service
+	streamHandler adapter.StreamHandler
 }
 
 // New creates a new REST adapter.
-func New(host string, port int, authz *auth.Authorizer, logger *slog.Logger) *Adapter {
+func New(
+	host string,
+	port int,
+	authz *auth.Authorizer,
+	logger *slog.Logger,
+	memStore memory.Store,
+	agents *agent.Registry,
+	skills *skill.Registry,
+	convMgr *conversation.Manager,
+	aiSvc *ai.Service,
+	streamHandler adapter.StreamHandler,
+) *Adapter {
 	return &Adapter{
-		authz:  authz,
-		logger: logger,
-		host:   host,
-		port:   port,
+		authz:         authz,
+		logger:        logger,
+		host:          host,
+		port:          port,
+		memStore:      memStore,
+		agents:        agents,
+		skills:        skills,
+		convMgr:       convMgr,
+		aiSvc:         aiSvc,
+		streamHandler: streamHandler,
 	}
 }
 
@@ -56,17 +84,45 @@ func (a *Adapter) Start(ctx context.Context, handler adapter.MessageHandler) err
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Use(APIKeyAuth(a.authz))
 
+		// Chat endpoints
 		r.Post("/chat", a.chatHandler(handler))
+		if a.streamHandler != nil {
+			r.Post("/chat/stream", streamChatHandler(a.streamHandler, a.aiSvc))
+		}
+
+		// Health
 		r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(`{"status":"ok"}`))
 		})
+
+		// Agents
+		if a.agents != nil {
+			r.Get("/agents", listAgentsHandler(a.agents))
+		}
+
+		// Skills
+		if a.skills != nil {
+			r.Get("/skills", listSkillsHandler(a.skills))
+		}
+
+		// Memories
+		if a.memStore != nil {
+			r.Get("/memories", listMemoriesHandler(a.memStore))
+			r.Post("/memories", createMemoryHandler(a.memStore))
+			r.Delete("/memories/{topic}", deleteMemoryHandler(a.memStore))
+		}
+
+		// Sessions
+		if a.convMgr != nil {
+			r.Get("/sessions", listSessionsHandler(a.convMgr))
+		}
 	})
 
 	// Public routes
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"name":"polypod","version":"0.1.0","endpoint":"POST /api/v1/chat"}`))
+		w.Write([]byte(`{"name":"polypod","version":"0.2.0","endpoint":"POST /api/v1/chat"}`))
 	})
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -78,7 +134,7 @@ func (a *Adapter) Start(ctx context.Context, handler adapter.MessageHandler) err
 		Addr:         addr,
 		Handler:      r,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
+		WriteTimeout: 120 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 
@@ -103,7 +159,6 @@ func (a *Adapter) Start(ctx context.Context, handler adapter.MessageHandler) err
 }
 
 func (a *Adapter) Send(ctx context.Context, msg adapter.OutMessage) error {
-	// REST responses are returned synchronously in the handler
 	return nil
 }
 

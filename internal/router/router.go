@@ -114,6 +114,70 @@ func (r *Router) Handler() adapter.MessageHandler {
 	}
 }
 
+// StreamHandler returns a StreamHandler that processes messages with streaming responses.
+func (r *Router) StreamHandler() adapter.StreamHandler {
+	return func(ctx context.Context, msg adapter.InMessage, chunks chan<- adapter.StreamChunk) {
+		defer close(chunks)
+
+		// Auth check
+		if !r.authz.IsAllowed(msg.Channel, msg.UserID) {
+			r.logger.Warn("unauthorized access", "channel", msg.Channel, "user", msg.UserID)
+			chunks <- adapter.StreamChunk{Delta: "Acesso nao autorizado.", Done: true}
+			return
+		}
+
+		// Rate limit check
+		rateLimitKey := fmt.Sprintf("%s:%s", msg.Channel, msg.UserID)
+		if !r.limiter.Allow(rateLimitKey) {
+			r.logger.Warn("rate limited", "channel", msg.Channel, "user", msg.UserID)
+			chunks <- adapter.StreamChunk{Delta: "Muitas mensagens. Aguarde um momento.", Done: true}
+			return
+		}
+
+		// Get or create session
+		sess, err := r.convMgr.GetSession(ctx, msg.Channel, msg.UserID)
+		if err != nil {
+			r.logger.Error("session error", "error", err)
+			chunks <- adapter.StreamChunk{Error: err, Done: true}
+			return
+		}
+
+		// Add user message to history
+		r.convMgr.AddUserMessage(ctx, sess, msg.Text)
+
+		// Stream AI answer
+		resp, err := r.aiSvc.AnswerStream(ctx, ai.AnswerRequest{
+			Channel: msg.Channel,
+			UserID:  msg.UserID,
+			Query:   msg.Text,
+			History: r.convMgr.GetHistory(sess),
+		}, func(delta string) {
+			chunks <- adapter.StreamChunk{Delta: delta}
+		})
+		if err != nil {
+			r.logger.Error("ai stream error", "error", err)
+			chunks <- adapter.StreamChunk{Error: err, Done: true}
+			return
+		}
+
+		// Save assistant response
+		if err := r.convMgr.AddAssistantMessage(ctx, sess, resp.Content); err != nil {
+			r.logger.Warn("failed to save response", "error", err)
+		}
+
+		// Log usage
+		r.logUsage(ctx, msg.Channel, msg.UserID, resp)
+
+		r.logger.Info("stream message processed",
+			"channel", msg.Channel,
+			"user", msg.UserID,
+			"tokens", resp.TotalTokens,
+		)
+
+		chunks <- adapter.StreamChunk{Done: true}
+	}
+}
+
 func (r *Router) logUsage(ctx context.Context, channel, userID string, resp *ai.AnswerResponse) {
 	if r.pool != nil {
 		_, err := r.pool.Exec(ctx, `

@@ -43,3 +43,18 @@ func (m *Manager) AddAssistantMessage(ctx context.Context, sess *Session, conten
 func (m *Manager) GetHistory(sess *Session) []Message {
 	return sess.History()
 }
+
+// ListSessions returns all active sessions.
+func (m *Manager) ListSessions() []*Session {
+	return m.store.GetAllSessions()
+}
+
+// ClearSession resets all messages in a session and persists the change.
+func (m *Manager) ClearSession(ctx context.Context, sess *Session) error {
+	sess.Messages = sess.Messages[:0]
+	if err := m.store.Save(ctx, sess); err != nil {
+		m.logger.Warn("failed to persist cleared session", "session", sess.ID, "error", err)
+		return err
+	}
+	return nil
+}

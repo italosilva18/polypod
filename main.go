@@ -55,7 +55,7 @@ func main() {
 
 	logger := observability.NewLogger(cfg.Log.Level, cfg.Log.Format)
 	slog.SetDefault(logger)
-	logger.Info("polypod starting", "version", "0.2.0")
+	logger.Info("polypod starting", "version", "0.3.0")
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -105,15 +105,10 @@ func main() {
 }
 
 // parseArgs decides the config path and whether to run the setup wizard.
-//
-//	./polypod           → config.yaml exists? yes → use it. no → run wizard
-//	./polypod --setup   → force wizard (overwrites if confirmed)
-//	./polypod config.yaml → legacy behavior
 func parseArgs() (configPath string, runSetup bool) {
 	configPath = defaultConfigPath
 
 	if len(os.Args) < 2 {
-		// No args: check if default config exists
 		if _, err := os.Stat(defaultConfigPath); os.IsNotExist(err) {
 			return configPath, true
 		}
@@ -125,12 +120,10 @@ func parseArgs() (configPath string, runSetup bool) {
 		return configPath, true
 	}
 
-	// Explicit config path
 	return arg, false
 }
 
 func run(ctx context.Context, cfg *config.Config, pgDB *database.DB, sqliteDB *database.SQLiteDB, logger *slog.Logger) error {
-	// Get pool and sqlDB (nil if not configured)
 	var pool *pgxpool.Pool
 	var sqlDB *sql.DB
 	if pgDB != nil {
@@ -218,9 +211,9 @@ func run(ctx context.Context, cfg *config.Config, pgDB *database.DB, sqliteDB *d
 		}
 	}
 
-	// AI client + service (with skill registry and agent registry)
+	// AI client + service (with skill registry, agent registry, and memory store)
 	aiClient := ai.NewClient(cfg.AI, skills)
-	aiSvc := ai.NewService(aiClient, knowledgeSvc, agents, "default", logger)
+	aiSvc := ai.NewService(aiClient, knowledgeSvc, agents, "default", memStore, logger)
 
 	// Auth + rate limiter
 	authz := auth.New(cfg)
@@ -229,16 +222,37 @@ func run(ctx context.Context, cfg *config.Config, pgDB *database.DB, sqliteDB *d
 	// Central router
 	rtr := router.New(convMgr, aiSvc, authz, limiter, pool, sqlDB, logger)
 	handler := rtr.Handler()
+	streamHandler := rtr.StreamHandler()
 
 	// Collect channels to start
 	var channels []adapter.Channel
 
 	if cfg.CLI.Enabled {
-		channels = append(channels, cliAdapter.New())
+		channels = append(channels, cliAdapter.New(
+			streamHandler,
+			aiSvc,
+			memStore,
+			convMgr,
+			agents,
+			skills,
+			logger,
+			cfg.Data.Dir,
+		))
 	}
 
 	if cfg.REST.Enabled {
-		restAdapter := rest.New(cfg.Server.Host, cfg.Server.Port, authz, logger)
+		restAdapter := rest.New(
+			cfg.Server.Host,
+			cfg.Server.Port,
+			authz,
+			logger,
+			memStore,
+			agents,
+			skills,
+			convMgr,
+			aiSvc,
+			streamHandler,
+		)
 		channels = append(channels, restAdapter)
 	}
 

@@ -134,6 +134,17 @@ func (s *Store) ListSessions() []string {
 	return ids
 }
 
+// GetAllSessions returns all active sessions.
+func (s *Store) GetAllSessions() []*Session {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sessions := make([]*Session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		sessions = append(sessions, sess)
+	}
+	return sessions
+}
+
 // --- PostgreSQL backend ---
 
 func (s *Store) saveToDB(ctx context.Context, sess *Session) error {
