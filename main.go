@@ -53,6 +53,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := setup.CheckAPIKey(cfg, configPath); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+
 	logger := observability.NewLogger(cfg.Log.Level, cfg.Log.Format)
 	slog.SetDefault(logger)
 	logger.Info("polypod starting", "version", "0.3.0")

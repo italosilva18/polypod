@@ -13,6 +13,13 @@ import (
 	"github.com/costa/polypod/internal/config"
 )
 
+// ANSI color codes for terminal output (white on dark backgrounds).
+const (
+	cW = "\033[97m" // bright white
+	cB = "\033[1m"  // bold
+	cR = "\033[0m"  // reset
+)
+
 type provider struct {
 	Name    string
 	BaseURL string
@@ -21,7 +28,9 @@ type provider struct {
 
 var providers = []provider{
 	{Name: "DeepSeek", BaseURL: "https://api.deepseek.com/v1", Model: "deepseek-chat"},
+	{Name: "Kimi", BaseURL: "https://api.moonshot.cn/v1", Model: "moonshot-v1-8k"},
 	{Name: "OpenAI", BaseURL: "https://api.openai.com/v1", Model: "gpt-4o-mini"},
+	{Name: "Claude", BaseURL: "https://openrouter.ai/api/v1", Model: "anthropic/claude-sonnet-4-20250514"},
 }
 
 // Run executes the interactive setup wizard and writes config to configPath.
@@ -29,16 +38,16 @@ func Run(configPath string) error {
 	scanner := bufio.NewScanner(os.Stdin)
 	cfg := config.DefaultConfig()
 
-	fmt.Println("==========================================================")
-	fmt.Println("  Polypod — Setup do seu agente pessoal")
-	fmt.Println("==========================================================")
+	fmt.Println(cB + cW + "==========================================================" + cR)
+	fmt.Println(cB + cW + "  Polypod — Setup do seu agente pessoal" + cR)
+	fmt.Println(cB + cW + "==========================================================" + cR)
 	fmt.Println()
-	fmt.Println("Vamos configurar em poucos passos.")
+	fmt.Println(cW + "Vamos configurar em poucos passos." + cR)
 
 	// --- Provider ---
 	fmt.Println()
-	fmt.Println("--- Provedor de IA ---")
-	choices := []string{"DeepSeek (recomendado)", "OpenAI", "Outro (compativel OpenAI)"}
+	fmt.Println(cB + cW + "--- Provedor de IA ---" + cR)
+	choices := []string{"DeepSeek (recomendado)", "Kimi (Moonshot)", "OpenAI (GPT)", "Claude (via OpenRouter)", "Outro (compativel OpenAI)"}
 	provIdx := askChoice(scanner, "Qual provedor?", choices, 1)
 
 	switch provIdx {
@@ -47,10 +56,18 @@ func Run(configPath string) error {
 		cfg.AI.BaseURL = providers[0].BaseURL
 		cfg.AI.Model = providers[0].Model
 	case 2:
-		cfg.AI.Provider = "openai"
+		cfg.AI.Provider = "kimi"
 		cfg.AI.BaseURL = providers[1].BaseURL
 		cfg.AI.Model = providers[1].Model
 	case 3:
+		cfg.AI.Provider = "openai"
+		cfg.AI.BaseURL = providers[2].BaseURL
+		cfg.AI.Model = providers[2].Model
+	case 4:
+		cfg.AI.Provider = "claude"
+		cfg.AI.BaseURL = providers[3].BaseURL
+		cfg.AI.Model = providers[3].Model
+	case 5:
 		cfg.AI.Provider = "custom"
 		cfg.AI.BaseURL = askString(scanner, "URL base da API:", "")
 		cfg.AI.Model = askString(scanner, "Nome do modelo:", "")
@@ -60,13 +77,13 @@ func Run(configPath string) error {
 
 	// --- Tools ---
 	fmt.Println()
-	fmt.Println("--- Ferramentas ---")
+	fmt.Println(cB + cW + "--- Ferramentas ---" + cR)
 	cfg.AI.Tools = askBool(scanner, "Habilitar tools (ler arquivos, executar comandos)?", true)
 
 	// --- Channels ---
 	fmt.Println()
-	fmt.Println("--- Canais ---")
-	fmt.Println("CLI ja vem habilitado.")
+	fmt.Println(cB + cW + "--- Canais ---" + cR)
+	fmt.Println(cW + "CLI ja vem habilitado." + cR)
 	fmt.Println()
 
 	// Telegram
@@ -88,14 +105,14 @@ func Run(configPath string) error {
 		key := askString(scanner, "API key (Enter = gerar):", "")
 		if key == "" {
 			key = generateAPIKey()
-			fmt.Printf("  Chave gerada: %s\n", key)
+			fmt.Printf("%s  Chave gerada: %s%s\n", cW, key, cR)
 		}
 		cfg.REST.APIKeys = []string{key}
 	}
 
 	// --- Database ---
 	fmt.Println()
-	fmt.Println("--- Armazenamento ---")
+	fmt.Println(cB + cW + "--- Armazenamento ---" + cR)
 	storageChoices := []string{"SQLite local (recomendado)", "PostgreSQL", "Nenhum (JSON local)"}
 	storageIdx := askChoice(scanner, "Onde guardar conversas e dados?", storageChoices, 1)
 
@@ -122,12 +139,12 @@ func Run(configPath string) error {
 
 	// --- Summary ---
 	fmt.Println()
-	fmt.Println("--- Resumo ---")
-	fmt.Printf("  Provedor: %s (%s)\n", cfg.AI.Provider, cfg.AI.Model)
+	fmt.Println(cB + cW + "--- Resumo ---" + cR)
+	fmt.Printf("%s  Provedor: %s (%s)%s\n", cW, cfg.AI.Provider, cfg.AI.Model, cR)
 	if cfg.AI.Tools {
-		fmt.Println("  Tools: habilitadas")
+		fmt.Println(cW + "  Tools: habilitadas" + cR)
 	} else {
-		fmt.Println("  Tools: desabilitadas")
+		fmt.Println(cW + "  Tools: desabilitadas" + cR)
 	}
 
 	var canais []string
@@ -141,19 +158,19 @@ func Run(configPath string) error {
 	if cfg.REST.Enabled {
 		canais = append(canais, "REST")
 	}
-	fmt.Printf("  Canais: %s\n", strings.Join(canais, ", "))
+	fmt.Printf("%s  Canais: %s%s\n", cW, strings.Join(canais, ", "), cR)
 
 	if cfg.Database.Enabled && cfg.Database.Driver == "sqlite" {
-		fmt.Printf("  Banco: SQLite (%s)\n", cfg.Database.Path)
+		fmt.Printf("%s  Banco: SQLite (%s)%s\n", cW, cfg.Database.Path, cR)
 	} else if cfg.Database.Enabled {
-		fmt.Printf("  Banco: PostgreSQL %s@%s:%d/%s\n", cfg.Database.User, cfg.Database.Host, cfg.Database.Port, cfg.Database.Name)
+		fmt.Printf("%s  Banco: PostgreSQL %s@%s:%d/%s%s\n", cW, cfg.Database.User, cfg.Database.Host, cfg.Database.Port, cfg.Database.Name, cR)
 	} else {
-		fmt.Println("  Banco: desabilitado (JSON local)")
+		fmt.Println(cW + "  Banco: desabilitado (JSON local)" + cR)
 	}
 	fmt.Println()
 
 	if !askBool(scanner, "Salvar e iniciar?", true) {
-		fmt.Println("Setup cancelado.")
+		fmt.Println(cW + "Setup cancelado." + cR)
 		return fmt.Errorf("setup cancelado pelo usuario")
 	}
 
@@ -166,7 +183,7 @@ func Run(configPath string) error {
 	if err := os.WriteFile(configPath, data, 0644); err != nil {
 		return fmt.Errorf("erro ao gravar %s: %w", configPath, err)
 	}
-	fmt.Printf("\nConfig salva em %s\n", configPath)
+	fmt.Printf("\n%sConfig salva em %s%s\n", cW, configPath, cR)
 
 	// Create directories
 	for _, dir := range []string{cfg.Data.Dir, cfg.Data.AgentsDir} {
@@ -200,16 +217,16 @@ skills:
 		}
 	}
 
-	fmt.Println("Iniciando Polypod...")
+	fmt.Println(cW + "Iniciando Polypod..." + cR)
 	return nil
 }
 
 // askString prompts for a string input with an optional default.
 func askString(scanner *bufio.Scanner, prompt, defaultVal string) string {
 	if defaultVal != "" {
-		fmt.Printf("%s [%s]: ", prompt, defaultVal)
+		fmt.Printf("%s%s [%s]: %s", cW, prompt, defaultVal, cR)
 	} else {
-		fmt.Printf("%s ", prompt)
+		fmt.Printf("%s%s %s", cW, prompt, cR)
 	}
 	if scanner.Scan() {
 		text := strings.TrimSpace(scanner.Text())
@@ -222,7 +239,7 @@ func askString(scanner *bufio.Scanner, prompt, defaultVal string) string {
 
 // askSecret prompts for a secret value (shown as typed — no masking in terminal).
 func askSecret(scanner *bufio.Scanner, prompt string) string {
-	fmt.Printf("%s ", prompt)
+	fmt.Printf("%s%s %s", cW, prompt, cR)
 	if scanner.Scan() {
 		return strings.TrimSpace(scanner.Text())
 	}
@@ -237,7 +254,7 @@ func askBool(scanner *bufio.Scanner, prompt string, defaultVal bool) bool {
 	} else {
 		def = "s/N"
 	}
-	fmt.Printf("%s (%s): ", prompt, def)
+	fmt.Printf("%s%s (%s): %s", cW, prompt, def, cR)
 	if scanner.Scan() {
 		text := strings.TrimSpace(strings.ToLower(scanner.Text()))
 		if text == "" {
@@ -250,11 +267,11 @@ func askBool(scanner *bufio.Scanner, prompt string, defaultVal bool) bool {
 
 // askChoice presents numbered options and returns the 1-based selection.
 func askChoice(scanner *bufio.Scanner, prompt string, options []string, defaultIdx int) int {
-	fmt.Println(prompt)
+	fmt.Printf("%s%s%s\n", cB+cW, prompt, cR)
 	for i, opt := range options {
-		fmt.Printf("  [%d] %s\n", i+1, opt)
+		fmt.Printf("%s  [%d] %s%s\n", cW, i+1, opt, cR)
 	}
-	fmt.Printf("Escolha [%d]: ", defaultIdx)
+	fmt.Printf("%sEscolha [%d]: %s", cW, defaultIdx, cR)
 	if scanner.Scan() {
 		text := strings.TrimSpace(scanner.Text())
 		if text == "" {
