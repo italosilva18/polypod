@@ -62,7 +62,7 @@ func (a *Adapter) Start(ctx context.Context, handler adapter.MessageHandler) err
 	}
 
 	m := newModel(ctx, sh, deps, a.dataDir)
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 
 	// Cancel program when context is done
 	go func() {

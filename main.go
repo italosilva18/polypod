@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -58,7 +59,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger := observability.NewLogger(cfg.Log.Level, cfg.Log.Format)
+	var logger *slog.Logger
+	if cfg.CLI.Enabled {
+		logPath := filepath.Join(cfg.Data.Dir, "polypod.log")
+		os.MkdirAll(cfg.Data.Dir, 0755)
+		var err error
+		logger, err = observability.NewLoggerToFile(cfg.Log.Level, cfg.Log.Format, logPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error creating log file: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		logger = observability.NewLogger(cfg.Log.Level, cfg.Log.Format)
+	}
 	slog.SetDefault(logger)
 	logger.Info("polypod starting", "version", "0.3.0")
 
