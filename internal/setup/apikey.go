@@ -3,25 +3,69 @@ package setup
 import (
 	"bufio"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/costa/polypod/internal/config"
 )
 
-// CheckAPIKey verifies that the config has an API key set. If not, it
-// interactively asks the user to pick a provider and enter a key.
-// When configPath is provided and the user opts to save, the updated
-// config is written to disk.
+// validateKey makes a quick GET to {baseURL}/models with the API key
+// to check if the key is valid. Returns true if the key works.
+func validateKey(baseURL, apiKey string) bool {
+	if baseURL == "" || apiKey == "" {
+		return false
+	}
+	url := strings.TrimRight(baseURL, "/") + "/models"
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden
+}
+
+// needsAPIKey returns true when the interactive prompt should be shown:
+// key is empty, or key fails validation against the configured API.
+func needsAPIKey(cfg *config.Config) bool {
+	if cfg.AI.APIKey == "" {
+		return true
+	}
+	if cfg.AI.BaseURL == "" {
+		return false // can't validate without a URL, assume it's fine
+	}
+	fmt.Printf("%sValidando API key...%s ", cW, cR)
+	if validateKey(cfg.AI.BaseURL, cfg.AI.APIKey) {
+		fmt.Println(cW + "OK" + cR)
+		return false
+	}
+	fmt.Println(cW + "falhou (401)" + cR)
+	return true
+}
+
+// CheckAPIKey verifies that the config has a working API key. If the key
+// is missing or returns 401, it interactively asks the user to pick a
+// provider and enter a valid key.
 func CheckAPIKey(cfg *config.Config, configPath string) error {
-	if cfg.AI.APIKey != "" {
+	if !needsAPIKey(cfg) {
 		return nil
 	}
 
 	scanner := bufio.NewScanner(os.Stdin)
 
 	fmt.Println()
-	fmt.Println(cB + cW + "Nenhuma API key configurada." + cR)
+	if cfg.AI.APIKey == "" {
+		fmt.Println(cB + cW + "Nenhuma API key configurada." + cR)
+	} else {
+		fmt.Println(cB + cW + "API key atual e invalida ou expirada." + cR)
+	}
 	fmt.Println()
 
 	// Provider selection
@@ -62,6 +106,15 @@ func CheckAPIKey(cfg *config.Config, configPath string) error {
 		return fmt.Errorf("API key nao pode ser vazia")
 	}
 	cfg.AI.APIKey = key
+
+	// Validate the new key
+	fmt.Printf("%sValidando...%s ", cW, cR)
+	if !validateKey(cfg.AI.BaseURL, cfg.AI.APIKey) {
+		fmt.Println(cW + "falhou" + cR)
+		fmt.Println(cW + "Continuando mesmo assim (verifique sua key)." + cR)
+	} else {
+		fmt.Println(cW + "OK" + cR)
+	}
 
 	fmt.Println()
 	if askBool(scanner, "Quer que eu salve no config?", true) {
