@@ -11,19 +11,24 @@ import (
 	"github.com/costa/polypod/internal/config"
 )
 
-// validateKey makes a quick GET to {baseURL}/models with the API key
-// to check if the key is valid. Returns true if the key works.
-func validateKey(baseURL, apiKey string) bool {
+// validateKey sends a minimal chat completion request to verify the key.
+// Returns true if the key is accepted (no 401/403).
+func validateKey(baseURL, apiKey, model string) bool {
 	if baseURL == "" || apiKey == "" {
 		return false
 	}
-	url := strings.TrimRight(baseURL, "/") + "/models"
-	req, err := http.NewRequest("GET", url, nil)
+	url := strings.TrimRight(baseURL, "/") + "/chat/completions"
+	if model == "" {
+		model = "deepseek-chat"
+	}
+	body := `{"model":"` + model + `","messages":[{"role":"user","content":"hi"}],"max_tokens":1}`
+	req, err := http.NewRequest("POST", url, strings.NewReader(body))
 	if err != nil {
 		return false
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	client := &http.Client{Timeout: 5 * time.Second}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return false
@@ -42,7 +47,7 @@ func needsAPIKey(cfg *config.Config) bool {
 		return false // can't validate without a URL, assume it's fine
 	}
 	fmt.Printf("%sValidando API key...%s ", cW, cR)
-	if validateKey(cfg.AI.BaseURL, cfg.AI.APIKey) {
+	if validateKey(cfg.AI.BaseURL, cfg.AI.APIKey, cfg.AI.Model) {
 		fmt.Println(cW + "OK" + cR)
 		return false
 	}
@@ -109,7 +114,7 @@ func CheckAPIKey(cfg *config.Config, configPath string) error {
 
 	// Validate the new key
 	fmt.Printf("%sValidando...%s ", cW, cR)
-	if !validateKey(cfg.AI.BaseURL, cfg.AI.APIKey) {
+	if !validateKey(cfg.AI.BaseURL, cfg.AI.APIKey, cfg.AI.Model) {
 		fmt.Println(cW + "falhou" + cR)
 		fmt.Println(cW + "Continuando mesmo assim (verifique sua key)." + cR)
 	} else {

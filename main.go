@@ -277,14 +277,25 @@ func run(ctx context.Context, cfg *config.Config, pgDB *database.DB, sqliteDB *d
 		return nil
 	}
 
-	// Start all channels concurrently
+	// Start all channels concurrently.
+	// Non-CLI channels log errors but don't bring down the process.
 	g, gCtx := errgroup.WithContext(ctx)
 	for _, ch := range channels {
 		ch := ch
-		g.Go(func() error {
-			logger.Info("starting channel", "name", ch.Name())
-			return ch.Start(gCtx, handler)
-		})
+		if ch.Name() == "cli" {
+			g.Go(func() error {
+				logger.Info("starting channel", "name", ch.Name())
+				return ch.Start(gCtx, handler)
+			})
+		} else {
+			g.Go(func() error {
+				logger.Info("starting channel", "name", ch.Name())
+				if err := ch.Start(gCtx, handler); err != nil {
+					logger.Warn("channel failed (non-fatal)", "name", ch.Name(), "error", err)
+				}
+				return nil
+			})
+		}
 	}
 
 	return g.Wait()
