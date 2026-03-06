@@ -123,6 +123,9 @@ var slashCommands = []string{
 	"/skills",
 	"/memory list", "/memory search ",
 	"/model", "/session",
+	"/copy", "/run ", "/file ", "/search ",
+	"/git status", "/git log", "/git diff", "/git branch",
+	"/project", "/export ", "/context",
 }
 
 func (m *model) resetTab() {
@@ -232,6 +235,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
+		case msg.Type == tea.KeyCtrlL && m.state == stateIdle:
+			m.messages = nil
+			m.updateViewport()
+			return m, nil
+
 		case msg.Type == tea.KeyEsc && m.state == stateIdle:
 			m.textarea.SetValue("")
 			m.textarea.Reset()
@@ -251,16 +259,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.history.ResetCursor()
 
 			// Check for local commands
-			result := processCommand(input, m.cmdDeps)
+			result := processCommand(input, m.cmdDeps, m.messages)
 			if result.quit {
 				return m, tea.Quit
 			}
 			if result.handled {
-				m.messages = append(m.messages, chatEntry{
-					role:      "system",
-					content:   result.output,
-					timestamp: time.Now(),
-				})
+				if result.clearDisplay {
+					m.messages = nil
+				}
+				if result.output != "" {
+					m.messages = append(m.messages, chatEntry{
+						role:      "system",
+						content:   result.output,
+						timestamp: time.Now(),
+					})
+				}
 				m.updateViewport()
 				return m, nil
 			}
