@@ -38,7 +38,7 @@ type model struct {
 	history  *inputHistory
 
 	messages  []chatEntry
-	streaming strings.Builder
+	streaming *strings.Builder
 	streamCh  <-chan streamMsg
 	state     state
 
@@ -73,6 +73,7 @@ func newModel(ctx context.Context, streamHandler adapter.StreamHandler, deps com
 		textarea:      ta,
 		spinner:       sp,
 		history:       newInputHistory(dataDir),
+		streaming:     &strings.Builder{},
 		streamHandler: streamHandler,
 		cmdDeps:       deps,
 		ctx:           ctx,
