@@ -190,10 +190,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.textarea.SetWidth(m.width - 4) // account for border padding
 		return m, nil
 
+	case tea.MouseMsg:
+		// Pass mouse events (scroll wheel) to viewport
+		var cmd tea.Cmd
+		m.viewport, cmd = m.viewport.Update(msg)
+		return m, cmd
+
 	case tea.KeyMsg:
 		switch {
 		case msg.Type == tea.KeyCtrlC:
 			return m, tea.Quit
+
+		case msg.Type == tea.KeyPgUp:
+			var cmd tea.Cmd
+			m.viewport, cmd = m.viewport.Update(msg)
+			return m, cmd
+
+		case msg.Type == tea.KeyPgDown:
+			var cmd tea.Cmd
+			m.viewport, cmd = m.viewport.Update(msg)
+			return m, cmd
 
 		case msg.Type == tea.KeyTab && m.state == stateIdle:
 			if m.tryTabComplete() {
@@ -380,9 +396,13 @@ func (m *model) updateViewport() {
 	if !m.ready {
 		return
 	}
+	// Auto-scroll only if user is already at/near bottom or streaming
+	atBottom := m.viewport.AtBottom() || m.state == stateStreaming
 	content := m.renderMessages()
 	m.viewport.SetContent(content)
-	m.viewport.GotoBottom()
+	if atBottom {
+		m.viewport.GotoBottom()
+	}
 }
 
 // ── Render messages ─────────────────────────────────────────────────────────
