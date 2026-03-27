@@ -1,6 +1,6 @@
 # Polypod
 
-A CLI de IA mais completa do mundo. Um unico binario Go de 26MB com 130+ skills, 92 packages, 5 providers, 5 canais, MCP client+server, hooks, plugins, modos, parallel tool execution, smart routing, e absolutamente tudo que existe no mercado — mais o que ninguem tem.
+A CLI de IA mais completa do mundo. Um unico binario Go de 26MB com 130+ skills, 88 packages (100% conectados, zero dead code), 5 providers, 5 canais, MCP client+server, hooks, plugins, modos, parallel tool execution, smart routing, e absolutamente tudo que existe no mercado — mais o que ninguem tem.
 
 ```
    ____       _                       _
@@ -58,8 +58,9 @@ cd polypod && make build
 
 ./polypod --setup          # Setup interativo
 ./polypod init             # Gera .polypod.md + commands + settings
-./polypod doctor           # Verifica ambiente
-./polypod config.yaml      # Executar
+./polypod doctor           # Verifica ambiente (API keys, deps, MCP, plugins)
+./polypod config.yaml      # Executar CLI interativa
+./polypod --version        # Versao atual
 
 # Headless (para scripts/CI)
 ./polypod -p "explique main.go"
@@ -67,8 +68,33 @@ cat error.log | ./polypod -p "analise"
 ./polypod -p "bugs" --output-format json
 
 # Shell completions
-eval "$(./polypod completion bash)"
+eval "$(./polypod completion bash)"   # bash
+polypod completion zsh > ~/.zsh/_polypod  # zsh
+polypod completion fish | source      # fish
+
+# Git hooks (commit messages IA + auto-test antes de push)
+./polypod hook install
+./polypod hook status
+
+# MCP Server (expoe skills para Claude Desktop, Cursor, etc.)
+./polypod mcp serve
 ```
+
+### O que acontece no startup
+
+1. Carrega `.env` e `.env.local` (antes do config, para `${VAR}` funcionar)
+2. Carrega e valida `config.yaml` (erros coloridos com sugestoes)
+3. Merge `config.d/*.yaml` (config fragments de equipe)
+4. Verifica atualizacao no GitHub (async, nao bloqueia)
+5. Conecta ao banco de dados (se habilitado)
+6. Registra 130+ skills de todos os 88 packages
+7. Conecta MCP servers com `auto_start: true`
+8. Carrega plugins, templates, commands de projeto
+9. Inicializa permissions, modes, hooks, budget
+10. Inicia scheduler (se habilitado)
+11. Verifica PR aberto (async)
+12. Dispara hook `SessionStart`
+13. Abre canais (CLI, REST, Telegram, WhatsApp, WebUI)
 
 ## Providers
 
@@ -433,7 +459,7 @@ Detecta PR aberto para a branch atual via `gh` CLI:
 - Dica: sessao longa — considere /compact
 ```
 
-## Arquitetura (92 packages)
+## Arquitetura (88 packages, 100% conectados)
 
 ```
 polypod/
@@ -598,13 +624,29 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
+## Subcomandos
+
+| Comando | Descricao |
+|---------|-----------|
+| `polypod config.yaml` | Iniciar CLI interativa |
+| `polypod --setup` | Setup interativo (gera config.yaml) |
+| `polypod -p "prompt"` | Modo headless (stdout, exit) |
+| `polypod -p "prompt" --output-format json` | Headless com output JSON |
+| `polypod doctor` | Diagnostico do ambiente |
+| `polypod init` | Gerar .polypod.md + commands + settings |
+| `polypod completion bash\|zsh\|fish` | Gerar shell completions |
+| `polypod hook install\|uninstall\|status` | Gerenciar git hooks |
+| `polypod mcp serve` | Expor skills via MCP protocol |
+| `polypod --version` | Mostrar versao |
+
 ## Numeros
 
 | Metrica | Valor |
 |---------|-------|
 | Arquivos Go | 132 |
 | Linhas de codigo | 22.696 |
-| Packages | 92 |
+| Packages | 88 (100% conectados) |
+| Dead code | 0 |
 | Skills | 130+ |
 | Templates | 8 |
 | Temas | 6 |
