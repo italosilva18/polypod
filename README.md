@@ -1,6 +1,6 @@
 # Polypod
 
-Gateway de IA multi-canal, multi-provider e auto-modificavel. Um unico binario Go de 26MB que conecta qualquer LLM a CLI, REST API, Telegram, WhatsApp e browser — com 110+ skills, 62 packages, MCP, hooks, modos, plugins, e tudo que voce precisa.
+A CLI de IA mais completa do mundo. Um unico binario Go de 26MB com 130+ skills, 78 packages, 5 providers, 5 canais, MCP, hooks, plugins, modos, e tudo que existe no mercado — mais o que ninguem tem.
 
 ```
    ____       _                       _
@@ -15,236 +15,232 @@ Gateway de IA multi-canal, multi-provider e auto-modificavel. Um unico binario G
 
 | Feature | Polypod | Claude Code | Aider | Gemini CLI | Codex CLI |
 |---------|---------|-------------|-------|------------|-----------|
-| Multi-canal (CLI+REST+Telegram+WhatsApp+Web) | **Sim** | Nao | Nao | Nao | Nao |
+| Multi-canal (CLI+REST+TG+WA+Web) | **Sim** | Nao | Nao | Nao | Nao |
 | IoT/Hardware (USB, serial, firmware) | **Sim** | Nao | Nao | Nao | Nao |
-| Auto-modificacao (persona, skills, agentes) | **Sim** | Parcial | Nao | Nao | Nao |
+| Auto-modificacao (persona, skills) | **Sim** | Parcial | Nao | Nao | Nao |
 | Cross-channel notifications | **Sim** | Nao | Nao | Nao | Nao |
-| Scheduler/cron integrado | **Sim** | Nao | Nao | Nao | Nao |
-| Multi-provider (5 nativos + fallback) | **Sim** | Nao | Sim | Nao | Nao |
+| Scheduler/cron + /loop | **Sim** | Parcial | Nao | Nao | Nao |
+| Provider fallback automatico | **Sim** | Nao | Nao | Nao | Nao |
+| Smart model routing (auto) | **Sim** | Nao | Nao | Nao | Nao |
+| Parallel tool execution | **Sim** | Sim | Nao | Nao | Nao |
+| Circuit breaker per-provider | **Sim** | Nao | Nao | Nao | Nao |
+| Image generation (/imagine) | **Sim** | Nao | Nao | Nao | Nao |
+| SSH remote execution | **Sim** | Nao | Nao | Nao | Nao |
+| DB migrations (/migrate) | **Sim** | Nao | Nao | Nao | Nao |
+| OpenAPI→tools (/openapi load) | **Sim** | Nao | Nao | Nao | Nao |
+| Test generation (/test generate) | **Sim** | Nao | Nao | Nao | Nao |
+| Docs generation (/docs) | **Sim** | Nao | Nao | Nao | Nao |
+| Profiling integration (/profile) | **Sim** | Nao | Nao | Nao | Nao |
+| Conversation tree branching | **Sim** | Parcial | Nao | Nao | Nao |
+| Export (HTML/JSON/Notebook) | **Sim** | Nao | Nao | Nao | Nao |
+| Dependency graph (/deps) | **Sim** | Nao | Nao | Nao | Nao |
+| Clipboard (/copy /paste) | **Sim** | Plugin | Nao | Nao | Nao |
+| Token budget management | **Sim** | Nao | Nao | Nao | Nao |
+| Spec-driven development | **Sim** | Nao | Nao | Nao | Nao |
 | MCP Client + Server | **Sim** | Sim | Nao | Sim | Nao |
 | Hooks (PreToolUse/PostToolUse) | **Sim** | Sim | Nao | Nao | Nao |
 | Modos (plan/ask/edit/auto) | **Sim** | Sim | Parcial | Sim | Sim |
 | Watch mode (// AI: triggers) | **Sim** | Nao | Sim | Nao | Nao |
 | Plugin system | **Sim** | Sim | Nao | Sim | Nao |
 | Browser UI | **Sim** | Nao | Sim | Nao | Nao |
-| Spec-driven development | **Sim** | Nao | Nao | Nao | Nao |
-| Provider fallback automatico | **Sim** | Nao | Nao | Nao | Nao |
 | Binario unico, zero deps | **Sim** | Nao | Nao | Nao | Nao |
 | Open source | **Sim** | Nao | Sim | Sim | Sim |
 
 ## Inicio Rapido
 
 ```bash
-# Compilar
 git clone https://github.com/italosilva18/polypod.git
 cd polypod && make build
 
-# Primeiro uso (setup interativo — detecta stack, gera config)
+# Setup interativo (detecta stack, gera config)
 ./polypod --setup
 
-# Ou inicializar projeto (gera .polypod.md + commands + settings)
+# Inicializar projeto (.polypod.md + commands + settings)
 ./polypod init
 
 # Executar
 ./polypod config.yaml
 
-# Modo headless (para scripts/CI)
-./polypod -p "explique o que faz main.go"
-
-# Pipe via stdin
-cat error.log | ./polypod -p "analise este log"
-
-# Output JSON
+# Modo headless
+./polypod -p "explique main.go"
+cat error.log | ./polypod -p "analise"
 ./polypod -p "liste bugs" --output-format json
 
-# Diagnostico de ambiente
+# Diagnostico
 ./polypod doctor
-```
-
-## Instalacao
-
-```bash
-# Pre-requisitos: Go 1.24+, uma API key
-go install github.com/italosilva18/polypod@latest
-
-# Ou compilar do fonte
-git clone https://github.com/italosilva18/polypod.git
-cd polypod
-make build          # binario local
-make build-linux    # cross-compile Linux amd64
-make build-arm      # cross-compile Linux arm64
 ```
 
 ## Providers de IA
 
-### DeepSeek (padrao — mais barato)
+5 providers nativos com fallback automatico:
 
 ```yaml
+# DeepSeek (padrao, mais barato)
 ai:
   provider: "deepseek"
   base_url: "https://api.deepseek.com/v1"
   api_key: "${DEEPSEEK_API_KEY}"
   model: "deepseek-chat"
+
+# Ollama (local, gratis, offline)
+# ai:
+#   provider: "ollama"
+#   base_url: "http://localhost:11434/v1"
+#   model: "llama3.1"
+
+# OpenAI / Anthropic / Google — configure em providers:[]
 ```
 
-### Ollama (local, gratis, offline)
+**Fallback automatico**: se DeepSeek falhar (429/5xx), tenta Ollama, depois OpenAI — com mapeamento inteligente de modelos.
 
-```yaml
-ai:
-  provider: "ollama"
-  base_url: "http://localhost:11434/v1"
-  model: "llama3.1"
-```
+**Smart routing**: `/effort auto` classifica complexidade do prompt e roteia para modelo barato (simples) ou caro (complexo). ~60% economia.
 
-### OpenAI
+**Circuit breaker**: 3 falhas → abre circuito → espera 30s → testa recovery. Per-provider.
 
-```yaml
-ai:
-  provider: "openai"
-  base_url: "https://api.openai.com/v1"
-  api_key: "${OPENAI_API_KEY}"
-  model: "gpt-4o"
-```
-
-### Anthropic (Claude)
-
-```yaml
-providers:
-  - name: anthropic
-    api_key: "${ANTHROPIC_API_KEY}"
-ai:
-  provider: "anthropic"
-  model: "claude-3-5-sonnet-latest"
-```
-
-### Google Gemini
-
-```yaml
-providers:
-  - name: google
-    api_key: "${GOOGLE_API_KEY}"
-ai:
-  provider: "google"
-  model: "gemini-1.5-pro"
-```
-
-### Provider Fallback Automatico
-
-Se o provider primario falhar (rate limit, timeout), Polypod automaticamente tenta o proximo na chain, com mapeamento inteligente de modelos entre providers:
-
-```yaml
-# deepseek falha → tenta ollama → tenta openai
-providers:
-  - name: ollama
-    base_url: "http://localhost:11434"
-  - name: openai
-    api_key: "${OPENAI_API_KEY}"
-```
-
-## Canais
+## 5 Canais
 
 | Canal | Config | Descricao |
 |-------|--------|-----------|
-| **CLI** | `cli.enabled: true` | Interface terminal rica (BubbleTea + Glamour), streaming, markdown |
-| **REST API** | `rest.enabled: true` | Endpoints `/api/chat`, `/api/chat/stream` (SSE), `/api/health`, `/api/skills` |
-| **Telegram** | `telegram.enabled: true` | Bot com polling, controle por ID |
-| **WhatsApp** | `whatsapp.enabled: true` | Via Green API, controle por numero |
-| **Browser UI** | `webui.enabled: true` | Chat web em `localhost:8090` com streaming SSE |
+| CLI | `cli.enabled: true` | BubbleTea + Glamour, streaming, 6 temas |
+| REST API | `rest.enabled: true` | `/api/chat`, `/api/chat/stream` (SSE), `/api/skills` |
+| Telegram | `telegram.enabled: true` | Bot com polling |
+| WhatsApp | `whatsapp.enabled: true` | Via Green API |
+| Browser | `webui.enabled: true` | `localhost:8090` com SSE |
 
 ## Comandos da CLI
+
+### Modos e Controle
 
 | Comando | Descricao |
 |---------|-----------|
 | `/mode plan\|ask\|edit\|auto` | Mudar modo de operacao |
-| `/effort low\|medium\|high` | Controlar profundidade de raciocinio |
-| `/compact [foco]` | Compactar contexto com foco customizado (ex: `/compact foco nas decisoes de API`) |
-| `/cost` | Mostrar tokens e custo da sessao |
-| `/context` | Diagnostico de uso do context window |
-| `/doctor` | Verificar saude do ambiente |
-| `/init` | Inicializar projeto (.polypod.md + commands + settings) |
-| `/undo` | Desfazer ultima mudanca de arquivo |
-| `/redo` | Refazer mudanca desfeita |
-| `/rewind` | Voltar a um checkpoint anterior |
-| `/theme dark\|light\|monokai\|dracula\|solarized\|nord` | Mudar tema visual |
-| `/color red\|blue\|green\|...` | Mudar cor da sessao |
-| `/loop 5m <prompt>` | Tarefa recorrente in-session |
-| `/loop list` | Listar loops ativos |
-| `/loop stop <id>` | Parar um loop |
-| `/spec <descricao>` | Gerar spec (requirements → design → tasks) |
+| `/effort low\|medium\|high\|auto` | Controlar profundidade de raciocinio |
+| `/compact [foco]` | Compactar contexto com IA (ex: `/compact foco nas decisoes de API`) |
+| `/cost` | Tokens e custo da sessao |
+| `/context` | Diagnostico do context window |
+| `/budget` | Status de limites de tokens/custo |
+
+### Sessao e Historico
+
+| Comando | Descricao |
+|---------|-----------|
+| `/undo` | Desfazer ultima mudanca |
+| `/redo` | Refazer |
+| `/rewind` | Voltar a checkpoint anterior |
+| `/tree` | Visualizar arvore de conversa (branching) |
+| `/fork` | Criar branch na conversa |
 | `/history search <query>` | Buscar em sessoes passadas |
-| `@path/to/file.go` | Incluir arquivo no prompt (com autocomplete) |
-| `@dir/` | Incluir listagem de diretorio |
+| `/export html\|json\|notebook\|markdown` | Exportar sessao |
+| `/copy` | Copiar ultima resposta para clipboard |
+| `/copy code` | Copiar so blocos de codigo |
+| `/paste` | Colar do clipboard como input |
 
-## Modos de Operacao
+### Projeto e DevOps
 
-| Modo | Comportamento | Quando usar |
-|------|---------------|-------------|
-| `edit` | Padrao. Edita arquivos e executa comandos | Desenvolvimento normal |
-| `plan` | Read-only. Analisa e planeja sem modificar nada | Arquitetura, planejamento |
-| `ask` | Sem tools. Apenas responde perguntas | Perguntas rapidas, aprendizado |
-| `auto` | Totalmente autonomo. Sem confirmacao | Tarefas bem definidas, scripts |
+| Comando | Descricao |
+|---------|-----------|
+| `/init` | Scaffold do projeto (.polypod.md + commands + settings) |
+| `/doctor` | Diagnostico do ambiente |
+| `/commit` | Gerar commit message IA do staged diff (Conventional Commits) |
+| `/test generate <file>` | Gerar testes unitarios (Go/Python/JS) |
+| `/docs readme\|changelog\|api\|godoc` | Gerar documentacao |
+| `/profile go\|python <file>` | Performance profiling |
+| `/deps tree\|circular\|graph` | Grafo de dependencias |
+| `/migrate diff\|lint\|apply\|list` | Migrations de banco de dados |
+| `/openapi load <url>` | Gerar tools a partir de spec OpenAPI |
+| `/ssh exec <host> <cmd>` | Executar comando remoto via SSH |
+| `/ssh hosts` | Listar hosts de ~/.ssh/config |
+| `/imagine <prompt>` | Gerar imagem (DALL-E/LocalAI) |
 
-## Skills (110+)
+### Automacao
+
+| Comando | Descricao |
+|---------|-----------|
+| `/loop 5m <prompt>` | Tarefa recorrente in-session |
+| `/loop list\|stop <id>` | Gerenciar loops |
+| `/spec <descricao>` | Gerar requirements → design → tasks |
+| `@path/to/file` | Incluir arquivo no prompt (autocomplete) |
+
+### Visual
+
+| Comando | Descricao |
+|---------|-----------|
+| `/theme dark\|light\|monokai\|dracula\|solarized\|nord` | Mudar tema |
+| `/color red\|blue\|green\|purple\|...` | Cor da sessao |
+
+## Skills (130+)
 
 ### Sistema (10)
-
-| Skill | Descricao |
-|-------|-----------|
-| `read_file` | Ler conteudo de arquivo |
-| `read_files` | Ler multiplos arquivos (glob/lista) |
-| `read_dir` | Ler todos os arquivos de um diretorio |
-| `list_directory` | Listar arquivos e pastas |
-| `run_command` | Executar comando shell |
-| `search_files` | Buscar arquivos por glob pattern |
-| `create_file` | Criar novo arquivo |
-| `edit_file` | Editar arquivo (substituicao cirurgica) |
-| `delete_file` | Excluir arquivo |
-| `patch_file` | Aplicar unified diff |
+`read_file` `read_files` `read_dir` `list_directory` `run_command` `search_files` `create_file` `edit_file` `delete_file` `patch_file`
 
 ### Git (16)
 `git_status` `git_diff` `git_log` `git_commit` `git_branch` `git_stash` `git_blame` `git_show` `git_pull` `git_push` `git_merge` `git_cherry_pick` `git_tag` `git_clone` `git_init` `git_remote`
 
-### Code Review (3)
-`code_review` `lint_check` `test_run` — auto-detecta Go, Node, Python, Rust
+### Code Quality (3)
+`code_review` `lint_check` `test_run`
+
+### Test Generation (1)
+`test_generate` — Go (table-driven), Python (pytest), JS (vitest), Rust (#[test])
+
+### Documentation (4)
+`docs_readme` `docs_changelog` `docs_api` `docs_godoc`
+
+### Profiling (4)
+`profile_go` `profile_analyze` `profile_flame` `profile_python`
 
 ### Memoria (4)
 `save_memory` `recall_memory` `list_memories` `delete_memory`
 
 ### Web (2)
-`web_search` (DuckDuckGo + cache) `fetch_url`
+`web_search` `fetch_url` — com cache local
 
 ### Vision (3)
 `analyze_image` `screenshot` `image_info`
 
-### Voz (4)
-`voice_record` `voice_transcribe` (Whisper) `voice_speak` (TTS) `voice_available`
+### Image Generation (1)
+`imagine` — DALL-E, LocalAI, Stable Diffusion
 
-### IoT / Hardware (5)
-`list_usb_devices` `list_serial_ports` `serial_send` `serial_exchange` `flash_firmware` (Arduino, ESP32, AVR)
+### Voz (4)
+`voice_record` `voice_transcribe` `voice_speak` `voice_available`
+
+### IoT/Hardware (5)
+`list_usb_devices` `list_serial_ports` `serial_send` `serial_exchange` `flash_firmware`
 
 ### MCP (4)
 `mcp_list_servers` `mcp_connect` `mcp_disconnect` `mcp_call`
 
+### SSH Remote (3)
+`ssh_exec` `ssh_hosts` `ssh_copy`
+
 ### Banco de Dados (3)
-`db_query` `db_schema` `db_tables` — Postgres, SQLite, MySQL via linguagem natural
+`db_query` `db_schema` `db_tables`
+
+### Migrations (4)
+`migrate_diff` `migrate_list` `migrate_apply` `migrate_lint`
+
+### OpenAPI (1)
+`openapi_load` — gera tools automaticamente de specs Swagger/OpenAPI
+
+### Dependencies (3)
+`deps_tree` `deps_circular` `deps_graph_image`
 
 ### Seguranca (3)
 `security_scan` `security_secrets` `security_deps`
 
 ### Sandbox Docker (3)
-`sandbox_run` `sandbox_script` (Python/Node/Go/Bash/Ruby) `sandbox_available`
+`sandbox_run` `sandbox_script` `sandbox_available`
 
 ### Codebase (3)
 `repo_map` `find_symbol` `project_info`
 
 ### Notificacoes (3)
-`notify_send` `notify_broadcast` `notify_channels` — Telegram, WhatsApp, Webhook
+`notify_send` `notify_broadcast` `notify_channels`
 
 ### Agendamento (4)
 `scheduler_add` `scheduler_remove` `scheduler_list` `scheduler_run`
 
 ### Tracking (2)
-`usage_summary` `usage_export` (CSV)
+`usage_summary` `usage_export`
 
 ### Sessoes (3)
 `list_sessions` `session_info` `export_session`
@@ -258,9 +254,151 @@ providers:
 ### Self-Modification (7)
 `read_agent_config` `update_persona` `add_agent_skill` `remove_agent_skill` `create_skill` `list_custom_skills` `delete_custom_skill`
 
-## MCP (Model Context Protocol)
+## Features Avancadas
 
-### Como cliente — conecte a qualquer servidor MCP
+### Parallel Tool Execution
+
+Quando a IA retorna multiplos tool calls, os independentes (leituras) executam em goroutines simultaneas. 4x mais rapido.
+
+### Smart Model Routing
+
+Classifica complexidade do prompt automaticamente:
+- **Baixa** (lista, traduza, formate) → modelo barato
+- **Media** (explique codigo, review) → modelo balanceado
+- **Alta** (arquitetura, debug, refactor) → modelo frontier
+
+### Circuit Breaker
+
+Per-provider, 3 estados: Closed (normal) → Open (3 falhas, rejeita) → Half-Open (testa recovery apos 30s).
+
+### Conversation Tree
+
+```
+> /tree
+
+*
+|-- [user] Crie uma API REST...
+|   |-- [assistant] Vou criar com Gin...
+|   |   |-- [user] Use Fiber em vez de Gin
+|   |   |   \-- > [assistant] Ok, refatorando para Fiber...
+|   |   \-- [user] Adicione autenticacao JWT
+|   |       \-- [assistant] Adicionando middleware JWT...
+```
+
+Fork em qualquer mensagem, navegacao entre branches.
+
+### Export Formatos
+
+```bash
+/export html      # HTML standalone com syntax highlight
+/export json      # JSON estruturado com metadados
+/export notebook  # Jupyter notebook (.ipynb)
+/export markdown  # Markdown limpo
+```
+
+### /commit (Diff-Aware)
+
+Analisa `git diff --staged` semanticamente, classifica mudancas, auto-detecta scope, gera Conventional Commit:
+
+```
+feat(api): add JWT authentication middleware
+
+- Add auth/jwt.go with token generation and validation
+- Add middleware/auth.go with route protection
+- Update router.go with protected routes
+```
+
+### /test generate
+
+```bash
+/test generate internal/auth/jwt.go
+# → Gera jwt_test.go com table-driven tests
+# → Inclui: sucesso, token expirado, token invalido, claims errados
+```
+
+### /docs
+
+```bash
+/docs readme      # README a partir da estrutura do projeto
+/docs changelog --since v1.0.0  # Changelog categorizado
+/docs api internal/router/  # Documentacao de API
+/docs godoc internal/auth/  # Comentarios godoc
+```
+
+### /profile
+
+```bash
+/profile go "go test" --type cpu    # pprof CPU profiling
+/profile analyze /tmp/cpu.prof      # Analise de hotspots
+/profile flame /tmp/cpu.prof        # Flame graph SVG
+/profile python script.py           # cProfile Python
+```
+
+### /deps
+
+```bash
+/deps tree         # Arvore de dependencias (Go/Node/Python)
+/deps circular     # Detectar ciclos
+/deps graph deps.svg  # Grafo visual (Graphviz)
+```
+
+### /migrate
+
+```bash
+/migrate diff add_users_table   # Gerar migration SQL
+/migrate lint                   # Validar seguranca (DROP TABLE, etc.)
+/migrate apply --dsn postgres://... --dry_run true
+/migrate list                   # Listar migrations
+```
+
+### /openapi load
+
+```bash
+/openapi load https://petstore.swagger.io/v2/swagger.json
+# → Parseia 20 endpoints, gera tool definitions
+# → Salva em .polypod/tools/openapi_endpoints.json
+```
+
+### /ssh
+
+```bash
+/ssh hosts          # Lista hosts de ~/.ssh/config
+/ssh exec prod-1 "docker ps"
+/ssh copy ./deploy.sh prod-1:/opt/app/
+```
+
+### /imagine
+
+```bash
+/imagine "um gato programando em Go, pixel art"
+# → Gera imagem via DALL-E ou LocalAI
+# → Salva em polypod-images/<timestamp>.png
+```
+
+### Token Budget
+
+```yaml
+budget:
+  per_session: 100000    # max tokens por sessao
+  per_day: 500000        # max tokens por dia
+  max_cost_day: 5.00     # max $5/dia
+  max_cost_month: 50.00  # max $50/mes
+  alert_at_50: true
+  alert_at_80: true
+  auto_downgrade: true   # muda para modelo barato perto do limite
+```
+
+### Clipboard
+
+```bash
+/copy        # Copia ultima resposta
+/copy code   # Copia so blocos de codigo
+/paste       # Cola clipboard como input
+```
+
+## MCP
+
+### Cliente — conecte a 5.800+ servers
 
 ```yaml
 mcp:
@@ -269,28 +407,19 @@ mcp:
     command: npx
     args: ["-y", "@modelcontextprotocol/server-filesystem", "/home"]
     auto_start: true
-
-  - name: github
-    transport: stdio
-    command: npx
-    args: ["-y", "@modelcontextprotocol/server-github"]
-    env:
-      GITHUB_TOKEN: "ghp_..."
-    auto_start: true
 ```
 
-### Como servidor — exponha skills do Polypod via MCP
+### Servidor — exponha skills do Polypod
 
 ```bash
 ./polypod mcp serve
-# Outros tools (Claude Desktop, Cursor) podem consumir as skills do Polypod
+# Claude Desktop, Cursor, etc. podem consumir as 130+ skills
 ```
 
-## Hooks (Lifecycle Events)
+## Hooks
 
 ```yaml
 hooks:
-  # Bloquear rm -rf
   - name: block-rm
     event: PreToolUse
     type: shell
@@ -298,361 +427,123 @@ hooks:
     command: |
       INPUT=$(cat)
       if echo "$INPUT" | grep -q "rm -rf"; then
-        echo '{"decision":"deny","message":"rm -rf bloqueado por seguranca"}'
-      else
-        echo '{"decision":"allow"}'
+        echo '{"decision":"deny","message":"bloqueado"}'
       fi
-    enabled: true
-
-  # Log de todas as tools
-  - name: log-tools
-    event: PostToolUse
-    type: http
-    url: "https://hooks.example.com/log"
-    enabled: true
-
-  # Auto-lint apos editar arquivo
-  - name: auto-lint
-    event: PostToolUse
-    type: shell
-    matcher: "edit_file"
-    command: "go vet ./... 2>&1"
     enabled: true
 ```
 
-Eventos: `SessionStart` `SessionEnd` `PreToolUse` `PostToolUse` `PreCompact` `PostCompact` `UserPrompt` `AssistantResponse` `Error` `Stop`
+10 eventos: `SessionStart` `SessionEnd` `PreToolUse` `PostToolUse` `PreCompact` `PostCompact` `UserPrompt` `AssistantResponse` `Error` `Stop`
 
-## Permissoes Granulares
+## Permissoes
 
 ```json
-// .polypod/settings.json
 {
-  "denied_tools": [
-    {"pattern": "run_command", "decision": "deny"},
-    {"pattern": "delete_file", "decision": "deny"}
-  ],
-  "ask_tools": [
-    {"pattern": "git_push", "decision": "ask"},
-    {"pattern": "git_commit", "decision": "ask"}
-  ],
-  "allowed_tools": [
-    {"pattern": "read_*", "decision": "allow"},
-    {"pattern": "git_status", "decision": "allow"}
-  ]
+  "denied_tools": [{"pattern": "delete_file", "decision": "deny"}],
+  "ask_tools": [{"pattern": "git_push", "decision": "ask"}],
+  "allowed_tools": [{"pattern": "read_*", "decision": "allow"}]
 }
 ```
 
-Hierarquia: user `~/.polypod/settings.json` < projeto `.polypod/settings.json`
-
-## Checkpoints, Undo, Rewind
-
-- **Auto-checkpoint**: snapshot antes de cada mudanca de arquivo
-- **`/undo`**: desfaz ultima mudanca + remove do historico
-- **`/redo`**: refaz mudanca desfeita
-- **`/rewind`**: volta a qualquer checkpoint anterior
-- **Named checkpoints**: `/checkpoint "antes do refactor"`
-- **Fork**: criar copia do checkpoint para tentar abordagem alternativa
-
-## Slash Commands de Projeto
-
-```markdown
-<!-- .polypod/commands/deploy.md -->
----
-name: deploy
-description: Deploy para producao
----
-
-Execute o deploy seguindo estes passos:
-1. Rode os testes: `go test ./...`
-2. Build: `make build-linux`
-3. Copie para o servidor
-4. Reinicie o servico
-
-Contexto: $ARGUMENTS
-```
-
-Use: `/deploy staging`
-
-## Recipes (Runbooks)
-
-```yaml
-# .polypod/recipes/release.yaml
-name: release
-description: Criar release
-parameters:
-  - name: version
-    required: true
-steps:
-  - name: test
-    command: "go test ./..."
-  - name: build
-    command: "make build-linux"
-  - name: tag
-    prompt: "Crie tag git v{{version}}"
-  - name: changelog
-    prompt: "Gere changelog para v{{version}}"
-```
-
-## Watch Mode
-
-```bash
-./polypod --watch
-```
-
-No seu editor, use comentarios para acionar a IA:
-
-```go
-// AI: refatore para usar context
-func oldFunc() { ... }
-
-// AI! corrija o null pointer
-func buggy(s *string) { ... }
-
-// AI? o que este regex faz?
-var re = regexp.MustCompile(`...`)
-```
-
-## Spec-Driven Development
-
-```
-> /spec sistema de autenticacao com JWT e refresh tokens
-
-# Polypod gera automaticamente:
-# 1. requirements.md — requisitos funcionais e nao-funcionais
-# 2. design.md — arquitetura, interfaces, fluxo de dados
-# 3. tasks.md — tarefas ordenadas para implementacao
-# Tudo salvo em .polypod/specs/<nome>/
-```
-
-## /doctor — Diagnostico
-
-```
-> /doctor
-
-## Polypod Doctor
-
-  [OK] Go                      go version go1.24.2 linux/amd64
-  [OK] Git                     git version 2.43.0
-  [OK] AI Provider             configurada (sk-abc12...)
-  [OK] Data dir                data/conversations
-  [OK] Agents dir              agents
-  [OK] Templates               templates
-  [!!] Docker                  nao encontrado (sandbox indisponivel)
-  [!!] Whisper (STT)           nao instalado (opcional)
-  [OK] Config                  provider=deepseek model=deepseek-chat
-
-Resultado: 7 ok, 2 avisos, 0 falhas
-```
-
-## /init — Inicializacao de Projeto
-
-```
-> /init
-
-Detectado: Go (Gin), Makefile, Git, Docker
-Gerando .polypod.md...
-Gerando .polypod/commands/test.md...
-Gerando .polypod/settings.json...
-
-3 arquivos criados. Edite .polypod.md para personalizar.
-```
-
-## Temas
-
-6 temas built-in: `dark` (padrao), `light`, `monokai`, `dracula`, `solarized`, `nord`
-
-```
-> /theme dracula
-Tema alterado para dracula.
-
-> /color purple
-Cor da sessao: purple.
-```
-
-## @File Mentions
-
-Inclua arquivos diretamente no prompt com `@`:
-
-```
-> Revise @internal/router/router.go e sugira melhorias
-
-> Compare @go.mod com @go.sum e verifique consistencia
-
-> O que faz @internal/ai/
-```
-
-Tab-completion fuzzy para caminhos de arquivo.
-
-## /loop — Tarefas Recorrentes
-
-```
-> /loop 5m verifique se o servidor esta respondendo em localhost:8080
-
-Loop #1 criado: a cada 5m
-
-> /loop list
-## Loops ativos
-- #1 a cada 5m0s | execucoes: 3 | ultima: 14:30:15
-  `verifique se o servidor esta respondendo em localhost:8080`
-
-> /loop stop 1
-Loop #1 cancelado.
-```
-
-## Auto-Memory
-
-Polypod extrai automaticamente decisoes e padroes das conversas e os salva para sessoes futuras:
-
-- Decisoes tecnicas ("optei por usar Redis para cache")
-- Padroes do projeto ("sempre usar context.Context como primeiro parametro")
-- Preferencias do usuario ("prefiro respostas concisas")
-
-Memorias automaticas sao injetadas como contexto quando relevantes.
-
-## Provider Fallback
-
-Quando o provider primario retorna rate limit (429) ou erro de servidor (5xx), Polypod automaticamente tenta o proximo provider na chain, com mapeamento inteligente de modelos:
-
-```
-deepseek-chat → (fallback) → llama3.1 (Ollama) → (fallback) → gpt-4o-mini (OpenAI)
-```
-
-## Config Fragments (config.d/)
-
-Distribua configuracoes em equipe sem editar o config principal:
-
-```
-config.d/
-  00-base.yaml          # defaults da equipe
-  10-security.yaml      # politicas de seguranca
-  20-team-hooks.yaml    # hooks compartilhados
-```
-
-Fragmentos sao mergeados em ordem alfabetica.
-
-## Web Search com Cache
-
-Resultados de busca sao cacheados localmente com TTL configuravel, reduzindo chamadas externas e acelerando respostas repetidas.
-
-## Prompt Templates (8 built-in)
-
-| Template | Categoria | Descricao |
-|----------|-----------|-----------|
-| `summarize` | analysis | Resumir texto |
-| `explain_code` | coding | Explicar codigo |
-| `review_code` | coding | Revisar codigo |
-| `commit_message` | coding | Gerar commit message |
-| `debug` | coding | Analisar erro |
-| `translate` | writing | Traduzir para PT-BR |
-| `sql_generate` | analysis | Gerar SQL |
-| `devops_diagnose` | devops | Diagnosticar infra |
-
-Crie os seus em `templates/meu_template.yaml`.
-
-## Plugin System
-
-```bash
-# Instalar de git
-> instale o plugin https://github.com/user/polypod-plugin-x
-
-# Criar plugin
-> crie um plugin chamado meu-plugin
-# Gera template em plugins/meu-plugin/plugin.yaml
-```
-
-## Agentes YAML
-
-```yaml
-# agents/devops.yaml
-name: devops
-description: Especialista em DevOps
-persona: |
-  Voce e um SRE/DevOps senior. Investigue antes de responder.
-skills:
-  - read_file
-  - run_command
-  - git_status
-  - security_scan
-  - db_query
-```
-
-## Arquitetura (62 packages)
+## Arquitetura (78 packages)
 
 ```
 polypod/
-├── main.go                      # Entry point, wiring
-├── config.yaml                  # Configuracao
-├── agents/                      # Agentes YAML
-├── templates/                   # Prompt templates
+├── main.go
 ├── internal/
-│   ├── adapter/                 # Canais
-│   │   ├── cli/                 #   CLI (BubbleTea + Glamour)
-│   │   ├── rest/                #   REST API (Chi)
-│   │   ├── telegram/            #   Telegram Bot
-│   │   └── whatsapp/            #   WhatsApp (Green API)
-│   ├── ai/                      # Cliente IA + tool loop + structured output
-│   ├── provider/                # Providers (OpenAI, Ollama, Anthropic, Google)
-│   ├── fallback/                # Provider fallback chain
-│   ├── mcp/                     # MCP Client (stdio + SSE)
-│   ├── mcpserver/               # MCP Server (expoe skills)
-│   ├── skill/                   # Skill registry + builtins
-│   ├── agent/                   # Agent registry
-│   ├── router/                  # Pipeline: auth → rate → session → AI
-│   ├── config/                  # Config YAML + env vars
-│   ├── configmerge/             # Config fragments (config.d/)
-│   ├── conversation/            # Sessoes e historico
-│   ├── session/                 # Persistencia + compactacao AI
-│   ├── memory/                  # Memoria persistente
-│   ├── automemory/              # Memoria automatica (extrai decisoes)
-│   ├── knowledge/               # RAG (pgvector / SQLite)
-│   ├── database/                # Postgres + SQLite
-│   ├── auth/                    # Autenticacao
-│   ├── ratelimit/               # Rate limiting
-│   ├── hooks/                   # Lifecycle hooks (Pre/PostToolUse)
-│   ├── permissions/             # Permissoes granulares por tool
-│   ├── modes/                   # Modos (plan/ask/edit/auto)
-│   ├── checkpoint/              # Checkpoints + rewind
-│   ├── undoredo/                # Undo/redo com snapshots
-│   ├── commands/                # Slash commands + recipes
-│   ├── headless/                # Modo headless (-p)
-│   ├── watcher/                 # Watch mode (// AI: triggers)
-│   ├── architect/               # Architect/Editor + lint-fix loop
-│   ├── diffview/                # Diff preview colorido
-│   ├── multiread/               # Leitura multi-arquivo
-│   ├── mentions/                # @file mentions + fuzzy autocomplete
-│   ├── worktree/                # Git worktrees isolados
-│   ├── webui/                   # Browser UI (SSE streaming)
-│   ├── plugin/                  # Sistema de plugins
-│   ├── template/                # Prompt templates
-│   ├── project/                 # .polypod.md loader
-│   ├── codemap/                 # Repo-map (simbolos)
-│   ├── git/                     # Git skills (16)
-│   ├── review/                  # Code review + lint + test
-│   ├── vision/                  # Analise de imagens
-│   ├── voice/                   # Voz (Whisper + TTS)
-│   ├── web/                     # Web search + fetch
-│   ├── webcache/                # Cache de resultados web
-│   ├── iot/                     # IoT/Hardware
-│   ├── selfmod/                 # Auto-modificacao
-│   ├── notify/                  # Notificacoes cross-channel
-│   ├── scheduler/               # Agendador cron
-│   ├── loop/                    # /loop (tarefas recorrentes in-session)
-│   ├── tracking/                # Cost/token tracking
-│   ├── security/                # Seguranca scanning
-│   ├── sandbox/                 # Docker sandbox
-│   ├── dbquery/                 # Text-to-SQL
-│   ├── doctor/                  # Diagnostico de ambiente
-│   ├── initcmd/                 # /init (scaffold de projeto)
-│   ├── theme/                   # Temas visuais (6 built-in)
-│   ├── search/                  # Busca em historico de sessoes
-│   ├── spec/                    # Spec-driven development
-│   └── observability/           # Logging
-├── cmd/ingest/                  # CLI de ingestao de knowledge
-├── scripts/
-│   ├── deploy.sh
-│   └── polypod.service
+│   ├── adapter/          # CLI, REST, Telegram, WhatsApp
+│   ├── ai/               # Client + tool loop + structured output
+│   ├── provider/          # OpenAI, Ollama, Anthropic, Google
+│   ├── fallback/          # Provider fallback chain
+│   ├── smartroute/        # Smart model routing by complexity
+│   ├── circuitbreaker/    # Circuit breaker per provider
+│   ├── parallel/          # Parallel tool execution
+│   ├── mcp/               # MCP Client (stdio + SSE)
+│   ├── mcpserver/         # MCP Server
+│   ├── skill/             # Skill registry + builtins
+│   ├── agent/             # YAML agent registry
+│   ├── router/            # auth → rate → session → AI pipeline
+│   ├── config/            # YAML + env vars
+│   ├── configmerge/       # config.d/ fragments
+│   ├── conversation/      # Sessions + history
+│   ├── session/           # Persistence + AI compaction
+│   ├── convtree/          # Conversation tree branching
+│   ├── memory/            # Persistent memory
+│   ├── automemory/        # Auto-extract decisions
+│   ├── knowledge/         # RAG (pgvector/SQLite)
+│   ├── database/          # Postgres + SQLite
+│   ├── auth/              # Authentication
+│   ├── ratelimit/         # Rate limiting
+│   ├── budget/            # Token budget management
+│   ├── hooks/             # Lifecycle hooks
+│   ├── permissions/       # Per-tool allow/deny/ask
+│   ├── modes/             # plan/ask/edit/auto
+│   ├── checkpoint/        # Checkpoints + rewind
+│   ├── undoredo/          # Undo/redo with snapshots
+│   ├── commands/          # Slash commands + recipes
+│   ├── headless/          # -p flag, stdin, JSON output
+│   ├── watcher/           # Watch mode (// AI: triggers)
+│   ├── architect/         # Dual-model + lint-fix loop
+│   ├── diffview/          # Colored diff preview
+│   ├── multiread/         # Multi-file read (glob)
+│   ├── mentions/          # @file fuzzy autocomplete
+│   ├── worktree/          # Git worktrees
+│   ├── webui/             # Browser UI (SSE)
+│   ├── plugin/            # Plugin system
+│   ├── template/          # Prompt templates (8 built-in)
+│   ├── project/           # .polypod.md loader
+│   ├── codemap/           # Repo-map + symbols
+│   ├── git/               # 16 git skills
+│   ├── review/            # Code review + lint + test
+│   ├── testgen/           # Test generation
+│   ├── docgen/            # Documentation generation
+│   ├── profiling/         # Performance profiling
+│   ├── commitai/          # AI commit messages
+│   ├── clipboard/         # System clipboard
+│   ├── vision/            # Image analysis
+│   ├── imagine/           # Image generation
+│   ├── voice/             # Whisper + TTS
+│   ├── web/               # Web search + fetch
+│   ├── webcache/          # Search result cache
+│   ├── iot/               # IoT/Hardware
+│   ├── selfmod/           # Self-modification
+│   ├── notify/            # Cross-channel notifications
+│   ├── scheduler/         # Cron scheduler
+│   ├── loop/              # /loop in-session recurring
+│   ├── tracking/          # Cost/token tracking
+│   ├── security/          # Security scanning
+│   ├── sandbox/           # Docker sandbox
+│   ├── dbquery/           # Text-to-SQL
+│   ├── openapitools/      # OpenAPI → tools
+│   ├── sshexec/           # SSH remote execution
+│   ├── depsgraph/         # Dependency graph
+│   ├── migrate/           # DB migrations
+│   ├── export/            # HTML/JSON/Notebook export
+│   ├── doctor/            # Environment diagnostics
+│   ├── initcmd/           # Project scaffold
+│   ├── theme/             # 6 visual themes
+│   ├── search/            # Transcript search
+│   ├── spec/              # Spec-driven development
+│   └── observability/     # Logging
+├── agents/                # YAML agent definitions
+├── templates/             # 8 prompt templates
+├── cmd/ingest/            # Knowledge ingestion CLI
+├── scripts/               # Deploy + systemd
 └── Makefile
 ```
+
+## Numeros
+
+| Metrica | Valor |
+|---------|-------|
+| Arquivos Go | 119 |
+| Linhas de codigo | 20.899 |
+| Packages | 78 |
+| Skills | 130+ |
+| Templates | 8 |
+| Temas | 6 |
+| Providers | 5 |
+| Canais | 5 |
+| Binario | 26MB |
 
 ## Deploy
 
@@ -675,7 +566,7 @@ ENTRYPOINT ["polypod"]
 CMD ["config.yaml"]
 ```
 
-### Docker Compose (com Traefik)
+### Docker Compose + Traefik
 
 ```yaml
 services:
@@ -716,25 +607,10 @@ User=polypod
 ExecStart=/usr/local/bin/polypod /etc/polypod/config.yaml
 Restart=always
 RestartSec=5
-Environment=DEEPSEEK_API_KEY=sk-...
 
 [Install]
 WantedBy=multi-user.target
 ```
-
-## Numeros
-
-| Metrica | Valor |
-|---------|-------|
-| Arquivos Go | 103 |
-| Linhas de codigo | 18.103 |
-| Packages | 62 |
-| Skills | 110+ |
-| Templates | 8 |
-| Temas | 6 |
-| Providers nativos | 5 |
-| Canais | 5 |
-| Binario | 26MB |
 
 ## Licenca
 
