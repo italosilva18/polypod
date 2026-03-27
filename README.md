@@ -1,6 +1,6 @@
 # Polypod
 
-A CLI de IA mais completa do mundo. Um unico binario Go de 26MB com 130+ skills, 78 packages, 5 providers, 5 canais, MCP, hooks, plugins, modos, e tudo que existe no mercado — mais o que ninguem tem.
+A CLI de IA mais completa do mundo. Um unico binario Go de 26MB com 130+ skills, 92 packages, 5 providers, 5 canais, MCP client+server, hooks, plugins, modos, parallel tool execution, smart routing, e absolutamente tudo que existe no mercado — mais o que ninguem tem.
 
 ```
    ____       _                       _
@@ -19,24 +19,28 @@ A CLI de IA mais completa do mundo. Um unico binario Go de 26MB com 130+ skills,
 | IoT/Hardware (USB, serial, firmware) | **Sim** | Nao | Nao | Nao | Nao |
 | Auto-modificacao (persona, skills) | **Sim** | Parcial | Nao | Nao | Nao |
 | Cross-channel notifications | **Sim** | Nao | Nao | Nao | Nao |
-| Scheduler/cron + /loop | **Sim** | Parcial | Nao | Nao | Nao |
-| Provider fallback automatico | **Sim** | Nao | Nao | Nao | Nao |
+| Provider fallback + circuit breaker | **Sim** | Nao | Nao | Nao | Nao |
 | Smart model routing (auto) | **Sim** | Nao | Nao | Nao | Nao |
 | Parallel tool execution | **Sim** | Sim | Nao | Nao | Nao |
-| Circuit breaker per-provider | **Sim** | Nao | Nao | Nao | Nao |
 | Image generation (/imagine) | **Sim** | Nao | Nao | Nao | Nao |
 | SSH remote execution | **Sim** | Nao | Nao | Nao | Nao |
 | DB migrations (/migrate) | **Sim** | Nao | Nao | Nao | Nao |
 | OpenAPI→tools (/openapi load) | **Sim** | Nao | Nao | Nao | Nao |
 | Test generation (/test generate) | **Sim** | Nao | Nao | Nao | Nao |
 | Docs generation (/docs) | **Sim** | Nao | Nao | Nao | Nao |
-| Profiling integration (/profile) | **Sim** | Nao | Nao | Nao | Nao |
+| Profiling (/profile go/python) | **Sim** | Nao | Nao | Nao | Nao |
 | Conversation tree branching | **Sim** | Parcial | Nao | Nao | Nao |
 | Export (HTML/JSON/Notebook) | **Sim** | Nao | Nao | Nao | Nao |
 | Dependency graph (/deps) | **Sim** | Nao | Nao | Nao | Nao |
-| Clipboard (/copy /paste) | **Sim** | Plugin | Nao | Nao | Nao |
 | Token budget management | **Sim** | Nao | Nao | Nao | Nao |
 | Spec-driven development | **Sim** | Nao | Nao | Nao | Nao |
+| Scriptable status line | **Sim** | Sim | Nao | Nao | Nao |
+| Config validation + .env loading | **Sim** | Sim | Nao | Nao | Nao |
+| Git hook self-install | **Sim** | Nao | Nao | Nao | Nao |
+| Auto-update check | **Sim** | Sim | Nao | Sim | Nao |
+| Background tasks (Ctrl+B) | **Sim** | Sim | Nao | Nao | Nao |
+| PR status in footer | **Sim** | Sim | Nao | Nao | Nao |
+| Shell completions (bash/zsh/fish) | **Sim** | Nao | Nao | Sim | Nao |
 | MCP Client + Server | **Sim** | Sim | Nao | Sim | Nao |
 | Hooks (PreToolUse/PostToolUse) | **Sim** | Sim | Nao | Nao | Nao |
 | Modos (plan/ask/edit/auto) | **Sim** | Sim | Parcial | Sim | Sim |
@@ -52,79 +56,77 @@ A CLI de IA mais completa do mundo. Um unico binario Go de 26MB com 130+ skills,
 git clone https://github.com/italosilva18/polypod.git
 cd polypod && make build
 
-# Setup interativo (detecta stack, gera config)
-./polypod --setup
+./polypod --setup          # Setup interativo
+./polypod init             # Gera .polypod.md + commands + settings
+./polypod doctor           # Verifica ambiente
+./polypod config.yaml      # Executar
 
-# Inicializar projeto (.polypod.md + commands + settings)
-./polypod init
-
-# Executar
-./polypod config.yaml
-
-# Modo headless
+# Headless (para scripts/CI)
 ./polypod -p "explique main.go"
 cat error.log | ./polypod -p "analise"
-./polypod -p "liste bugs" --output-format json
+./polypod -p "bugs" --output-format json
 
-# Diagnostico
-./polypod doctor
+# Shell completions
+eval "$(./polypod completion bash)"
 ```
 
-## Providers de IA
+## Providers
 
-5 providers nativos com fallback automatico:
+5 providers nativos com **fallback automatico** + **smart routing** + **circuit breaker**:
 
 ```yaml
-# DeepSeek (padrao, mais barato)
 ai:
-  provider: "deepseek"
+  provider: "deepseek"                    # Padrao, mais barato
   base_url: "https://api.deepseek.com/v1"
-  api_key: "${DEEPSEEK_API_KEY}"
+  api_key: "${DEEPSEEK_API_KEY}"          # Carrega de .env automaticamente
   model: "deepseek-chat"
 
-# Ollama (local, gratis, offline)
-# ai:
-#   provider: "ollama"
-#   base_url: "http://localhost:11434/v1"
-#   model: "llama3.1"
-
-# OpenAI / Anthropic / Google — configure em providers:[]
+# Fallback: deepseek → ollama → openai
+providers:
+  - name: ollama
+    base_url: "http://localhost:11434"
+  - name: openai
+    api_key: "${OPENAI_API_KEY}"
+  - name: anthropic
+    api_key: "${ANTHROPIC_API_KEY}"
+  - name: google
+    api_key: "${GOOGLE_API_KEY}"
 ```
 
-**Fallback automatico**: se DeepSeek falhar (429/5xx), tenta Ollama, depois OpenAI — com mapeamento inteligente de modelos.
-
-**Smart routing**: `/effort auto` classifica complexidade do prompt e roteia para modelo barato (simples) ou caro (complexo). ~60% economia.
-
-**Circuit breaker**: 3 falhas → abre circuito → espera 30s → testa recovery. Per-provider.
+- **Smart routing**: classifica complexidade e roteia para modelo barato ou caro (~60% economia)
+- **Circuit breaker**: 3 falhas → abre circuito → espera 30s → testa recovery
+- **Retry UX**: countdown visivel "Aguardando 1:25..." durante rate-limit
 
 ## 5 Canais
 
 | Canal | Config | Descricao |
 |-------|--------|-----------|
-| CLI | `cli.enabled: true` | BubbleTea + Glamour, streaming, 6 temas |
+| CLI | `cli.enabled: true` | BubbleTea + Glamour, 6 temas, streaming |
 | REST API | `rest.enabled: true` | `/api/chat`, `/api/chat/stream` (SSE), `/api/skills` |
-| Telegram | `telegram.enabled: true` | Bot com polling |
-| WhatsApp | `whatsapp.enabled: true` | Via Green API |
-| Browser | `webui.enabled: true` | `localhost:8090` com SSE |
+| Telegram | `telegram.enabled: true` | Bot polling |
+| WhatsApp | `whatsapp.enabled: true` | Green API |
+| Browser | `webui.enabled: true` | `localhost:8090` SSE streaming |
 
-## Comandos da CLI
+## Todos os Comandos
 
-### Modos e Controle
+### Modo e Controle
 
 | Comando | Descricao |
 |---------|-----------|
-| `/mode plan\|ask\|edit\|auto` | Mudar modo de operacao |
-| `/effort low\|medium\|high\|auto` | Controlar profundidade de raciocinio |
-| `/compact [foco]` | Compactar contexto com IA (ex: `/compact foco nas decisoes de API`) |
-| `/cost` | Tokens e custo da sessao |
-| `/context` | Diagnostico do context window |
+| `/mode plan\|ask\|edit\|auto` | Modo de operacao |
+| `/effort low\|medium\|high\|auto` | Profundidade de raciocinio |
+| `/compact [foco]` | Compactar contexto com IA (`/compact foco nas decisoes de API`) |
+| `/cost` | Tokens, custo, duracao da sessao |
+| `/stats` | Uso diario dos ultimos 7 dias |
+| `/context` | Breakdown do context window com barra visual e sugestoes |
 | `/budget` | Status de limites de tokens/custo |
+| `/model` | Picker interativo de modelos (inclui Ollama auto-discovery) |
 
 ### Sessao e Historico
 
 | Comando | Descricao |
 |---------|-----------|
-| `/undo` | Desfazer ultima mudanca |
+| `/undo` | Desfazer ultima mudanca de arquivo |
 | `/redo` | Refazer |
 | `/rewind` | Voltar a checkpoint anterior |
 | `/tree` | Visualizar arvore de conversa (branching) |
@@ -133,24 +135,26 @@ ai:
 | `/export html\|json\|notebook\|markdown` | Exportar sessao |
 | `/copy` | Copiar ultima resposta para clipboard |
 | `/copy code` | Copiar so blocos de codigo |
-| `/paste` | Colar do clipboard como input |
+| `/paste` | Colar clipboard como input |
+| `/insights` | Analise de padroes e otimizacao da sessao |
 
 ### Projeto e DevOps
 
 | Comando | Descricao |
 |---------|-----------|
-| `/init` | Scaffold do projeto (.polypod.md + commands + settings) |
-| `/doctor` | Diagnostico do ambiente |
-| `/commit` | Gerar commit message IA do staged diff (Conventional Commits) |
-| `/test generate <file>` | Gerar testes unitarios (Go/Python/JS) |
+| `/init` | Scaffold (.polypod.md + commands + settings) |
+| `/doctor` | Diagnostico completo do ambiente |
+| `/commit` | Commit message IA do staged diff (Conventional Commits, auto-scope) |
+| `/test generate <file>` | Gerar testes (Go table-driven, Python pytest, JS vitest) |
 | `/docs readme\|changelog\|api\|godoc` | Gerar documentacao |
-| `/profile go\|python <file>` | Performance profiling |
+| `/profile go\|python <file>` | Performance profiling + flame graph |
 | `/deps tree\|circular\|graph` | Grafo de dependencias |
 | `/migrate diff\|lint\|apply\|list` | Migrations de banco de dados |
-| `/openapi load <url>` | Gerar tools a partir de spec OpenAPI |
-| `/ssh exec <host> <cmd>` | Executar comando remoto via SSH |
+| `/openapi load <url>` | Gerar tools a partir de spec OpenAPI/Swagger |
+| `/ssh exec <host> <cmd>` | Executar remoto via SSH |
 | `/ssh hosts` | Listar hosts de ~/.ssh/config |
 | `/imagine <prompt>` | Gerar imagem (DALL-E/LocalAI) |
+| `/security-review` | Analise de seguranca das mudancas pendentes |
 
 ### Automacao
 
@@ -158,15 +162,29 @@ ai:
 |---------|-----------|
 | `/loop 5m <prompt>` | Tarefa recorrente in-session |
 | `/loop list\|stop <id>` | Gerenciar loops |
-| `/spec <descricao>` | Gerar requirements → design → tasks |
-| `@path/to/file` | Incluir arquivo no prompt (autocomplete) |
+| `/spec <descricao>` | Spec-driven: requirements → design → tasks |
+| `@path/to/file` | Incluir arquivo no prompt (fuzzy autocomplete) |
+| `!<comando>` | Executar shell direto (sem IA) |
+| `Ctrl+B` | Mover comando para background |
+| `Ctrl+T` | Mostrar/esconder task list |
+| `Ctrl+G` | Abrir $EDITOR com prompt atual |
 
-### Visual
+### Visual e Config
 
 | Comando | Descricao |
 |---------|-----------|
-| `/theme dark\|light\|monokai\|dracula\|solarized\|nord` | Mudar tema |
+| `/theme dark\|light\|monokai\|dracula\|solarized\|nord` | Tema |
 | `/color red\|blue\|green\|purple\|...` | Cor da sessao |
+| `/debug [categorias]` | Inspecionar system prompt e API calls |
+| `/release-notes` | Changelog embutido |
+
+### Git Hooks
+
+```bash
+polypod hook install     # Instala prepare-commit-msg + pre-push
+polypod hook uninstall   # Remove hooks
+polypod hook status      # Lista hooks ativos
+```
 
 ## Skills (130+)
 
@@ -219,7 +237,7 @@ ai:
 `migrate_diff` `migrate_list` `migrate_apply` `migrate_lint`
 
 ### OpenAPI (1)
-`openapi_load` — gera tools automaticamente de specs Swagger/OpenAPI
+`openapi_load`
 
 ### Dependencies (3)
 `deps_tree` `deps_circular` `deps_graph_image`
@@ -256,195 +274,166 @@ ai:
 
 ## Features Avancadas
 
-### Parallel Tool Execution
+### .env Auto-Loading
 
-Quando a IA retorna multiplos tool calls, os independentes (leituras) executam em goroutines simultaneas. 4x mais rapido.
+Polypod carrega `.env` e `.env.local` automaticamente do diretorio do projeto. Precedencia: env vars existentes > .env.local > .env > config.yaml. Avisa se `.env` contem secrets e nao esta no `.gitignore`.
 
-### Smart Model Routing
+### Config Validation
 
-Classifica complexidade do prompt automaticamente:
-- **Baixa** (lista, traduza, formate) → modelo barato
-- **Media** (explique codigo, review) → modelo balanceado
-- **Alta** (arquitetura, debug, refactor) → modelo frontier
-
-### Circuit Breaker
-
-Per-provider, 3 estados: Closed (normal) → Open (3 falhas, rejeita) → Half-Open (testa recovery apos 30s).
-
-### Conversation Tree
-
+Ao carregar, valida todos os campos com mensagens coloridas:
 ```
-> /tree
-
-*
-|-- [user] Crie uma API REST...
-|   |-- [assistant] Vou criar com Gin...
-|   |   |-- [user] Use Fiber em vez de Gin
-|   |   |   \-- > [assistant] Ok, refatorando para Fiber...
-|   |   \-- [user] Adicione autenticacao JWT
-|   |       \-- [assistant] Adicionando middleware JWT...
+  [ERRO] ai.api_key: API key nao configurada
+         → defina DEEPSEEK_API_KEY no ambiente ou configure ai.api_key
+  [WARN] ai.max_tokens: max_tokens muito baixo (100)
+         → use pelo menos 1024, recomendado 4096
+  2 erro(s), 1 aviso(s)
 ```
 
-Fork em qualquer mensagem, navegacao entre branches.
+### Retry UX com Countdown
 
-### Export Formatos
+Quando rate-limited, mostra countdown visivel:
+```
+[deepseek] Aguardando 1:25... (limite de taxa, tentativa 2/3)
+```
+Classifica erros por tipo (auth, rate_limit, server, timeout, connection) com estrategia diferente para cada.
+
+### Shell Completions
 
 ```bash
-/export html      # HTML standalone com syntax highlight
-/export json      # JSON estruturado com metadados
-/export notebook  # Jupyter notebook (.ipynb)
-/export markdown  # Markdown limpo
+# Bash
+eval "$(polypod completion bash)"
+
+# Zsh
+polypod completion zsh > ~/.zsh/completions/_polypod
+
+# Fish
+polypod completion fish | source
 ```
 
-### /commit (Diff-Aware)
-
-Analisa `git diff --staged` semanticamente, classifica mudancas, auto-detecta scope, gera Conventional Commit:
+### /debug — Inspecao do System Prompt
 
 ```
-feat(api): add JWT authentication middleware
-
-- Add auth/jwt.go with token generation and validation
-- Add middleware/auth.go with route protection
-- Update router.go with protected routes
+/debug            # Mostra system prompt montado, tools, memorias
+/debug api        # Loga request/response da API
+/debug hooks      # Mostra hook events
 ```
 
-### /test generate
+### Model Picker Interativo
 
-```bash
-/test generate internal/auth/jwt.go
-# → Gera jwt_test.go com table-driven tests
-# → Inclui: sucesso, token expirado, token invalido, claims errados
+```
+/model
+
+## Modelos disponiveis
+
+### deepseek
+> deepseek-chat
+  deepseek-coder
+  deepseek-reasoner
+
+### ollama
+  llama3.1:8b (4.7B)
+  llama3.1:70b (39.2B)
+  codellama:13b (7.4B)
 ```
 
-### /docs
+### /cost + /stats + /context
 
-```bash
-/docs readme      # README a partir da estrutura do projeto
-/docs changelog --since v1.0.0  # Changelog categorizado
-/docs api internal/router/  # Documentacao de API
-/docs godoc internal/auth/  # Comentarios godoc
+```
+/cost
+- Modelo: deepseek-chat
+- Duracao: 23m15s
+- Tokens: 45.230 prompt + 12.891 completion = 58.121 total
+- Custo: $0.0081 USD
+- Media: $0.0004/req, 2906 tokens/req
+
+/context
+Uso: 12.450 / 128.000 tokens (9%)
+[████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 9%
+
+System prompt              2.100 tokens  ( 1.6%)
+Tool definitions           4.200 tokens  ( 3.3%)
+Memorias                     350 tokens  ( 0.3%)
+Historico de mensagens     5.800 tokens  ( 4.5%)
+Livre                    115.550 tokens  (90.3%)
 ```
 
-### /profile
+### Scriptable Status Line
 
-```bash
-/profile go "go test" --type cpu    # pprof CPU profiling
-/profile analyze /tmp/cpu.prof      # Analise de hotspots
-/profile flame /tmp/cpu.prof        # Flame graph SVG
-/profile python script.py           # cProfile Python
-```
-
-### /deps
-
-```bash
-/deps tree         # Arvore de dependencias (Go/Node/Python)
-/deps circular     # Detectar ciclos
-/deps graph deps.svg  # Grafo visual (Graphviz)
-```
-
-### /migrate
-
-```bash
-/migrate diff add_users_table   # Gerar migration SQL
-/migrate lint                   # Validar seguranca (DROP TABLE, etc.)
-/migrate apply --dsn postgres://... --dry_run true
-/migrate list                   # Listar migrations
-```
-
-### /openapi load
-
-```bash
-/openapi load https://petstore.swagger.io/v2/swagger.json
-# → Parseia 20 endpoints, gera tool definitions
-# → Salva em .polypod/tools/openapi_endpoints.json
-```
-
-### /ssh
-
-```bash
-/ssh hosts          # Lista hosts de ~/.ssh/config
-/ssh exec prod-1 "docker ps"
-/ssh copy ./deploy.sh prod-1:/opt/app/
-```
-
-### /imagine
-
-```bash
-/imagine "um gato programando em Go, pixel art"
-# → Gera imagem via DALL-E ou LocalAI
-# → Salva em polypod-images/<timestamp>.png
-```
-
-### Token Budget
+Configure um script que recebe JSON e renderiza a barra:
 
 ```yaml
-budget:
-  per_session: 100000    # max tokens por sessao
-  per_day: 500000        # max tokens por dia
-  max_cost_day: 5.00     # max $5/dia
-  max_cost_month: 50.00  # max $50/mes
-  alert_at_50: true
-  alert_at_80: true
-  auto_downgrade: true   # muda para modelo barato perto do limite
+# config.yaml
+statusline:
+  type: command
+  command: "~/.polypod/statusline.sh"
 ```
 
-### Clipboard
-
-```bash
-/copy        # Copia ultima resposta
-/copy code   # Copia so blocos de codigo
-/paste       # Cola clipboard como input
-```
-
-## MCP
-
-### Cliente — conecte a 5.800+ servers
-
-```yaml
-mcp:
-  - name: filesystem
-    transport: stdio
-    command: npx
-    args: ["-y", "@modelcontextprotocol/server-filesystem", "/home"]
-    auto_start: true
-```
-
-### Servidor — exponha skills do Polypod
-
-```bash
-./polypod mcp serve
-# Claude Desktop, Cursor, etc. podem consumir as 130+ skills
-```
-
-## Hooks
-
-```yaml
-hooks:
-  - name: block-rm
-    event: PreToolUse
-    type: shell
-    matcher: "run_command"
-    command: |
-      INPUT=$(cat)
-      if echo "$INPUT" | grep -q "rm -rf"; then
-        echo '{"decision":"deny","message":"bloqueado"}'
-      fi
-    enabled: true
-```
-
-10 eventos: `SessionStart` `SessionEnd` `PreToolUse` `PostToolUse` `PreCompact` `PostCompact` `UserPrompt` `AssistantResponse` `Error` `Stop`
-
-## Permissoes
-
+O script recebe via stdin:
 ```json
 {
-  "denied_tools": [{"pattern": "delete_file", "decision": "deny"}],
-  "ask_tools": [{"pattern": "git_push", "decision": "ask"}],
-  "allowed_tools": [{"pattern": "read_*", "decision": "allow"}]
+  "model": "deepseek-chat",
+  "context_used_pct": 9.7,
+  "session_tokens": 58121,
+  "total_cost_usd": 0.0081,
+  "mode": "edit",
+  "requests": 20,
+  "mcp_servers": 2
 }
 ```
 
-## Arquitetura (78 packages)
+### Git Hooks Self-Install
+
+```bash
+polypod hook install
+# Instala:
+# - prepare-commit-msg: gera commit message IA do staged diff
+# - pre-push: roda testes antes do push (auto-detecta Go/Node/Python)
+
+polypod hook uninstall   # Remove
+polypod hook status      # Lista hooks ativos
+```
+
+### Auto-Update
+
+Verifica GitHub releases no startup. Se nova versao disponivel:
+```
+[UPDATE] Nova versao disponivel: v0.5.0 (atual: v0.4.0)
+  https://github.com/italosilva18/polypod/releases/tag/v0.5.0
+```
+
+### Background Tasks (Ctrl+B)
+
+```
+> !npm run build     # Ctrl+B para mover para background
+Background task #1 iniciada.
+
+> Ctrl+T             # Mostrar task list
+## Background Tasks
+✓ #1 [done] npm run build (45s)
+⏳ #2 [running] go test ./... (12s)
+```
+
+### PR Status no Footer
+
+Detecta PR aberto para a branch atual via `gh` CLI:
+- Verde: aprovado
+- Amarelo: aguardando review
+- Vermelho: changes requested
+- Cinza: draft
+
+### /insights — Analise da Sessao
+
+```
+/insights
+
+## Insights da sessao
+- Eficiencia: 2.906 tokens/req, $0.0004/req
+- Ratio read/write: 45 leituras / 12 escritas
+- Tools mais usadas: read_file (32), edit_file (12), git_diff (8)
+- Dica: sessao longa — considere /compact
+```
+
+## Arquitetura (92 packages)
 
 ```
 polypod/
@@ -454,16 +443,18 @@ polypod/
 │   ├── ai/               # Client + tool loop + structured output
 │   ├── provider/          # OpenAI, Ollama, Anthropic, Google
 │   ├── fallback/          # Provider fallback chain
-│   ├── smartroute/        # Smart model routing by complexity
+│   ├── smartroute/        # Smart model routing
 │   ├── circuitbreaker/    # Circuit breaker per provider
 │   ├── parallel/          # Parallel tool execution
 │   ├── mcp/               # MCP Client (stdio + SSE)
 │   ├── mcpserver/         # MCP Server
 │   ├── skill/             # Skill registry + builtins
 │   ├── agent/             # YAML agent registry
-│   ├── router/            # auth → rate → session → AI pipeline
+│   ├── router/            # auth → rate → session → AI
 │   ├── config/            # YAML + env vars
 │   ├── configmerge/       # config.d/ fragments
+│   ├── configval/         # Config validation
+│   ├── dotenv/            # .env file loading
 │   ├── conversation/      # Sessions + history
 │   ├── session/           # Persistence + AI compaction
 │   ├── convtree/          # Conversation tree branching
@@ -474,11 +465,12 @@ polypod/
 │   ├── auth/              # Authentication
 │   ├── ratelimit/         # Rate limiting
 │   ├── budget/            # Token budget management
+│   ├── retryux/           # Retry countdown + error classification
 │   ├── hooks/             # Lifecycle hooks
 │   ├── permissions/       # Per-tool allow/deny/ask
 │   ├── modes/             # plan/ask/edit/auto
 │   ├── checkpoint/        # Checkpoints + rewind
-│   ├── undoredo/          # Undo/redo with snapshots
+│   ├── undoredo/          # Undo/redo snapshots
 │   ├── commands/          # Slash commands + recipes
 │   ├── headless/          # -p flag, stdin, JSON output
 │   ├── watcher/           # Watch mode (// AI: triggers)
@@ -523,27 +515,23 @@ polypod/
 │   ├── theme/             # 6 visual themes
 │   ├── search/            # Transcript search
 │   ├── spec/              # Spec-driven development
+│   ├── debug/             # Debug mode + system prompt inspection
+│   ├── modelpicker/       # Interactive model picker
+│   ├── costcmd/           # /cost /stats /context
+│   ├── statusline/        # Scriptable status line
+│   ├── githook/           # Git hook installer
+│   ├── autoupdate/        # Version check + update
+│   ├── background/        # Background task manager
+│   ├── prstatus/          # PR status footer
+│   ├── insights/          # Session analysis
+│   ├── completion/        # Shell completions (bash/zsh/fish)
 │   └── observability/     # Logging
-├── agents/                # YAML agent definitions
+├── agents/                # YAML agents
 ├── templates/             # 8 prompt templates
-├── cmd/ingest/            # Knowledge ingestion CLI
+├── cmd/ingest/            # Knowledge ingestion
 ├── scripts/               # Deploy + systemd
 └── Makefile
 ```
-
-## Numeros
-
-| Metrica | Valor |
-|---------|-------|
-| Arquivos Go | 119 |
-| Linhas de codigo | 20.899 |
-| Packages | 78 |
-| Skills | 130+ |
-| Templates | 8 |
-| Temas | 6 |
-| Providers | 5 |
-| Canais | 5 |
-| Binario | 26MB |
 
 ## Deploy
 
@@ -583,8 +571,6 @@ services:
       - "traefik.http.routers.polypod.entrypoints=websecure"
       - "traefik.http.routers.polypod.tls.certresolver=letsencrypt"
       - "traefik.http.services.polypod.loadbalancer.server.port=8080"
-    environment:
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
 
 volumes:
   polypod-data:
@@ -611,6 +597,20 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 ```
+
+## Numeros
+
+| Metrica | Valor |
+|---------|-------|
+| Arquivos Go | 132 |
+| Linhas de codigo | 22.696 |
+| Packages | 92 |
+| Skills | 130+ |
+| Templates | 8 |
+| Temas | 6 |
+| Providers | 5 |
+| Canais | 5 |
+| Binario | 26MB |
 
 ## Licenca
 
