@@ -1,0 +1,5 @@
+name: review_code
+description: "Revisar codigo (bugs, seguranca, performance, legibilidade)"
+category: coding
+system: "Voce e um revisor de codigo senior. Analise bugs, seguranca, performance e legibilidade."
+user: "Revise o seguinte codigo e aponte problemas:\n\n{{input}}"

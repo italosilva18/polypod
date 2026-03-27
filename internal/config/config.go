@@ -23,6 +23,57 @@ type Config struct {
 	Auth      AuthConfig      `yaml:"auth"`
 	Rate      RateConfig      `yaml:"rate"`
 	Log       LogConfig       `yaml:"log"`
+	// New modules
+	Providers []ProviderConfig `yaml:"providers"`
+	MCP       []MCPServerConf  `yaml:"mcp"`
+	Sandbox   SandboxConfig    `yaml:"sandbox"`
+	Scheduler SchedulerConfig  `yaml:"scheduler"`
+	Notify    NotifyConfig     `yaml:"notify"`
+	Plugins   PluginsConfig    `yaml:"plugins"`
+	Templates TemplatesConfig  `yaml:"templates"`
+}
+
+type ProviderConfig struct {
+	Name    string `yaml:"name"`    // "openai", "ollama", "anthropic", "google"
+	BaseURL string `yaml:"base_url"`
+	APIKey  string `yaml:"api_key"`
+	Default bool   `yaml:"default"` // use as default provider
+}
+
+type MCPServerConf struct {
+	Name      string            `yaml:"name"`
+	Transport string            `yaml:"transport"` // "stdio" or "sse"
+	Command   string            `yaml:"command"`
+	Args      []string          `yaml:"args"`
+	URL       string            `yaml:"url"`
+	Env       map[string]string `yaml:"env"`
+	AutoStart bool              `yaml:"auto_start"`
+}
+
+type SandboxConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	Image       string `yaml:"image"`
+	MemoryLimit string `yaml:"memory_limit"`
+	CPULimit    string `yaml:"cpu_limit"`
+	Timeout     int    `yaml:"timeout"`
+	Network     bool   `yaml:"network"`
+}
+
+type SchedulerConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	DataFile string `yaml:"data_file"`
+}
+
+type NotifyConfig struct {
+	Webhook string `yaml:"webhook"` // webhook URL for notifications
+}
+
+type PluginsConfig struct {
+	Dir string `yaml:"dir"` // plugins directory
+}
+
+type TemplatesConfig struct {
+	Dir string `yaml:"dir"` // templates directory
 }
 
 type ServerConfig struct {
@@ -181,6 +232,28 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Log.Format == "" {
 		cfg.Log.Format = "text"
+	}
+	// New module defaults
+	if cfg.Sandbox.Image == "" {
+		cfg.Sandbox.Image = "ubuntu:22.04"
+	}
+	if cfg.Sandbox.MemoryLimit == "" {
+		cfg.Sandbox.MemoryLimit = "256m"
+	}
+	if cfg.Sandbox.CPULimit == "" {
+		cfg.Sandbox.CPULimit = "1"
+	}
+	if cfg.Sandbox.Timeout == 0 {
+		cfg.Sandbox.Timeout = 30
+	}
+	if cfg.Scheduler.DataFile == "" {
+		cfg.Scheduler.DataFile = "data/scheduler.json"
+	}
+	if cfg.Plugins.Dir == "" {
+		cfg.Plugins.Dir = "data/plugins"
+	}
+	if cfg.Templates.Dir == "" {
+		cfg.Templates.Dir = "templates"
 	}
 }
 

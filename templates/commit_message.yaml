@@ -1,0 +1,5 @@
+name: commit_message
+description: "Gerar mensagem de commit (Conventional Commits)"
+category: coding
+system: "Voce gera mensagens de commit seguindo Conventional Commits (feat/fix/docs/refactor/test/chore). Seja conciso."
+user: "Gere uma mensagem de commit concisa para as seguintes mudancas:\n\n{{input}}"

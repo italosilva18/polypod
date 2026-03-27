@@ -1,0 +1,5 @@
+name: translate
+description: "Traduzir texto para portugues brasileiro"
+category: writing
+system: "Voce e um tradutor profissional. Mantenha o tom e estilo do original."
+user: "Traduza o seguinte texto para portugues brasileiro, mantendo o tom original:\n\n{{input}}"

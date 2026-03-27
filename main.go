@@ -21,18 +21,34 @@ import (
 	"github.com/costa/polypod/internal/agent"
 	"github.com/costa/polypod/internal/ai"
 	"github.com/costa/polypod/internal/auth"
+	"github.com/costa/polypod/internal/codemap"
 	"github.com/costa/polypod/internal/config"
 	"github.com/costa/polypod/internal/conversation"
 	"github.com/costa/polypod/internal/database"
+	"github.com/costa/polypod/internal/dbquery"
+	"github.com/costa/polypod/internal/git"
 	"github.com/costa/polypod/internal/iot"
 	"github.com/costa/polypod/internal/knowledge"
+	"github.com/costa/polypod/internal/mcp"
 	"github.com/costa/polypod/internal/memory"
+	"github.com/costa/polypod/internal/notify"
 	"github.com/costa/polypod/internal/observability"
+	"github.com/costa/polypod/internal/plugin"
+	"github.com/costa/polypod/internal/project"
 	"github.com/costa/polypod/internal/ratelimit"
+	"github.com/costa/polypod/internal/review"
 	"github.com/costa/polypod/internal/router"
+	"github.com/costa/polypod/internal/sandbox"
+	"github.com/costa/polypod/internal/scheduler"
+	"github.com/costa/polypod/internal/security"
 	"github.com/costa/polypod/internal/selfmod"
+	"github.com/costa/polypod/internal/session"
 	"github.com/costa/polypod/internal/setup"
 	"github.com/costa/polypod/internal/skill"
+	"github.com/costa/polypod/internal/template"
+	"github.com/costa/polypod/internal/tracking"
+	"github.com/costa/polypod/internal/vision"
+	"github.com/costa/polypod/internal/voice"
 	"github.com/costa/polypod/internal/web"
 )
 
@@ -199,7 +215,112 @@ func run(ctx context.Context, cfg *config.Config, pgDB *database.DB, sqliteDB *d
 	skill.LoadAndRegisterCustomSkills(skills, customSkillsDir)
 	skill.RegisterDynamicManagement(skills, customSkillsDir)
 
-	logger.Info("skills loaded", "count", len(skills.List()), "skills", skills.List())
+	// === NEW MODULES ===
+
+	// Git integration skills
+	git.RegisterSkills(skills)
+	git.RegisterFileSkills(skills)
+
+	// Code review & testing skills
+	review.RegisterSkills(skills)
+
+	// Vision/image skills
+	vision.RegisterSkills(skills)
+
+	// Voice I/O skills
+	voice.RegisterSkills(skills)
+
+	// Security scanning skills
+	security.RegisterSkills(skills)
+
+	// Database query skills
+	dbquery.RegisterSkills(skills)
+
+	// Codebase mapping skills
+	codemap.RegisterSkills(skills, ".", logger)
+
+	// Project instruction files (.polypod.md)
+	if projCtx := project.InjectProjectContext(); projCtx != "" {
+		logger.Info("project instructions loaded")
+	}
+
+	// Session manager
+	sessMgr := session.NewManager(cfg.Data.Dir, logger)
+	session.RegisterSkills(skills, sessMgr)
+
+	// Cost/token tracker
+	tracker := tracking.NewTracker(filepath.Join(cfg.Data.Dir, "usage.json"), logger)
+	tracking.RegisterSkills(skills, tracker)
+
+	// Notification dispatcher
+	notifyDisp := notify.NewDispatcher(logger)
+	if cfg.Telegram.Enabled && cfg.Telegram.Token != "" {
+		notifyDisp.Register(notify.NewTelegramNotifier(cfg.Telegram.Token, logger))
+	}
+	if cfg.WhatsApp.Enabled && cfg.WhatsApp.IDInstance != "" {
+		notifyDisp.Register(notify.NewWhatsAppNotifier(cfg.WhatsApp.IDInstance, cfg.WhatsApp.APIToken, logger))
+	}
+	if cfg.Notify.Webhook != "" {
+		notifyDisp.Register(notify.NewWebhookNotifier(cfg.Notify.Webhook, logger))
+	}
+	notify.RegisterSkills(skills, notifyDisp)
+
+	// Docker sandbox
+	sb := sandbox.New(sandbox.Config{
+		Enabled:     cfg.Sandbox.Enabled,
+		Image:       cfg.Sandbox.Image,
+		MemoryLimit: cfg.Sandbox.MemoryLimit,
+		CPULimit:    cfg.Sandbox.CPULimit,
+		Timeout:     cfg.Sandbox.Timeout,
+		Network:     cfg.Sandbox.Network,
+	}, logger)
+	sandbox.RegisterSkills(skills, sb)
+
+	// Scheduler
+	sched := scheduler.New(cfg.Scheduler.DataFile, logger)
+	sched.Load()
+	scheduler.RegisterSkills(skills, sched)
+
+	// Plugin system
+	pluginMgr := plugin.NewManager(cfg.Plugins.Dir, logger)
+	pluginMgr.LoadAll()
+	pluginCount := pluginMgr.RegisterAllSkills(skills)
+	plugin.RegisterManagementSkills(skills, pluginMgr)
+	if pluginCount > 0 {
+		logger.Info("plugin skills loaded", "count", pluginCount)
+	}
+
+	// Prompt templates
+	tmplReg := template.NewRegistry(cfg.Templates.Dir)
+	tmplReg.LoadAll()
+	tmplReg.RegisterSkills(skills)
+
+	// MCP servers
+	mcpMgr := mcp.NewManager(logger)
+	for _, mcpCfg := range cfg.MCP {
+		if mcpCfg.AutoStart {
+			if err := mcpMgr.Connect(ctx, mcp.ServerConfig{
+				Name:      mcpCfg.Name,
+				Transport: mcpCfg.Transport,
+				Command:   mcpCfg.Command,
+				Args:      mcpCfg.Args,
+				URL:       mcpCfg.URL,
+				Env:       mcpCfg.Env,
+			}); err != nil {
+				logger.Warn("mcp server failed to connect", "name", mcpCfg.Name, "error", err)
+			}
+		}
+	}
+	mcpToolCount := mcpMgr.RegisterTools(skills)
+	mcp.RegisterSkills(skills, mcpMgr)
+	if mcpToolCount > 0 {
+		logger.Info("mcp tools loaded", "count", mcpToolCount)
+	}
+	defer mcpMgr.Close()
+
+	// === END NEW MODULES ===
+
+	logger.Info("skills loaded", "count", len(skills.List()))
 
 	activeAgent := agents.Get("default")
 	logger.Info("agent active", "name", activeAgent.Name, "skills", activeAgent.Skills)

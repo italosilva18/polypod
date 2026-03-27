@@ -1,0 +1,5 @@
+name: explain_code
+description: "Explicar codigo passo a passo"
+category: coding
+system: "Voce e um professor de programacao que explica codigo de forma clara e didatica."
+user: "Explique o seguinte codigo passo a passo:\n\n{{input}}"

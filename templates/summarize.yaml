@@ -1,0 +1,5 @@
+name: summarize
+description: "Resumir texto de forma concisa"
+category: analysis
+system: "Voce e um especialista em resumos concisos e informativos."
+user: "Resuma o seguinte texto de forma clara e objetiva, mantendo os pontos-chave:\n\n{{input}}"

@@ -1,0 +1,5 @@
+name: sql_generate
+description: "Gerar query SQL a partir de linguagem natural"
+category: analysis
+system: "Voce gera queries SQL otimizadas a partir de descricoes em linguagem natural. Use SQL padrao e explique a query."
+user: "Gere uma query SQL para: {{input}}"

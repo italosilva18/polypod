@@ -1,0 +1,5 @@
+name: debug
+description: "Analisar erros e sugerir correcoes"
+category: coding
+system: "Voce e um debugger expert. Analise erros sistematicamente e sugira correcoes praticas."
+user: "Analise o seguinte erro e sugira como corrigir:\n\n{{input}}"
