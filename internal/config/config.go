@@ -31,6 +31,25 @@ type Config struct {
 	Notify    NotifyConfig     `yaml:"notify"`
 	Plugins   PluginsConfig    `yaml:"plugins"`
 	Templates TemplatesConfig  `yaml:"templates"`
+	Hooks     []HookConfig     `yaml:"hooks"`
+	WebUI     WebUIConfig      `yaml:"webui"`
+}
+
+type HookConfig struct {
+	Name    string `yaml:"name"`
+	Event   string `yaml:"event"`
+	Type    string `yaml:"type"`    // "shell" or "http"
+	Command string `yaml:"command"`
+	URL     string `yaml:"url"`
+	Matcher string `yaml:"matcher"`
+	Timeout int    `yaml:"timeout"`
+	Enabled bool   `yaml:"enabled"`
+}
+
+type WebUIConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Host    string `yaml:"host"`
+	Port    int    `yaml:"port"`
 }
 
 type ProviderConfig struct {
@@ -254,6 +273,17 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Templates.Dir == "" {
 		cfg.Templates.Dir = "templates"
+	}
+	if cfg.WebUI.Host == "" {
+		cfg.WebUI.Host = "127.0.0.1"
+	}
+	if cfg.WebUI.Port == 0 {
+		cfg.WebUI.Port = 8090
+	}
+	for i := range cfg.Hooks {
+		if cfg.Hooks[i].Timeout == 0 {
+			cfg.Hooks[i].Timeout = 10
+		}
 	}
 }
 

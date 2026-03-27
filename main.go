@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
@@ -22,15 +23,18 @@ import (
 	"github.com/costa/polypod/internal/ai"
 	"github.com/costa/polypod/internal/auth"
 	"github.com/costa/polypod/internal/codemap"
+	"github.com/costa/polypod/internal/commands"
 	"github.com/costa/polypod/internal/config"
 	"github.com/costa/polypod/internal/conversation"
 	"github.com/costa/polypod/internal/database"
 	"github.com/costa/polypod/internal/dbquery"
 	"github.com/costa/polypod/internal/git"
+	"github.com/costa/polypod/internal/hooks"
 	"github.com/costa/polypod/internal/iot"
 	"github.com/costa/polypod/internal/knowledge"
 	"github.com/costa/polypod/internal/mcp"
 	"github.com/costa/polypod/internal/memory"
+	"github.com/costa/polypod/internal/multiread"
 	"github.com/costa/polypod/internal/notify"
 	"github.com/costa/polypod/internal/observability"
 	"github.com/costa/polypod/internal/plugin"
@@ -50,6 +54,7 @@ import (
 	"github.com/costa/polypod/internal/vision"
 	"github.com/costa/polypod/internal/voice"
 	"github.com/costa/polypod/internal/web"
+	"github.com/costa/polypod/internal/webui"
 )
 
 const defaultConfigPath = "config.yaml"
@@ -318,6 +323,37 @@ func run(ctx context.Context, cfg *config.Config, pgDB *database.DB, sqliteDB *d
 	}
 	defer mcpMgr.Close()
 
+	// Multi-file read skills
+	multiread.RegisterSkills(skills)
+
+	// Hooks system
+	hookMgr := hooks.NewManager(logger)
+	for _, h := range cfg.Hooks {
+		hookMgr.Register(hooks.Hook{
+			Name:    h.Name,
+			Event:   hooks.Event(h.Event),
+			Type:    hooks.HandlerType(h.Type),
+			Command: h.Command,
+			URL:     h.URL,
+			Matcher: h.Matcher,
+			Timeout: h.Timeout,
+			Enabled: h.Enabled,
+		})
+	}
+
+	// Project commands (.polypod/commands/*.md)
+	cmdReg := commands.NewRegistry()
+	cmdReg.LoadFromDir(".polypod")
+	if cmds := cmdReg.ListCommands(); len(cmds) > 0 {
+		logger.Info("project commands loaded", "count", len(cmds))
+	}
+
+	// Fire SessionStart hook
+	hookMgr.Fire(ctx, hooks.HookPayload{
+		Event:     hooks.EventSessionStart,
+		Timestamp: time.Now().Format(time.RFC3339),
+	})
+
 	// === END NEW MODULES ===
 
 	logger.Info("skills loaded", "count", len(skills.List()))
@@ -403,6 +439,16 @@ func run(ctx context.Context, cfg *config.Config, pgDB *database.DB, sqliteDB *d
 	if cfg.WhatsApp.Enabled {
 		waAdapter := whatsapp.New(cfg.WhatsApp.IDInstance, cfg.WhatsApp.APIToken, logger)
 		channels = append(channels, waAdapter)
+	}
+
+	// Web UI (browser interface)
+	if cfg.WebUI.Enabled {
+		go func() {
+			wui := webui.New(cfg.WebUI.Host, cfg.WebUI.Port, streamHandler, logger)
+			if err := wui.Start(ctx); err != nil {
+				logger.Warn("webui failed", "error", err)
+			}
+		}()
 	}
 
 	if len(channels) == 0 {
