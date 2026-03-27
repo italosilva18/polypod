@@ -2,47 +2,129 @@ server:
   host: "0.0.0.0"
   port: 8080
 
+# Banco de dados (opcional — sem ele, persiste em JSON)
 database:
-  host: "localhost"
-  port: 5432
-  user: "polypod"
-  password: "CHANGE_ME"
-  name: "polypod"
-  sslmode: "disable"
-  max_conns: 10
+  enabled: false
+  # driver: sqlite
+  # path: data/polypod.db
+  # --- ou Postgres ---
+  # driver: postgres
+  # host: "localhost"
+  # port: 5432
+  # user: "polypod"
+  # password: "CHANGE_ME"
+  # name: "polypod"
+  # sslmode: "disable"
+  # max_conns: 10
 
+# Provider principal de IA
 ai:
   provider: "deepseek"
   base_url: "https://api.deepseek.com/v1"
-  api_key: "sk-your-deepseek-key"
+  api_key: "${DEEPSEEK_API_KEY:sk-your-key}"
   model: "deepseek-chat"
-  max_tokens: 2048
+  max_tokens: 4096
   temperature: 0.3
+  tools: true
+
+# Providers adicionais (opcional)
+# providers:
+#   - name: ollama
+#     base_url: "http://localhost:11434"
+#   - name: anthropic
+#     api_key: "${ANTHROPIC_API_KEY}"
+#   - name: google
+#     api_key: "${GOOGLE_API_KEY}"
+
+# Embeddings para RAG (opcional)
+embedding:
+  enabled: false
+  # api_key: ""
+  # base_url: ""
+
+# --- Canais ---
+
+cli:
+  enabled: true
+
+rest:
+  enabled: true
+  api_keys:
+    - "${API_KEY:your-api-key}"
 
 telegram:
   enabled: false
-  token: "123456:ABC-DEF"
+  token: "${TELEGRAM_BOT_TOKEN}"
 
 whatsapp:
   enabled: false
   api_url: "https://api.green-api.com"
   media_url: "https://media.green-api.com"
-  id_instance: "your-instance-id"
-  api_token: "your-api-token"
+  id_instance: "${WA_INSTANCE}"
+  api_token: "${WA_TOKEN}"
 
-rest:
+webui:
+  enabled: false
+  host: "127.0.0.1"
+  port: 8090
+
+# --- MCP Servers ---
+# mcp:
+#   - name: filesystem
+#     transport: stdio
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "/home"]
+#     auto_start: true
+
+# --- Hooks ---
+# hooks:
+#   - name: log-tools
+#     event: PostToolUse
+#     type: shell
+#     command: "cat >> /tmp/polypod-tools.log"
+#     enabled: true
+
+# --- Sandbox Docker ---
+sandbox:
+  enabled: false
+  image: "ubuntu:22.04"
+  memory_limit: "256m"
+  cpu_limit: "1"
+  timeout: 30
+  network: false
+
+# --- Agendador ---
+scheduler:
   enabled: true
-  api_keys:
-    - "your-api-key-here"
+  data_file: "data/scheduler.json"
 
+# --- Notificacoes ---
+notify:
+  webhook: ""
+
+# --- Plugins ---
+plugins:
+  dir: "data/plugins"
+
+# --- Templates ---
+templates:
+  dir: "templates"
+
+# --- Auth & Rate Limiting ---
 auth:
   telegram_allowed_ids: []
   whatsapp_allowed_numbers: []
 
 rate:
-  requests_per_minute: 20
-  burst_size: 5
+  requests_per_minute: 30
+  burst_size: 10
 
+# --- Logging ---
 log:
   level: "info"
   format: "text"
+
+# --- Data ---
+data:
+  dir: "data/conversations"
+  agents_dir: "agents"
