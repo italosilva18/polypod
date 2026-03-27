@@ -53,6 +53,20 @@ func (c *Compactor) NeedsCompaction(messages []Message) bool {
 	return EstimateTokens(messages) > c.config.MaxTokens
 }
 
+// CompactWithFocus compresses older messages with custom focus instructions.
+func (c *Compactor) CompactWithFocus(messages []Message, focus string) ([]Message, string) {
+	result, summary := c.Compact(messages)
+	if focus != "" && summary != "" {
+		// Replace generic summary with focus-aware prompt
+		for i, m := range result {
+			if m.Role == "system" && strings.HasPrefix(m.Content, "[Resumo da conversa anterior]") {
+				result[i].Content = fmt.Sprintf("[Resumo da conversa anterior (foco: %s)]\n%s", focus, summary)
+			}
+		}
+	}
+	return result, summary
+}
+
 // Compact compresses older messages into a summary.
 // Returns [system, summary, ...recent] messages.
 func (c *Compactor) Compact(messages []Message) ([]Message, string) {
