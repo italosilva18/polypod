@@ -1,0 +1,26 @@
+services:
+  polypod:
+    build: .
+    container_name: polypod
+    restart: unless-stopped
+    volumes:
+      - ./config.yaml:/etc/polypod/config.yaml:ro
+      - polypod-data:/home/polypod/data
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+    networks:
+      - traefik-proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.polypod.rule=Host(`ai.${DOMAIN:-gisctech.com.br}`)"
+      - "traefik.http.routers.polypod.entrypoints=websecure"
+      - "traefik.http.routers.polypod.tls.certresolver=letsencrypt"
+      - "traefik.http.services.polypod.loadbalancer.server.port=8080"
+
+volumes:
+  polypod-data:
+
+networks:
+  traefik-proxy:
+    external: true

@@ -1,0 +1,15 @@
+polypod
+*.log
+*.prof
+*.svg
+.git
+.github
+.env
+.env.local
+config.yaml
+config.local.yaml
+data/
+polypod-images/
+.polypod/
+*.md
+!README.md
