@@ -12,6 +12,7 @@ ai:
   model: "deepseek-chat"
   max_tokens: 2048
   temperature: 0.3
+  tools: true
 
 embedding:
   enabled: false

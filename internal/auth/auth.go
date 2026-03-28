@@ -57,8 +57,8 @@ func (a *Authorizer) IsAllowed(channel, userID string) bool {
 	case "rest":
 		// REST auth is handled by API key middleware
 		return true
-	case "cli":
-		// CLI is always allowed (local access)
+	case "cli", "headless", "webui":
+		// Local access is always allowed
 		return true
 	default:
 		return false

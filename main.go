@@ -231,13 +231,20 @@ func main() {
 		}
 	}
 
-	if err := setup.CheckAPIKey(cfg, configPath); err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
+	if headlessPrompt == "" {
+		if err := setup.CheckAPIKey(cfg, configPath); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	var logger *slog.Logger
-	if cfg.CLI.Enabled && headlessPrompt == "" {
+	if headlessPrompt != "" {
+		// Headless mode: log to file only, keep stdout clean for output
+		logPath := filepath.Join(cfg.Data.Dir, "polypod.log")
+		os.MkdirAll(cfg.Data.Dir, 0755)
+		logger, _ = observability.NewLoggerToFile("warn", cfg.Log.Format, logPath)
+	} else if cfg.CLI.Enabled {
 		logPath := filepath.Join(cfg.Data.Dir, "polypod.log")
 		os.MkdirAll(cfg.Data.Dir, 0755)
 		var err error
