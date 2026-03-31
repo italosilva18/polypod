@@ -1,0 +1,13 @@
+{
+  "denied_tools": [],
+  "ask_tools": [
+    {"pattern": "git_push", "decision": "ask"},
+    {"pattern": "delete_file", "decision": "ask"}
+  ],
+  "allowed_tools": [
+    {"pattern": "read_*", "decision": "allow"},
+    {"pattern": "git_status", "decision": "allow"},
+    {"pattern": "git_diff", "decision": "allow"},
+    {"pattern": "git_log", "decision": "allow"}
+  ]
+}

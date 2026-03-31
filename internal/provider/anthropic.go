@@ -1,33 +1,35 @@
 package provider
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
-	"time"
+
+	anthropic "github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
 )
 
-// Anthropic provides native access to Claude models.
+// Anthropic provides native access to Claude models via the official SDK.
 type Anthropic struct {
-	apiKey     string
-	baseURL    string
-	httpClient *http.Client
+	client        anthropic.Client
+	enableCaching bool
+	thinkingMode  string // "", "enabled", "adaptive"
+	thinkBudget   int
 }
 
-// NewAnthropic creates an Anthropic provider.
+// NewAnthropic creates an Anthropic provider using the official Go SDK.
 func NewAnthropic(apiKey, baseURL string) *Anthropic {
-	if baseURL == "" {
-		baseURL = "https://api.anthropic.com"
+	opts := []option.RequestOption{
+		option.WithAPIKey(apiKey),
 	}
+	if baseURL != "" {
+		opts = append(opts, option.WithBaseURL(baseURL))
+	}
+
 	return &Anthropic{
-		apiKey:     apiKey,
-		baseURL:    baseURL,
-		httpClient: &http.Client{Timeout: 5 * time.Minute},
+		client:        anthropic.NewClient(opts...),
+		enableCaching: true,
 	}
 }
 
@@ -36,294 +38,184 @@ func (a *Anthropic) SupportsVision() bool           { return true }
 func (a *Anthropic) SupportsTools() bool            { return true }
 func (a *Anthropic) SupportsStructuredOutput() bool { return true }
 
-type anthropicReq struct {
-	Model     string             `json:"model"`
-	MaxTokens int                `json:"max_tokens"`
-	System    string             `json:"system,omitempty"`
-	Messages  []anthropicMsg     `json:"messages"`
-	Tools     []anthropicTool    `json:"tools,omitempty"`
-	Stream    bool               `json:"stream,omitempty"`
-}
-
-type anthropicMsg struct {
-	Role    string        `json:"role"`
-	Content any           `json:"content"`
-}
-
-type anthropicContentBlock struct {
-	Type   string `json:"type"`
-	Text   string `json:"text,omitempty"`
-	ID     string `json:"id,omitempty"`
-	Name   string `json:"name,omitempty"`
-	Input  any    `json:"input,omitempty"`
-	Source *anthropicImageSource `json:"source,omitempty"`
-	ToolUseID string `json:"tool_use_id,omitempty"`
-	Content   string `json:"content,omitempty"`
-}
-
-type anthropicImageSource struct {
-	Type      string `json:"type"`
-	MediaType string `json:"media_type"`
-	Data      string `json:"data"`
-}
-
-type anthropicTool struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	InputSchema any    `json:"input_schema"`
-}
-
-type anthropicResp struct {
-	ID           string                  `json:"id"`
-	Content      []anthropicContentBlock `json:"content"`
-	StopReason   string                  `json:"stop_reason"`
-	Usage        anthropicUsage          `json:"usage"`
-}
-
-type anthropicUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+// SetThinking configures extended thinking mode.
+func (a *Anthropic) SetThinking(mode string, budget int) {
+	a.thinkingMode = mode
+	a.thinkBudget = budget
 }
 
 func (a *Anthropic) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
-	body := a.buildRequest(req, false)
-	data, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
+	params := a.buildParams(req)
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", a.baseURL+"/v1/messages", bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	a.setHeaders(httpReq)
-
-	resp, err := a.httpClient.Do(httpReq)
+	msg, err := a.client.Messages.New(ctx, params)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: %w", err)
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("anthropic HTTP %d: %s", resp.StatusCode, string(b))
-	}
-
-	var aResp anthropicResp
-	if err := json.NewDecoder(resp.Body).Decode(&aResp); err != nil {
-		return nil, fmt.Errorf("anthropic decode: %w", err)
-	}
-
-	return a.parseResponse(aResp), nil
+	return a.parseResponse(msg), nil
 }
 
 func (a *Anthropic) ChatStream(ctx context.Context, req ChatRequest, callback StreamCallback) (*ChatResponse, error) {
-	body := a.buildRequest(req, true)
-	data, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
+	params := a.buildParams(req)
+
+	stream := a.client.Messages.NewStreaming(ctx, params)
+	msg := anthropic.Message{}
+
+	for stream.Next() {
+		event := stream.Current()
+		msg.Accumulate(event)
+
+		// Extract text deltas for streaming
+		switch evt := event.AsAny().(type) {
+		case anthropic.ContentBlockDeltaEvent:
+			if delta, ok := evt.Delta.AsAny().(anthropic.TextDelta); ok {
+				if callback != nil {
+					callback(StreamDelta{Content: delta.Text})
+				}
+			}
+		}
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", a.baseURL+"/v1/messages", bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	a.setHeaders(httpReq)
-
-	resp, err := a.httpClient.Do(httpReq)
-	if err != nil {
+	if err := stream.Err(); err != nil {
 		return nil, fmt.Errorf("anthropic stream: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("anthropic HTTP %d: %s", resp.StatusCode, string(b))
-	}
-
-	scanner := bufio.NewScanner(resp.Body)
-	var content strings.Builder
-	var toolCalls []ToolCall
-	var usage anthropicUsage
-	var currentToolID, currentToolName string
-	var currentToolArgs strings.Builder
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		eventData := strings.TrimPrefix(line, "data: ")
-		if eventData == "[DONE]" {
-			break
-		}
-
-		var event map[string]any
-		if err := json.Unmarshal([]byte(eventData), &event); err != nil {
-			continue
-		}
-
-		eventType, _ := event["type"].(string)
-		switch eventType {
-		case "content_block_start":
-			if cb, ok := event["content_block"].(map[string]any); ok {
-				if cb["type"] == "tool_use" {
-					currentToolID, _ = cb["id"].(string)
-					currentToolName, _ = cb["name"].(string)
-					currentToolArgs.Reset()
-				}
-			}
-		case "content_block_delta":
-			if delta, ok := event["delta"].(map[string]any); ok {
-				dtype, _ := delta["type"].(string)
-				switch dtype {
-				case "text_delta":
-					text, _ := delta["text"].(string)
-					content.WriteString(text)
-					if callback != nil {
-						callback(StreamDelta{Content: text})
-					}
-				case "input_json_delta":
-					partial, _ := delta["partial_json"].(string)
-					currentToolArgs.WriteString(partial)
-				}
-			}
-		case "content_block_stop":
-			if currentToolName != "" {
-				toolCalls = append(toolCalls, ToolCall{
-					ID:        currentToolID,
-					Name:      currentToolName,
-					Arguments: currentToolArgs.String(),
-				})
-				currentToolName = ""
-			}
-		case "message_delta":
-			if u, ok := event["usage"].(map[string]any); ok {
-				if v, ok := u["output_tokens"].(float64); ok {
-					usage.OutputTokens = int(v)
-				}
-			}
-		}
 	}
 
 	if callback != nil {
 		callback(StreamDelta{Done: true})
 	}
 
-	return &ChatResponse{
-		Content:          content.String(),
-		ToolCalls:        toolCalls,
-		PromptTokens:     usage.InputTokens,
-		CompletionTokens: usage.OutputTokens,
-		TotalTokens:      usage.InputTokens + usage.OutputTokens,
-	}, nil
+	return a.parseResponse(&msg), nil
 }
 
-func (a *Anthropic) setHeaders(req *http.Request) {
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", a.apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-}
-
-func (a *Anthropic) buildRequest(req ChatRequest, stream bool) anthropicReq {
-	aReq := anthropicReq{
+func (a *Anthropic) buildParams(req ChatRequest) anthropic.MessageNewParams {
+	params := anthropic.MessageNewParams{
 		Model:     req.Model,
-		MaxTokens: req.MaxTokens,
-		Stream:    stream,
+		MaxTokens: int64(req.MaxTokens),
 	}
-	if aReq.MaxTokens == 0 {
-		aReq.MaxTokens = 4096
+	if params.MaxTokens == 0 {
+		params.MaxTokens = 4096
 	}
 
 	for _, m := range req.Messages {
-		if m.Role == "system" {
-			aReq.System = m.Content
-			continue
-		}
+		switch m.Role {
+		case "system":
+			block := anthropic.TextBlockParam{Text: m.Content}
+			if a.enableCaching {
+				block.CacheControl = anthropic.CacheControlEphemeralParam{Type: "ephemeral"}
+			}
+			params.System = append(params.System, block)
 
-		role := m.Role
-		if role == "tool" {
-			// Anthropic expects tool results as user messages with tool_result content blocks
-			aReq.Messages = append(aReq.Messages, anthropicMsg{
-				Role: "user",
-				Content: []anthropicContentBlock{{
-					Type:      "tool_result",
-					ToolUseID: m.ToolCallID,
-					Content:   m.Content,
-				}},
-			})
-			continue
-		}
-
-		if len(m.Parts) > 0 {
-			var blocks []anthropicContentBlock
-			for _, p := range m.Parts {
-				switch p.Type {
-				case "text":
-					blocks = append(blocks, anthropicContentBlock{Type: "text", Text: p.Text})
-				case "image_base64":
-					blocks = append(blocks, anthropicContentBlock{
-						Type: "image",
-						Source: &anthropicImageSource{
-							Type:      "base64",
-							MediaType: p.MimeType,
-							Data:      p.ImageB64,
-						},
-					})
+		case "user":
+			var blocks []anthropic.ContentBlockParamUnion
+			if len(m.Parts) > 0 {
+				for _, p := range m.Parts {
+					switch p.Type {
+					case "text":
+						blocks = append(blocks, anthropic.NewTextBlock(p.Text))
+					case "image_base64":
+						blocks = append(blocks, anthropic.NewImageBlockBase64(p.MimeType, p.ImageB64))
+					case "image_url":
+						// URL images: use base64 source with URL
+						blocks = append(blocks, anthropic.ContentBlockParamUnion{
+							OfImage: &anthropic.ImageBlockParam{
+								Source: anthropic.ImageBlockParamSourceUnion{
+									OfURL: &anthropic.URLImageSourceParam{URL: p.ImageURL},
+								},
+							},
+						})
+					}
 				}
+			} else {
+				blocks = append(blocks, anthropic.NewTextBlock(m.Content))
 			}
-			aReq.Messages = append(aReq.Messages, anthropicMsg{Role: role, Content: blocks})
-		} else if len(m.ToolCalls) > 0 {
-			var blocks []anthropicContentBlock
-			if m.Content != "" {
-				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: m.Content})
+			params.Messages = append(params.Messages, anthropic.NewUserMessage(blocks...))
+
+		case "assistant":
+			if len(m.ToolCalls) > 0 {
+				var blocks []anthropic.ContentBlockParamUnion
+				if m.Content != "" {
+					blocks = append(blocks, anthropic.NewTextBlock(m.Content))
+				}
+				for _, tc := range m.ToolCalls {
+					var input any
+					json.Unmarshal([]byte(tc.Arguments), &input)
+					blocks = append(blocks, anthropic.NewToolUseBlock(tc.ID, input, tc.Name))
+				}
+				params.Messages = append(params.Messages, anthropic.NewAssistantMessage(blocks...))
+			} else {
+				params.Messages = append(params.Messages, anthropic.NewAssistantMessage(
+					anthropic.NewTextBlock(m.Content),
+				))
 			}
-			for _, tc := range m.ToolCalls {
-				var input any
-				json.Unmarshal([]byte(tc.Arguments), &input)
-				blocks = append(blocks, anthropicContentBlock{
-					Type:  "tool_use",
-					ID:    tc.ID,
-					Name:  tc.Name,
-					Input: input,
-				})
-			}
-			aReq.Messages = append(aReq.Messages, anthropicMsg{Role: role, Content: blocks})
-		} else {
-			aReq.Messages = append(aReq.Messages, anthropicMsg{Role: role, Content: m.Content})
+
+		case "tool":
+			params.Messages = append(params.Messages, anthropic.NewUserMessage(
+				anthropic.NewToolResultBlock(m.ToolCallID, m.Content, false),
+			))
 		}
 	}
 
+	// Tools
 	for _, t := range req.Tools {
-		aReq.Tools = append(aReq.Tools, anthropicTool{
+		schemaBytes, _ := json.Marshal(t.Parameters)
+		var schema anthropic.ToolInputSchemaParam
+		json.Unmarshal(schemaBytes, &schema)
+
+		tool := anthropic.ToolParam{
 			Name:        t.Name,
-			Description: t.Description,
-			InputSchema: t.Parameters,
-		})
+			Description: anthropic.String(t.Description),
+			InputSchema: schema,
+		}
+		if a.enableCaching {
+			tool.CacheControl = anthropic.CacheControlEphemeralParam{Type: "ephemeral"}
+		}
+		params.Tools = append(params.Tools, anthropic.ToolUnionParam{OfTool: &tool})
 	}
 
-	return aReq
+	// Extended thinking
+	switch a.thinkingMode {
+	case "enabled":
+		budget := int64(a.thinkBudget)
+		if budget == 0 {
+			budget = 4096
+		}
+		params.Thinking = anthropic.ThinkingConfigParamUnion{
+			OfEnabled: &anthropic.ThinkingConfigEnabledParam{BudgetTokens: budget},
+		}
+	case "adaptive":
+		params.Thinking = anthropic.ThinkingConfigParamUnion{
+			OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{},
+		}
+	}
+
+	return params
 }
 
-func (a *Anthropic) parseResponse(resp anthropicResp) *ChatResponse {
+func (a *Anthropic) parseResponse(msg *anthropic.Message) *ChatResponse {
 	cr := &ChatResponse{
-		FinishReason:     resp.StopReason,
-		PromptTokens:     resp.Usage.InputTokens,
-		CompletionTokens: resp.Usage.OutputTokens,
-		TotalTokens:      resp.Usage.InputTokens + resp.Usage.OutputTokens,
+		FinishReason:     string(msg.StopReason),
+		PromptTokens:     int(msg.Usage.InputTokens),
+		CompletionTokens: int(msg.Usage.OutputTokens),
+		TotalTokens:      int(msg.Usage.InputTokens + msg.Usage.OutputTokens),
 	}
-	for _, block := range resp.Content {
-		switch block.Type {
-		case "text":
-			cr.Content += block.Text
-		case "tool_use":
-			argsJSON, _ := json.Marshal(block.Input)
+
+	var textParts []string
+	for _, block := range msg.Content {
+		switch v := block.AsAny().(type) {
+		case anthropic.TextBlock:
+			textParts = append(textParts, v.Text)
+		case anthropic.ToolUseBlock:
+			argsJSON, _ := json.Marshal(v.Input)
 			cr.ToolCalls = append(cr.ToolCalls, ToolCall{
-				ID:        block.ID,
-				Name:      block.Name,
+				ID:        v.ID,
+				Name:      v.Name,
 				Arguments: string(argsJSON),
 			})
+		case anthropic.ThinkingBlock:
+			textParts = append(textParts, fmt.Sprintf("<thinking>%s</thinking>", v.Thinking))
 		}
 	}
+	cr.Content = strings.Join(textParts, "")
+
 	return cr
 }

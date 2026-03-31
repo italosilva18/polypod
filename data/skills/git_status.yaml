@@ -1,0 +1,16 @@
+name: git_status
+description: Verificar o estado do repositório Git (status, branch, modificações)
+parameters: {}
+script: |-
+    #!/bin/bash
+    echo "=== Status do Repositório Git ==="
+    echo ""
+    echo "Branch atual:"
+    git branch --show-current
+    echo ""
+    echo "Status:"
+    git status --short
+    echo ""
+    echo "Último commit:"
+    git log --oneline -1
+created_at: 2026-03-28T08:00:53.022283068-03:00

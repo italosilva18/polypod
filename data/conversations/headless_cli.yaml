@@ -1,0 +1,61 @@
+id: headless:cli
+channel: headless
+user_id: cli
+messages:
+    - role: user
+      content: diga ola mundo em 3 idiomas
+      timestamp: 2026-03-28T07:48:25.364110746-03:00
+    - role: assistant
+      content: |-
+        Olá mundo! Aqui estão três idiomas diferentes:
+
+        1. **Português**: Olá, mundo!
+        2. **Inglês**: Hello, world!
+        3. **Espanhol**: ¡Hola, mundo!
+      timestamp: 2026-03-28T07:48:28.391347659-03:00
+    - role: user
+      content: diga ola em 5 idiomas, um por linha
+      timestamp: 2026-03-28T07:51:09.212586492-03:00
+    - role: assistant
+      content: "Olá em 5 idiomas:\n\nPortuguês: Olá  \nInglês: Hello  \nEspanhol: Hola  \nFrancês: Bonjour  \nItaliano: Ciao"
+      timestamp: 2026-03-28T07:51:12.13168589-03:00
+    - role: user
+      content: quanto e 2+2?
+      timestamp: 2026-03-28T07:51:12.185836287-03:00
+    - role: assistant
+      content: 2 + 2 = 4
+      timestamp: 2026-03-28T07:51:14.148596548-03:00
+    - role: user
+      content: traduza para japones
+      timestamp: 2026-03-28T07:51:14.214109119-03:00
+    - role: assistant
+      content: "Tradução para japonês:\n\n**Português:** traduza para japonês  \n**Japonês:** 日本語に翻訳してください (Nihongo ni hon'yaku shite kudasai)"
+      timestamp: 2026-03-28T07:51:16.794653509-03:00
+    - role: user
+      content: liste os arquivos .yaml neste diretorio usando a skill list_directory
+      timestamp: 2026-03-28T07:52:54.106969186-03:00
+    - role: assistant
+      content: |-
+        Agora vou filtrar os arquivos .yaml da lista:
+
+        Arquivos .yaml neste diretório:
+        1. **config.cli.yaml** (412 bytes)
+        2. **config.example.yaml** (2290 bytes)
+        3. **config.local.yaml** (470 bytes)
+
+        Também há o arquivo **docker-compose.yml** (738 bytes) que é um arquivo YAML, mas com extensão .yml.
+      timestamp: 2026-03-28T07:53:01.238116389-03:00
+    - role: user
+      content: use git_status para ver o estado do repositorio
+      timestamp: 2026-03-28T08:00:42.657996207-03:00
+    - role: assistant
+      content: "**Status do repositório Git:**\n\n**Branch atual:** master\n\n**Arquivos modificados:**\n- `config.local.yaml` (modificado)\n- `internal/auth/auth.go` (modificado)  \n- `main.go` (modificado)\n\n**Arquivos não monitorados (novos):**\n- `.polypod.md`\n- `.polypod/` (diretório)\n- `data/` (diretório)\n\n**Último commit:** `2033614 feat: add Dockerfile, CI/CD, and 11 test suites — production ready`\n\nO repositório tem 3 arquivos modificados e 3 novos arquivos/diretórios não monitorados. O branch está atualizado com a origem."
+      timestamp: 2026-03-28T08:01:07.830225917-03:00
+    - role: user
+      content: quanto e 7 * 8?
+      timestamp: 2026-03-30T21:25:31.857799761-03:00
+    - role: assistant
+      content: 7 × 8 = 56
+      timestamp: 2026-03-30T21:25:33.757747062-03:00
+created_at: 2026-03-28T07:48:25.364108845-03:00
+updated_at: 2026-03-30T21:25:33.75774789-03:00
