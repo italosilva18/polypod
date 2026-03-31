@@ -1,6 +1,6 @@
 # Polypod
 
-A CLI de IA mais completa do mundo. Um unico binario Go de 26MB com 130+ skills, 88 packages (100% conectados, zero dead code), 5 providers, 5 canais, MCP client+server, hooks, plugins, modos, parallel tool execution, smart routing, e absolutamente tudo que existe no mercado — mais o que ninguem tem.
+A CLI de IA mais completa do mundo. Um unico binario Go de 32MB com 135+ skills, 92 packages, **16 providers**, 5 canais, SDKs oficiais (Anthropic + MCP), PageRank repo-map, auto-lint, diff sandbox, LLM arena, prompt caching, extended thinking — e absolutamente tudo que existe no mercado, mais o que ninguem tem.
 
 ```
    ____       _                       _
@@ -96,32 +96,49 @@ polypod completion fish | source      # fish
 12. Dispara hook `SessionStart`
 13. Abre canais (CLI, REST, Telegram, WhatsApp, WebUI)
 
-## Providers
+## 16 Providers
 
-5 providers nativos com **fallback automatico** + **smart routing** + **circuit breaker**:
+| Provider | API | Modelos exemplo |
+|----------|-----|-----------------|
+| **DeepSeek** | OpenAI-compat | deepseek-chat, deepseek-reasoner |
+| **OpenAI** | OpenAI-compat | gpt-4o, gpt-4o-mini |
+| **Ollama** | Nativo | llama3.1, codellama, mistral (local, gratis) |
+| **Anthropic** | **SDK oficial** | claude-3-5-sonnet, claude-3-opus (prompt caching, extended thinking) |
+| **Google** | Nativo | gemini-1.5-pro, gemini-1.5-flash |
+| **Groq** | OpenAI-compat | llama-3.1-70b, mixtral (ultra rapido) |
+| **Mistral** | OpenAI-compat | mistral-large, mistral-medium |
+| **Cohere** | OpenAI-compat | command-r-plus |
+| **OpenRouter** | OpenAI-compat | 100+ modelos agregados |
+| **Together** | OpenAI-compat | llama-3.1, qwen-2.5 |
+| **Perplexity** | OpenAI-compat | sonar-pro (search-enhanced) |
+| **Fireworks** | OpenAI-compat | llama-3.1-405b |
+| **DeepInfra** | OpenAI-compat | qualquer modelo open-source |
+| **xAI** | OpenAI-compat | grok-2, grok-3 |
+| **Cerebras** | OpenAI-compat | llama-3.1 (inferencia mais rapida) |
+| **SambaNova** | OpenAI-compat | llama-3.1 |
 
 ```yaml
 ai:
-  provider: "deepseek"                    # Padrao, mais barato
-  base_url: "https://api.deepseek.com/v1"
-  api_key: "${DEEPSEEK_API_KEY}"          # Carrega de .env automaticamente
+  provider: "deepseek"
+  api_key: "${DEEPSEEK_API_KEY}"    # .env carregado automaticamente
   model: "deepseek-chat"
 
-# Fallback: deepseek → ollama → openai
+# Providers adicionais (fallback automatico)
 providers:
   - name: ollama
     base_url: "http://localhost:11434"
-  - name: openai
-    api_key: "${OPENAI_API_KEY}"
-  - name: anthropic
-    api_key: "${ANTHROPIC_API_KEY}"
-  - name: google
-    api_key: "${GOOGLE_API_KEY}"
+  - name: groq
+    api_key: "${GROQ_API_KEY}"
+  - name: openrouter
+    api_key: "${OPENROUTER_API_KEY}"
 ```
 
-- **Smart routing**: classifica complexidade e roteia para modelo barato ou caro (~60% economia)
+- **Fallback automatico**: deepseek falha → tenta ollama → tenta groq → ...
+- **Smart routing**: classifica complexidade e roteia para modelo barato/caro (~60% economia)
 - **Circuit breaker**: 3 falhas → abre circuito → espera 30s → testa recovery
-- **Retry UX**: countdown visivel "Aguardando 1:25..." durante rate-limit
+- **Prompt caching**: 90% economia no Anthropic (SDK oficial com cache_control)
+- **Extended thinking**: modos enabled/adaptive com budget controlavel
+- **LLM Arena**: `/arena` envia mesmo prompt para N modelos, compara lado a lado
 
 ## 5 Canais
 
@@ -300,6 +317,99 @@ polypod hook status      # Lista hooks ativos
 
 ## Features Avancadas
 
+### SDKs Oficiais
+
+Polypod usa os **SDKs oficiais** mantidos pelas proprias empresas:
+
+- **Anthropic Go SDK** (`anthropic-sdk-go` v1.27.1) — prompt caching (90% economia), extended thinking (enabled/adaptive), citations, PDF support, batches API (50% desconto), token counting exato
+- **MCP Go SDK** (`modelcontextprotocol/go-sdk` v1.4.1) — co-mantido por Anthropic + Google, suporta spec ate 2025-11-25
+
+### PageRank Repo-Map
+
+Inspirado no Aider (42.6K stars), Polypod constroi um mapa do codebase rankeado por relevancia:
+
+1. **Parse AST** — Go nativo (`go/parser`) + regex para Python/JS/TS/Rust/Java/Ruby
+2. **Grafo de dependencias** — imports/referencias entre arquivos
+3. **PageRank personalizado** — bias para arquivos mencionados na conversa
+4. **Token budget** — seleciona simbolos mais relevantes que cabem no limite
+
+```
+> Polypod automaticamente injeta no contexto:
+internal/router/router.go
+  struct Router (line 19)
+  function New (line 30)
+  method Handler (line 51)
+internal/ai/service.go
+  function NewService (line 44)
+  method Answer (line 112)
+  method AnswerStream (line 137)
+```
+
+### Auto-Lint + Auto-Test
+
+Apos cada edicao da IA, Polypod automaticamente:
+1. Roda o linter (auto-detecta: `go vet`, `eslint`, `ruff`, `cargo clippy`)
+2. Roda os testes (auto-detecta: `go test`, `npm test`, `pytest`, `cargo test`)
+3. Se encontrar erros, alimenta de volta à IA para correcao
+4. Repete ate `max_retries` (default: 3)
+
+```yaml
+autolint:
+  enabled: true
+  auto_fix: true   # alimentar erros de volta à IA
+  run_tests: true  # tambem rodar testes
+  max_retries: 3
+```
+
+### Diff Sandbox (Staging Area)
+
+Todas as mudancas da IA ficam em staging antes de serem aplicadas:
+
+```
+> Refatore o handler de auth
+
+[sandbox] 3 mudanca(s) pendente(s):
+
+### 1. EDITAR: internal/auth/handler.go (-5 +12 linhas)
+- func oldHandler(w http.ResponseWriter, r *http.Request) {
++ func newHandler(w http.ResponseWriter, r *http.Request) {
++     token := r.Header.Get("Authorization")
+...
+
+### 2. NOVO: internal/auth/middleware.go (+45 linhas)
+
+Total: +57 -5 linhas em 2 arquivo(s)
+Use /apply para aplicar ou /reject para descartar.
+```
+
+### LLM Arena
+
+Compare modelos lado a lado:
+
+```
+> /arena "explique o que e um mutex"
+
+## Arena: 3 modelo(s)
+
+### 1. DeepSeek (deepseek-chat)
+Um mutex (mutual exclusion) e um mecanismo de sincronizacao...
+Tokens: 45 in + 120 out | Tempo: 890ms
+
+### 2. Groq (llama-3.1-70b)
+Mutex, abreviacao de "mutual exclusion"...
+Tokens: 45 in + 95 out | Tempo: 210ms
+
+### 3. Ollama (llama3.1:8b)
+Um mutex e uma ferramenta de programacao concorrente...
+Tokens: 45 in + 80 out | Tempo: 1.2s
+
+| Modelo | Tokens | Tempo | Status |
+|--------|--------|-------|--------|
+| deepseek-chat | 165 | 890ms | OK |
+| llama-3.1-70b | 140 | 210ms | OK |
+| llama3.1:8b | 125 | 1.2s | OK |
+```
+
 ### .env Auto-Loading
 
 Polypod carrega `.env` e `.env.local` automaticamente do diretorio do projeto. Precedencia: env vars existentes > .env.local > .env > config.yaml. Avisa se `.env` contem secrets e nao esta no `.gitignore`.
@@ -459,7 +569,7 @@ Detecta PR aberto para a branch atual via `gh` CLI:
 - Dica: sessao longa — considere /compact
 ```
 
-## Arquitetura (88 packages, 100% conectados)
+## Arquitetura (92 packages)
 
 ```
 polypod/
@@ -551,6 +661,10 @@ polypod/
 │   ├── prstatus/          # PR status footer
 │   ├── insights/          # Session analysis
 │   ├── completion/        # Shell completions (bash/zsh/fish)
+│   ├── treesitter/        # PageRank repo-map (AST + graph ranking)
+│   ├── autolint/          # Auto-lint/test after AI edits
+│   ├── diffsandbox/       # Staging area (/apply /reject)
+│   ├── arena/             # LLM Arena (compare models)
 │   └── observability/     # Logging
 ├── agents/                # YAML agents
 ├── templates/             # 8 prompt templates
@@ -643,16 +757,17 @@ WantedBy=multi-user.target
 
 | Metrica | Valor |
 |---------|-------|
-| Arquivos Go | 132 |
-| Linhas de codigo | 22.696 |
-| Packages | 88 (100% conectados) |
-| Dead code | 0 |
-| Skills | 130+ |
+| Arquivos Go | 135 (+11 test) |
+| Linhas de codigo | 24.725 |
+| Packages | 92 |
+| Test suites | 11 (38 test functions, todos passando) |
+| Skills | 135+ |
 | Templates | 8 |
 | Temas | 6 |
-| Providers | 5 |
+| Providers | **16** |
 | Canais | 5 |
-| Binario | 26MB |
+| SDKs oficiais | Anthropic Go SDK + MCP Go SDK |
+| Binario | 32MB |
 
 ## Licenca
 
