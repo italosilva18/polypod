@@ -2,153 +2,219 @@ package mcp
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os/exec"
+	"strings"
 	"sync"
+
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/costa/polypod/internal/skill"
+	"github.com/sashabaranov/go-openai/jsonschema"
 )
 
-// Client manages a connection to a single MCP server.
-type Client struct {
-	transport  Transport
-	nextID     int
-	serverInfo *InitializeResult
-	logger     *slog.Logger
-	mu         sync.Mutex
+// ServerConfig describes how to connect to an MCP server.
+type ServerConfig struct {
+	Name      string            `yaml:"name"`
+	Transport string            `yaml:"transport"` // "stdio" or "sse"
+	Command   string            `yaml:"command"`
+	Args      []string          `yaml:"args"`
+	URL       string            `yaml:"url"`
+	Env       map[string]string `yaml:"env"`
 }
 
-// NewClient wraps a transport into an MCP client.
-func NewClient(transport Transport, logger *slog.Logger) *Client {
-	return &Client{
-		transport: transport,
-		nextID:    1,
-		logger:    logger,
+// Manager manages multiple MCP server connections using the official SDK.
+type Manager struct {
+	mu       sync.RWMutex
+	sessions map[string]*mcpsdk.ClientSession
+	tools    map[string][]*mcpsdk.Tool
+	client   *mcpsdk.Client
+	logger   *slog.Logger
+}
+
+// NewManager creates an MCP manager.
+func NewManager(logger *slog.Logger) *Manager {
+	client := mcpsdk.NewClient(&mcpsdk.Implementation{
+		Name:    "polypod",
+		Version: "0.4.0",
+	}, nil)
+
+	return &Manager{
+		sessions: make(map[string]*mcpsdk.ClientSession),
+		tools:    make(map[string][]*mcpsdk.Tool),
+		client:   client,
+		logger:   logger,
 	}
 }
 
-func (c *Client) newID() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	id := c.nextID
-	c.nextID++
-	return id
-}
+// Connect connects to an MCP server using the given config.
+func (m *Manager) Connect(ctx context.Context, cfg ServerConfig) error {
+	var transport mcpsdk.Transport
 
-// Initialize performs the MCP handshake with the server.
-func (c *Client) Initialize(_ context.Context) (*InitializeResult, error) {
-	id := c.newID()
-	req := JSONRPCRequest{
-		JSONRPC: "2.0",
-		ID:      id,
-		Method:  "initialize",
-		Params: InitializeParams{
-			ProtocolVersion: "2024-11-05",
-			ClientInfo:      ClientInfo{Name: "polypod", Version: "0.3.0"},
-		},
+	switch cfg.Transport {
+	case "stdio":
+		args := cfg.Args
+		cmd := exec.Command(cfg.Command, args...)
+		if len(cfg.Env) > 0 {
+			for k, v := range cfg.Env {
+				cmd.Env = append(cmd.Env, k+"="+v)
+			}
+		}
+		transport = &mcpsdk.CommandTransport{Command: cmd}
+	case "sse":
+		transport = &mcpsdk.SSEClientTransport{Endpoint: cfg.URL}
+	default:
+		return fmt.Errorf("mcp: transport desconhecido %q (use 'stdio' ou 'sse')", cfg.Transport)
 	}
 
-	if err := c.transport.Send(req); err != nil {
-		return nil, fmt.Errorf("mcp initialize send: %w", err)
-	}
-
-	resp, err := c.transport.Receive()
+	session, err := m.client.Connect(ctx, transport, nil)
 	if err != nil {
-		return nil, fmt.Errorf("mcp initialize receive: %w", err)
-	}
-	if resp.Error != nil {
-		return nil, resp.Error
+		return fmt.Errorf("mcp connect %s: %w", cfg.Name, err)
 	}
 
-	var result InitializeResult
-	if err := json.Unmarshal(resp.Result, &result); err != nil {
-		return nil, fmt.Errorf("mcp initialize decode: %w", err)
+	// List tools
+	result, err := session.ListTools(ctx, nil)
+	if err != nil {
+		session.Close()
+		return fmt.Errorf("mcp list tools %s: %w", cfg.Name, err)
 	}
 
-	// Send the initialized notification
-	notif := JSONRPCNotification{
-		JSONRPC: "2.0",
-		Method:  "notifications/initialized",
-	}
-	if err := c.transport.SendNotification(notif); err != nil {
-		c.logger.Warn("mcp: falha ao enviar notifications/initialized", "error", err)
-	}
+	m.mu.Lock()
+	m.sessions[cfg.Name] = session
+	m.tools[cfg.Name] = result.Tools
+	m.mu.Unlock()
 
-	c.serverInfo = &result
-	c.logger.Info("mcp: servidor conectado",
-		"server", result.ServerInfo.Name,
-		"version", result.ServerInfo.Version,
-		"protocol", result.ProtocolVersion,
+	m.logger.Info("mcp: servidor conectado",
+		"name", cfg.Name,
+		"tools", len(result.Tools),
 	)
 
-	return &result, nil
+	return nil
 }
 
-// ListTools returns all tools exposed by the server.
-func (c *Client) ListTools(_ context.Context) ([]MCPTool, error) {
-	id := c.newID()
-	req := JSONRPCRequest{
-		JSONRPC: "2.0",
-		ID:      id,
-		Method:  "tools/list",
+// Disconnect closes a server connection.
+func (m *Manager) Disconnect(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	session, ok := m.sessions[name]
+	if !ok {
+		return fmt.Errorf("mcp: servidor %q nao conectado", name)
 	}
 
-	if err := c.transport.Send(req); err != nil {
-		return nil, fmt.Errorf("mcp tools/list send: %w", err)
-	}
-
-	resp, err := c.transport.Receive()
-	if err != nil {
-		return nil, fmt.Errorf("mcp tools/list receive: %w", err)
-	}
-	if resp.Error != nil {
-		return nil, resp.Error
-	}
-
-	var result ToolsListResult
-	if err := json.Unmarshal(resp.Result, &result); err != nil {
-		return nil, fmt.Errorf("mcp tools/list decode: %w", err)
-	}
-
-	c.logger.Info("mcp: ferramentas listadas", "count", len(result.Tools))
-	return result.Tools, nil
+	err := session.Close()
+	delete(m.sessions, name)
+	delete(m.tools, name)
+	return err
 }
 
-// CallTool invokes a tool on the server.
-func (c *Client) CallTool(_ context.Context, name string, args map[string]any) (*CallToolResult, error) {
-	id := c.newID()
-	req := JSONRPCRequest{
-		JSONRPC: "2.0",
-		ID:      id,
-		Method:  "tools/call",
-		Params:  CallToolParams{Name: name, Arguments: args},
-	}
+// RegisterTools registers all MCP tools from connected servers into a skill registry.
+func (m *Manager) RegisterTools(reg *skill.Registry) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
-	if err := c.transport.Send(req); err != nil {
-		return nil, fmt.Errorf("mcp tools/call send: %w", err)
+	count := 0
+	for serverName, tools := range m.tools {
+		session := m.sessions[serverName]
+		for _, tool := range tools {
+			s := m.toolToSkill(serverName, tool, session)
+			reg.Register(s)
+			count++
+		}
 	}
-
-	resp, err := c.transport.Receive()
-	if err != nil {
-		return nil, fmt.Errorf("mcp tools/call receive: %w", err)
-	}
-	if resp.Error != nil {
-		return nil, resp.Error
-	}
-
-	var result CallToolResult
-	if err := json.Unmarshal(resp.Result, &result); err != nil {
-		return nil, fmt.Errorf("mcp tools/call decode: %w", err)
-	}
-
-	return &result, nil
+	return count
 }
 
-// ServerInfo returns info about the connected server, or nil if not initialized.
-func (c *Client) ServerInfo() *InitializeResult {
-	return c.serverInfo
+func (m *Manager) toolToSkill(serverName string, tool *mcpsdk.Tool, session *mcpsdk.ClientSession) *skill.Skill {
+	skillName := fmt.Sprintf("mcp_%s_%s", serverName, tool.Name)
+
+	params := jsonschema.Definition{
+		Type:       jsonschema.Object,
+		Properties: make(map[string]jsonschema.Definition),
+	}
+
+	// Convert MCP inputSchema (any) to jsonschema.Definition
+	if tool.InputSchema != nil {
+		if schemaMap, ok := tool.InputSchema.(map[string]any); ok {
+			if props, ok := schemaMap["properties"].(map[string]any); ok {
+				for name := range props {
+					params.Properties[name] = jsonschema.Definition{
+						Type: jsonschema.String,
+					}
+				}
+			}
+		}
+	}
+
+	return &skill.Skill{
+		Name:        skillName,
+		Description: fmt.Sprintf("[MCP:%s] %s", serverName, tool.Description),
+		Parameters:  params,
+		Execute: func(args map[string]string) (string, error) {
+			mcpArgs := make(map[string]any, len(args))
+			for k, v := range args {
+				mcpArgs[k] = v
+			}
+
+			result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+				Name:      tool.Name,
+				Arguments: mcpArgs,
+			})
+			if err != nil {
+				return "", fmt.Errorf("mcp call %s/%s: %w", serverName, tool.Name, err)
+			}
+
+			if result.IsError {
+				var errTexts []string
+				for _, c := range result.Content {
+					if tc, ok := c.(*mcpsdk.TextContent); ok {
+						errTexts = append(errTexts, tc.Text)
+					}
+				}
+				return "", fmt.Errorf("mcp tool error: %s", strings.Join(errTexts, "; "))
+			}
+
+			var texts []string
+			for _, c := range result.Content {
+				if tc, ok := c.(*mcpsdk.TextContent); ok {
+					texts = append(texts, tc.Text)
+				}
+			}
+			return strings.Join(texts, "\n"), nil
+		},
+	}
 }
 
-// Close shuts down the transport.
-func (c *Client) Close() error {
-	return c.transport.Close()
+// ListServers returns info about connected servers and their tools.
+func (m *Manager) ListServers() map[string][]string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	result := make(map[string][]string)
+	for name, tools := range m.tools {
+		var toolNames []string
+		for _, t := range tools {
+			toolNames = append(toolNames, t.Name)
+		}
+		result[name] = toolNames
+	}
+	return result
+}
+
+// Close disconnects all servers.
+func (m *Manager) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var lastErr error
+	for name, session := range m.sessions {
+		if err := session.Close(); err != nil {
+			lastErr = err
+			m.logger.Warn("mcp close error", "server", name, "error", err)
+		}
+	}
+	m.sessions = make(map[string]*mcpsdk.ClientSession)
+	m.tools = make(map[string][]*mcpsdk.Tool)
+	return lastErr
 }
