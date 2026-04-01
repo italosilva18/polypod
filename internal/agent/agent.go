@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/costa/polypod/internal/types"
 	"gopkg.in/yaml.v3"
 )
 
@@ -17,6 +18,11 @@ type Agent struct {
 	Model       string   `yaml:"model,omitempty"`
 	MaxTokens   int      `yaml:"max_tokens,omitempty"`
 	Temperature float32  `yaml:"temperature,omitempty"`
+
+	// Enhanced fields (inspired by Claude Code AgentDefinition)
+	Aliases     []string `yaml:"aliases,omitempty"`      // alternate names for lookup
+	IsBuiltIn   bool     `yaml:"-"`                      // true for built-in agents
+	ParentAgent string   `yaml:"parent_agent,omitempty"` // for agent inheritance
 }
 
 // Registry holds all loaded agents.
@@ -36,6 +42,10 @@ func NewRegistry() *Registry {
 // Register adds an agent to the registry.
 func (r *Registry) Register(a *Agent) {
 	r.agents[a.Name] = a
+	// Also register under aliases
+	for _, alias := range a.Aliases {
+		r.agents[alias] = a
+	}
 }
 
 // Get returns an agent by name. Falls back to default.
@@ -49,13 +59,28 @@ func (r *Registry) Get(name string) *Agent {
 	return DefaultAgent()
 }
 
-// List returns all agent names.
+// Has returns true if an agent with the given name exists.
+func (r *Registry) Has(name string) bool {
+	_, ok := r.agents[name]
+	return ok
+}
+
+// List returns all agent names (deduplicated, excluding aliases).
 func (r *Registry) List() []string {
+	seen := make(map[string]bool)
 	names := make([]string, 0, len(r.agents))
-	for name := range r.agents {
-		names = append(names, name)
+	for _, a := range r.agents {
+		if !seen[a.Name] {
+			seen[a.Name] = true
+			names = append(names, a.Name)
+		}
 	}
 	return names
+}
+
+// Count returns the number of registered agents.
+func (r *Registry) Count() int {
+	return len(r.List())
 }
 
 // LoadDir loads all .yaml/.yml agent definitions from a directory.
@@ -93,11 +118,20 @@ func (r *Registry) LoadDir(dir string) error {
 	return nil
 }
 
+// AgentID returns a types.AgentID for the given agent name.
+func (r *Registry) AgentID(name string) types.AgentID {
+	if !r.Has(name) {
+		name = r.Default
+	}
+	return types.NewAgentID(name)
+}
+
 // DefaultAgent returns the built-in default agent.
 func DefaultAgent() *Agent {
 	return &Agent{
 		Name:        "default",
 		Description: "Assistente padrao com acesso total ao sistema",
+		IsBuiltIn:   true,
 		Persona: `Voce e um assistente inteligente com acesso total ao sistema local. Siga estas regras:
 
 1. Voce tem ferramentas para acessar o sistema: ler arquivos, listar diretorios, executar comandos e buscar arquivos.
@@ -117,4 +151,20 @@ func (a *Agent) BuildSystemPrompt(knowledgeContext string) string {
 		prompt += fmt.Sprintf("\n\nCONTEXTO DISPONIVEL:\n---\n%s\n---", knowledgeContext)
 	}
 	return prompt
+}
+
+// GetEffectiveModel returns the model to use, falling back to the provided default.
+func (a *Agent) GetEffectiveModel(defaultModel string) string {
+	if a.Model != "" {
+		return a.Model
+	}
+	return defaultModel
+}
+
+// GetEffectiveMaxTokens returns the max tokens, falling back to the provided default.
+func (a *Agent) GetEffectiveMaxTokens(defaultMax int) int {
+	if a.MaxTokens > 0 {
+		return a.MaxTokens
+	}
+	return defaultMax
 }

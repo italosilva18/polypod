@@ -11,22 +11,24 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/costa/polypod/internal/types"
 )
 
 // Event types for the lifecycle hook system.
 type Event string
 
 const (
-	EventSessionStart     Event = "SessionStart"
-	EventSessionEnd       Event = "SessionEnd"
-	EventPreToolUse       Event = "PreToolUse"
-	EventPostToolUse      Event = "PostToolUse"
-	EventPreCompact       Event = "PreCompact"
-	EventPostCompact      Event = "PostCompact"
-	EventUserPrompt       Event = "UserPrompt"
+	EventSessionStart      Event = "SessionStart"
+	EventSessionEnd        Event = "SessionEnd"
+	EventPreToolUse        Event = "PreToolUse"
+	EventPostToolUse       Event = "PostToolUse"
+	EventPreCompact        Event = "PreCompact"
+	EventPostCompact       Event = "PostCompact"
+	EventUserPrompt        Event = "UserPrompt"
 	EventAssistantResponse Event = "AssistantResponse"
-	EventError            Event = "Error"
-	EventStop             Event = "Stop"
+	EventError             Event = "Error"
+	EventStop              Event = "Stop"
 )
 
 // Decision returned by PreToolUse hooks.
@@ -42,8 +44,8 @@ const (
 type HandlerType string
 
 const (
-	HandlerShell   HandlerType = "shell"   // Run a shell command
-	HandlerHTTP    HandlerType = "http"    // POST to a URL
+	HandlerShell HandlerType = "shell" // Run a shell command
+	HandlerHTTP  HandlerType = "http"  // POST to a URL
 )
 
 // Hook defines a single lifecycle hook.
@@ -60,21 +62,21 @@ type Hook struct {
 
 // HookPayload is the data passed to hook handlers.
 type HookPayload struct {
-	Event     Event          `json:"event"`
-	Timestamp string         `json:"timestamp"`
-	ToolName  string         `json:"tool_name,omitempty"`
-	ToolArgs  map[string]any `json:"tool_args,omitempty"`
-	ToolResult string        `json:"tool_result,omitempty"`
-	Message   string         `json:"message,omitempty"`
-	SessionID string         `json:"session_id,omitempty"`
-	Channel   string         `json:"channel,omitempty"`
-	UserID    string         `json:"user_id,omitempty"`
+	Event      Event          `json:"event"`
+	Timestamp  string         `json:"timestamp"`
+	ToolName   string         `json:"tool_name,omitempty"`
+	ToolArgs   map[string]any `json:"tool_args,omitempty"`
+	ToolResult string         `json:"tool_result,omitempty"`
+	Message    string         `json:"message,omitempty"`
+	SessionID  string         `json:"session_id,omitempty"`
+	Channel    string         `json:"channel,omitempty"`
+	UserID     string         `json:"user_id,omitempty"`
 }
 
 // HookResult is the response from a hook handler.
 type HookResult struct {
-	Decision Decision `json:"decision,omitempty"` // for PreToolUse
-	Message  string   `json:"message,omitempty"`
+	Decision Decision       `json:"decision,omitempty"` // for PreToolUse
+	Message  string         `json:"message,omitempty"`
 	Modified map[string]any `json:"modified,omitempty"` // modified tool args
 }
 
@@ -144,6 +146,104 @@ func (m *Manager) Fire(ctx context.Context, payload HookPayload) (*HookResult, e
 	}
 
 	return &HookResult{Decision: DecisionAllow}, nil
+}
+
+// FireWithProgress triggers hooks with progress reporting via callback.
+func (m *Manager) FireWithProgress(ctx context.Context, payload HookPayload, onProgress func(types.ToolProgress)) (*HookResult, error) {
+	m.mu.RLock()
+	hooks := make([]Hook, len(m.hooks))
+	copy(hooks, m.hooks)
+	m.mu.RUnlock()
+
+	total := len(hooks)
+	done := 0
+
+	for _, h := range hooks {
+		if !h.Enabled || h.Event != payload.Event {
+			continue
+		}
+
+		if onProgress != nil {
+			onProgress(types.ToolProgress{
+				Message: fmt.Sprintf("executando hook: %s", h.Name),
+				Percent: done * 100 / total,
+			})
+		}
+
+		if h.Matcher != "" && payload.ToolName != "" {
+			if !matchTool(h.Matcher, payload.ToolName) {
+				done++
+				continue
+			}
+		}
+
+		result, err := m.executeHook(ctx, h, payload)
+		done++
+
+		if err != nil {
+			m.logger.Warn("hook error", "name", h.Name, "error", err)
+			continue
+		}
+
+		if payload.Event == EventPreToolUse && result != nil {
+			if result.Decision == DecisionDeny || result.Decision == DecisionAsk {
+				return result, nil
+			}
+		}
+	}
+
+	if onProgress != nil {
+		onProgress(types.ToolProgress{
+			Message: "hooks concluidos",
+			Percent: 100,
+		})
+	}
+
+	return &HookResult{Decision: DecisionAllow}, nil
+}
+
+// CheckToolPermission integrates with the permission system by running
+// PreToolUse hooks and translating their decisions to PermissionBehavior.
+func (m *Manager) CheckToolPermission(ctx context.Context, toolName string, toolArgs map[string]any) types.PermissionDecision {
+	result, err := m.Fire(ctx, HookPayload{
+		Event:     EventPreToolUse,
+		Timestamp: time.Now().Format(time.RFC3339),
+		ToolName:  toolName,
+		ToolArgs:  toolArgs,
+	})
+	if err != nil {
+		m.logger.Warn("hook permission check failed", "error", err)
+		return types.PermissionDecision{
+			Behavior: types.PermissionAllow,
+			Message:  "hook errored, permitido por padrao",
+		}
+	}
+
+	switch result.Decision {
+	case DecisionDeny:
+		return types.PermissionDecision{
+			Behavior: types.PermissionDeny,
+			Message:  result.Message,
+			DecisionReason: &types.PermissionDecisionReason{
+				Type:   "hook",
+				Detail: fmt.Sprintf("hook negou: %s", result.Message),
+			},
+		}
+	case DecisionAsk:
+		return types.PermissionDecision{
+			Behavior: types.PermissionAsk,
+			Message:  result.Message,
+			DecisionReason: &types.PermissionDecisionReason{
+				Type:   "hook",
+				Detail: fmt.Sprintf("hook solicitou confirmacao: %s", result.Message),
+			},
+		}
+	default:
+		return types.PermissionDecision{
+			Behavior: types.PermissionAllow,
+			Message:  result.Message,
+		}
+	}
 }
 
 func (m *Manager) executeHook(ctx context.Context, h Hook, payload HookPayload) (*HookResult, error) {
