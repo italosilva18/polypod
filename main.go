@@ -46,6 +46,7 @@ import (
 	"github.com/costa/polypod/internal/dbquery"
 	"github.com/costa/polypod/internal/debug"
 	"github.com/costa/polypod/internal/depsgraph"
+	"github.com/costa/polypod/internal/geminibridge"
 	"github.com/costa/polypod/internal/diffview"
 	"github.com/costa/polypod/internal/doctor"
 	"github.com/costa/polypod/internal/docgen"
@@ -405,8 +406,9 @@ func run(ctx context.Context, cfg *config.Config, pgDB *database.DB, sqliteDB *d
 	codemap.RegisterSkills(skills, ".", logger)
 	multiread.RegisterSkills(skills)
 
-	// Claude Code bridge (delegates complex tasks to claude CLI if installed)
+	// External CLI bridges (delegate to installed tools)
 	claudebridge.RegisterSkills(skills)
+	geminibridge.RegisterSkills(skills)
 
 	// ===== PHASE 4: Advanced Skills =====
 	testgen.RegisterSkills(skills)
