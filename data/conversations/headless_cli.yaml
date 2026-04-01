@@ -57,5 +57,17 @@ messages:
     - role: assistant
       content: 7 × 8 = 56
       timestamp: 2026-03-30T21:25:33.757747062-03:00
+    - role: user
+      content: 2+2=?
+      timestamp: 2026-03-30T22:35:43.605036572-03:00
+    - role: assistant
+      content: 2 + 2 = 4
+      timestamp: 2026-03-30T22:35:50.086243708-03:00
+    - role: user
+      content: 3*7=?
+      timestamp: 2026-03-30T23:18:00.277851001-03:00
+    - role: assistant
+      content: 3 × 7 = 21
+      timestamp: 2026-03-30T23:18:01.955257469-03:00
 created_at: 2026-03-28T07:48:25.364108845-03:00
-updated_at: 2026-03-30T21:25:33.75774789-03:00
+updated_at: 2026-03-30T23:18:01.955257726-03:00

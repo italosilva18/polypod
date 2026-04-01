@@ -1,0 +1,21 @@
+# Multi-provider with fallback chain
+# If DeepSeek fails → Ollama → Groq → OpenAI
+ai:
+  provider: "deepseek"
+  base_url: "https://api.deepseek.com/v1"
+  api_key: "${DEEPSEEK_API_KEY}"
+  model: "deepseek-chat"
+  tools: true
+
+providers:
+  - name: ollama
+    base_url: "http://localhost:11434"
+  - name: groq
+    api_key: "${GROQ_API_KEY}"
+  - name: openai
+    api_key: "${OPENAI_API_KEY}"
+  - name: anthropic
+    api_key: "${ANTHROPIC_API_KEY}"
+
+cli:
+  enabled: true

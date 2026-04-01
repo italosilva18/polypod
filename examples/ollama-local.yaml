@@ -1,0 +1,18 @@
+# 100% local/offline config — Ollama, no cloud APIs
+ai:
+  provider: "ollama"
+  base_url: "http://localhost:11434/v1"
+  model: "llama3.1"
+  max_tokens: 4096
+  temperature: 0.3
+  tools: true
+
+cli:
+  enabled: true
+
+database:
+  enabled: true
+  driver: sqlite
+  path: data/polypod.db
+
+# No REST/Telegram/WhatsApp — fully local

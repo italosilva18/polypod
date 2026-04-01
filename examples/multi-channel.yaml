@@ -1,0 +1,36 @@
+# Multi-channel config — CLI + REST + Telegram + WhatsApp + WebUI
+ai:
+  provider: "deepseek"
+  base_url: "https://api.deepseek.com/v1"
+  api_key: "${DEEPSEEK_API_KEY}"
+  model: "deepseek-chat"
+  tools: true
+
+cli:
+  enabled: true
+
+rest:
+  enabled: true
+  api_keys:
+    - "${API_KEY}"
+
+telegram:
+  enabled: true
+  token: "${TELEGRAM_BOT_TOKEN}"
+
+whatsapp:
+  enabled: true
+  id_instance: "${WA_INSTANCE}"
+  api_token: "${WA_TOKEN}"
+
+webui:
+  enabled: true
+  host: "127.0.0.1"
+  port: 8090
+
+notify:
+  webhook: "${WEBHOOK_URL}"
+
+server:
+  host: "0.0.0.0"
+  port: 8080
