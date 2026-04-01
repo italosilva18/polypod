@@ -30,6 +30,7 @@ import (
 	"github.com/costa/polypod/internal/budget"
 	"github.com/costa/polypod/internal/checkpoint"
 	"github.com/costa/polypod/internal/circuitbreaker"
+	"github.com/costa/polypod/internal/claudebridge"
 	"github.com/costa/polypod/internal/clipboard"
 	"github.com/costa/polypod/internal/codemap"
 	"github.com/costa/polypod/internal/commands"
@@ -403,6 +404,9 @@ func run(ctx context.Context, cfg *config.Config, pgDB *database.DB, sqliteDB *d
 	dbquery.RegisterSkills(skills)
 	codemap.RegisterSkills(skills, ".", logger)
 	multiread.RegisterSkills(skills)
+
+	// Claude Code bridge (delegates complex tasks to claude CLI if installed)
+	claudebridge.RegisterSkills(skills)
 
 	// ===== PHASE 4: Advanced Skills =====
 	testgen.RegisterSkills(skills)
