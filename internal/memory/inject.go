@@ -15,18 +15,13 @@ func AutoInject(ctx context.Context, store Store, query string) string {
 		return ""
 	}
 
-	memories, err := store.Search(ctx, query)
+	memories, err := store.SearchRelevant(ctx, query, maxAutoInjectMemories, 0.2)
 	if err != nil {
 		return ""
 	}
 
 	if len(memories) == 0 {
 		return ""
-	}
-
-	// Limit to max memories
-	if len(memories) > maxAutoInjectMemories {
-		memories = memories[:maxAutoInjectMemories]
 	}
 
 	var lines []string

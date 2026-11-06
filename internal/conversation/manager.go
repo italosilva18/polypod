@@ -27,6 +27,9 @@ func (m *Manager) GetSession(ctx context.Context, channel, userID string) (*Sess
 // AddUserMessage adds a user message to the session.
 func (m *Manager) AddUserMessage(ctx context.Context, sess *Session, content string) {
 	sess.AddMessage(RoleUser, content)
+	if err := m.store.Save(ctx, sess); err != nil {
+		m.logger.Warn("failed to persist user message", "session", sess.ID, "error", err)
+	}
 }
 
 // AddAssistantMessage adds an assistant message and persists the session.

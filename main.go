@@ -43,11 +43,13 @@ import (
 	"github.com/costa/polypod/internal/githook"
 	"github.com/costa/polypod/internal/headless"
 	"github.com/costa/polypod/internal/hooks"
+	"github.com/costa/polypod/internal/humanloop"
 	"github.com/costa/polypod/internal/initcmd"
 	"github.com/costa/polypod/internal/mcp"
 	"github.com/costa/polypod/internal/memory"
 	"github.com/costa/polypod/internal/migrate"
 	"github.com/costa/polypod/internal/multiread"
+	"github.com/costa/polypod/internal/notifier"
 	"github.com/costa/polypod/internal/observability"
 	"github.com/costa/polypod/internal/openapitools"
 	"github.com/costa/polypod/internal/permissions"
@@ -532,19 +534,22 @@ func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service) adapter.Messa
 	return func(ctx context.Context, msg adapter.InMessage) (adapter.OutMessage, error) {
 		sess, err := convMgr.GetSession(ctx, msg.Channel, msg.UserID)
 		if err != nil {
-			return adapter.OutMessage{Text: "Erro de sessao"}, nil
+			return adapter.OutMessage{Text: "Erro de sessao"}, err
 		}
+		history := append([]conversation.Message(nil), convMgr.GetHistory(sess)...)
 		convMgr.AddUserMessage(ctx, sess, msg.Text)
 		resp, err := aiSvc.Answer(ctx, ai.AnswerRequest{
 			Channel: msg.Channel,
 			UserID:  msg.UserID,
 			Query:   msg.Text,
-			History: convMgr.GetHistory(sess),
+			History: history,
 		})
 		if err != nil {
-			return adapter.OutMessage{Text: "Erro ao processar: " + err.Error()}, nil
+			return adapter.OutMessage{Text: "Erro ao processar: " + err.Error()}, err
 		}
-		convMgr.AddAssistantMessage(ctx, sess, resp.Content)
+		if err := convMgr.AddAssistantMessage(ctx, sess, resp.Content); err != nil {
+			return adapter.OutMessage{Text: resp.Content}, err
+		}
 		return adapter.OutMessage{
 			Text:    resp.Content,
 			Channel: msg.Channel,
@@ -579,13 +584,14 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service) adapter
 			chunks <- adapter.StreamChunk{Error: err, Done: true}
 			return
 		}
+		history := append([]conversation.Message(nil), convMgr.GetHistory(sess)...)
 		convMgr.AddUserMessage(ctx, sess, msg.Text)
 
 		resp, err := aiSvc.AnswerStream(ctx, ai.AnswerRequest{
 			Channel: msg.Channel,
 			UserID:  msg.UserID,
 			Query:   msg.Text,
-			History: convMgr.GetHistory(sess),
+			History: history,
 		}, func(delta string) {
 			chunks <- adapter.StreamChunk{Delta: delta}
 		})
@@ -593,7 +599,10 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service) adapter
 			chunks <- adapter.StreamChunk{Error: err, Done: true}
 			return
 		}
-		convMgr.AddAssistantMessage(ctx, sess, resp.Content)
+		if err := convMgr.AddAssistantMessage(ctx, sess, resp.Content); err != nil {
+			chunks <- adapter.StreamChunk{Error: err, Done: true}
+			return
+		}
 		chunks <- adapter.StreamChunk{Done: true}
 	}
 }
@@ -784,11 +793,20 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 
 	// Scheduler
 	sched := scheduler.New(cfg.Scheduler.DataFile, logger)
-	sched.Load()
-	scheduler.RegisterSkills(skills, sched)
-	if cfg.Scheduler.Enabled {
-		go sched.Start(ctx)
+	if err := sched.Load(); err != nil {
+		logger.Warn("scheduler state load failed", "error", err)
 	}
+	scheduler.RegisterSkills(skills, sched)
+	humanStore, err := humanloop.NewStore(filepath.Join(cfg.Data.Dir, "humanloop.json"), 500)
+	if err != nil {
+		return fmt.Errorf("initializing durable human loop: %w", err)
+	}
+	var heartbeat *humanloop.Processor
+	humanloop.RegisterSkills(skills, humanStore, func() {
+		if heartbeat != nil {
+			heartbeat.Wake()
+		}
+	})
 
 	// Templates
 	tmplReg := template.NewRegistry(cfg.Templates.Dir)
@@ -989,6 +1007,118 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	// Inline handlers (replace router)
 	handler := makeHandler(convMgr, aiSvc)
 	streamHandler := makeStreamHandler(convMgr, aiSvc)
+
+	// Optional remote human relay for questions and notifications. Credentials
+	// come from environment-expanded config and are never written by Polypod.
+	var remoteRelay *approval.TelegramApprovalRelay
+	if cfg.Remote.Enabled {
+		if strings.TrimSpace(cfg.Remote.BotToken) == "" || strings.TrimSpace(cfg.Remote.ChatID) == "" {
+			logger.Warn("remote relay disabled", "reason", "bot_token or chat_id missing")
+		} else {
+			remoteRelay = approval.NewTelegramApprovalRelay(approval.TelegramRelayConfig{
+				BotToken: cfg.Remote.BotToken,
+				ChatID:   cfg.Remote.ChatID,
+				Timeout:  time.Duration(cfg.Remote.TimeoutSeconds) * time.Second,
+				Logger:   logger,
+			})
+			sys.UserPromptHandler.SetRemoteAsk(func(questionCtx context.Context, requestID string, question tool.UserQuestion) (string, error) {
+				return remoteRelay.AskQuestion(questionCtx, requestID, question.Question)
+			})
+			logger.Info("remote human relay active", "channel", "telegram", "chat_id", cfg.Remote.ChatID)
+		}
+	}
+
+	localNotifier := notifier.NewNotifier(logger)
+	heartbeat, err = humanloop.NewProcessor(humanloop.ProcessorConfig{
+		Store:       humanStore,
+		Interval:    30 * time.Second,
+		Timeout:     30 * time.Minute,
+		MaxAttempts: 4,
+		Process: func(processCtx context.Context, msg humanloop.Message) (string, error) {
+			out, processErr := handler(processCtx, adapter.InMessage{
+				ID:        msg.ID,
+				Channel:   "inbox",
+				UserID:    msg.UserID,
+				Text:      msg.Text,
+				Timestamp: msg.CreatedAt,
+			})
+			return out.Text, processErr
+		},
+		Deliver: func(deliverCtx context.Context, msg humanloop.Message) error {
+			if remoteRelay != nil {
+				if err := remoteRelay.SendNotification(deliverCtx, "Polypod", msg.Text); err != nil {
+					return err
+				}
+			}
+			return localNotifier.Notify(deliverCtx, "Polypod", msg.Text)
+		},
+		Logger: logger,
+	})
+	if err != nil {
+		return fmt.Errorf("initializing heartbeat: %w", err)
+	}
+	heartbeat.Start(ctx)
+	defer heartbeat.Stop()
+
+	// Automatic long-term memory consolidation uses a tool-free model call
+	// and a durable watermark so restarts do not duplicate processed batches.
+	dreamSvc := automemory.NewDreamService(automemory.DreamConfig{
+		Logger:        logger,
+		Memory:        memStore,
+		SessionStore:  store,
+		StateFile:     filepath.Join(cfg.Data.Dir, "dream-state.json"),
+		IdleThreshold: 5 * time.Minute,
+		Interval:      30 * time.Minute,
+		MaxMessages:   50,
+		ExtractFn: func(extractCtx context.Context, transcript string) ([]automemory.ExtractedMemory, error) {
+			resp, err := aiClient.Complete(extractCtx, []ai.ChatMessage{
+				{Role: "system", Content: automemory.DreamExtractionInstructions},
+				{Role: "user", Content: "<transcript>\n" + transcript + "</transcript>"},
+			})
+			if err != nil {
+				return nil, err
+			}
+			return automemory.ParseExtractedMemories(resp.Content)
+		},
+	})
+	aiSvc.SetActivityCallback(dreamSvc.MarkActivity)
+	dreamSvc.Start(ctx)
+	defer dreamSvc.Stop()
+
+	// Human-language routines wake the same complete operational agent used by
+	// the CLI, with a separate persistent conversation per routine.
+	sched.SetPromptRunner(func(runCtx context.Context, task *scheduler.Task) (string, error) {
+		prompt := fmt.Sprintf("ROTINA AGENDADA: %s\nID: %s\nObjetivo:\n%s\n\nExecute o objetivo completo, verifique o resultado e relate de forma objetiva. Nao crie outra rotina a menos que o objetivo mande explicitamente.", task.Name, task.ID, task.Prompt)
+		out, err := handler(runCtx, adapter.InMessage{
+			ID:        fmt.Sprintf("routine-%s-%d", task.ID, time.Now().UnixNano()),
+			Channel:   "scheduler",
+			UserID:    task.ID,
+			Text:      prompt,
+			Timestamp: time.Now(),
+		})
+		return out.Text, err
+	})
+	sched.SetCallback(func(task *scheduler.Task, result string) {
+		message := fmt.Sprintf("Rotina %q concluida com status %s.", task.Name, task.LastStatus)
+		if task.LastError != "" {
+			message += " Erro: " + task.LastError
+		} else if strings.TrimSpace(result) != "" {
+			message += " Resultado: " + result
+		}
+		if _, err := humanStore.EnqueueOutbound("scheduler", "owner", message, task.ID); err != nil {
+			logger.Error("failed to queue routine notification", "task", task.ID, "error", err)
+			return
+		}
+		heartbeat.Wake()
+	})
+	if cfg.Scheduler.Enabled {
+		go func() {
+			if err := sched.Start(ctx); err != nil {
+				logger.Error("scheduler stopped with error", "error", err)
+			}
+		}()
+		defer sched.Stop()
+	}
 
 	// Headless mode
 	if headlessPrompt != "" {

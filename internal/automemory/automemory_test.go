@@ -429,8 +429,8 @@ func TestDreamService_RunNow_SavesExtractedMemories(t *testing.T) {
 	// Verify topic, priority normalisation, and confidence mapping.
 	var gotFact, gotPref bool
 	for _, m := range saved {
-		switch m.Topic {
-		case "dream_fact":
+		switch {
+		case strings.HasPrefix(m.Topic, "dream_fact_"):
 			gotFact = true
 			if m.Priority != 2 { // importance 5 → critical (2)
 				t.Errorf("importance 5 should map to priority 2, got %d", m.Priority)
@@ -438,7 +438,7 @@ func TestDreamService_RunNow_SavesExtractedMemories(t *testing.T) {
 			if m.Confidence != 1.0 {
 				t.Errorf("expected confidence 1.0 for importance 5, got %v", m.Confidence)
 			}
-		case "dream_preference":
+		case strings.HasPrefix(m.Topic, "dream_preference_"):
 			gotPref = true
 			if m.Priority != 1 { // importance 3 → high (1)
 				t.Errorf("importance 3 should map to priority 1, got %d", m.Priority)
@@ -565,18 +565,49 @@ func TestDreamService_StartThenStopCleanShutdown(t *testing.T) {
 func TestDreamService_TopicForCategorization(t *testing.T) {
 	d := NewDreamService(DreamConfig{Logger: quietLogger()})
 	cases := map[string]string{
-		"fact":       "dream_fact",
-		"preference": "dream_preference",
-		"skill":      "dream_skill",
-		"context":    "dream_context",
-		"":           "dream_context", // empty defaults to context
-		"  ":         "dream_context",
+		"fact":       "dream_fact_",
+		"preference": "dream_preference_",
+		"skill":      "dream_skill_",
+		"context":    "dream_context_",
+		"":           "dream_context_", // empty defaults to context
+		"  ":         "dream_context_",
 	}
 	for in, want := range cases {
 		got := d.topicFor(ExtractedMemory{Type: in})
-		if got != want {
-			t.Errorf("topicFor(%q)=%q, want %q", in, got, want)
+		if !strings.HasPrefix(got, want) {
+			t.Errorf("topicFor(%q)=%q, want prefix %q", in, got, want)
 		}
+	}
+}
+
+func TestDreamService_StatePreventsReprocessing(t *testing.T) {
+	now := time.Now().Add(-time.Minute)
+	store := seededSessionStore(t, []conversation.Message{{
+		Role: conversation.RoleUser, Content: "prefiro respostas curtas", Timestamp: now,
+	}})
+	stateFile := filepath.Join(t.TempDir(), "dream-state.json")
+	calls := 0
+	extract := func(_ context.Context, _ string) ([]ExtractedMemory, error) {
+		calls++
+		return []ExtractedMemory{{Type: "preference", Content: "prefere respostas curtas", Importance: 4}}, nil
+	}
+
+	d1 := NewDreamService(DreamConfig{
+		Logger: quietLogger(), SessionStore: store, Memory: &stubMemoryStore{},
+		ExtractFn: extract, StateFile: stateFile,
+	})
+	if err := d1.RunNow(context.Background()); err != nil {
+		t.Fatalf("first RunNow: %v", err)
+	}
+	d2 := NewDreamService(DreamConfig{
+		Logger: quietLogger(), SessionStore: store, Memory: &stubMemoryStore{},
+		ExtractFn: extract, StateFile: stateFile,
+	})
+	if err := d2.RunNow(context.Background()); err != nil {
+		t.Fatalf("second RunNow: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected one extraction across restart, got %d", calls)
 	}
 }
 

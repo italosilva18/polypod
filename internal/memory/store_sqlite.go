@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -32,14 +33,14 @@ func (s *SQLiteStore) Save(ctx context.Context, topic, content string) error {
 
 func (s *SQLiteStore) Get(ctx context.Context, topic string) (*Memory, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, topic, content, created_at, updated_at FROM memories WHERE topic = ?`, topic)
+		`SELECT id, topic, content, created_at, updated_at, tags, priority, session_id, source, confidence FROM memories WHERE topic = ?`, topic)
 	return scanMemory(row)
 }
 
 func (s *SQLiteStore) Search(ctx context.Context, query string) ([]Memory, error) {
 	like := "%" + query + "%"
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, topic, content, created_at, updated_at FROM memories
+		`SELECT id, topic, content, created_at, updated_at, tags, priority, session_id, source, confidence FROM memories
 		 WHERE topic LIKE ? OR content LIKE ? ORDER BY updated_at DESC`,
 		like, like,
 	)
@@ -52,7 +53,7 @@ func (s *SQLiteStore) Search(ctx context.Context, query string) ([]Memory, error
 
 func (s *SQLiteStore) List(ctx context.Context) ([]Memory, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, topic, content, created_at, updated_at FROM memories ORDER BY updated_at DESC`)
+		`SELECT id, topic, content, created_at, updated_at, tags, priority, session_id, source, confidence FROM memories ORDER BY updated_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("listing memories: %w", err)
 	}
@@ -73,11 +74,17 @@ func (s *SQLiteStore) Delete(ctx context.Context, topic string) error {
 }
 
 func (s *SQLiteStore) SaveWithMeta(ctx context.Context, mem Memory) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO memories (topic, content, created_at, updated_at)
-		 VALUES (?, ?, datetime('now'), datetime('now'))
-		 ON CONFLICT(topic) DO UPDATE SET content = excluded.content, updated_at = datetime('now')`,
-		mem.Topic, mem.Content,
+	tags, err := json.Marshal(mem.Tags)
+	if err != nil {
+		return fmt.Errorf("encoding memory tags: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO memories (topic, content, tags, priority, session_id, source, confidence, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+		 ON CONFLICT(topic) DO UPDATE SET content = excluded.content, tags = excluded.tags,
+		 priority = excluded.priority, session_id = excluded.session_id, source = excluded.source,
+		 confidence = excluded.confidence, updated_at = datetime('now')`,
+		mem.Topic, mem.Content, string(tags), mem.Priority, mem.SessionID, mem.Source, mem.Confidence,
 	)
 	if err != nil {
 		return fmt.Errorf("saving memory with meta: %w", err)
@@ -86,8 +93,7 @@ func (s *SQLiteStore) SaveWithMeta(ctx context.Context, mem Memory) error {
 }
 
 func (s *SQLiteStore) SearchRelevant(ctx context.Context, query string, maxResults int, minScore float64) ([]Memory, error) {
-	// Use Search as fallback and score in memory
-	memories, err := s.Search(ctx, query)
+	memories, err := s.List(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -110,8 +116,8 @@ type scannable interface {
 
 func scanMemory(row scannable) (*Memory, error) {
 	var m Memory
-	var createdAt, updatedAt string
-	if err := row.Scan(&m.ID, &m.Topic, &m.Content, &createdAt, &updatedAt); err != nil {
+	var createdAt, updatedAt, tags string
+	if err := row.Scan(&m.ID, &m.Topic, &m.Content, &createdAt, &updatedAt, &tags, &m.Priority, &m.SessionID, &m.Source, &m.Confidence); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("memoria nao encontrada")
 		}
@@ -119,6 +125,9 @@ func scanMemory(row scannable) (*Memory, error) {
 	}
 	m.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
 	m.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
+	if err := json.Unmarshal([]byte(tags), &m.Tags); err != nil {
+		return nil, fmt.Errorf("decoding memory tags: %w", err)
+	}
 	return &m, nil
 }
 
@@ -126,12 +135,15 @@ func scanMemories(rows *sql.Rows) ([]Memory, error) {
 	var memories []Memory
 	for rows.Next() {
 		var m Memory
-		var createdAt, updatedAt string
-		if err := rows.Scan(&m.ID, &m.Topic, &m.Content, &createdAt, &updatedAt); err != nil {
+		var createdAt, updatedAt, tags string
+		if err := rows.Scan(&m.ID, &m.Topic, &m.Content, &createdAt, &updatedAt, &tags, &m.Priority, &m.SessionID, &m.Source, &m.Confidence); err != nil {
 			return nil, fmt.Errorf("scanning memory row: %w", err)
 		}
 		m.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
 		m.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
+		if err := json.Unmarshal([]byte(tags), &m.Tags); err != nil {
+			return nil, fmt.Errorf("decoding memory tags: %w", err)
+		}
 		memories = append(memories, m)
 	}
 	return memories, rows.Err()

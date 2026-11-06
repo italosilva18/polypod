@@ -124,6 +124,15 @@ func TestNeedsAPIKey_EmptyKey(t *testing.T) {
 	}
 }
 
+func TestNeedsAPIKey_ChatGPTOAuthDoesNotPrompt(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AI.Provider = "chatgpt"
+	cfg.AI.APIKey = ""
+	if needsAPIKey(cfg) {
+		t.Error("ChatGPT OAuth provider must not prompt for a legacy API key")
+	}
+}
+
 func TestNeedsAPIKey_EmptyBaseURLAssumedValid(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.AI.APIKey = "sk-something"

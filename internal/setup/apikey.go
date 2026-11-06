@@ -40,6 +40,12 @@ func validateKey(baseURL, apiKey, model string) bool {
 // needsAPIKey returns true when the interactive prompt should be shown:
 // key is empty, or key fails validation against the configured API.
 func needsAPIKey(cfg *config.Config) bool {
+	// ChatGPT uses the encrypted OAuth credential store. Asking for a legacy
+	// API key here would deadlock unattended service startup before the OAuth
+	// provider has a chance to refresh or report its own actionable error.
+	if strings.EqualFold(cfg.AI.Provider, "chatgpt") {
+		return false
+	}
 	if cfg.AI.APIKey == "" {
 		return true
 	}

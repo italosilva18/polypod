@@ -2,8 +2,13 @@ package automemory
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +38,10 @@ type DreamConfig struct {
 	// MaxMessages caps how many recent messages a single run will process.
 	// Defaults to 50 when zero.
 	MaxMessages int
+
+	// StateFile persists the timestamp through which conversations were
+	// consolidated, preventing repeated model calls after restarts.
+	StateFile string
 }
 
 // ExtractedMemory is the structured output the AI callback returns for each
@@ -58,11 +67,12 @@ type DreamStats struct {
 type DreamService struct {
 	config DreamConfig
 
-	mu           sync.Mutex
-	lastRun      time.Time
-	lastActivity time.Time
-	running      bool
-	stats        DreamStats
+	mu            sync.Mutex
+	lastRun       time.Time
+	lastActivity  time.Time
+	lastProcessed time.Time
+	running       bool
+	stats         DreamStats
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -82,11 +92,13 @@ func NewDreamService(cfg DreamConfig) *DreamService {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &DreamService{
+	d := &DreamService{
 		config:       cfg,
 		lastActivity: time.Now(),
 		stopCh:       make(chan struct{}),
 	}
+	d.loadState()
+	return d
 }
 
 // Start begins the background service. Returns immediately. The service
@@ -215,7 +227,7 @@ func (d *DreamService) extractMemories(ctx context.Context) error {
 		return err
 	}
 
-	transcript, msgCount := d.collectTranscript()
+	transcript, msgCount, processedThrough := d.collectTranscript()
 	if msgCount == 0 {
 		logger.Debug("dream: no messages to process")
 		return nil
@@ -230,6 +242,7 @@ func (d *DreamService) extractMemories(ctx context.Context) error {
 	}
 
 	added := 0
+	saveFailed := false
 	for _, m := range memories {
 		if strings.TrimSpace(m.Content) == "" {
 			continue
@@ -247,9 +260,20 @@ func (d *DreamService) extractMemories(ctx context.Context) error {
 		}
 		if err := d.config.Memory.SaveWithMeta(ctx, mem); err != nil {
 			logger.Warn("dream: failed saving memory", "error", err)
+			saveFailed = true
 			continue
 		}
 		added++
+	}
+	if !processedThrough.IsZero() && !saveFailed {
+		d.mu.Lock()
+		if processedThrough.After(d.lastProcessed) {
+			d.lastProcessed = processedThrough
+		}
+		d.mu.Unlock()
+		if err := d.saveState(); err != nil {
+			logger.Warn("dream: failed saving consolidation state", "error", err)
+		}
 	}
 
 	d.mu.Lock()
@@ -257,6 +281,11 @@ func (d *DreamService) extractMemories(ctx context.Context) error {
 	d.stats.MessagesProcessed += msgCount
 	d.stats.LastError = ""
 	d.mu.Unlock()
+	if saveFailed {
+		err := fmt.Errorf("dream: uma ou mais memorias nao puderam ser salvas; lote sera reprocessado")
+		d.recordError(err)
+		return err
+	}
 
 	logger.Info("dream: extraction complete",
 		"messages_processed", msgCount,
@@ -267,12 +296,15 @@ func (d *DreamService) extractMemories(ctx context.Context) error {
 
 // collectTranscript gathers recent messages from all sessions, capped at
 // MaxMessages, and renders them as a single transcript string.
-func (d *DreamService) collectTranscript() (string, int) {
+func (d *DreamService) collectTranscript() (string, int, time.Time) {
 	store := d.config.SessionStore
 	sessions := store.GetAllSessions()
 	if len(sessions) == 0 {
-		return "", 0
+		return "", 0, time.Time{}
 	}
+	d.mu.Lock()
+	lastProcessed := d.lastProcessed
+	d.mu.Unlock()
 
 	// Flatten all messages with timestamps so we can sort newest-first.
 	type stamped struct {
@@ -281,18 +313,27 @@ func (d *DreamService) collectTranscript() (string, int) {
 	}
 	var all []stamped
 	for _, sess := range sessions {
+		// Background-generated prompts are operational artifacts, not evidence
+		// of user preferences. Excluding them prevents self-reinforcing memory.
+		if sess.Channel == "scheduler" || sess.Channel == "heartbeat" || sess.Channel == "inbox" {
+			continue
+		}
 		for _, m := range sess.Messages {
+			if !m.Timestamp.IsZero() && !m.Timestamp.After(lastProcessed) {
+				continue
+			}
 			all = append(all, stamped{sessionID: sess.ID, msg: m})
 		}
 	}
 	if len(all) == 0 {
-		return "", 0
+		return "", 0, time.Time{}
 	}
 
-	// Sort by timestamp descending (most recent first).
+	// Sort chronologically. Processing the oldest unseen batch first ensures
+	// that a busy conversation cannot permanently skip messages beyond the cap.
 	for i := 0; i < len(all); i++ {
 		for j := i + 1; j < len(all); j++ {
-			if all[j].msg.Timestamp.After(all[i].msg.Timestamp) {
+			if all[j].msg.Timestamp.Before(all[i].msg.Timestamp) {
 				all[i], all[j] = all[j], all[i]
 			}
 		}
@@ -304,20 +345,19 @@ func (d *DreamService) collectTranscript() (string, int) {
 		all = all[:max]
 	}
 
-	// Reverse so the transcript reads chronologically.
-	for i, j := 0, len(all)-1; i < j; i, j = i+1, j-1 {
-		all[i], all[j] = all[j], all[i]
-	}
-
 	var sb strings.Builder
+	var processedThrough time.Time
 	for _, s := range all {
 		fmt.Fprintf(&sb, "[%s] %s: %s\n",
 			s.sessionID,
 			string(s.msg.Role),
 			strings.TrimSpace(s.msg.Content),
 		)
+		if s.msg.Timestamp.After(processedThrough) {
+			processedThrough = s.msg.Timestamp
+		}
 	}
-	return sb.String(), len(all)
+	return sb.String(), len(all), processedThrough
 }
 
 func (d *DreamService) recordError(err error) {
@@ -331,7 +371,47 @@ func (d *DreamService) topicFor(m ExtractedMemory) string {
 	if t == "" {
 		t = "context"
 	}
-	return "dream_" + t
+	sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(m.Content))))
+	return "dream_" + t + "_" + hex.EncodeToString(sum[:6])
+}
+
+type dreamState struct {
+	LastProcessed time.Time `json:"last_processed"`
+}
+
+func (d *DreamService) loadState() {
+	if d.config.StateFile == "" {
+		return
+	}
+	raw, err := os.ReadFile(d.config.StateFile)
+	if err != nil {
+		return
+	}
+	var state dreamState
+	if json.Unmarshal(raw, &state) == nil {
+		d.lastProcessed = state.LastProcessed
+	}
+}
+
+func (d *DreamService) saveState() error {
+	if d.config.StateFile == "" {
+		return nil
+	}
+	d.mu.Lock()
+	state := dreamState{LastProcessed: d.lastProcessed}
+	d.mu.Unlock()
+	raw, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(d.config.StateFile), 0o700); err != nil {
+		return err
+	}
+	tmp := d.config.StateFile + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, d.config.StateFile)
 }
 
 func normalisePriority(importance int) int {

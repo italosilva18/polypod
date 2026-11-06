@@ -40,6 +40,14 @@ type Service struct {
 	memStore    memory.Store
 	logger      *slog.Logger
 	autoCompact *compact.AutoCompactService
+	onActivity  func()
+}
+
+// SetActivityCallback registers a lightweight hook invoked whenever a user or
+// routine starts an AI turn. The dreaming service uses it to avoid learning
+// from a conversation while that conversation is still active.
+func (s *Service) SetActivityCallback(fn func()) {
+	s.onActivity = fn
 }
 
 // NewService creates a new AI service.
@@ -166,6 +174,9 @@ func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) []ChatMe
 
 // Answer processes a query through the full pipeline (synchronous).
 func (s *Service) Answer(ctx context.Context, req AnswerRequest) (*AnswerResponse, error) {
+	if s.onActivity != nil {
+		s.onActivity()
+	}
 	messages := s.buildMessages(ctx, req)
 
 	resp, err := s.client.CompleteWithTools(ctx, messages, s.logger)
@@ -191,6 +202,9 @@ func (s *Service) Answer(ctx context.Context, req AnswerRequest) (*AnswerRespons
 // AnswerStream processes a query through the full pipeline with streaming.
 // callback is called for each content delta token.
 func (s *Service) AnswerStream(ctx context.Context, req AnswerRequest, callback StreamCallback) (*AnswerResponse, error) {
+	if s.onActivity != nil {
+		s.onActivity()
+	}
 	messages := s.buildMessages(ctx, req)
 
 	resp, err := s.client.CompleteWithToolsStream(ctx, messages, callback, s.logger)

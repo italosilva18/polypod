@@ -22,6 +22,7 @@ type Config struct {
 	MCP         []MCPServerConf    `yaml:"mcp"`
 	Sandbox     SandboxConfig      `yaml:"sandbox"`
 	Scheduler   SchedulerConfig    `yaml:"scheduler"`
+	Remote      RemoteConfig       `yaml:"remote"`
 	Templates   TemplatesConfig    `yaml:"templates"`
 	Hooks       []HookConfig       `yaml:"hooks"`
 	Permissions *PermissionsConfig `yaml:"permissions,omitempty"`
@@ -67,6 +68,15 @@ type SandboxConfig struct {
 type SchedulerConfig struct {
 	Enabled  bool   `yaml:"enabled"`
 	DataFile string `yaml:"data_file"`
+}
+
+// RemoteConfig configures an optional human-question and notification relay.
+// It is a relay for the CLI runtime, not a general chat adapter.
+type RemoteConfig struct {
+	Enabled        bool   `yaml:"enabled"`
+	BotToken       string `yaml:"bot_token"`
+	ChatID         string `yaml:"chat_id"`
+	TimeoutSeconds int    `yaml:"timeout_seconds"`
 }
 
 type TemplatesConfig struct {
@@ -192,6 +202,9 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Scheduler.DataFile == "" {
 		cfg.Scheduler.DataFile = "data/scheduler.json"
+	}
+	if cfg.Remote.TimeoutSeconds == 0 {
+		cfg.Remote.TimeoutSeconds = 300
 	}
 	if cfg.Templates.Dir == "" {
 		cfg.Templates.Dir = "templates"

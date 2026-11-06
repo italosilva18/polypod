@@ -1,7 +1,11 @@
 package tool
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/costa/polypod/internal/types"
@@ -12,6 +16,7 @@ const askUserTimeout = 300 * time.Second
 
 // UserQuestion carries a question from the AI tool to the TUI.
 type UserQuestion struct {
+	ID       string
 	Question string
 	Options  []UserQuestionOption
 	Header   string
@@ -29,7 +34,15 @@ type UserQuestionOption struct {
 type UserPromptHandler struct {
 	QuestionCh chan UserQuestion // tool sends question to TUI
 	AnswerCh   chan string       // TUI sends answer back to tool
+
+	mu        sync.RWMutex
+	remoteAsk RemoteAskFunc
+	askMu     sync.Mutex
 }
+
+// RemoteAskFunc forwards a correlated question to a remote human channel.
+// Implementations must honor ctx and must not log credentials or answers.
+type RemoteAskFunc func(ctx context.Context, requestID string, question UserQuestion) (string, error)
 
 // NewUserPromptHandler creates a ready-to-use handler.
 func NewUserPromptHandler() *UserPromptHandler {
@@ -37,6 +50,108 @@ func NewUserPromptHandler() *UserPromptHandler {
 		QuestionCh: make(chan UserQuestion, 1),
 		AnswerCh:   make(chan string, 1),
 	}
+}
+
+// SetRemoteAsk installs an optional remote human-question relay. The local
+// TUI remains active and the first successful response wins.
+func (h *UserPromptHandler) SetRemoteAsk(fn RemoteAskFunc) {
+	h.mu.Lock()
+	h.remoteAsk = fn
+	h.mu.Unlock()
+}
+
+func (h *UserPromptHandler) getRemoteAsk() RemoteAskFunc {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.remoteAsk
+}
+
+type askResult struct {
+	answer string
+	err    error
+}
+
+// Ask delivers a question locally and, when configured, remotely. Only one
+// ask is active at a time because the legacy TUI answer channel is untagged.
+func (h *UserPromptHandler) Ask(ctx context.Context, question UserQuestion) (string, error) {
+	h.askMu.Lock()
+	defer h.askMu.Unlock()
+
+	if question.ID == "" {
+		question.ID = newQuestionID()
+	}
+	raceCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	remote := h.getRemoteAsk()
+	var remoteCh chan askResult
+	if remote != nil {
+		remoteCh = make(chan askResult, 1)
+		go func() {
+			answer, err := remote(raceCtx, question.ID, question)
+			remoteCh <- askResult{answer: answer, err: err}
+		}()
+	}
+
+	// Deliver to the TUI. If its queue is temporarily full, a successful
+	// remote answer can still complete the request.
+	for {
+		select {
+		case h.QuestionCh <- question:
+			goto delivered
+		case result := <-remoteCh:
+			if result.err == nil && result.answer != "" {
+				h.discardQueuedQuestion(question.ID)
+				return result.answer, nil
+			}
+			remoteCh = nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+
+delivered:
+	timer := time.NewTimer(askUserTimeout)
+	defer timer.Stop()
+	for {
+		select {
+		case answer := <-h.AnswerCh:
+			if answer == "" {
+				continue
+			}
+			return answer, nil
+		case result := <-remoteCh:
+			if result.err == nil && result.answer != "" {
+				h.discardQueuedQuestion(question.ID)
+				return result.answer, nil
+			}
+			remoteCh = nil
+		case <-timer.C:
+			return "", fmt.Errorf("user did not respond within the timeout period")
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+}
+
+func (h *UserPromptHandler) discardQueuedQuestion(id string) {
+	select {
+	case queued := <-h.QuestionCh:
+		if queued.ID != id {
+			// Preserve an unrelated queued question. The channel is buffered and
+			// asks are serialized, so this is defensive rather than expected.
+			h.QuestionCh <- queued
+		}
+	default:
+	}
+}
+
+func newQuestionID() string {
+	var raw [4]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return fmt.Sprintf("q_%d", time.Now().UnixNano())
+	}
+	return "q_" + hex.EncodeToString(raw[:])
 }
 
 // RegisterAskUserTool registers the real ask_user tool that blocks until
@@ -118,33 +233,22 @@ func newAskUserDef(name string, handler *UserPromptHandler) types.ToolDef {
 				}
 			}
 
-			// Send the question to the TUI
-			select {
-			case handler.QuestionCh <- uq:
-			case <-ctx.Context.Done():
-				return types.ToolResult{
-					Content: "Tool cancelled: context expired before question could be delivered.",
-					IsError: true,
-				}, nil
-			}
-
-			// Block waiting for the user's answer
-			select {
-			case answer := <-handler.AnswerCh:
+			answer, err := handler.Ask(ctx.Context, uq)
+			if err == nil {
 				return types.ToolResult{
 					Content: fmt.Sprintf("User responded: %s", answer),
 				}, nil
-			case <-time.After(askUserTimeout):
-				return types.ToolResult{
-					Content: "User did not respond within the timeout period.",
-					IsError: true,
-				}, nil
-			case <-ctx.Context.Done():
+			}
+			if ctx.Context.Err() != nil {
 				return types.ToolResult{
 					Content: "Tool cancelled: context expired while waiting for user response.",
 					IsError: true,
 				}, nil
 			}
+			return types.ToolResult{
+				Content: "User did not respond within the timeout period.",
+				IsError: true,
+			}, nil
 		},
 	}
 }

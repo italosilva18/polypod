@@ -1,6 +1,8 @@
 package scheduler
 
 import (
+	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -352,5 +354,64 @@ func TestSetCallback(t *testing.T) {
 	s.onRun(&Task{Name: "test"}, "result")
 	if !called {
 		t.Error("callback was not invoked")
+	}
+}
+
+func TestPromptRoutineUsesFullRunnerAndPersistsHistory(t *testing.T) {
+	s := newTestScheduler(t)
+	task := &Task{Name: "relatorio", Schedule: "* * * * *", Prompt: "gere o relatorio", MaxRetries: 1}
+	if err := s.AddTask(task); err != nil {
+		t.Fatalf("AddTask: %v", err)
+	}
+	s.SetPromptRunner(func(_ context.Context, got *Task) (string, error) {
+		if got.ID != task.ID || got.Prompt != task.Prompt {
+			t.Fatalf("runner received wrong task: %+v", got)
+		}
+		return "feito", nil
+	})
+	s.runTask(task)
+
+	if task.LastStatus != "success" || task.LastResult != "feito" {
+		t.Fatalf("unexpected result: status=%q result=%q", task.LastStatus, task.LastResult)
+	}
+	if len(task.History) != 1 || task.History[0].Status != "success" {
+		t.Fatalf("unexpected history: %+v", task.History)
+	}
+
+	loaded := New(s.dataFile, s.logger)
+	if err := loaded.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, ok := loaded.GetTask(task.ID)
+	if !ok || len(got.History) != 1 {
+		t.Fatalf("durable history missing after reload: %+v", got)
+	}
+}
+
+func TestPromptRoutineRetriesAndRecovers(t *testing.T) {
+	s := newTestScheduler(t)
+	s.retryDelays = []time.Duration{time.Millisecond}
+	task := &Task{Name: "instavel", Schedule: "* * * * *", Prompt: "tente", MaxRetries: 2}
+	if err := s.AddTask(task); err != nil {
+		t.Fatalf("AddTask: %v", err)
+	}
+	calls := 0
+	s.SetPromptRunner(func(context.Context, *Task) (string, error) {
+		calls++
+		if calls < 3 {
+			return "", errors.New("temporario")
+		}
+		return "recuperado", nil
+	})
+	s.runTask(task)
+
+	if calls != 3 || task.LastStatus != "success" {
+		t.Fatalf("calls=%d status=%q error=%q", calls, task.LastStatus, task.LastError)
+	}
+	if len(task.History) != 3 {
+		t.Fatalf("expected 3 durable attempts, got %d", len(task.History))
+	}
+	if task.History[0].Status != "failed" || task.History[2].Status != "success" {
+		t.Fatalf("unexpected attempt history: %+v", task.History)
 	}
 }

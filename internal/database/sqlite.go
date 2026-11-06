@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -89,8 +90,49 @@ func (s *SQLiteDB) Migrate(ctx context.Context) error {
 			return fmt.Errorf("executing migration: %w", err)
 		}
 	}
+	if err := s.ensureMemoryMetadataColumns(ctx); err != nil {
+		return err
+	}
 
 	s.logger.Info("sqlite migrations applied")
+	return nil
+}
+
+func (s *SQLiteDB) ensureMemoryMetadataColumns(ctx context.Context) error {
+	rows, err := s.DB.QueryContext(ctx, `PRAGMA table_info(memories)`)
+	if err != nil {
+		return fmt.Errorf("inspecting memory schema: %w", err)
+	}
+	existing := make(map[string]bool)
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("scanning memory schema: %w", err)
+		}
+		existing[strings.ToLower(name)] = true
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("closing memory schema rows: %w", err)
+	}
+	columns := map[string]string{
+		"tags":       `TEXT NOT NULL DEFAULT '[]'`,
+		"priority":   `INTEGER NOT NULL DEFAULT 0`,
+		"session_id": `TEXT NOT NULL DEFAULT ''`,
+		"source":     `TEXT NOT NULL DEFAULT ''`,
+		"confidence": `REAL NOT NULL DEFAULT 0`,
+	}
+	for name, definition := range columns {
+		if existing[name] {
+			continue
+		}
+		stmt := fmt.Sprintf("ALTER TABLE memories ADD COLUMN %s %s", name, definition)
+		if _, err := s.DB.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("adding memory column %s: %w", name, err)
+		}
+	}
 	return nil
 }
 
