@@ -74,6 +74,9 @@ func TestAgentRunner_SpawnAndWait_Success(t *testing.T) {
 	if done.State.EndTime == nil {
 		t.Error("expected EndTime to be set")
 	}
+	if _, err := r.Wait(nil, task.State.ID); err != nil {
+		t.Errorf("Wait with nil context: %v", err)
+	}
 }
 
 func TestAgentRunner_SpawnAndWait_Failure(t *testing.T) {
@@ -93,13 +96,15 @@ func TestAgentRunner_SpawnAndWait_Failure(t *testing.T) {
 		t.Fatalf("Spawn returned error: %v", err)
 	}
 
-	<-task.Done
-
-	if task.State.Status != types.TaskStatusFailed {
-		t.Errorf("expected status failed, got %s", task.State.Status)
+	done, err := r.Wait(context.Background(), task.State.ID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if task.Error == nil || !errors.Is(task.Error, wantErr) {
-		t.Errorf("expected executor error, got %v", task.Error)
+	if done.State.Status != types.TaskStatusFailed {
+		t.Errorf("expected status failed, got %s", done.State.Status)
+	}
+	if done.Error == nil || !errors.Is(done.Error, wantErr) {
+		t.Errorf("expected executor error, got %v", done.Error)
 	}
 }
 
@@ -211,7 +216,13 @@ func TestAgentRunner_KillRunning(t *testing.T) {
 	}
 
 	// Wait for the goroutine to observe cancellation and finish.
-	<-task.Done
+	done, err := r.Wait(context.Background(), task.State.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done.State.Status != types.TaskStatusKilled {
+		t.Errorf("killed status overwritten by worker: %s", done.State.Status)
+	}
 
 	// Killing a terminal task should fail.
 	if err := r.Kill(task.State.ID); err == nil {
@@ -221,6 +232,44 @@ func TestAgentRunner_KillRunning(t *testing.T) {
 	// Killing unknown id should fail.
 	if err := r.Kill(types.TaskID("no-such")); err == nil {
 		t.Error("expected error killing unknown task")
+	}
+}
+
+func TestAgentRunnerSnapshotsDoNotExposeMutableState(t *testing.T) {
+	r := NewAgentRunner(testLogger())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	task, err := r.Spawn(context.Background(), SpawnConfig{AgentName: "task", Query: "snapshot"},
+		func(context.Context, string) (string, error) {
+			close(started)
+			<-release
+			return "finished", nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	first, ok := r.Get(task.State.ID)
+	if !ok || first.State.Status != types.TaskStatusRunning {
+		t.Fatalf("running snapshot = %+v, found=%v", first, ok)
+	}
+	listed := r.List()
+	if len(listed) != 1 {
+		t.Fatalf("listed %d tasks, want 1", len(listed))
+	}
+	first.State.Status = types.TaskStatusFailed
+	listed[0].Result = "external mutation"
+	current, _ := r.Get(task.State.ID)
+	if current.State.Status != types.TaskStatusRunning || current.Result != "" {
+		t.Fatalf("external snapshot mutation reached runner: %+v", current)
+	}
+	close(release)
+	done, err := r.Wait(context.Background(), task.State.ID)
+	if err != nil || done.State.Status != types.TaskStatusCompleted || done.Result != "finished" {
+		t.Fatalf("completed snapshot = %+v, %v", done, err)
+	}
+	if current.State.Status != types.TaskStatusRunning {
+		t.Fatal("previous snapshot changed after worker completion")
 	}
 }
 
@@ -249,9 +298,12 @@ func TestAgentRunner_Spawn_DefaultTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	<-task.Done
-	if task.State.Status != types.TaskStatusCompleted {
-		t.Errorf("status = %s, want completed; err=%v", task.State.Status, task.Error)
+	done, err := r.Wait(context.Background(), task.State.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done.State.Status != types.TaskStatusCompleted {
+		t.Errorf("status = %s, want completed; err=%v", done.State.Status, done.Error)
 	}
 }
 
@@ -341,6 +393,10 @@ func TestNewAgentToolWithFunc_ExecuteSuccess(t *testing.T) {
 	}
 	if gotQuery != "analyze file" {
 		t.Errorf("executor called with query=%q, want 'analyze file'", gotQuery)
+	}
+	withoutContext, err := tool.Execute(types.ToolContext{}, map[string]any{"prompt": "without context"})
+	if err != nil || withoutContext.IsError || withoutContext.Content != "sub-result" {
+		t.Fatalf("tool with nil context = %+v, %v", withoutContext, err)
 	}
 }
 

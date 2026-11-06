@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -25,6 +27,7 @@ const (
 type Skill struct {
 	Name        string
 	Description string
+	Origin      string // optional runtime source; used to avoid deleting unrelated skills
 	Parameters  jsonschema.Definition
 	Execute     func(args map[string]string) (string, error)
 	// InputSchema and ExecuteResult support typed, multimodal external tools.
@@ -32,10 +35,22 @@ type Skill struct {
 	ExecuteResult func(context.Context, map[string]any) (types.ToolResult, error)
 }
 
+// FileSkillOrigin identifies the exact file that supplied a filesystem skill.
+func FileSkillOrigin(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "file:" + filepath.Clean(path)
+	}
+	return "file:" + filepath.Clean(abs)
+}
+
 // Registry holds all registered skills.
 type Registry struct {
-	skills  map[string]*Skill
-	patches *PatchRegistry
+	mu                sync.RWMutex
+	skills            map[string]*Skill
+	patches           *PatchRegistry
+	onChange          func(name string, exists bool)
+	registrationGuard func(name string) error
 }
 
 // NewRegistry creates a registry with all built-in skills.
@@ -48,17 +63,22 @@ func NewRegistry() *Registry {
 // SetPatchRegistry wires a PatchRegistry into the skill Registry so that
 // patches are applied transparently on every Get and ToolDefinitions call.
 func (r *Registry) SetPatchRegistry(pr *PatchRegistry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.patches = pr
 }
 
 // Get returns a skill by name, with any runtime patches applied.
 func (r *Registry) Get(name string) (*Skill, bool) {
+	r.mu.RLock()
 	s, ok := r.skills[name]
+	patches := r.patches
+	r.mu.RUnlock()
 	if !ok {
 		return nil, false
 	}
-	if r.patches != nil {
-		patched := ApplyPatches(*s, r.patches)
+	if patches != nil {
+		patched := ApplyPatches(*s, patches)
 		return &patched, true
 	}
 	return s, ok
@@ -66,6 +86,8 @@ func (r *Registry) Get(name string) (*Skill, bool) {
 
 // List returns all skill names.
 func (r *Registry) List() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	names := make([]string, 0, len(r.skills))
 	for name := range r.skills {
 		names = append(names, name)
@@ -79,6 +101,8 @@ func (r *Registry) ToolDefinitions(names []string) []openai.Tool {
 	if len(names) == 0 {
 		names = r.List()
 	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	tools := make([]openai.Tool, 0, len(names))
 	for _, name := range names {
 		s, ok := r.skills[name]
@@ -114,7 +138,9 @@ func (r *Registry) Execute(name string, argsJSON string) (string, error) {
 
 // ExecuteResult preserves images and native JSON arguments for rich skills.
 func (r *Registry) ExecuteResult(name string, argsJSON string) (types.ToolResult, error) {
+	r.mu.RLock()
 	s, ok := r.skills[name]
+	r.mu.RUnlock()
 	if !ok {
 		return types.ToolResult{}, fmt.Errorf("skill desconhecida: %s", name)
 	}
@@ -140,14 +166,113 @@ func (r *Registry) ExecuteResult(name string, argsJSON string) (types.ToolResult
 	return result, nil
 }
 
-// Register adds a skill to the registry.
+// SetRegistrationGuard reserves names that ordinary loaders and plugins may
+// not replace or remove. The guard runs while the registry lock is held.
+func (r *Registry) SetRegistrationGuard(fn func(name string) error) {
+	r.mu.Lock()
+	r.registrationGuard = fn
+	r.mu.Unlock()
+}
+
+// Register adds a skill to the registry and logs a rejected registration.
 func (r *Registry) Register(s *Skill) {
+	if err := r.TryRegister(s); err != nil {
+		slog.Warn("skill registration rejected", "name", s.Name, "error", err)
+	}
+}
+
+// TryRegister reports a registration denied by the configured guard.
+func (r *Registry) TryRegister(s *Skill) error {
+	return r.register(s, false)
+}
+
+// RegisterTrusted is for a file whose bytes and path have just been verified
+// against the applied evolution draft. It bypasses only the name reservation.
+func (r *Registry) RegisterTrusted(s *Skill) error {
+	return r.register(s, true)
+}
+
+func (r *Registry) register(s *Skill, trusted bool) error {
+	r.mu.Lock()
+	if !trusted && r.registrationGuard != nil {
+		if err := r.registrationGuard(s.Name); err != nil {
+			r.mu.Unlock()
+			return err
+		}
+	}
+	if !trusted && strings.HasPrefix(s.Origin, "file:") {
+		if existing, ok := r.skills[s.Name]; ok && existing.Origin != s.Origin {
+			r.mu.Unlock()
+			return fmt.Errorf("skill %q pertence a outra origem", s.Name)
+		}
+	}
 	r.skills[s.Name] = s
+	onChange := r.onChange
+	r.mu.Unlock()
+	if onChange != nil {
+		onChange(s.Name, true)
+	}
+	return nil
 }
 
 // Unregister removes a skill from the registry.
 func (r *Registry) Unregister(name string) {
+	if err := r.TryUnregister(name); err != nil {
+		slog.Warn("skill removal rejected", "name", name, "error", err)
+	}
+}
+
+// TryUnregister reports a removal denied by the configured guard.
+func (r *Registry) TryUnregister(name string) error {
+	return r.unregister(name, false, "")
+}
+
+// UnregisterTrusted removes a previously verified applied skill after its
+// source file is deleted. Ordinary callers must use Unregister.
+func (r *Registry) UnregisterTrusted(name string) error {
+	return r.unregister(name, true, "")
+}
+
+// UnregisterIfOrigin atomically checks ownership before removing a file skill.
+// The watcher passes trusted only for an applied file it has already verified.
+func (r *Registry) UnregisterIfOrigin(name, origin string, trusted bool) error {
+	if origin == "" {
+		return fmt.Errorf("origem da skill é obrigatória")
+	}
+	return r.unregister(name, trusted, origin)
+}
+
+func (r *Registry) unregister(name string, trusted bool, expectedOrigin string) error {
+	r.mu.Lock()
+	if expectedOrigin != "" {
+		current, ok := r.skills[name]
+		if !ok || current.Origin != expectedOrigin {
+			r.mu.Unlock()
+			return fmt.Errorf("skill %q mudou de origem", name)
+		}
+	}
+	if !trusted && r.registrationGuard != nil {
+		if err := r.registrationGuard(name); err != nil {
+			r.mu.Unlock()
+			return err
+		}
+	}
 	delete(r.skills, name)
+	onChange := r.onChange
+	r.mu.Unlock()
+	if onChange != nil {
+		onChange(name, false)
+	}
+	return nil
+}
+
+// SetOnChange observes later skill registrations and removals. The callback
+// runs without the registry lock, so it may safely read the registry to sync
+// tool adapters. Register initial skills before installing the callback.
+func (r *Registry) SetOnChange(fn func(name string, exists bool)) {
+	r.mu.Lock()
+	r.onChange = fn
+	r.mu.Unlock()
 }
 
 func (r *Registry) registerBuiltins() {

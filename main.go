@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -10,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,6 +24,8 @@ import (
 	"github.com/costa/polypod/internal/agent"
 	"github.com/costa/polypod/internal/ai"
 	"github.com/costa/polypod/internal/approval"
+	"github.com/costa/polypod/internal/audio"
+	"github.com/costa/polypod/internal/audit"
 	"github.com/costa/polypod/internal/auth"
 	"github.com/costa/polypod/internal/automemory"
 	"github.com/costa/polypod/internal/autoupdate"
@@ -39,7 +44,9 @@ import (
 	"github.com/costa/polypod/internal/depsgraph"
 	"github.com/costa/polypod/internal/docgen"
 	"github.com/costa/polypod/internal/doctor"
+	"github.com/costa/polypod/internal/document"
 	"github.com/costa/polypod/internal/dotenv"
+	"github.com/costa/polypod/internal/evolution"
 	"github.com/costa/polypod/internal/git"
 	"github.com/costa/polypod/internal/githook"
 	"github.com/costa/polypod/internal/goals"
@@ -69,6 +76,7 @@ import (
 	"github.com/costa/polypod/internal/setup"
 	"github.com/costa/polypod/internal/skill"
 	"github.com/costa/polypod/internal/sshexec"
+	"github.com/costa/polypod/internal/taskqueue"
 	"github.com/costa/polypod/internal/template"
 	"github.com/costa/polypod/internal/testgen"
 	"github.com/costa/polypod/internal/tool"
@@ -702,6 +710,23 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 
 	// Wire core subsystems via wiring.WireAll
 	memStore := memory.NewStoreFromDB(sqlDB, cfg.Data.Dir)
+	var embedder memory.Embedder
+	if cfg.Embedding.Enabled {
+		configured, err := memory.NewHTTPEmbedder(memory.HTTPEmbeddingConfig{
+			BaseURL: cfg.Embedding.BaseURL, APIKey: cfg.Embedding.APIKey, Model: cfg.Embedding.Model})
+		if err != nil {
+			return fmt.Errorf("configuring semantic memory: %w", err)
+		}
+		embedder = configured
+		if managed, ok := memStore.(*memory.ManagedStore); ok {
+			managed.SetEmbedder(embedder)
+		}
+	}
+	documentIndex, err := document.OpenIndex(filepath.Join(cfg.Data.Dir, "document-index.db"), embedder)
+	if err != nil {
+		return fmt.Errorf("opening document knowledge index: %w", err)
+	}
+	defer documentIndex.Close()
 	sys := wiring.WireAll(wiring.Config{
 		Logger:      logger,
 		WorkingDir:  ".",
@@ -709,8 +734,27 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		DataDir:     cfg.Data.Dir,
 		MemoryStore: memStore,
 	})
+	tool.RegisterDocumentKnowledgeTool(sys.ToolRegistry, documentIndex, cfg.WhatsApp.OwnerChat)
+	auditHome, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("locating audit home: %w", err)
+	}
+	auditStore, err := audit.Open(filepath.Join(auditHome, ".local", "share", "polypod", "audit"))
+	if err != nil {
+		return fmt.Errorf("opening durable audit: %w", err)
+	}
+	sys.Orchestrator.SetAuditStore(auditStore)
+	tool.RegisterAuditTool(sys.ToolRegistry, auditStore)
+	taskQueue, err := taskqueue.Open(filepath.Join(cfg.Data.Dir, "taskqueue.db"))
+	if err != nil {
+		return fmt.Errorf("opening task queue: %w", err)
+	}
+	defer taskQueue.Close()
+	tool.RegisterTaskQueueTool(sys.ToolRegistry, taskQueue)
 
 	tool.RegisterAdvancedTools(sys.ToolRegistry, ".")
+	tool.RegisterHardwareTools(sys.ToolRegistry)
+	tool.RegisterSerialHardwareTools(sys.ToolRegistry)
 	computerUseTools := computeruse.RegisterComputerUseTools(sys.ToolRegistry)
 	if computerUseTools == 0 {
 		logger.Warn("computer use tools unavailable", "reason", "no graphical display environment")
@@ -725,43 +769,146 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	// Skill registry — load + register all built-in skills
 	skills := sys.SkillRegistry
 	agents := sys.Agents
-	agents.LoadDir(cfg.Data.AgentsDir)
+	if err := agents.LoadDir(cfg.Data.AgentsDir); err != nil {
+		return fmt.Errorf("loading agent definitions: %w", err)
+	}
+	localCatalog := skill.NewLocalCatalog(filepath.Join("third_party", "polyclaw", "skills"),
+		filepath.Join(".polypod", "skills"), skills)
+	tool.RegisterSkillCatalogTools(sys.ToolRegistry, localCatalog)
+	evolutionStore, err := evolution.Open(filepath.Join(cfg.Data.Dir, "evolution.db"),
+		filepath.Join(".polypod", "skills"))
+	if err != nil {
+		return fmt.Errorf("opening skill evolution: %w", err)
+	}
+	defer evolutionStore.Close()
+	skills.SetRegistrationGuard(func(name string) error {
+		return evolutionStore.ProtectAppliedSkillName(ctx, name)
+	})
 	registerSkills(skills, memStore, agents, cfg.Data.AgentsDir, cfg.Data.Dir, logger)
+	for _, name := range skills.List() {
+		if loaded, ok := skills.Get(name); ok && loaded.Origin == "custom_script" {
+			agents.AddSkill("default", name)
+		}
+	}
+	appliedNames, appliedErr := evolutionStore.AppliedSkillNames(ctx)
+	if appliedErr != nil {
+		logger.Warn("applied skill unavailable; skipping until repaired", "error", appliedErr)
+	}
+	if len(appliedNames) > 0 {
+		for _, name := range appliedNames {
+			agents.AddSkill("default", name)
+		}
+	}
+	tool.RegisterEvolutionTool(sys.ToolRegistry, evolutionStore, func(name string) error {
+		path := filepath.Join(".polypod", "skills", name, "SKILL.md")
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		trusted, err := evolutionStore.ValidateAppliedSkillFile(ctx, path, name, content)
+		if err != nil {
+			return err
+		}
+		if !trusted {
+			return fmt.Errorf("skill %q não consta como aplicada", name)
+		}
+		parsed, err := skill.ParseSkillFile(path, content)
+		if err != nil {
+			return err
+		}
+		if err := parsed.Frontmatter.Validate(); err != nil {
+			return err
+		}
+		if parsed.Frontmatter.Name != name {
+			return fmt.Errorf("skill aplicada tem nome divergente: %s", name)
+		}
+		body := parsed.Body
+		if err := skills.RegisterTrusted(&skill.Skill{Name: name, Description: parsed.Frontmatter.Description,
+			Origin:     skill.FileSkillOrigin(path),
+			Parameters: jsonschema.Definition{Type: jsonschema.Object},
+			Execute:    func(map[string]string) (string, error) { return body, nil }}); err != nil {
+			return err
+		}
+		agents.AddSkill("default", name)
+		return nil
+	})
 
 	// Filesystem skill loader — scans ~/.claude/skills, ./claude/skills and
 	// ./.polypod/skills for SKILL.md files and registers each as a simple
 	// body-returning skill in the runtime registry.
 	fsLoader := skill.NewFSSkillLoader(skill.DefaultSkillDirs()...)
-	if parsed, err := fsLoader.LoadAll(ctx); err == nil {
-		for _, ps := range parsed {
-			if err := ps.Frontmatter.Validate(); err != nil {
+	parsedSkills, skillLoadErr := fsLoader.LoadAll(ctx)
+	if skillLoadErr != nil {
+		logger.Warn("filesystem skill loader skipped invalid files", "error", skillLoadErr)
+	}
+	for _, ps := range parsedSkills {
+		content, err := os.ReadFile(ps.SourcePath)
+		if err != nil {
+			logger.Warn("filesystem skill unavailable", "path", ps.SourcePath, "error", err)
+			continue
+		}
+		current, err := skill.ParseSkillFile(ps.SourcePath, content)
+		if err != nil {
+			logger.Warn("filesystem skill invalid", "path", ps.SourcePath, "error", err)
+			continue
+		}
+		if err := current.Frontmatter.Validate(); err != nil {
+			continue
+		}
+		trusted, err := evolutionStore.ValidateAppliedSkillFile(ctx, ps.SourcePath, current.Frontmatter.Name, content)
+		if err != nil {
+			logger.Warn("filesystem skill rejected", "path", ps.SourcePath, "error", err)
+			continue
+		}
+		body := current.Body
+		loaded := &skill.Skill{
+			Name:        current.Frontmatter.Name,
+			Description: current.Frontmatter.Description,
+			Origin:      skill.FileSkillOrigin(ps.SourcePath),
+			Parameters:  jsonschema.Definition{Type: jsonschema.Object},
+			Execute:     func(map[string]string) (string, error) { return body, nil },
+		}
+		if trusted {
+			if err := skills.RegisterTrusted(loaded); err != nil {
+				logger.Warn("reviewed filesystem skill registration rejected", "path", ps.SourcePath, "error", err)
 				continue
 			}
-			body := ps.Body
-			skills.Register(&skill.Skill{
-				Name:        ps.Frontmatter.Name,
-				Description: ps.Frontmatter.Description,
-				Parameters:  jsonschema.Definition{Type: jsonschema.Object},
-				Execute:     func(map[string]string) (string, error) { return body, nil },
-			})
+		} else {
+			if err := skills.TryRegister(loaded); err != nil {
+				logger.Warn("filesystem skill registration rejected", "path", ps.SourcePath, "error", err)
+				continue
+			}
 		}
+		agents.AddSkill("default", loaded.Name)
 	}
 
 	// Plugin-based skills
+	beforePlugins := make(map[string]bool)
+	for _, name := range skills.List() {
+		beforePlugins[name] = true
+	}
 	pluginLoader := skill.NewPluginLoader(skill.DefaultSkillDirs(), logger)
 	if n, err := pluginLoader.LoadAll(skills); err != nil {
 		logger.Warn("plugin skill loader error", "error", err)
 	} else if n > 0 {
 		logger.Info("plugin skills loaded", "count", n)
 	}
-
-	// Skill hot-reload
-	if skillWatcher, err := skill.NewSkillWatcher(skill.DefaultSkillDirs(), fsLoader, skills, logger); err != nil {
-		logger.Warn("skill watcher unavailable", "error", err)
-	} else {
-		go skillWatcher.Start(ctx)
+	for _, name := range skills.List() {
+		if !beforePlugins[name] {
+			agents.AddSkill("default", name)
+		}
 	}
 
+	// Skill hot-reload
+	var skillWatcher *skill.SkillWatcher
+	if watcher, err := skill.NewSkillWatcher(skill.DefaultSkillDirs(), fsLoader, skills, logger); err != nil {
+		logger.Warn("skill watcher unavailable", "error", err)
+	} else {
+		skillWatcher = watcher
+		skillWatcher.SetBeforeRegister(func(path, name string, content []byte) (bool, error) {
+			return evolutionStore.ValidateAppliedSkillFile(ctx, path, name, content)
+		})
+	}
 	// Session managers
 	sessMgr := session.NewManager(cfg.Data.Dir, logger)
 	session.RegisterSkills(skills, sessMgr)
@@ -834,6 +981,10 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	tmplReg.RegisterSkills(skills)
 
 	// MCP
+	beforeMCP := make(map[string]bool)
+	for _, name := range skills.List() {
+		beforeMCP[name] = true
+	}
 	mcpMgr := mcp.NewManager(logger)
 	for _, mcpCfg := range cfg.MCP {
 		if !mcpCfg.AutoStart {
@@ -852,7 +1003,32 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	if mcpToolCount > 0 {
 		logger.Info("mcp tools loaded", "count", mcpToolCount)
 	}
+	for _, name := range skills.List() {
+		if !beforeMCP[name] {
+			agents.AddSkill("default", name)
+		}
+	}
 	defer mcpMgr.Close()
+	// Wire every skill registered after WireAll, including scheduler, goals,
+	// human loop, filesystem skills and MCP, into the agent's tool path.
+	tool.RegisterAllSkills(sys.ToolRegistry, skills)
+	// Custom skills created during a turn and filesystem hot reloads must also
+	// pass through the tool registry without waiting for a process restart.
+	var skillSync sync.Mutex
+	skills.SetOnChange(func(name string, _ bool) {
+		skillSync.Lock()
+		defer skillSync.Unlock()
+		if _, exists := skills.Get(name); exists {
+			tool.RegisterAllSkills(sys.ToolRegistry, skills)
+			agents.AddSkill("default", name)
+		} else {
+			sys.ToolRegistry.Remove("skill_" + name)
+			agents.RemoveSkill("default", name)
+		}
+	})
+	if skillWatcher != nil {
+		go skillWatcher.Start(ctx)
+	}
 
 	// Hooks
 	hookMgr := sys.Hooks
@@ -1027,6 +1203,18 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	// Inline handlers (replace router)
 	handler := makeHandler(convMgr, aiSvc)
 	streamHandler := makeStreamHandler(convMgr, aiSvc)
+	taskQueue.SetHandler(func(taskCtx context.Context, task taskqueue.Task) (string, error) {
+		prompt := fmt.Sprintf("TAREFA PONTUAL: %s\nID: %s\nTentativa: %d\nObjetivo:\n%s\n\nExecute o objetivo completo e confira o resultado. Em uma retomada, confira primeiro se a tentativa anterior ja produziu o efeito desejado antes de repetir a acao.",
+			task.Title, task.ID, task.Attempts, task.Prompt)
+		out, err := handler(taskCtx, adapter.InMessage{
+			ID:        fmt.Sprintf("task-%s-%d", task.ID, task.Attempts),
+			Channel:   "task_queue",
+			UserID:    task.ID,
+			Text:      prompt,
+			Timestamp: time.Now(),
+		})
+		return out.Text, err
+	})
 
 	// Optional remote human relay for questions and notifications. Credentials
 	// come from environment-expanded config and are never written by Polypod.
@@ -1088,14 +1276,39 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 				return fmt.Errorf("registering whatsapp notification: %w", err)
 			}
 			tool.RegisterAllSkills(sys.ToolRegistry, skills)
-			activeAgent := agents.Get("default")
-			activeAgent.Skills = append(activeAgent.Skills, "whatsapp_notify")
+			agents.AddSkill("default", "whatsapp_notify")
 		}
 		vision, _ := providerReg.Get(cfg.AI.Provider)
 		whatsappMedia = &whatsappgateway.MediaInterpreter{
 			MediaDir:    filepath.Join(cfg.WhatsApp.SessionDir, "media"),
 			Vision:      vision,
 			VisionModel: cfg.AI.Model,
+			OCRLanguage: os.Getenv("POLYPOD_OCR_LANG"),
+			IndexDocument: func(ctx context.Context, event whatsappgateway.Event, text, format string) (string, string, error) {
+				sum := sha256.Sum256([]byte(event.ChatID + "\x00" + event.ID))
+				sourceID := hex.EncodeToString(sum[:])
+				indexed, _, err := documentIndex.IndexText(ctx, event.ChatID, sourceID, text, format)
+				if err != nil {
+					return "", "", err
+				}
+				return sourceID, indexed.Citation(1), nil
+			},
+		}
+		if cfg.WhatsApp.AudioTranscription.Enabled {
+			transcriber, err := audio.NewHTTPTranscriber(cfg.WhatsApp.AudioTranscription.Endpoint,
+				cfg.WhatsApp.AudioTranscription.Model, cfg.WhatsApp.AudioTranscription.APIKey, nil)
+			if err != nil {
+				return fmt.Errorf("configuring WhatsApp audio transcription: %w", err)
+			}
+			whatsappMedia.TranscribeAudio = transcriber.Transcribe
+		}
+	}
+	for _, name := range agents.Get("default").Skills {
+		if _, direct := sys.ToolRegistry.Get(name); direct {
+			continue
+		}
+		if _, bridged := sys.ToolRegistry.Get("skill_" + name); !bridged {
+			logger.Warn("agent skill unavailable in tool registry", "skill", name)
 		}
 	}
 	if remoteRelay != nil || whatsappQuestions != nil {
@@ -1135,6 +1348,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		Timeout:     30 * time.Minute,
 		MaxAttempts: 4,
 		Process: func(processCtx context.Context, msg humanloop.Message) (string, error) {
+			processCtx = tool.WithRemoteDocumentScope(processCtx, msg.Channel, msg.UserID)
 			messageText := msg.Text
 			var askStatus *whatsappgateway.AskDeliveryStatus
 			if msg.Channel == whatsappgateway.Channel {
@@ -1181,7 +1395,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 			}
 			var deliveryErr error
 			if whatsapp != nil && cfg.WhatsApp.OwnerChat != "" &&
-				(msg.Channel == "notification" || msg.Channel == "scheduler") &&
+				(msg.Channel == "notification" || msg.Channel == "scheduler" || msg.Channel == "task_queue") &&
 				!humanStore.DeliveredTo(msg.ID, whatsappgateway.Channel) {
 				copy := msg
 				copy.Channel, copy.UserID, copy.ReplyTo = whatsappgateway.Channel, cfg.WhatsApp.OwnerChat, ""
@@ -1216,8 +1430,23 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	if err != nil {
 		return fmt.Errorf("initializing heartbeat: %w", err)
 	}
+	taskQueue.SetNotifier(func(noticeCtx context.Context, notice taskqueue.Notice) error {
+		message := fmt.Sprintf("Tarefa %s concluiu com status %s.", notice.TaskID, notice.Status)
+		if notice.Error != "" {
+			message += " Erro: " + notice.Error
+		} else if strings.TrimSpace(notice.Result) != "" {
+			message += " Resultado: " + notice.Result
+		}
+		if _, err := humanStore.EnqueueOutboundOnce("task_queue", "owner", message, notice.TaskID, notice.Key); err != nil {
+			return err
+		}
+		heartbeat.Wake()
+		return nil
+	})
 	heartbeat.Start(ctx)
 	defer heartbeat.Stop()
+	taskQueue.Start(ctx)
+	defer taskQueue.Stop()
 	if whatsappQuestions != nil {
 		go whatsappQuestions.Run(ctx)
 	}
@@ -1293,7 +1522,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	const heartbeatID = "system_heartbeat"
 	if cfg.Scheduler.Enabled && cfg.Scheduler.HeartbeatEnabled {
 		heartbeatSchedule := "@every " + cfg.Scheduler.HeartbeatInterval
-		const heartbeatPrompt = "Consulte goal_review, inbox_list (especialmente itens failed), scheduler_list e memoria de pendencias. Avance somente proximas acoes prontas e autorizadas; confirme o resultado e registre evidencia com goal_update. Respeite metas paused/blocked e dependencias. Avise o dono quando houver algo relevante. Se faltar uma informacao essencial, use ask_user. Se nao houver nada a fazer ou relatar, responda exatamente NO_REPLY."
+		const heartbeatPrompt = "Consulte goal_review, inbox_list (especialmente itens failed), scheduler_list, task_queue action=status (depois list para failed quando preciso), skill_evolution action=patterns e memoria de pendencias. Avance somente proximas acoes prontas e autorizadas; confirme o resultado e registre evidencia com goal_update. Para padroes repetidos e verificados, proponha/revise/aplique skill util. Respeite metas paused/blocked e dependencias. Avise o dono quando houver algo relevante. Se faltar uma informacao essencial, use ask_user. Se nao houver nada a fazer ou relatar, responda exatamente NO_REPLY."
 		if existing, ok := sched.GetTask(heartbeatID); !ok {
 			if err := sched.AddTask(&scheduler.Task{ID: heartbeatID, Name: "Acompanhamento operacional", Schedule: heartbeatSchedule, Prompt: heartbeatPrompt, Channel: "system", UserID: "owner", MisfirePolicy: "skip", MaxRetries: 1}); err != nil {
 				logger.Error("failed to create operational heartbeat", "error", err)

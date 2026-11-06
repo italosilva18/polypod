@@ -54,7 +54,7 @@ func LoadAndRegisterCustomSkills(reg *Registry, dir string) error {
 			continue
 		}
 
-		if def.Name == "" || def.Script == "" {
+		if !validName.MatchString(def.Name) || def.Script == "" {
 			continue
 		}
 
@@ -81,6 +81,7 @@ func RegisterCustomSkill(reg *Registry, def *CustomSkillDef) {
 	reg.Register(&Skill{
 		Name:        def.Name,
 		Description: def.Description,
+		Origin:      "custom_script",
 		Parameters: jsonschema.Definition{
 			Type:       jsonschema.Object,
 			Properties: props,
@@ -148,6 +149,9 @@ func ListCustomSkills(dir string) ([]CustomSkillDef, error) {
 
 // SaveCustomSkill saves a custom skill definition to a YAML file.
 func SaveCustomSkill(dir string, def *CustomSkillDef) error {
+	if def == nil || !validName.MatchString(def.Name) {
+		return fmt.Errorf("nome de skill customizada inválido")
+	}
 	data, err := yaml.Marshal(def)
 	if err != nil {
 		return fmt.Errorf("serializing skill: %w", err)
@@ -158,6 +162,9 @@ func SaveCustomSkill(dir string, def *CustomSkillDef) error {
 
 // DeleteCustomSkill removes a custom skill YAML file.
 func DeleteCustomSkill(dir, name string) error {
+	if !validName.MatchString(name) {
+		return fmt.Errorf("nome de skill customizada inválido")
+	}
 	path := filepath.Join(dir, name+".yaml")
 	if err := os.Remove(path); err != nil {
 		if os.IsNotExist(err) {

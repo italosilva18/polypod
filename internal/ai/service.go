@@ -113,11 +113,8 @@ func (s *Service) SetToolEventCallback(cb ToolEventCallback) {
 }
 
 // buildMessages assembles the full message list for a request.
-func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) []ChatMessage {
+func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) ([]ChatMessage, []string) {
 	ag := s.agentReg.Get(s.agentName)
-
-	// Update client skill names dynamically
-	s.client.SetSkillNames(ag.Skills)
 
 	// Search knowledge base
 	var knowledgeCtx string
@@ -169,7 +166,7 @@ func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) []ChatMe
 
 	// Add current query
 	messages = append(messages, ChatMessage{Role: "user", Content: req.Query})
-	return messages
+	return messages, ag.Skills
 }
 
 // Answer processes a query through the full pipeline (synchronous).
@@ -177,9 +174,9 @@ func (s *Service) Answer(ctx context.Context, req AnswerRequest) (*AnswerRespons
 	if s.onActivity != nil {
 		s.onActivity()
 	}
-	messages := s.buildMessages(ctx, req)
+	messages, names := s.buildMessages(ctx, req)
 
-	resp, err := s.client.CompleteWithTools(ctx, messages, s.logger)
+	resp, err := s.client.CompleteWithTools(withRequestSkillNames(ctx, names), messages, s.logger)
 	if err != nil {
 		return nil, err
 	}
@@ -205,9 +202,9 @@ func (s *Service) AnswerStream(ctx context.Context, req AnswerRequest, callback 
 	if s.onActivity != nil {
 		s.onActivity()
 	}
-	messages := s.buildMessages(ctx, req)
+	messages, names := s.buildMessages(ctx, req)
 
-	resp, err := s.client.CompleteWithToolsStream(ctx, messages, callback, s.logger)
+	resp, err := s.client.CompleteWithToolsStream(withRequestSkillNames(ctx, names), messages, callback, s.logger)
 	if err != nil {
 		return nil, err
 	}

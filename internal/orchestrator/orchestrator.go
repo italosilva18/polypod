@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/costa/polypod/internal/agent"
+	"github.com/costa/polypod/internal/audit"
 	"github.com/costa/polypod/internal/command"
 	"github.com/costa/polypod/internal/hooks"
 	"github.com/costa/polypod/internal/memory"
@@ -32,6 +33,7 @@ type Orchestrator struct {
 	runner   *subagent.AgentRunner
 	memory   memory.Store
 	logger   *slog.Logger
+	audit    *audit.Store
 
 	// Current session
 	sessionID types.SessionID
@@ -39,6 +41,14 @@ type Orchestrator struct {
 
 	// Plan simulator for plan mode
 	planSimulator *modes.PlanSimulator
+}
+
+// SetAuditStore connects a durable, metadata-only trail to tool execution.
+// Call it during startup before agent turns begin.
+func (o *Orchestrator) SetAuditStore(store *audit.Store) {
+	o.mu.Lock()
+	o.audit = store
+	o.mu.Unlock()
 }
 
 // Config holds orchestrator configuration.
@@ -180,8 +190,29 @@ func (o *Orchestrator) ExecuteTool(ctx context.Context, toolName string, args ma
 		}
 	}
 
-	// 6. Execute
+	// 6. Write the start marker before a side effect. An unavailable audit
+	// trail prevents the tool from starting; it cannot be reconstructed later.
+	started := time.Now()
+	if o.audit != nil {
+		if err := o.audit.Append(ctx, audit.Event{Kind: "tool", Tool: toolName, Status: "started",
+			SessionID: o.sessionID.String(), AgentID: o.agentName}); err != nil {
+			o.logger.Error("tool audit start failed", "tool", toolName, "error", err)
+			return types.ToolResult{Content: "auditoria indisponivel; ferramenta nao iniciada", IsError: true}, nil
+		}
+	}
+
+	// 7. Execute
 	result, err := t.Execute(tCtx, args)
+	if o.audit != nil {
+		status := "completed"
+		if err != nil || result.IsError {
+			status = "failed"
+		}
+		if auditErr := o.audit.Append(context.Background(), audit.Event{Kind: "tool", Tool: toolName, Status: status,
+			SessionID: o.sessionID.String(), AgentID: o.agentName, DurationMS: time.Since(started).Milliseconds()}); auditErr != nil {
+			o.logger.Error("tool audit completion failed", "tool", toolName, "error", auditErr)
+		}
+	}
 	if err != nil {
 		o.logger.Error("tool execution error", "tool", toolName, "error", err)
 		return types.ToolResult{
@@ -190,7 +221,7 @@ func (o *Orchestrator) ExecuteTool(ctx context.Context, toolName string, args ma
 		}, nil
 	}
 
-	// 7. Fire PostToolUse hooks
+	// 8. Fire PostToolUse hooks
 	if o.hooks != nil {
 		o.hooks.Fire(ctx, hooks.HookPayload{
 			Event:      hooks.EventPostToolUse,
@@ -201,7 +232,7 @@ func (o *Orchestrator) ExecuteTool(ctx context.Context, toolName string, args ma
 		})
 	}
 
-	// 8. Auto-extract memories from tool results
+	// 9. Auto-extract memories from tool results
 	if o.memory != nil && !result.IsError {
 		o.autoExtractMemory(toolName, args, result)
 	}

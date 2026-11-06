@@ -13,7 +13,7 @@ import (
 func RegisterDynamicManagement(reg *Registry, skillsDir string) {
 	reg.Register(&Skill{
 		Name:        "create_skill",
-		Description: "Criar uma nova skill customizada baseada em script bash. A skill fica disponivel imediatamente e persiste entre reinicializacoes.",
+		Description: "Criar uma nova skill customizada baseada em script bash. Ela entra no registro imediatamente, persiste e fica disponível ao agente padrão no próximo turno.",
 		Parameters: jsonschema.Definition{
 			Type: jsonschema.Object,
 			Properties: map[string]jsonschema.Definition{
@@ -26,11 +26,11 @@ func RegisterDynamicManagement(reg *Registry, skillsDir string) {
 		},
 		Execute: func(args map[string]string) (string, error) {
 			name := args["name"]
-			if name == "" {
-				return "", fmt.Errorf("name e obrigatorio")
-			}
 			if !validName.MatchString(name) {
 				return "", fmt.Errorf("nome invalido: use apenas letras, numeros e underscore, comecando com letra")
+			}
+			if _, exists := reg.Get(name); exists {
+				return "", fmt.Errorf("skill '%s' ja existe; escolha outro nome", name)
 			}
 			if len(args["script"]) > maxScriptBytes {
 				return "", fmt.Errorf("script excede limite de %d bytes", maxScriptBytes)
@@ -60,7 +60,7 @@ func RegisterDynamicManagement(reg *Registry, skillsDir string) {
 			// Register in runtime
 			RegisterCustomSkill(reg, def)
 
-			return fmt.Sprintf("Skill '%s' criada com sucesso. Disponivel imediatamente.", name), nil
+			return fmt.Sprintf("Skill '%s' criada e registrada. Ela fica disponível ao agente padrão no próximo turno.", name), nil
 		},
 	})
 
@@ -105,16 +105,19 @@ func RegisterDynamicManagement(reg *Registry, skillsDir string) {
 		},
 		Execute: func(args map[string]string) (string, error) {
 			name := args["name"]
-			if name == "" {
-				return "", fmt.Errorf("name e obrigatorio")
+			if !validName.MatchString(name) {
+				return "", fmt.Errorf("nome de skill customizada inválido")
 			}
 
 			if err := DeleteCustomSkill(skillsDir, name); err != nil {
 				return "", err
 			}
 
-			// Unregister from runtime
-			reg.Unregister(name)
+			// Only remove the custom script itself; a filesystem or reviewed
+			// skill with the same name may currently own the runtime entry.
+			if active, exists := reg.Get(name); exists && active.Origin == "custom_script" {
+				reg.Unregister(name)
+			}
 
 			return fmt.Sprintf("Skill '%s' deletada com sucesso.", name), nil
 		},

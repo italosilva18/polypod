@@ -26,11 +26,27 @@ func TestBrowserRegisteredWithoutDisplay(t *testing.T) {
 		t.Setenv(key, "")
 	}
 	reg := &browserTestRegistry{defs: map[string]types.ToolDef{}}
-	if got := RegisterComputerUseTools(reg); got != 2 {
+	if got := RegisterComputerUseTools(reg); got != 3 {
 		t.Fatalf("registered %d", got)
 	}
 	if _, ok := reg.defs["browser_observe"]; !ok {
 		t.Fatal("browser observer missing")
+	}
+	if _, ok := reg.defs["browser_manage"]; !ok {
+		t.Fatal("browser manager missing")
+	}
+	manager := reg.defs["browser_manage"]
+	if !manager.IsDestructiveFn(map[string]any{"action": "evaluate"}) || manager.IsReadOnlyFn(map[string]any{"action": "evaluate"}) {
+		t.Fatal("browser evaluate bypasses side-effect classification")
+	}
+	if !manager.IsReadOnlyFn(map[string]any{"action": "tabs"}) || manager.IsDestructiveFn(map[string]any{"action": "tabs"}) {
+		t.Fatal("browser tabs classified as a write")
+	}
+	if manager.ValidateFn(map[string]any{"action": "navigate", "url": "javascript:alert(1)"}).Valid {
+		t.Fatal("unsafe navigation accepted")
+	}
+	if manager.ValidateFn(map[string]any{"action": "evaluate", "javascript": "1+1"}).Valid {
+		t.Fatal("evaluate without exact tab accepted")
 	}
 	action := reg.defs["browser_act"]
 	if !action.IsDestructiveFn(nil) {

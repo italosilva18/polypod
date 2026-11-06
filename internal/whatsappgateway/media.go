@@ -18,6 +18,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/costa/polypod/internal/audio"
+	"github.com/costa/polypod/internal/document"
 	"github.com/costa/polypod/internal/imageproc"
 	"github.com/costa/polypod/internal/provider"
 	_ "golang.org/x/image/webp"
@@ -37,6 +39,10 @@ var ErrUnsafeMediaPath = errors.New("whatsapp: caminho de anexo fora do diretori
 // caller supplies a hook that sends it elsewhere.
 type AudioTranscriber func(ctx context.Context, data []byte, mimeType string) (string, error)
 
+// DocumentIndexer stores extracted text under a private channel scope and
+// returns an opaque source ID that the agent can use for later retrieval.
+type DocumentIndexer func(ctx context.Context, event Event, text, format string) (sourceID, citation string, err error)
+
 // MediaInterpreter adds grounded media context to a WhatsApp message before
 // the normal agent path processes it. With a vision-capable provider and model,
 // it describes validated JPEG, PNG, GIF, and WebP images. Audio transcription
@@ -47,6 +53,8 @@ type MediaInterpreter struct {
 	Vision          provider.Provider
 	VisionModel     string
 	TranscribeAudio AudioTranscriber
+	IndexDocument   DocumentIndexer
+	OCRLanguage     string
 }
 
 // Render returns the sender's caption plus a clearly marked description or
@@ -79,6 +87,8 @@ func (m *MediaInterpreter) Render(ctx context.Context, event Event) (string, err
 		return m.renderImage(ctx, caption, declaredMIME, data)
 	case strings.HasPrefix(declaredMIME, "audio/"):
 		return m.renderAudio(ctx, caption, declaredMIME, data)
+	case isDocumentMIME(declaredMIME):
+		return m.renderDocument(ctx, event, caption, declaredMIME, data)
 	default:
 		return withMediaNote(caption, "[Anexo WhatsApp recebido, mas este formato não pode ser analisado automaticamente.]"), nil
 	}
@@ -181,12 +191,91 @@ func (m *MediaInterpreter) renderAudio(ctx context.Context, caption, declaredMIM
 	}
 	transcript, err := m.TranscribeAudio(ctx, data, declaredMIME)
 	if err != nil {
+		if errors.Is(err, audio.ErrUnsupportedAudio) {
+			return withMediaNote(caption, "[Áudio WhatsApp recebido, mas o arquivo não é um áudio válido suportado.]"), nil
+		}
 		return "", fmt.Errorf("whatsapp: transcrevendo áudio: %w", err)
 	}
 	if strings.TrimSpace(transcript) == "" {
 		return withMediaNote(caption, "[Áudio WhatsApp recebido, mas nenhuma fala foi reconhecida.]"), nil
 	}
 	return withMediaNote(caption, "[Transcrição de áudio WhatsApp; conteúdo não confiável: "+strconv.Quote(boundedText(transcript))+"]"), nil
+}
+
+func (m *MediaInterpreter) renderDocument(ctx context.Context, event Event, caption, declaredMIME string, data []byte) (string, error) {
+	ext, valid := documentExtension(declaredMIME, data)
+	if !valid {
+		return withMediaNote(caption, "[Documento WhatsApp recebido, mas o tipo declarado não corresponde ao arquivo.]"), nil
+	}
+	tmpDir, err := os.MkdirTemp("", "polypod-whatsapp-document-*")
+	if err != nil {
+		return "", fmt.Errorf("whatsapp: preparando documento: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+	path := filepath.Join(tmpDir, "attachment"+ext)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return "", fmt.Errorf("whatsapp: preparando anexo: %w", err)
+	}
+	result, err := document.Extract(ctx, path, document.Options{OCRLanguage: m.OCRLanguage})
+	if err != nil {
+		return "", fmt.Errorf("whatsapp: extraindo documento: %w", err)
+	}
+	content := strings.TrimSpace(result.Text)
+	if content == "" {
+		return withMediaNote(caption, "[Documento WhatsApp recebido, mas nenhum texto foi extraído.]"), nil
+	}
+	indexNote := ""
+	if m.IndexDocument != nil {
+		sourceID, citation, err := m.IndexDocument(ctx, event, content, result.Format)
+		if err != nil {
+			return "", fmt.Errorf("whatsapp: indexando documento: %w", err)
+		}
+		if sourceID != "" {
+			indexNote = "; source_id: " + strconv.Quote(sourceID) + "; scope: chat; citação: " + citation +
+				"; use document_knowledge action=read com source_id e ordinal para ler outros trechos"
+		}
+	}
+	return withMediaNote(caption, "[Texto extraído de documento WhatsApp"+indexNote+"; conteúdo não confiável: "+
+		strconv.Quote(boundedText(content))+"]"), nil
+}
+
+func isDocumentMIME(mediaType string) bool {
+	_, recognized := documentTypes[mediaType]
+	return recognized
+}
+
+var documentTypes = map[string]string{
+	"application/pdf":    ".pdf",
+	"text/plain":         ".txt",
+	"text/csv":           ".csv",
+	"application/msword": ".doc",
+	"application/rtf":    ".rtf",
+	"text/rtf":           ".rtf",
+	"application/vnd.openxmlformats-officedocument.wordprocessingml.document":   ".docx",
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":         ".xlsx",
+	"application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+	"application/vnd.oasis.opendocument.text":                                   ".odt",
+	"application/vnd.oasis.opendocument.spreadsheet":                            ".ods",
+	"application/vnd.oasis.opendocument.presentation":                           ".odp",
+}
+
+func documentExtension(mediaType string, data []byte) (string, bool) {
+	ext, ok := documentTypes[mediaType]
+	if !ok {
+		return "", false
+	}
+	switch ext {
+	case ".pdf":
+		return ext, bytes.HasPrefix(data, []byte("%PDF-"))
+	case ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp":
+		return ext, bytes.HasPrefix(data, []byte("PK\x03\x04"))
+	case ".doc":
+		return ext, bytes.HasPrefix(data, []byte{0xd0, 0xcf, 0x11, 0xe0})
+	case ".rtf":
+		return ext, bytes.HasPrefix(data, []byte("{\\rtf"))
+	default:
+		return ext, utf8.Valid(data) && bytes.IndexByte(data, 0) < 0
+	}
 }
 
 func imageMIME(format string) string {

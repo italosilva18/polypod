@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"context"
 	"fmt"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -11,7 +12,12 @@ import (
 
 // executeSkillResult keeps legacy skill registries usable without discarding
 // structured results from registries that support images.
-func executeSkillResult(reg SkillRegistry, name, args string) (types.ToolResult, error) {
+func executeSkillResult(ctx context.Context, reg SkillRegistry, name, args string) (types.ToolResult, error) {
+	if rich, ok := reg.(interface {
+		ExecuteResultContext(context.Context, string, string) (types.ToolResult, error)
+	}); ok {
+		return rich.ExecuteResultContext(ctx, name, args)
+	}
 	if rich, ok := reg.(interface {
 		ExecuteResult(string, string) (types.ToolResult, error)
 	}); ok {

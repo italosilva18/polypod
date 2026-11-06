@@ -271,3 +271,28 @@ func TestManagerConcurrentAddStop(t *testing.T) {
 		t.Errorf("Count after concurrent stop = %d, want 0", got)
 	}
 }
+
+func TestManagerConcurrentAddRespectsLimit(t *testing.T) {
+	m := newTestManager()
+	defer m.StopAll()
+
+	const attempts = 80
+	var successes atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := m.Add(context.Background(), "15s", "concurrent limit"); err == nil {
+				successes.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := successes.Load(); got != 20 {
+		t.Fatalf("accepted %d loops, want exactly 20", got)
+	}
+	if got := m.Count(); got != 20 {
+		t.Fatalf("active loops = %d, want 20", got)
+	}
+}

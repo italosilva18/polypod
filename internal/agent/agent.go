@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"sync"
 
 	"github.com/costa/polypod/internal/types"
 	"gopkg.in/yaml.v3"
@@ -28,46 +30,118 @@ type Agent struct {
 
 // Registry holds all loaded agents.
 type Registry struct {
-	agents  map[string]*Agent
-	Default string
+	mu            sync.RWMutex
+	agents        map[string]*Agent
+	dynamicSkills map[string]map[string]bool
+	Default       string
 }
 
 // NewRegistry creates an empty agent registry.
 func NewRegistry() *Registry {
 	return &Registry{
-		agents:  make(map[string]*Agent),
-		Default: "default",
+		agents:        make(map[string]*Agent),
+		dynamicSkills: make(map[string]map[string]bool),
+		Default:       "default",
 	}
 }
 
 // Register adds an agent to the registry.
 func (r *Registry) Register(a *Agent) {
-	r.agents[a.Name] = a
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	copy := cloneAgent(a)
+	r.agents[a.Name] = copy
 	// Also register under aliases
 	for _, alias := range a.Aliases {
-		r.agents[alias] = a
+		r.agents[alias] = copy
 	}
+}
+
+// AddSkill enables a skill on an agent without losing concurrent additions.
+// Get returns snapshots, so callers must use this method for live changes.
+func (r *Registry) AddSkill(agentName, skillName string) bool {
+	if skillName == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a, ok := r.agents[agentName]
+	if !ok {
+		return false
+	}
+	for _, existing := range a.Skills {
+		if existing == skillName {
+			return false
+		}
+	}
+	if r.dynamicSkills[a.Name] == nil {
+		r.dynamicSkills[a.Name] = make(map[string]bool)
+	}
+	if r.dynamicSkills[a.Name][skillName] {
+		return false
+	}
+	r.dynamicSkills[a.Name][skillName] = true
+	return true
+}
+
+// RemoveSkill disables a skill on an agent after its runtime adapter is gone.
+func (r *Registry) RemoveSkill(agentName, skillName string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a, ok := r.agents[agentName]
+	if !ok {
+		return false
+	}
+	if !r.dynamicSkills[a.Name][skillName] {
+		return false
+	}
+	delete(r.dynamicSkills[a.Name], skillName)
+	return true
 }
 
 // Get returns an agent by name. Falls back to default.
 func (r *Registry) Get(name string) *Agent {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if a, ok := r.agents[name]; ok {
-		return a
+		return r.withDynamicSkills(a)
 	}
 	if a, ok := r.agents[r.Default]; ok {
-		return a
+		return r.withDynamicSkills(a)
 	}
 	return DefaultAgent()
 }
 
+// withDynamicSkills must be called while the registry read lock is held.
+func (r *Registry) withDynamicSkills(a *Agent) *Agent {
+	copy := cloneAgent(a)
+	seen := make(map[string]bool, len(copy.Skills))
+	for _, name := range copy.Skills {
+		seen[name] = true
+	}
+	var dynamicNames []string
+	for name := range r.dynamicSkills[a.Name] {
+		if !seen[name] {
+			dynamicNames = append(dynamicNames, name)
+		}
+	}
+	sort.Strings(dynamicNames)
+	copy.Skills = append(copy.Skills, dynamicNames...)
+	return copy
+}
+
 // Has returns true if an agent with the given name exists.
 func (r *Registry) Has(name string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	_, ok := r.agents[name]
 	return ok
 }
 
 // List returns all agent names (deduplicated, excluding aliases).
 func (r *Registry) List() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	seen := make(map[string]bool)
 	names := make([]string, 0, len(r.agents))
 	for _, a := range r.agents {
@@ -77,6 +151,13 @@ func (r *Registry) List() []string {
 		}
 	}
 	return names
+}
+
+func cloneAgent(a *Agent) *Agent {
+	copy := *a
+	copy.Skills = append([]string(nil), a.Skills...)
+	copy.Aliases = append([]string(nil), a.Aliases...)
+	return &copy
 }
 
 // Count returns the number of registered agents.

@@ -2,27 +2,13 @@ package preventsleep
 
 import (
 	"os/exec"
-	"runtime"
 	"sync"
 	"testing"
-	"time"
 )
 
-// NOTE ON TEST DESIGN
-//
-// The package uses a global `guard` with a background "restart" goroutine
-// that is launched by startRestart() whenever the refCount transitions from
-// 0 → 1. That goroutine references the shared `guard.ticker` field, so if
-// multiple tests repeatedly cycle the refCount through zero, stale restart
-// goroutines end up racing on the field and can panic on a nil ticker.
-//
-// To test the *semantics* of the public API without tripping over that
-// source-level race, these tests manipulate the reference counter directly
-// under the guard's mutex (we're in the same package, so the unexported
-// fields are in scope). A single dedicated test exercises the real
-// PreventSleep/AllowSleep entry points end-to-end, and then immediately
-// calls ForceAllow so at most one background goroutine is ever alive for
-// the duration of the suite.
+// Most bookkeeping tests manipulate the reference counter directly to avoid
+// spawning an operating-system sleep inhibitor. Lifecycle tests exercise the
+// restart goroutine separately.
 
 // setRefCount writes directly to the guarded counter. Tests use this instead
 // of PreventSleep/AllowSleep whenever they only need to assert bookkeeping
@@ -196,29 +182,7 @@ func TestRefCountBookkeeping(t *testing.T) {
 	}
 }
 
-// settleRestartGoroutine gives the background restart goroutine spawned by
-// startRestart() a chance to actually reach its select statement before we
-// tear the ticker down. Without this yield, a fast PreventSleep→ForceAllow
-// sequence can nil out guard.ticker before the goroutine captures it into
-// the select's case expressions, producing a nil-pointer panic on the next
-// scheduler tick. See the comment at the top of this file.
-func settleRestartGoroutine() {
-	// A handful of Gosched calls plus a short sleep is enough for the
-	// runtime to pick up the newly-created goroutine on any reasonable
-	// scheduler.
-	for i := 0; i < 10; i++ {
-		runtime.Gosched()
-	}
-	time.Sleep(20 * time.Millisecond)
-	for i := 0; i < 10; i++ {
-		runtime.Gosched()
-	}
-}
-
-// TestPreventSleepAllowSleepRoundtrip is the single end-to-end test that
-// actually calls the public Prevent/Allow pair. It runs exactly once and
-// then calls ForceAllow to wind everything down, so at most one restart
-// goroutine is ever spawned by the whole test suite.
+// TestPreventSleepAllowSleepRoundtrip exercises the public Prevent/Allow pair.
 func TestPreventSleepAllowSleepRoundtrip(t *testing.T) {
 	// Start from a known-zero state.
 	ForceAllow()
@@ -227,8 +191,6 @@ func TestPreventSleepAllowSleepRoundtrip(t *testing.T) {
 	}
 
 	PreventSleep()
-	// Let the restart goroutine reach its select before any state mutation.
-	settleRestartGoroutine()
 	if got := currentRefCount(); got != 1 {
 		t.Fatalf("refCount after PreventSleep = %d, want 1", got)
 	}
@@ -246,9 +208,6 @@ func TestPreventSleepAllowSleepRoundtrip(t *testing.T) {
 
 	// ForceAllow must return to zero regardless of outstanding holders.
 	ForceAllow()
-	// Give the goroutine a moment to observe the stop signal and exit
-	// cleanly before subsequent tests run.
-	settleRestartGoroutine()
 	if got := currentRefCount(); got != 0 {
 		t.Fatalf("refCount after ForceAllow = %d, want 0", got)
 	}
@@ -262,11 +221,30 @@ func TestPreventSleepAllowSleepRoundtrip(t *testing.T) {
 	}
 }
 
+func TestRestartRapidCyclesUseIndependentChannels(t *testing.T) {
+	g := &sleepGuard{}
+	for i := 0; i < 100; i++ {
+		g.mu.Lock()
+		g.startRestart()
+		oldStop := g.stopCh
+		g.stopRestart()
+		stopped := g.ticker == nil && g.stopCh == nil
+		g.mu.Unlock()
+		if !stopped {
+			t.Fatal("stopped restart generation retained shared state")
+		}
+		select {
+		case <-oldStop:
+		default:
+			t.Fatal("restart generation was not stopped")
+		}
+	}
+}
+
 // TestConcurrentDirectRefCountBookkeeping checks that the mutex correctly
 // serialises concurrent reads and writes against the counter. Like the
-// other bookkeeping tests, it avoids PreventSleep/AllowSleep to sidestep
-// the restart-goroutine lifecycle; run this with -race to verify the
-// locking contract.
+// other bookkeeping tests, it avoids spawning an OS inhibitor; run this with
+// -race to verify the locking contract.
 func TestConcurrentDirectRefCountBookkeeping(t *testing.T) {
 	guard.mu.Lock()
 	orig := guard.refCount

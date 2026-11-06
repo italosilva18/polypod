@@ -73,12 +73,30 @@ The local root systemd deployment is documented in [scripts/README.md](scripts/R
 - built-in coder, researcher, reviewer, architect and DevOps agents;
 - subagents, task tracking and swarm coordination;
 - sessions, compaction, memory, checkpoints, undo/redo and conversation trees;
+- document knowledge index with citations and exact conversation scopes;
+- durable priority task queue, completion notices and tool audit trail;
 - agent-readable persistent secrets through `save_secret`, `get_secret`,
   `list_secrets` and `delete_secret`;
 - hooks, plugins, custom skills and hot reloading;
+- local PolyClaw skill discovery/import and reviewed evolution from verified outcomes;
 - code review, security analysis, testing, linting and profiling;
 - browser/computer-use, SSH, OpenAPI tools and scheduled work;
+- managed Chrome profile for browser actions and native WhatsApp media intake;
 - token, context-window and cost tracking.
+
+The [PolyClaw skill import](docs/integrations/polyclaw-import.md) records the
+ported catalog and its limits. See the [document index](docs/integrations/document-index.md)
+and [WhatsApp audio setup](docs/integrations/audio-transcription.md) for the
+new opt-in integrations.
+The [managed browser](docs/integrations/browser-managed.md) explains the
+isolated profile and desktop handoff.
+The [skill catalog](docs/integrations/skill-catalog.md) and
+[skill evolution cycle](docs/integrations/skill-evolution.md) cover discovery,
+import, evidence, review and application.
+The [I2C/SPI guide](docs/integrations/hardware-i2c-spi.md) describes device
+parameters and the remaining physical verification.
+The [USB/serial/firmware guide](docs/integrations/serial-hardware.md) covers
+discovery, bounded serial exchanges and supported flash backends.
 
 ## Configuration
 

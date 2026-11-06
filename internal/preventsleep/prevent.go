@@ -38,9 +38,7 @@ type sleepGuard struct {
 	stopCh   chan struct{}
 }
 
-var guard = &sleepGuard{
-	stopCh: make(chan struct{}, 1),
-}
+var guard = &sleepGuard{}
 
 // PreventSleep increments the reference count and starts inhibiting sleep
 // if this is the first caller.
@@ -164,18 +162,21 @@ func (g *sleepGuard) startRestart() {
 	if g.ticker != nil {
 		return
 	}
-	g.ticker = time.NewTicker(restartInterval)
+	ticker := time.NewTicker(restartInterval)
+	stopCh := make(chan struct{})
+	g.ticker = ticker
+	g.stopCh = stopCh
 	go func() {
 		for {
 			select {
-			case <-g.ticker.C:
+			case <-ticker.C:
 				g.mu.Lock()
-				if g.refCount > 0 {
+				if g.ticker == ticker && g.refCount > 0 {
 					g.killInhibitor()
 					g.spawnInhibitor()
 				}
 				g.mu.Unlock()
-			case <-g.stopCh:
+			case <-stopCh:
 				return
 			}
 		}
@@ -185,11 +186,9 @@ func (g *sleepGuard) startRestart() {
 func (g *sleepGuard) stopRestart() {
 	if g.ticker != nil {
 		g.ticker.Stop()
+		close(g.stopCh)
 		g.ticker = nil
-		select {
-		case g.stopCh <- struct{}{}:
-		default:
-		}
+		g.stopCh = nil
 	}
 }
 

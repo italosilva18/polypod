@@ -49,7 +49,7 @@ func RegisterComputerUseTools(reg ToolRegistry) int {
 	cuTool := NewComputerUseTool()
 	registerBrowserTools(reg, cuTool)
 	if !IsDisplayAvailable() {
-		return 2
+		return 3
 	}
 
 	reg.RegisterDef(newScreenshotTool(cuTool))
@@ -63,7 +63,7 @@ func RegisterComputerUseTools(reg ToolRegistry) int {
 	reg.RegisterDef(newRightClickTool(cuTool))
 	reg.RegisterDef(newDisplayInfoTool(cuTool))
 
-	return 12
+	return 13
 }
 
 // ─── Tool definitions ──────────────────────────────────────────────────

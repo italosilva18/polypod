@@ -15,11 +15,13 @@ const SchemaVersion = 1
 var Categories = []string{"gui", "memory", "routine", "channels", "safety"}
 
 type Task struct {
-	ID        string `json:"id"`
-	Category  string `json:"category"`
-	Criterion string `json:"criterion"`
-	Benchmark string `json:"benchmark"`
-	Recovery  bool   `json:"recovery"`
+	ID             string `json:"id"`
+	Category       string `json:"category"`
+	Criterion      string `json:"criterion"`
+	Benchmark      string `json:"benchmark"`
+	Recovery       bool   `json:"recovery"`
+	Prompt         string `json:"prompt,omitempty"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 }
 type Manifest struct {
 	SchemaVersion int    `json:"schema_version"`

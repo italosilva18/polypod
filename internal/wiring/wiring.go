@@ -172,8 +172,8 @@ func WireAll(cfg Config) *Systems {
 	// 4. ToolRegistryAdapter — bridges tool.Registry → ai.SkillRegistry
 	//    Routes every tool call through the Orchestrator pipeline.
 	// ---------------------------------------------------------------
-	toolAdapter := ai.NewToolRegistryAdapter(toolReg, func(name string, args map[string]any) (types.ToolResult, error) {
-		return orch.ExecuteTool(context.Background(), name, args)
+	toolAdapter := ai.NewToolRegistryAdapterWithContext(toolReg, func(ctx context.Context, name string, args map[string]any) (types.ToolResult, error) {
+		return orch.ExecuteTool(ctx, name, args)
 	})
 
 	// ---------------------------------------------------------------

@@ -1,26 +1,32 @@
 package computeruse
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/costa/polypod/internal/browser"
 	"github.com/costa/polypod/internal/types"
 )
 
 func registerBrowserTools(reg ToolRegistry, cu *ComputerUseTool) {
-	client := browser.CDP{Endpoint: os.Getenv("POLYPOD_BROWSER_CDP_URL")}
+	runtime := newBrowserRuntime()
 	reg.RegisterDef(types.ToolDef{
 		NameFn: func() string { return "browser_observe" },
 		DescriptionFn: func() string {
-			return "Observa abas e elementos DOM do navegador via CDP local, com seletores e imagem. Sem CDP, usa screenshot/OCR desktop. Use tab_id quando houver várias abas. Coordenadas DOM são do viewport, não da tela."
+			return "Observa abas e elementos DOM do Chrome com perfil privado ou CDP local, com seletores e imagem. Sem navegador, usa screenshot/OCR desktop. Use tab_id quando houver várias abas. Coordenadas DOM são do viewport, não da tela."
 		},
 		InputSchemaFn: func() map[string]any {
 			return map[string]any{"type": "object", "properties": map[string]any{"tab_id": map[string]any{"type": "string"}}}
 		},
 		IsReadOnlyFn: func(map[string]any) bool { return true },
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
+			client, err := runtime.client(ctx.Context)
+			if err != nil {
+				return browserDesktopFallback(ctx, cu, err), nil
+			}
 			tabs, err := client.Tabs(ctx.Context)
 			if err != nil {
 				return browserDesktopFallback(ctx, cu, err), nil
@@ -70,6 +76,10 @@ func registerBrowserTools(reg ToolRegistry, cu *ComputerUseTool) {
 			return types.ValidationResult{Valid: true}
 		},
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
+			client, err := runtime.client(ctx.Context)
+			if err != nil {
+				return types.ToolResult{IsError: true, Content: err.Error()}, nil
+			}
 			result, err := client.Act(ctx.Context, browser.Action{TabID: stringArg(args, "tab_id", ""), Kind: stringArg(args, "action", ""), Selector: stringArg(args, "selector", ""), Text: stringArg(args, "text", ""), ExpectedText: stringArg(args, "expected_text", ""), ExpectedURL: stringArg(args, "expected_url", "")})
 			if err != nil {
 				message := err.Error()
@@ -86,6 +96,43 @@ func registerBrowserTools(reg ToolRegistry, cu *ComputerUseTool) {
 			return output, nil
 		},
 	})
+	registerBrowserManageTool(reg, runtime)
+}
+
+type browserRuntime struct {
+	endpoint string
+	managed  *browser.ManagedBrowser
+}
+
+func newBrowserRuntime() *browserRuntime {
+	headless := !IsDisplayAvailable()
+	if raw := strings.TrimSpace(os.Getenv("POLYPOD_BROWSER_HEADLESS")); raw != "" {
+		headless = raw != "0" && !strings.EqualFold(raw, "false")
+	}
+	return &browserRuntime{
+		endpoint: strings.TrimSpace(os.Getenv("POLYPOD_BROWSER_CDP_URL")),
+		managed: browser.NewManagedBrowser(browser.ManagedConfig{
+			Binary: os.Getenv("POLYPOD_BROWSER_BINARY"), ProfileDir: os.Getenv("POLYPOD_BROWSER_PROFILE_DIR"),
+			Headless: headless, FallbackHeadless: !headless,
+			DesktopUser: os.Getenv("POLYPOD_DESKTOP_USER"), DesktopHome: os.Getenv("POLYPOD_DESKTOP_HOME"),
+		}),
+	}
+}
+
+func (r *browserRuntime) client(ctx context.Context) (browser.CDP, error) {
+	if r.endpoint != "" {
+		return browser.CDP{Endpoint: r.endpoint}, nil
+	}
+	return r.managed.Start(ctx)
+}
+
+func browserActionResult(result *browser.ActionResult) types.ToolResult {
+	data, _ := json.Marshal(result)
+	out := types.ToolResult{Content: string(data)}
+	if result.Observation != nil && result.Observation.Screenshot != "" {
+		out.Images = []types.ToolImage{{MIMEType: "image/png", Base64: result.Observation.Screenshot}}
+	}
+	return out
 }
 func browserObservationResult(obs *browser.Observation) types.ToolResult {
 	data, _ := json.Marshal(obs)

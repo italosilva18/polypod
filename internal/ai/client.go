@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/costa/polypod/internal/chatgptauth"
@@ -26,6 +27,7 @@ type Client struct {
 	temp             float32
 	toolsOn          bool
 	skills           SkillRegistry
+	skillNamesMu     sync.RWMutex
 	skillNames       []string
 	costEngine       *tracking.CostEngine
 	toolEventCB      ToolEventCallback
@@ -87,7 +89,24 @@ func NewClient(cfg config.AIConfig, skills SkillRegistry) *Client {
 
 // SetSkillNames sets the active skill names for tool definitions.
 func (c *Client) SetSkillNames(names []string) {
-	c.skillNames = names
+	c.skillNamesMu.Lock()
+	c.skillNames = append([]string(nil), names...)
+	c.skillNamesMu.Unlock()
+}
+
+type requestSkillNamesKey struct{}
+
+func withRequestSkillNames(ctx context.Context, names []string) context.Context {
+	return context.WithValue(ctx, requestSkillNamesKey{}, append([]string(nil), names...))
+}
+
+func (c *Client) skillNamesFor(ctx context.Context) []string {
+	if names, ok := ctx.Value(requestSkillNamesKey{}).([]string); ok {
+		return names
+	}
+	c.skillNamesMu.RLock()
+	defer c.skillNamesMu.RUnlock()
+	return append([]string(nil), c.skillNames...)
 }
 
 // Model returns the configured model name.
@@ -242,7 +261,7 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 	}
 	var tools []openai.Tool
 	if c.toolsOn && c.skills != nil {
-		tools = c.skills.ToolDefinitions(c.skillNames)
+		tools = c.skills.ToolDefinitions(c.skillNamesFor(ctx))
 	}
 	if !c.toolsOn || len(tools) == 0 {
 		return c.Complete(ctx, messages)
@@ -304,7 +323,7 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 				c.costEngine.RecordToolUse(tc.Function.Name, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
 			}
 
-			richResult, execErr := executeSkillResult(c.skills, tc.Function.Name, tc.Function.Arguments)
+			richResult, execErr := executeSkillResult(ctx, c.skills, tc.Function.Name, tc.Function.Arguments)
 			result := richResult.Content
 			observations = append(observations, ToolCallResult{ID: tc.ID, Name: tc.Function.Name, Images: richResult.Images, IsError: richResult.IsError || execErr != nil})
 			if execErr != nil {
@@ -335,7 +354,7 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 	}
 	var tools []openai.Tool
 	if c.toolsOn && c.skills != nil {
-		tools = c.skills.ToolDefinitions(c.skillNames)
+		tools = c.skills.ToolDefinitions(c.skillNamesFor(ctx))
 	}
 
 	msgs := make([]openai.ChatCompletionMessage, len(messages))
@@ -560,7 +579,7 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 					c.costEngine.RecordToolUse(tc.Function.Name, 0, 0)
 				}
 
-				richResult, execErr := executeSkillResult(c.skills, tc.Function.Name, tc.Function.Arguments)
+				richResult, execErr := executeSkillResult(ctx, c.skills, tc.Function.Name, tc.Function.Arguments)
 				result := richResult.Content
 				observations = append(observations, ToolCallResult{ID: tc.ID, Name: tc.Function.Name, Images: richResult.Images, IsError: richResult.IsError || execErr != nil})
 

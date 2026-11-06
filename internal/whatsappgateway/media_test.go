@@ -160,3 +160,32 @@ func TestMediaInterpreterRetriesModelFailureAndHonorsCancellation(t *testing.T) 
 		t.Fatalf("cancelled render: %v", err)
 	}
 }
+
+func TestMediaInterpreterExtractsAndIndexesDocumentWithoutExposingPath(t *testing.T) {
+	dir, path := mediaFixture(t, []byte("Relatório privado\n"))
+	called := false
+	m := &MediaInterpreter{MediaDir: dir, IndexDocument: func(ctx context.Context, event Event, text, format string) (string, string, error) {
+		called = true
+		if event.ID != "msg-1" || event.ChatID != "chat@lid" || text != "Relatório privado" || format != ".txt" {
+			t.Fatalf("unexpected indexed document metadata")
+		}
+		return "fixture-source", "[doc:fixture#1]", nil
+	}}
+	out, err := m.Render(context.Background(), Event{ID: "msg-1", ChatID: "chat@lid", MediaPath: path,
+		MIME: "text/plain", Text: "Leia este arquivo"})
+	if err != nil || !called || !strings.Contains(out, "Relatório privado") ||
+		!strings.Contains(out, "fixture-source") || !strings.Contains(out, "[doc:fixture#1]") || strings.Contains(out, path) {
+		t.Fatalf("document render failed: %q, %v", out, err)
+	}
+
+	called = false
+	badPath := filepath.Join(dir, "bad.bin")
+	if err := os.WriteFile(badPath, []byte("not a pdf"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out, err = m.Render(context.Background(), Event{ID: "msg-2", ChatID: "chat@lid", MediaPath: badPath,
+		MIME: "application/pdf"})
+	if err != nil || called || !strings.Contains(out, "não corresponde") {
+		t.Fatalf("spoofed PDF accepted: %q, %v", out, err)
+	}
+}

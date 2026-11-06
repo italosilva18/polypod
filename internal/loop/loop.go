@@ -40,7 +40,9 @@ func NewManager(logger *slog.Logger) *Manager {
 
 // SetCallback sets the function called when a loop task fires.
 func (m *Manager) SetCallback(fn func(string)) {
+	m.mu.Lock()
 	m.onRun = fn
+	m.mu.Unlock()
 }
 
 // Add creates a new recurring task. Returns task ID.
@@ -55,6 +57,10 @@ func (m *Manager) Add(ctx context.Context, intervalStr, prompt string) (int, err
 	}
 
 	m.mu.Lock()
+	if len(m.tasks) >= 20 {
+		m.mu.Unlock()
+		return 0, fmt.Errorf("limite de 20 loops atingido")
+	}
 	m.nextID++
 	id := m.nextID
 
@@ -68,13 +74,6 @@ func (m *Manager) Add(ctx context.Context, intervalStr, prompt string) (int, err
 	}
 	m.tasks[id] = task
 	m.mu.Unlock()
-
-	// Limit to 20 concurrent loops
-	if len(m.tasks) > 20 {
-		cancel()
-		delete(m.tasks, id)
-		return 0, fmt.Errorf("limite de 20 loops atingido")
-	}
 
 	go m.run(taskCtx, task)
 
@@ -92,12 +91,17 @@ func (m *Manager) run(ctx context.Context, task *Task) {
 			return
 		case <-ticker.C:
 			m.mu.Lock()
+			if ctx.Err() != nil {
+				m.mu.Unlock()
+				return
+			}
 			task.LastRun = time.Now()
 			task.RunCount++
+			onRun := m.onRun
 			m.mu.Unlock()
 
-			if m.onRun != nil {
-				m.onRun(task.Prompt)
+			if onRun != nil && ctx.Err() == nil {
+				onRun(task.Prompt)
 			}
 		}
 	}

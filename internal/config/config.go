@@ -86,11 +86,19 @@ type RemoteConfig struct {
 // WhatsAppConfig enables the native bridge to a separately migrated linked-device session.
 // The allowlists are exact JIDs; the existing PolyClaw session is never opened directly.
 type WhatsAppConfig struct {
-	Enabled        bool     `yaml:"enabled"`
-	SessionDir     string   `yaml:"session_dir"`
-	OwnerChat      string   `yaml:"owner_chat"`
-	AllowedChats   []string `yaml:"allowed_chats"`
-	AllowedSenders []string `yaml:"allowed_senders"`
+	Enabled            bool                     `yaml:"enabled"`
+	SessionDir         string                   `yaml:"session_dir"`
+	OwnerChat          string                   `yaml:"owner_chat"`
+	AllowedChats       []string                 `yaml:"allowed_chats"`
+	AllowedSenders     []string                 `yaml:"allowed_senders"`
+	AudioTranscription AudioTranscriptionConfig `yaml:"audio_transcription"`
+}
+
+type AudioTranscriptionConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	Endpoint string `yaml:"endpoint"`
+	Model    string `yaml:"model"`
+	APIKey   string `yaml:"api_key"`
 }
 
 type TemplatesConfig struct {
@@ -121,6 +129,7 @@ type EmbeddingConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	APIKey  string `yaml:"api_key"`
 	BaseURL string `yaml:"base_url"`
+	Model   string `yaml:"model"`
 }
 
 type DataConfig struct {

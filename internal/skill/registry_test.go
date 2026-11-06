@@ -37,6 +37,50 @@ func TestNewRegistry_NotNil(t *testing.T) {
 	}
 }
 
+func TestRegistryConcurrentReloadAndReads(t *testing.T) {
+	r := NewRegistry()
+	const workers = 6
+	const iterations = 200
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				if worker == 0 {
+					r.Register(newTestSkill("reloaded", "latest", nil))
+					if i%3 == 0 {
+						r.Unregister("reloaded")
+					}
+					continue
+				}
+				r.Get("reloaded")
+				r.List()
+				r.ToolDefinitions([]string{"reloaded"})
+				_, _ = r.ExecuteResult("reloaded", "{}")
+			}
+		}(worker)
+	}
+	wg.Wait()
+}
+
+func TestUnregisterIfOriginKeepsReplacement(t *testing.T) {
+	r := NewRegistry()
+	fileSkill := newTestSkill("observed", "file", nil)
+	fileSkill.Origin = "file:/tmp/observed/SKILL.md"
+	r.Register(fileSkill)
+	replacement := newTestSkill("observed", "replacement", nil)
+	replacement.Origin = "plugin:replacement"
+	r.Register(replacement)
+	if err := r.UnregisterIfOrigin("observed", fileSkill.Origin, false); err == nil {
+		t.Fatal("watcher removed a skill owned by another source")
+	}
+	got, ok := r.Get("observed")
+	if !ok || got.Origin != replacement.Origin {
+		t.Fatalf("replacement was lost: %+v", got)
+	}
+}
+
 func TestNewRegistry_HasBuiltins(t *testing.T) {
 	r := NewRegistry()
 	// registerBuiltins registers: read_file, list_directory, run_command,

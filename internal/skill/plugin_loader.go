@@ -277,6 +277,7 @@ func skillFromParsed(path string, data []byte) (*Skill, error) {
 	return &Skill{
 		Name:        ps.Frontmatter.Name,
 		Description: ps.Frontmatter.Description,
+		Origin:      FileSkillOrigin(path),
 		Parameters:  jsonschema.Definition{Type: jsonschema.Object},
 		Execute: func(_ map[string]string) (string, error) {
 			return body, nil
@@ -327,6 +328,7 @@ func skillFromJSON(path string, data []byte) (*Skill, error) {
 	return &Skill{
 		Name:        skillName,
 		Description: def.Description,
+		Origin:      FileSkillOrigin(path),
 		Parameters: jsonschema.Definition{
 			Type:       jsonschema.Object,
 			Properties: props,

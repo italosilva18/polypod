@@ -22,6 +22,7 @@ embedding:
   enabled: false
   api_key: ""
   base_url: ""
+  model: ""
 
 cli:
   enabled: true
@@ -78,6 +79,13 @@ whatsapp:
   owner_chat: ""
   allowed_chats: []
   allowed_senders: []
+  # OpenAI-compatible STT endpoint, e.g. Groq /openai/v1/audio/transcriptions.
+  # Requires a separate API credential; a Grok/ChatGPT app login is not an API key.
+  audio_transcription:
+    enabled: false
+    endpoint: "${POLYPOD_ASR_ENDPOINT:}"
+    model: "${POLYPOD_ASR_MODEL:}"
+    api_key: "${POLYPOD_ASR_API_KEY:}"
 
 templates:
   dir: templates

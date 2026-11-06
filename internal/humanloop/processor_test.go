@@ -147,19 +147,20 @@ func TestHeartbeatStartWakeAndStop(t *testing.T) {
 		t.Fatal(err)
 	}
 	processor.Wake()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		mu.Lock()
 		count := processed
 		mu.Unlock()
-		if count == 1 {
-			state, _ := store.Snapshot()
-			if state.LastHeartbeat.IsZero() {
-				t.Fatal("heartbeat nao foi registrado")
-			}
+		state, _ := store.Snapshot()
+		if count == 1 && !state.LastHeartbeat.IsZero() {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatal("Wake nao processou a mensagem")
+	mu.Lock()
+	count := processed
+	mu.Unlock()
+	state, _ := store.Snapshot()
+	t.Fatalf("Wake/heartbeat nao concluiu: processadas=%d heartbeat=%v", count, state.LastHeartbeat)
 }

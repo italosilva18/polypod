@@ -16,7 +16,7 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 		req.Messages = append(req.Messages, providerapi.Message{Role: msg.Role, Content: msg.Content, Parts: msg.Parts})
 	}
 	if c.toolsOn && c.skills != nil {
-		for _, tool := range c.skills.ToolDefinitions(c.skillNames) {
+		for _, tool := range c.skills.ToolDefinitions(c.skillNamesFor(ctx)) {
 			if tool.Function != nil {
 				req.Tools = append(req.Tools, providerapi.Tool{
 					Name: tool.Function.Name, Description: tool.Function.Description, Parameters: responseToolParameters(tool.Function.Parameters),
@@ -84,7 +84,7 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 				logger.Debug("executing Responses API tool", "tool", tc.Name, "iter", iter)
 				c.fireResponseToolStart(tc)
 				started := time.Now()
-				richResult, execErr := executeSkillResult(c.skills, tc.Name, tc.Arguments)
+				richResult, execErr := executeSkillResult(ctx, c.skills, tc.Name, tc.Arguments)
 				result := richResult.Content
 				observations = append(observations, ToolCallResult{ID: tc.ID, Name: tc.Name, Images: richResult.Images, IsError: richResult.IsError || execErr != nil})
 				if execErr != nil {

@@ -15,8 +15,15 @@ import (
 // system (with permissions, validation, concurrency safety) to be used by
 // the AI client's tool-calling loop.
 type ToolRegistryAdapter struct {
-	registry    *tool.Registry
-	orchestrate func(name string, args map[string]any) (types.ToolResult, error)
+	registry           *tool.Registry
+	orchestrate        func(name string, args map[string]any) (types.ToolResult, error)
+	orchestrateContext func(context.Context, string, map[string]any) (types.ToolResult, error)
+}
+
+// NewToolRegistryAdapterWithContext preserves the request's cancellation and
+// deadline through the orchestrator and the tool it executes.
+func NewToolRegistryAdapterWithContext(reg *tool.Registry, orchestrateFn func(context.Context, string, map[string]any) (types.ToolResult, error)) *ToolRegistryAdapter {
+	return &ToolRegistryAdapter{registry: reg, orchestrateContext: orchestrateFn}
 }
 
 // NewToolRegistryAdapter creates an adapter that wraps tool.Registry.
@@ -73,16 +80,23 @@ func (a *ToolRegistryAdapter) Execute(name string, argsJSON string) (string, err
 // ExecuteResult preserves multimodal output while Execute remains compatible
 // with older text-only skill registries.
 func (a *ToolRegistryAdapter) ExecuteResult(name string, argsJSON string) (types.ToolResult, error) {
+	return a.ExecuteResultContext(context.Background(), name, argsJSON)
+}
+
+// ExecuteResultContext runs a tool with the request context when available.
+func (a *ToolRegistryAdapter) ExecuteResultContext(ctx context.Context, name string, argsJSON string) (types.ToolResult, error) {
 	var args map[string]any
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return types.ToolResult{}, fmt.Errorf("parsing tool args: %w", err)
 	}
 	var result types.ToolResult
 	var err error
-	if a.orchestrate != nil {
+	if a.orchestrateContext != nil {
+		result, err = a.orchestrateContext(ctx, name, args)
+	} else if a.orchestrate != nil {
 		result, err = a.orchestrate(name, args)
 	} else {
-		result, err = a.registry.Execute(name, args, types.ToolContext{Context: context.Background(), WorkingDir: "."})
+		result, err = a.registry.Execute(name, args, types.ToolContext{Context: ctx, WorkingDir: "."})
 	}
 	if err != nil {
 		return types.ToolResult{Content: fmt.Sprintf("Erro: %v", err), IsError: true}, nil

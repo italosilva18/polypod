@@ -1,6 +1,6 @@
 # Avaliação reproduzível
 
-Este harness offline importa resultados de verificadores e traces de sessão do Polypod; não executa tarefas, não baixa datasets, não chama modelos e não comprova superioridade sobre outros agentes. O manifesto `manifest.v1.json` é um smoke test local de cinco capacidades, **não** uma reprodução dos benchmarks oficiais. A fixture é sintética e todo relatório gerado a partir dela traz esse aviso.
+Este pacote oferece duas etapas: um runner programático que executa tarefas por um `Executor` injetado e o harness offline que importa resultados de verificadores e traces. Nenhum comando deste diretório chama um modelo ou executa tarefas sozinho. O manifesto `manifest.v1.json` é um smoke test local de cinco capacidades, **não** uma reprodução dos benchmarks oficiais. A fixture é sintética e todo relatório gerado a partir dela traz esse aviso.
 
 ```bash
 go run ./internal/evaluation/cmd \
@@ -18,6 +18,16 @@ go vet ./internal/evaluation/...
 ```
 
 O comando fica dentro de `internal/` para seguir a convenção do repositório. Para um executável separado: `go build -o /tmp/polypod-eval ./internal/evaluation/cmd`.
+
+## Runner programático
+
+Para uma execução real, forneça `prompt` a cada tarefa do manifesto. `timeout_seconds` é opcional; o limite aplicado por caso é o menor entre ele e `metadata.budget.max_seconds`. Fixe prompts, estado inicial e verificadores antes do teste. O manifesto de exemplo não contém prompts executáveis, por isso o runner o rejeita até que uma cópia de teste acrescente esses campos.
+
+`evaluation.Run(ctx, manifest, metadata, RunOptions{Executor, Verifier})` executa as tarefas na ordem do manifesto. `Executor` recebe o contexto com prazo e retorna `Execution{Response, CostUSD, Steps, Trace}`; ele deve respeitar cancelamento e isolar o estado de cada caso. `Verifier` recebe o resultado e confere um efeito externo, como arquivo final, estado de canal, histórico da rotina ou log de ações. Retorna `Verification{Status, Evidence, VerifiedBy, Recovered}`. O texto da resposta não é copiado para o artefato de resultados, mas pode ser lido pelo verificador.
+
+Sem `Verifier`, uma execução concluída é marcada `skipped`: a frase “concluído” do agente não vale como prova. Uma integração também pode fornecer `RunOptions.ExternalEvidence` com julgamentos por ID de tarefa coletados por verificador externo; esse mapa não autentica a origem da evidência por si só. Sucesso exige `Evidence` e `VerifiedBy` não vazios. Timeout do executor ou verificador vira `timeout`; outras falhas viram `error`. Custos e passos reportados pelo executor permanecem no resultado mesmo quando o verificador falha. O pacote retorna `Results` compatível com `Evaluate` e a ferramenta offline existente.
+
+O prazo usa `context.Context` e é cooperativo. Um executor que ignore o cancelamento pode continuar agindo após o prazo; o adaptador concreto deve supervisionar e encerrar subprocessos ou sessões do agente quando necessário. O runner não impõe gasto ou passos durante a execução; `Evaluate` só desconta excessos medidos ao final, e um coletor externo deve aplicar esses limites em tempo real.
 
 ## Contrato e pontuação
 
