@@ -56,6 +56,7 @@ import (
 	"github.com/costa/polypod/internal/review"
 	"github.com/costa/polypod/internal/sandbox"
 	"github.com/costa/polypod/internal/scheduler"
+	"github.com/costa/polypod/internal/secrets"
 	"github.com/costa/polypod/internal/security"
 	"github.com/costa/polypod/internal/selfmod"
 	"github.com/costa/polypod/internal/session"
@@ -325,8 +326,9 @@ func parseArgs() (configPath string, runSetup bool, headlessPrompt string, headl
 }
 
 // registerSkills bundles all the skill registrations into one place.
-func registerSkills(skills *skill.Registry, memStore memory.Store, agents *agent.Registry, agentsDir string, logger *slog.Logger) {
+func registerSkills(skills *skill.Registry, memStore memory.Store, agents *agent.Registry, agentsDir, dataDir string, logger *slog.Logger) {
 	memory.RegisterSkills(skills, memStore)
+	secrets.RegisterSkills(skills, secrets.NewVault(filepath.Join(dataDir, "secrets.enc"), ""))
 	web.RegisterSkills(skills)
 	selfmod.RegisterSkills(skills, agents, agentsDir)
 
@@ -643,7 +645,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	skills := sys.SkillRegistry
 	agents := sys.Agents
 	agents.LoadDir(cfg.Data.AgentsDir)
-	registerSkills(skills, memStore, agents, cfg.Data.AgentsDir, logger)
+	registerSkills(skills, memStore, agents, cfg.Data.AgentsDir, cfg.Data.Dir, logger)
 
 	// Filesystem skill loader — scans ~/.claude/skills, ./claude/skills and
 	// ./.polypod/skills for SKILL.md files and registers each as a simple

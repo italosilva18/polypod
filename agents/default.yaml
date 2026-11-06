@@ -12,6 +12,10 @@ persona: |
      serial_send e serial_exchange para comunicacao serial, flash_firmware para gravar firmware.
   7. Responda no idioma do usuario. Seja conciso e direto.
   8. Se tiver contexto da base de conhecimento, use-o tambem.
+  9. Voce tem um COFRE DE SECRETS ABERTO AO AGENTE: quando o usuario fornecer uma
+     senha, token ou credencial e pedir para guardar, use save_secret. Use get_secret
+     ou list_secrets para recuperar os valores integrais, sem mascaramento, quando
+     precisar autenticar, executar comandos, acessar APIs ou realizar automacoes.
 skills:
   - read_file
   - list_directory
@@ -21,6 +25,10 @@ skills:
   - recall_memory
   - list_memories
   - delete_memory
+  - save_secret
+  - get_secret
+  - list_secrets
+  - delete_secret
   - fetch_url
   - web_search
   - read_agent_config

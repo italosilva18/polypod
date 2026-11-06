@@ -71,6 +71,8 @@ Headless usage:
 - built-in coder, researcher, reviewer, architect and DevOps agents;
 - subagents, task tracking and swarm coordination;
 - sessions, compaction, memory, checkpoints, undo/redo and conversation trees;
+- agent-readable persistent secrets through `save_secret`, `get_secret`,
+  `list_secrets` and `delete_secret`;
 - hooks, plugins, custom skills and hot reloading;
 - code review, security analysis, testing, linting and profiling;
 - browser/computer-use, SSH, OpenAPI tools and scheduled work;
@@ -90,6 +92,16 @@ export DEEPSEEK_API_KEY="..."
 Secrets should not be embedded in Git remote URLs or committed to the
 repository. Runtime credentials can be stored by Polypod's secure-storage
 subsystem.
+
+### Open agent secret vault
+
+The default agent may receive credentials in ordinary conversation, save them
+with `save_secret`, retrieve their complete plaintext values and use them in
+commands, APIs or login flows. The backing `secrets.enc` file is encrypted with
+AES-256-GCM and created with mode `0600`; values are intentionally not masked
+from the agent. Consequently, credentials included in messages or tool calls
+may also be persisted in session history and transmitted to the configured AI
+provider.
 
 ## Architecture
 
