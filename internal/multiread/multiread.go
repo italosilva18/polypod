@@ -20,7 +20,7 @@ func RegisterSkills(reg *skill.Registry) {
 		Parameters: jsonschema.Definition{
 			Type: jsonschema.Object,
 			Properties: map[string]jsonschema.Definition{
-				"paths":   {Type: jsonschema.String, Description: "Caminhos separados por virgula OU glob pattern (ex: *.go, internal/**/*.go)"},
+				"paths":     {Type: jsonschema.String, Description: "Caminhos separados por virgula OU glob pattern (ex: *.go, internal/**/*.go)"},
 				"max_lines": {Type: jsonschema.String, Description: "Maximo de linhas por arquivo (default: 200)"},
 			},
 			Required: []string{"paths"},

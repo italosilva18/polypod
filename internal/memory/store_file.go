@@ -78,6 +78,58 @@ func (s *FileStore) Save(_ context.Context, topic, content string) error {
 	return s.persist()
 }
 
+func (s *FileStore) SaveWithMeta(_ context.Context, mem Memory) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	mem.UpdatedAt = now
+	if mem.CreatedAt.IsZero() {
+		mem.CreatedAt = now
+	}
+	if existing, ok := s.memories[mem.Topic]; ok {
+		mem.ID = existing.ID
+		mem.CreatedAt = existing.CreatedAt
+	} else {
+		mem.ID = int64(len(s.memories) + 1)
+	}
+	s.memories[mem.Topic] = &mem
+	return s.persist()
+}
+
+func (s *FileStore) SearchRelevant(_ context.Context, query string, maxResults int, minScore float64) ([]Memory, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	type scored struct {
+		mem   Memory
+		score float64
+	}
+	var results []scored
+	for _, m := range s.memories {
+		relevant, score := m.IsRelevant(query)
+		if relevant && score >= minScore {
+			results = append(results, scored{*m, score})
+		}
+	}
+	// Sort by score descending
+	for i := 0; i < len(results); i++ {
+		for j := i + 1; j < len(results); j++ {
+			if results[j].score > results[i].score {
+				results[i], results[j] = results[j], results[i]
+			}
+		}
+	}
+	if maxResults > 0 && len(results) > maxResults {
+		results = results[:maxResults]
+	}
+	memories := make([]Memory, len(results))
+	for i, r := range results {
+		memories[i] = r.mem
+	}
+	return memories, nil
+}
+
 func (s *FileStore) Get(_ context.Context, topic string) (*Memory, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

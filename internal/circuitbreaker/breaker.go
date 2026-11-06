@@ -30,14 +30,14 @@ func (s State) String() string {
 
 // Breaker implements the circuit breaker pattern for a single provider.
 type Breaker struct {
-	mu             sync.Mutex
-	state          State
-	failures       int
-	successes      int
-	maxFailures    int           // trips to Open after this many consecutive failures
-	resetTimeout   time.Duration // time in Open before trying Half-Open
-	halfOpenMax    int           // successes needed in Half-Open to close
-	lastFailure    time.Time
+	mu              sync.Mutex
+	state           State
+	failures        int
+	successes       int
+	maxFailures     int           // trips to Open after this many consecutive failures
+	resetTimeout    time.Duration // time in Open before trying Half-Open
+	halfOpenMax     int           // successes needed in Half-Open to close
+	lastFailure     time.Time
 	lastStateChange time.Time
 }
 

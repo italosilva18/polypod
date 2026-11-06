@@ -1,33 +1,35 @@
 database:
   enabled: false
+  driver: sqlite
+  path: data/polypod.db
 
 ai:
-  base_url: "https://api.deepseek.com/v1"
+  provider: deepseek
+  base_url: https://api.deepseek.com/v1
   api_key: "${DEEPSEEK_API_KEY}"
-  model: "deepseek-chat"
+  model: deepseek-chat
   max_tokens: 2048
   temperature: 0.3
   tools: true
 
 data:
-  dir: "data/conversations"
-  agents_dir: "agents"
-
-cli:
-  enabled: true
-
-rest:
-  enabled: false
+  dir: data/conversations
+  agents_dir: agents
 
 embedding:
   enabled: false
 
-telegram:
-  enabled: false
-
-whatsapp:
-  enabled: false
+cli:
+  enabled: true
 
 log:
-  level: "info"
-  format: "text"
+  level: info
+  format: text
+
+permissions:
+  mode: bypassPermissions
+  defaultMode: bypassPermissions
+
+sandbox:
+  enabled: false
+  network: true

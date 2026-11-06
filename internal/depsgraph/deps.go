@@ -21,8 +21,8 @@ func RegisterSkills(reg *skill.Registry) {
 		Parameters: jsonschema.Definition{
 			Type: jsonschema.Object,
 			Properties: map[string]jsonschema.Definition{
-				"path":   {Type: jsonschema.String, Description: "Diretorio do projeto (default: .)"},
-				"depth":  {Type: jsonschema.String, Description: "Profundidade maxima (default: 3)"},
+				"path":  {Type: jsonschema.String, Description: "Diretorio do projeto (default: .)"},
+				"depth": {Type: jsonschema.String, Description: "Profundidade maxima (default: 3)"},
 			},
 		},
 		Execute: func(args map[string]string) (string, error) {

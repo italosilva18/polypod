@@ -28,30 +28,30 @@ func NewOllama(baseURL string) *Ollama {
 	}
 }
 
-func (o *Ollama) Name() string                  { return "ollama" }
+func (o *Ollama) Name() string                   { return "ollama" }
 func (o *Ollama) SupportsVision() bool           { return true }
 func (o *Ollama) SupportsTools() bool            { return true }
 func (o *Ollama) SupportsStructuredOutput() bool { return true }
 
 type ollamaChatReq struct {
-	Model    string            `json:"model"`
-	Messages []ollamaMsg       `json:"messages"`
-	Stream   bool              `json:"stream"`
-	Tools    []ollamaTool      `json:"tools,omitempty"`
-	Format   json.RawMessage   `json:"format,omitempty"`
+	Model    string                 `json:"model"`
+	Messages []ollamaMsg            `json:"messages"`
+	Stream   bool                   `json:"stream"`
+	Tools    []ollamaTool           `json:"tools,omitempty"`
+	Format   json.RawMessage        `json:"format,omitempty"`
 	Options  map[string]interface{} `json:"options,omitempty"`
 }
 
 type ollamaMsg struct {
-	Role      string            `json:"role"`
-	Content   string            `json:"content"`
-	Images    []string          `json:"images,omitempty"`
-	ToolCalls []ollamaToolCall  `json:"tool_calls,omitempty"`
+	Role      string           `json:"role"`
+	Content   string           `json:"content"`
+	Images    []string         `json:"images,omitempty"`
+	ToolCalls []ollamaToolCall `json:"tool_calls,omitempty"`
 }
 
 type ollamaTool struct {
-	Type     string          `json:"type"`
-	Function ollamaFunction  `json:"function"`
+	Type     string         `json:"type"`
+	Function ollamaFunction `json:"function"`
 }
 
 type ollamaFunction struct {
@@ -68,11 +68,11 @@ type ollamaToolCall struct {
 }
 
 type ollamaChatResp struct {
-	Message          ollamaMsg `json:"message"`
-	Done             bool      `json:"done"`
-	TotalDuration    int64     `json:"total_duration"`
-	PromptEvalCount  int       `json:"prompt_eval_count"`
-	EvalCount        int       `json:"eval_count"`
+	Message         ollamaMsg `json:"message"`
+	Done            bool      `json:"done"`
+	TotalDuration   int64     `json:"total_duration"`
+	PromptEvalCount int       `json:"prompt_eval_count"`
+	EvalCount       int       `json:"eval_count"`
 }
 
 func (o *Ollama) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {

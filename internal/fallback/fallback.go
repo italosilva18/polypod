@@ -102,11 +102,11 @@ func (c *Chain) mapModel(providerName, model string) string {
 func defaultModelMap() map[string]map[string]string {
 	return map[string]map[string]string{
 		"ollama": {
-			"deepseek-chat":           "deepseek-coder-v2",
-			"gpt-4o":                  "llama3.1:70b",
-			"gpt-4o-mini":             "llama3.1:8b",
+			"deepseek-chat":            "deepseek-coder-v2",
+			"gpt-4o":                   "llama3.1:70b",
+			"gpt-4o-mini":              "llama3.1:8b",
 			"claude-3-5-sonnet-latest": "llama3.1:70b",
-			"gemini-1.5-pro":          "llama3.1:70b",
+			"gemini-1.5-pro":           "llama3.1:70b",
 		},
 		"openai": {
 			"deepseek-chat": "gpt-4o-mini",

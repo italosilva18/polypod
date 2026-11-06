@@ -26,7 +26,7 @@ func NewOpenAICompat(name, apiKey, baseURL string) *OpenAICompat {
 	return &OpenAICompat{name: name, client: openai.NewClientWithConfig(cfg)}
 }
 
-func (o *OpenAICompat) Name() string                  { return o.name }
+func (o *OpenAICompat) Name() string                   { return o.name }
 func (o *OpenAICompat) SupportsVision() bool           { return true }
 func (o *OpenAICompat) SupportsTools() bool            { return true }
 func (o *OpenAICompat) SupportsStructuredOutput() bool { return true }

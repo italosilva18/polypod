@@ -11,10 +11,11 @@ import (
 )
 
 const (
-	repoOwner   = "italosilva18"
-	repoName    = "polypod"
-	currentVersion = "0.4.0"
+	repoOwner = "italosilva18"
+	repoName  = "polypod"
 )
+
+var currentVersion = "0.6.0"
 
 // Release holds GitHub release info.
 type Release struct {

@@ -40,7 +40,7 @@ func RegisterSkills(reg *skill.Registry) {
 		Parameters: jsonschema.Definition{
 			Type: jsonschema.Object,
 			Properties: map[string]jsonschema.Definition{
-				"since": {Type: jsonschema.String, Description: "Tag ou commit inicial (ex: v1.0.0)"},
+				"since":  {Type: jsonschema.String, Description: "Tag ou commit inicial (ex: v1.0.0)"},
 				"format": {Type: jsonschema.String, Description: "Formato: keepachangelog (default), conventional"},
 			},
 		},

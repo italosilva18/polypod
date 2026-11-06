@@ -1,0 +1,18 @@
+package sample
+
+import "fmt"
+
+// Greeter greets people.
+type Greeter struct {
+    Name string
+}
+
+// Hello returns a greeting.
+func (g *Greeter) Hello() string {
+    return fmt.Sprintf("Hello, %s!", g.Name)
+}
+
+func main() {
+    g := &Greeter{Name: "World"}
+    fmt.Println(g.Hello())
+}

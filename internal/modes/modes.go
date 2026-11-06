@@ -3,6 +3,10 @@ package modes
 import (
 	"fmt"
 	"strings"
+	"sync"
+
+	"github.com/costa/polypod/internal/constants"
+	"github.com/costa/polypod/internal/types"
 )
 
 // Mode defines how the AI operates.
@@ -20,10 +24,10 @@ var AllModes = []Mode{ModeEdit, ModePlan, ModeAsk, ModeAuto}
 
 // State holds the current operational mode and thinking config.
 type State struct {
-	Current       Mode
-	ThinkTokens   int    // reasoning token budget (0 = default)
-	ThinkEnabled  bool   // extended thinking on/off
-	ArchitectMode bool   // use dual-model architect/editor
+	Current        Mode
+	ThinkTokens    int    // reasoning token budget (0 = default)
+	ThinkEnabled   bool   // extended thinking on/off
+	ArchitectMode  bool   // use dual-model architect/editor
 	ArchitectModel string // model for planning (empty = same)
 	EditorModel    string // model for editing (empty = same)
 }
@@ -137,4 +141,108 @@ func (s *State) ArchitectPrompt() string {
 4. Seu plano sera executado por um Editor que aplicara as mudancas.
 
 `
+}
+
+// ToPermissionMode converts the current mode to a PermissionMode.
+func (s *State) ToPermissionMode() types.PermissionMode {
+	switch s.Current {
+	case ModeAuto:
+		return types.ModeDontAsk
+	case ModePlan:
+		return types.ModePlan
+	case ModeAsk:
+		return types.ModeDefault
+	default:
+		return types.ModeDefault
+	}
+}
+
+// IsReadOnly returns true if the mode only allows read operations.
+func (s *State) IsReadOnly() bool {
+	return s.Current == ModePlan || s.Current == ModeAsk
+}
+
+// --- Plan Mode Simulator ---
+
+// PlanSimulator simulates destructive tool calls without executing them.
+type PlanSimulator struct {
+	mu        sync.Mutex
+	simulated []SimulationEntry
+	logger    interface{ Debug(string, ...any) }
+}
+
+// SimulationEntry records a simulated tool call.
+type SimulationEntry struct {
+	ToolName string
+	Args     map[string]any
+	Result   string
+}
+
+// NewPlanSimulator creates a plan simulator.
+func NewPlanSimulator(logger interface{ Debug(string, ...any) }) *PlanSimulator {
+	return &PlanSimulator{
+		simulated: make([]SimulationEntry, 0),
+		logger:    logger,
+	}
+}
+
+// SimulateToolCall intercepts a tool call and returns a simulated result.
+func (p *PlanSimulator) SimulateToolCall(toolName string, args map[string]any) (types.ToolResult, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	isDestructive := constants.IsDestructiveTool(toolName)
+	if !isDestructive {
+		return types.ToolResult{}, false // not intercepted
+	}
+
+	simResult := fmt.Sprintf("[PLAN] Operacao simulada: %s", toolName)
+	if path, ok := args["path"].(string); ok {
+		simResult += fmt.Sprintf(" em %s", path)
+	}
+	if cmd, ok := args["command"].(string); ok {
+		simResult += fmt.Sprintf(" — comando: %s", cmd)
+	}
+
+	entry := SimulationEntry{
+		ToolName: toolName,
+		Args:     args,
+		Result:   simResult,
+	}
+	p.simulated = append(p.simulated, entry)
+	if p.logger != nil {
+		p.logger.Debug("plan simulation", "tool", toolName)
+	}
+
+	return types.ToolResult{Content: simResult}, true
+}
+
+// GetSimulated returns all simulated entries.
+func (p *PlanSimulator) GetSimulated() []SimulationEntry {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	result := make([]SimulationEntry, len(p.simulated))
+	copy(result, p.simulated)
+	return result
+}
+
+// Reset clears the simulation log.
+func (p *PlanSimulator) Reset() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.simulated = p.simulated[:0]
+}
+
+// FormatPlanSummary returns a human-readable summary of simulated operations.
+func (p *PlanSimulator) FormatPlanSummary() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.simulated) == 0 {
+		return "Nenhuma operacao simulada."
+	}
+	summary := fmt.Sprintf("=== Plano de execucao (%d operacoes) ===\n\n", len(p.simulated))
+	for i, e := range p.simulated {
+		summary += fmt.Sprintf("%d. %s\n", i+1, e.Result)
+	}
+	return summary
 }

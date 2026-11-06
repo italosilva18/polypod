@@ -11,34 +11,26 @@ import (
 )
 
 type Config struct {
-	Server    ServerConfig    `yaml:"server"`
 	Database  DatabaseConfig  `yaml:"database"`
 	AI        AIConfig        `yaml:"ai"`
 	Data      DataConfig      `yaml:"data"`
 	Embedding EmbeddingConfig `yaml:"embedding"`
 	CLI       CLIConfig       `yaml:"cli"`
-	Telegram  TelegramConfig  `yaml:"telegram"`
-	WhatsApp  WhatsAppConfig  `yaml:"whatsapp"`
-	REST      RESTConfig      `yaml:"rest"`
-	Auth      AuthConfig      `yaml:"auth"`
-	Rate      RateConfig      `yaml:"rate"`
 	Log       LogConfig       `yaml:"log"`
 	// New modules
-	Providers []ProviderConfig `yaml:"providers"`
-	MCP       []MCPServerConf  `yaml:"mcp"`
-	Sandbox   SandboxConfig    `yaml:"sandbox"`
-	Scheduler SchedulerConfig  `yaml:"scheduler"`
-	Notify    NotifyConfig     `yaml:"notify"`
-	Plugins   PluginsConfig    `yaml:"plugins"`
-	Templates TemplatesConfig  `yaml:"templates"`
-	Hooks     []HookConfig     `yaml:"hooks"`
-	WebUI     WebUIConfig      `yaml:"webui"`
+	Providers   []ProviderConfig   `yaml:"providers"`
+	MCP         []MCPServerConf    `yaml:"mcp"`
+	Sandbox     SandboxConfig      `yaml:"sandbox"`
+	Scheduler   SchedulerConfig    `yaml:"scheduler"`
+	Templates   TemplatesConfig    `yaml:"templates"`
+	Hooks       []HookConfig       `yaml:"hooks"`
+	Permissions *PermissionsConfig `yaml:"permissions,omitempty"`
 }
 
 type HookConfig struct {
 	Name    string `yaml:"name"`
 	Event   string `yaml:"event"`
-	Type    string `yaml:"type"`    // "shell" or "http"
+	Type    string `yaml:"type"` // "shell" or "http"
 	Command string `yaml:"command"`
 	URL     string `yaml:"url"`
 	Matcher string `yaml:"matcher"`
@@ -46,14 +38,8 @@ type HookConfig struct {
 	Enabled bool   `yaml:"enabled"`
 }
 
-type WebUIConfig struct {
-	Enabled bool   `yaml:"enabled"`
-	Host    string `yaml:"host"`
-	Port    int    `yaml:"port"`
-}
-
 type ProviderConfig struct {
-	Name    string `yaml:"name"`    // "openai", "ollama", "anthropic", "google"
+	Name    string `yaml:"name"` // "openai", "ollama", "anthropic", "google"
 	BaseURL string `yaml:"base_url"`
 	APIKey  string `yaml:"api_key"`
 	Default bool   `yaml:"default"` // use as default provider
@@ -83,39 +69,14 @@ type SchedulerConfig struct {
 	DataFile string `yaml:"data_file"`
 }
 
-type NotifyConfig struct {
-	Webhook string `yaml:"webhook"` // webhook URL for notifications
-}
-
-type PluginsConfig struct {
-	Dir string `yaml:"dir"` // plugins directory
-}
-
 type TemplatesConfig struct {
 	Dir string `yaml:"dir"` // templates directory
 }
 
-type ServerConfig struct {
-	Host string `yaml:"host"`
-	Port int    `yaml:"port"`
-}
-
 type DatabaseConfig struct {
-	Enabled  bool   `yaml:"enabled"`
-	Driver   string `yaml:"driver"`   // "sqlite" | "postgres" (default: "postgres" for backwards compat)
-	Path     string `yaml:"path"`     // SQLite file path (only used when driver=sqlite)
-	Host     string `yaml:"host"`
-	Port     int    `yaml:"port"`
-	User     string `yaml:"user"`
-	Password string `yaml:"password"`
-	Name     string `yaml:"name"`
-	SSLMode  string `yaml:"sslmode"`
-	MaxConns int    `yaml:"max_conns"`
-}
-
-func (d DatabaseConfig) DSN() string {
-	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s",
-		d.User, d.Password, d.Host, d.Port, d.Name, d.SSLMode)
+	Enabled bool   `yaml:"enabled"`
+	Driver  string `yaml:"driver"` // "sqlite" (only supported driver in CLI build)
+	Path    string `yaml:"path"`   // SQLite file path
 }
 
 type AIConfig struct {
@@ -134,19 +95,6 @@ type EmbeddingConfig struct {
 	BaseURL string `yaml:"base_url"`
 }
 
-type TelegramConfig struct {
-	Enabled bool   `yaml:"enabled"`
-	Token   string `yaml:"token"`
-}
-
-type WhatsAppConfig struct {
-	Enabled    bool   `yaml:"enabled"`
-	APIURL     string `yaml:"api_url"`
-	MediaURL   string `yaml:"media_url"`
-	IDInstance string `yaml:"id_instance"`
-	APIToken   string `yaml:"api_token"`
-}
-
 type DataConfig struct {
 	Dir       string `yaml:"dir"`
 	AgentsDir string `yaml:"agents_dir"`
@@ -154,21 +102,6 @@ type DataConfig struct {
 
 type CLIConfig struct {
 	Enabled bool `yaml:"enabled"`
-}
-
-type RESTConfig struct {
-	Enabled bool     `yaml:"enabled"`
-	APIKeys []string `yaml:"api_keys"`
-}
-
-type AuthConfig struct {
-	TelegramAllowedIDs []int64  `yaml:"telegram_allowed_ids"`
-	WhatsAppAllowedNos []string `yaml:"whatsapp_allowed_numbers"`
-}
-
-type RateConfig struct {
-	RequestsPerMinute int `yaml:"requests_per_minute"`
-	BurstSize         int `yaml:"burst_size"`
 }
 
 type LogConfig struct {
@@ -200,30 +133,24 @@ func Load(path string) (*Config, error) {
 	}
 
 	setDefaults(cfg)
+	if err := cfg.Permissions.Validate(); err != nil {
+		return nil, fmt.Errorf("validating permissions: %w", err)
+	}
 	return cfg, nil
 }
 
 func setDefaults(cfg *Config) {
-	if cfg.Server.Host == "" {
-		cfg.Server.Host = "0.0.0.0"
+	if cfg.Permissions == nil {
+		cfg.Permissions = &PermissionsConfig{
+			Mode:        "bypassPermissions",
+			DefaultMode: "bypassPermissions",
+		}
 	}
-	if cfg.Server.Port == 0 {
-		cfg.Server.Port = 8080
+	if cfg.Database.Driver == "" {
+		cfg.Database.Driver = "sqlite"
 	}
-	if cfg.Database.Enabled && cfg.Database.Driver == "" {
-		cfg.Database.Driver = "postgres"
-	}
-	if cfg.Database.Driver == "sqlite" && cfg.Database.Path == "" {
+	if cfg.Database.Path == "" {
 		cfg.Database.Path = "data/polypod.db"
-	}
-	if cfg.Database.Port == 0 {
-		cfg.Database.Port = 5432
-	}
-	if cfg.Database.SSLMode == "" {
-		cfg.Database.SSLMode = "disable"
-	}
-	if cfg.Database.MaxConns == 0 {
-		cfg.Database.MaxConns = 10
 	}
 	if cfg.AI.Model == "" {
 		cfg.AI.Model = "deepseek-chat"
@@ -233,12 +160,6 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.AI.Temp == 0 {
 		cfg.AI.Temp = 0.3
-	}
-	if cfg.Rate.RequestsPerMinute == 0 {
-		cfg.Rate.RequestsPerMinute = 20
-	}
-	if cfg.Rate.BurstSize == 0 {
-		cfg.Rate.BurstSize = 5
 	}
 	if cfg.Data.Dir == "" {
 		cfg.Data.Dir = "data/conversations"
@@ -268,17 +189,8 @@ func setDefaults(cfg *Config) {
 	if cfg.Scheduler.DataFile == "" {
 		cfg.Scheduler.DataFile = "data/scheduler.json"
 	}
-	if cfg.Plugins.Dir == "" {
-		cfg.Plugins.Dir = "data/plugins"
-	}
 	if cfg.Templates.Dir == "" {
 		cfg.Templates.Dir = "templates"
-	}
-	if cfg.WebUI.Host == "" {
-		cfg.WebUI.Host = "127.0.0.1"
-	}
-	if cfg.WebUI.Port == 0 {
-		cfg.WebUI.Port = 8090
 	}
 	for i := range cfg.Hooks {
 		if cfg.Hooks[i].Timeout == 0 {

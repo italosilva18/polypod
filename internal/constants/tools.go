@@ -46,6 +46,7 @@ const (
 
 	// Planner
 	ToolTodoWrite = "todo_write"
+	ToolTodoRead  = "todo_read"
 	ToolPlanMode  = "plan_mode"
 
 	// Misc

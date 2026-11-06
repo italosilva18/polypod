@@ -11,14 +11,33 @@ import (
 	"time"
 
 	"github.com/atotto/clipboard"
+
+	"github.com/costa/polypod/internal/command"
+	"github.com/costa/polypod/internal/commitai"
+	"github.com/costa/polypod/internal/config"
+	pgit "github.com/costa/polypod/internal/git"
+	"github.com/costa/polypod/internal/initcmd"
+	"github.com/costa/polypod/internal/tracking"
 )
 
 // commandResult holds the output of a local slash command.
 type commandResult struct {
 	output       string
+	modelInput   string
 	handled      bool
 	quit         bool
 	clearDisplay bool // limpa m.messages quando true
+	// replaceMessages, when non-nil, replaces m.messages entirely.
+	// Used by /resume to load messages from a persisted session and by
+	// /rewind to drop the last N turns from the display.
+	replaceMessages []chatEntry
+	// openConfigForm asks the host model to display the interactive
+	// /config form overlay. Used by the bare "/config" invocation.
+	openConfigForm bool
+	// openModelPicker, when true, signals the Bubbletea model loop to
+	// open the interactive model picker overlay. Used by /model so the
+	// command both reports a status and brings up the picker.
+	openModelPicker bool
 }
 
 // processCommand checks if input is a slash command and executes it locally.
@@ -115,13 +134,120 @@ func processCommand(input string, deps commandDeps, messages []chatEntry) comman
 	case "/context":
 		return handleContext(deps, messages)
 
-	default:
-		return commandResult{
-			output: errorStyle.Render("comando desconhecido: ") +
-				cmdValueStyle.Render(cmd) + "\n" +
-				cmdLabelStyle.Render("digite /help para ver comandos"),
-			handled: true,
+	case "/cost":
+		return handleCost(deps)
+
+	case "/sessions":
+		return handleSessions(parts, deps)
+
+	case "/init":
+		return handleInit(parts)
+
+	case "/commit":
+		// Preserve the rest of the original input (with original case) as the message
+		var userMsg string
+		if len(parts) >= 2 {
+			userMsg = strings.TrimSpace(strings.TrimPrefix(input, parts[0]))
 		}
+		return handleCommit(deps, userMsg)
+
+	case "/diff":
+		return handleDiff(parts)
+
+	case "/compact":
+		return handleCompact(deps, messages)
+
+	case "/resume":
+		arg := ""
+		if len(parts) >= 2 {
+			arg = parts[1]
+		}
+		return handleResume(deps, arg)
+
+	case "/rewind":
+		arg := ""
+		if len(parts) >= 2 {
+			arg = parts[1]
+		}
+		return handleRewind(deps, messages, arg)
+
+	case "/permissions":
+		return handlePermissions(parts, deps)
+
+	case "/plan":
+		sub := ""
+		if len(parts) >= 2 {
+			sub = strings.ToLower(parts[1])
+		}
+		return handlePlan(deps, sub)
+
+	case "/doctor":
+		return handleDoctor(deps)
+
+	case "/mcp":
+		return handleMCP(parts, deps)
+
+	case "/hooks":
+		return handleHooks(parts, deps)
+
+	case "/files":
+		return handleFiles(deps)
+
+	case "/add-dir":
+		return handleAddDir(parts, deps)
+
+	case "/config":
+		return handleConfig(parts, input, deps)
+
+	case "/effort":
+		return handleEffort(parts, deps)
+
+	case "/branch":
+		return handleBranch(parts, deps, messages)
+
+	case "/usage":
+		return handleUsage(parts, deps)
+
+	case "/init-verifiers":
+		return handleInitVerifiers(parts)
+
+	default:
+		if deps.commandRegistry != nil {
+			name := strings.TrimPrefix(cmd, "/")
+			if registered, ok := deps.commandRegistry.Get(name); ok {
+				workingDir, err := os.Getwd()
+				if err != nil {
+					workingDir = "."
+				}
+				ctx := command.CommandContext{WorkingDir: workingDir}
+				args := parts[1:]
+				switch registered.Type {
+				case command.CommandPrompt:
+					if registered.GetPrompt == nil {
+						return commandResult{output: errorStyle.Render("comando sem gerador de prompt: /" + name), handled: true}
+					}
+					prompt, promptErr := registered.GetPrompt(args, ctx)
+					if promptErr != nil {
+						return commandResult{output: errorStyle.Render(promptErr.Error()), handled: true}
+					}
+					return commandResult{modelInput: prompt, handled: false}
+				case command.CommandLocal:
+					if registered.Execute == nil {
+						return commandResult{output: errorStyle.Render("comando sem executor: /" + name), handled: true}
+					}
+					result, execErr := registered.Execute(args, ctx)
+					if execErr != nil {
+						return commandResult{output: errorStyle.Render(execErr.Error()), handled: true}
+					}
+					if result == nil {
+						return commandResult{handled: true}
+					}
+					return commandResult{output: result.Display, handled: true}
+				}
+			}
+		}
+		// Unknown slash command falls through to the model as written.
+		return commandResult{handled: false}
 	}
 }
 
@@ -152,6 +278,28 @@ func helpText() string {
 		{"/project", "mostra arvore do projeto"},
 		{"/export [file]", "exporta conversa pra markdown"},
 		{"/context", "mostra info do contexto atual"},
+		{"/cost", "mostra custo detalhado da sessao"},
+		{"/sessions [search <q>]", "lista ou busca sessoes persistidas"},
+		{"/resume [id]", "lista ou carrega uma sessao persistida"},
+		{"/rewind [n]", "rebobina conversa em N pares de mensagens"},
+		{"/permissions [sub]", "gerencia regras de permissoes"},
+		{"/plan [on|off|show|execute]", "alterna/gerencia plan mode"},
+		{"/init [--force]", "bootstrap .polypod.md e estrutura do projeto"},
+		{"/commit [msg]", "commit git com mensagem AI-assistida"},
+		{"/diff [--staged|<file>]", "mostra diff git com cores"},
+		{"/review [target]", "code review AI (--staged, ranges, arquivo, --pr)"},
+		{"/security-review [target]", "review focado em seguranca (--staged, --full, arquivo)"},
+		{"/compact", "compacta historico da conversa via AI"},
+		{"/doctor", "relatorio de diagnostico do sistema"},
+		{"/mcp [sub]", "gerencia servidores MCP (list|status|tools|reconnect)"},
+		{"/hooks [sub]", "gerencia hooks (list|enable|disable|show)"},
+		{"/files", "arquivos no contexto atual"},
+		{"/add-dir <path>", "adiciona diretorio de trabalho extra"},
+		{"/config [get|set|save|reload]", "ver/editar config (sem args abre form)"},
+		{"/effort [low|med|high|max]", "ajusta nivel de raciocinio da AI"},
+		{"/branch [sub] [name]", "gerencia branches da conversa (new|switch|delete|tree)"},
+		{"/usage [model]", "mostra limites de uso e consumo por provider"},
+		{"/init-verifiers", "detecta e configura comandos de teste/lint do projeto"},
 		{"/quit", "sai do programa"},
 	}
 
@@ -235,7 +383,7 @@ func handleAgentSwitch(deps commandDeps, name string) commandResult {
 	}
 	deps.setAgent(name)
 	return commandResult{
-		output: notifySuccessStyle.Render("agente trocado: ") + cmdValueStyle.Render(name),
+		output:  notifySuccessStyle.Render("agente trocado: ") + cmdValueStyle.Render(name),
 		handled: true,
 	}
 }
@@ -301,7 +449,7 @@ func handleMemory(parts []string, deps commandDeps) commandResult {
 	case "search":
 		if len(parts) < 3 {
 			return commandResult{
-				output: cmdLabelStyle.Render("uso: ") + cmdValueStyle.Render("/memory search <query>"),
+				output:  cmdLabelStyle.Render("uso: ") + cmdValueStyle.Render("/memory search <query>"),
 				handled: true,
 			}
 		}
@@ -351,7 +499,7 @@ func handleMemorySearch(deps commandDeps, query string) commandResult {
 	}
 	if len(memories) == 0 {
 		return commandResult{
-			output: cmdLabelStyle.Render("nenhuma memoria encontrada para: ") + cmdValueStyle.Render(query),
+			output:  cmdLabelStyle.Render("nenhuma memoria encontrada para: ") + cmdValueStyle.Render(query),
 			handled: true,
 		}
 	}
@@ -374,12 +522,26 @@ func handleMemorySearch(deps commandDeps, query string) commandResult {
 }
 
 func handleModel(deps commandDeps) commandResult {
-	if deps.activeAgent == nil {
-		return commandResult{output: cmdLabelStyle.Render("servico AI nao disponivel"), handled: true}
+	// /model now opens the interactive model picker overlay so users
+	// can browse the full capabilities database and switch models in
+	// one place. When no setModel callback is wired we fall back to
+	// the old read-only behaviour, reporting the current model name.
+	if deps.setModel == nil {
+		current := ""
+		if deps.currentModel != nil {
+			current = deps.currentModel()
+		}
+		if current == "" && deps.activeAgent != nil {
+			current = deps.activeAgent()
+		}
+		return commandResult{
+			output:  cmdLabelStyle.Render("modelo atual: ") + cmdActiveStyle.Render(current),
+			handled: true,
+		}
 	}
 	return commandResult{
-		output: cmdLabelStyle.Render("agente ativo: ") + cmdActiveStyle.Render(deps.activeAgent()),
-		handled: true,
+		handled:         true,
+		openModelPicker: true,
 	}
 }
 
@@ -424,6 +586,17 @@ func handleSession(deps commandDeps) commandResult {
 	return commandResult{output: b.String(), handled: true}
 }
 
+func handleCost(deps commandDeps) commandResult {
+	if deps.costReport == nil {
+		return commandResult{output: cmdLabelStyle.Render("cost engine nao disponivel"), handled: true}
+	}
+	report := deps.costReport()
+	if report == "" {
+		return commandResult{output: cmdLabelStyle.Render("nenhum custo registrado nesta sessao"), handled: true}
+	}
+	return commandResult{output: report, handled: true}
+}
+
 // ── Power commands ──────────────────────────────────────────────────────────
 
 func handleCopy(messages []chatEntry) commandResult {
@@ -438,7 +611,7 @@ func handleCopy(messages []chatEntry) commandResult {
 			}
 			preview := truncate(messages[i].content, 60)
 			return commandResult{
-				output:  notifySuccessStyle.Render("copiado pro clipboard ") + cmdLabelStyle.Render("(" + preview + ")"),
+				output:  notifySuccessStyle.Render("copiado pro clipboard ") + cmdLabelStyle.Render("("+preview+")"),
 				handled: true,
 			}
 		}
@@ -587,7 +760,7 @@ func handleGit(sub string) commandResult {
 		shellCmd = "git status --short"
 	default:
 		return commandResult{
-			output: cmdLabelStyle.Render("uso: ") + cmdValueStyle.Render("/git [status|log|diff|branch]"),
+			output:  cmdLabelStyle.Render("uso: ") + cmdValueStyle.Render("/git [status|log|diff|branch]"),
 			handled: true,
 		}
 	}
@@ -729,6 +902,83 @@ func handleContext(deps commandDeps, messages []chatEntry) commandResult {
 	return commandResult{output: b.String(), handled: true}
 }
 
+func handleSessions(parts []string, deps commandDeps) commandResult {
+	if deps.listSessions == nil {
+		return commandResult{output: cmdLabelStyle.Render("session storage nao disponivel"), handled: true}
+	}
+
+	// /sessions search <query>
+	if len(parts) >= 3 && strings.ToLower(parts[1]) == "search" {
+		query := strings.Join(parts[2:], " ")
+		if deps.searchSessions == nil {
+			return commandResult{output: cmdLabelStyle.Render("busca de sessoes nao disponivel"), handled: true}
+		}
+		sessions, err := deps.searchSessions(query)
+		if err != nil {
+			return commandResult{output: errorStyle.Render(fmt.Sprintf("erro: %v", err)), handled: true}
+		}
+		if len(sessions) == 0 {
+			return commandResult{
+				output:  cmdLabelStyle.Render("nenhuma sessao encontrada para: ") + cmdValueStyle.Render(query),
+				handled: true,
+			}
+		}
+		return formatSessionsList("Resultados", sessions)
+	}
+
+	// /sessions [count]
+	count := 10
+	if len(parts) >= 2 {
+		fmt.Sscanf(parts[1], "%d", &count)
+	}
+
+	sessions, err := deps.listSessions(count)
+	if err != nil {
+		return commandResult{output: errorStyle.Render(fmt.Sprintf("erro: %v", err)), handled: true}
+	}
+	if len(sessions) == 0 {
+		return commandResult{
+			output: cmdLabelStyle.Render("nenhuma sessao persistida. use ") +
+				cmdValueStyle.Render("-c") +
+				cmdLabelStyle.Render(" ou ") +
+				cmdValueStyle.Render("-r <id>") +
+				cmdLabelStyle.Render(" para restaurar sessoes."),
+			handled: true,
+		}
+	}
+
+	return formatSessionsList("Sessoes", sessions)
+}
+
+func formatSessionsList(title string, sessions []sessionEntry) commandResult {
+	var b strings.Builder
+	b.WriteString(cmdTitleStyle.Render(title))
+	b.WriteString(cmdLabelStyle.Render(fmt.Sprintf(" (%d)", len(sessions))))
+	b.WriteString("\n\n")
+
+	for _, s := range sessions {
+		b.WriteString("  ")
+		b.WriteString(cmdBadgeStyle.Render(s.id))
+		b.WriteString("  ")
+		b.WriteString(cmdValueStyle.Render(s.title))
+		b.WriteString("\n")
+		b.WriteString("    ")
+		b.WriteString(subtleStyle.Render(fmt.Sprintf("%d msgs  %s", s.messages, s.updatedAt.Format("2006-01-02 15:04"))))
+		if s.preview != "" {
+			b.WriteString("\n    ")
+			b.WriteString(cmdPreviewStyle.Render(truncate(s.preview, 80)))
+		}
+		b.WriteString("\n\n")
+	}
+
+	b.WriteString(cmdLabelStyle.Render("  restaurar: "))
+	b.WriteString(cmdValueStyle.Render("polypod -r <id>"))
+	b.WriteString(cmdLabelStyle.Render("  continuar ultima: "))
+	b.WriteString(cmdValueStyle.Render("polypod -c"))
+
+	return commandResult{output: b.String(), handled: true}
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 func truncate(s string, maxLen int) string {
@@ -744,16 +994,132 @@ type memoryEntry struct {
 	content string
 }
 
+// sessionEntry is a simplified session representation for display.
+type sessionEntry struct {
+	id        string
+	title     string
+	messages  int
+	updatedAt time.Time
+	preview   string
+}
+
 // commandDeps holds function callbacks for slash commands.
 type commandDeps struct {
-	activeAgent    func() string
-	setAgent       func(name string)
-	listAgents     func() []string
-	listSkills     func() []string
-	listMemories   func() ([]memoryEntry, error)
-	searchMemories func(query string) ([]memoryEntry, error)
-	clearSession   func() error
-	sessionInfo    func() (string, int, error) // id, count, err
+	commandRegistry *command.Registry
+	activeAgent     func() string
+	setAgent        func(name string)
+	listAgents      func() []string
+	listSkills      func() []string
+	listMemories    func() ([]memoryEntry, error)
+	searchMemories  func(query string) ([]memoryEntry, error)
+	clearSession    func() error
+	sessionInfo     func() (string, int, error) // id, count, err
+	listSessions    func(count int) ([]sessionEntry, error)
+	searchSessions  func(query string) ([]sessionEntry, error)
+	costReport      func() string // returns formatted cost report from CostEngine
+
+	// sessionCost returns the current session total cost in USD. Used by
+	// the rich status bar. Optional.
+	sessionCost func() float64
+	// contextTokens returns the current (used, max) context window token
+	// counts. Used by the rich status bar. Optional.
+	contextTokens func() (used, max int)
+	// currentModel returns the model name currently selected for the
+	// active agent. Used by the rich status bar. Optional.
+	currentModel func() string
+	// setModel switches the underlying AI client's model. Optional;
+	// when nil, the /model command falls back to a read-only display
+	// and the model picker overlay is disabled.
+	setModel func(model string)
+	// generateCommitMsg calls the AI to produce a Conventional-Commits
+	// message from a staged diff prompt. Returns the raw message.
+	generateCommitMsg func(prompt string) (string, error)
+	// generateText runs a one-shot, history-less AI prompt and returns
+	// the raw response text. Used by /review and /security-review for
+	// non-streaming AI calls outside of the chat conversation.
+	generateText func(prompt string) (string, error)
+	// compactAvailable reports whether the compact service is wired in.
+	compactAvailable func() bool
+
+	// loadSession loads a persisted session by ID and returns its
+	// messages as chatEntry items in display order. Used by /resume.
+	loadSession func(id string) ([]chatEntry, error)
+	// truncateMessages drops the last n messages from the active
+	// conversation, persists the change, and returns the number actually
+	// removed. Used by /rewind.
+	truncateMessages func(n int) (int, error)
+
+	// permissionsList returns all configured permission rules, each tuple
+	// being (pattern, decision, source).
+	permissionsList func() [][3]string
+	// permissionsAdd adds a new rule with the given decision ("allow",
+	// "deny", or "ask") for the given tool pattern, persisting it to
+	// .polypod/settings.json.
+	permissionsAdd func(decision, pattern string) error
+	// permissionsRemove removes all rules matching the given tool pattern.
+	// Returns the number of rules removed.
+	permissionsRemove func(pattern string) (int, error)
+	// permissionsReset clears all in-memory rules and rewrites the
+	// .polypod/settings.json file to a clean slate.
+	permissionsReset func() error
+
+	// planCurrent returns the current mode name: "edit", "plan", "ask"
+	// or "auto".
+	planCurrent func() string
+	// planSet changes the mode; the first return value is a short
+	// description suitable for display.
+	planSet func(mode string) (string, error)
+	// planSummary returns a human-readable summary of the simulated
+	// operations recorded while in plan mode.
+	planSummary func() string
+	// planExecute switches back to edit mode and returns a summary of
+	// what would be executed. The actual execution of simulated actions
+	// depends on upstream wiring; by default this just drains the
+	// simulator.
+	planExecute func() (string, error)
+
+	// ── MCP management (for /mcp) ───────────────────────────────────
+	// listMCPServers returns a snapshot of configured/connected MCP
+	// servers with their transport and tool counts.
+	listMCPServers func() []mcpServerInfo
+	// reconnectMCP closes and re-opens the connection to a named server.
+	reconnectMCP func(name string) error
+
+	// ── Hooks management (for /hooks) ───────────────────────────────
+	// listHooks returns a snapshot of all registered legacy hooks.
+	listHooks func() []hookInfo
+	// setHookEnabled toggles a hook by name. Returns true if the hook
+	// was found and updated, false otherwise.
+	setHookEnabled func(name string, enabled bool) bool
+
+	// ── Session-local mutable state (for /files, /add-dir) ───────────
+	// sessionState holds runtime state that slash commands can mutate
+	// (tracked files, additional working dirs, etc.). Owned by the
+	// bubbletea model.
+	sessionState *cliSessionState
+
+	// modelBreakdown returns the per-model usage/cost breakdown from
+	// the active CostEngine. Used by /usage to render a per-provider
+	// summary. Optional.
+	modelBreakdown func() map[string]tracking.ModelCost
+
+	// ── Config (for /config) ────────────────────────────────────────
+	// configSnapshot returns the live *config.Config used by the
+	// running polypod instance. The form is read-only with respect to
+	// this pointer until the user explicitly applies/saves.
+	configSnapshot func() *config.Config
+	// configGet returns the current value of a dotted-path key, plus
+	// whether the key was recognised. Optional.
+	configGet func(key string) (string, bool)
+	// configSet writes a new value to a dotted-path key (in-memory),
+	// returning an error if the key/value is not valid.
+	configSet func(key, value string) error
+	// configSave persists the current in-memory config to disk.
+	configSave func() error
+	// configReload reloads the config from disk into memory.
+	configReload func() error
+	// configPath reports the on-disk path used by save/reload.
+	configPath func() string
 }
 
 // runShellCmd executes a shell command with a 15s timeout and returns its output.
@@ -770,6 +1136,404 @@ func runShellCmd(command string) (string, error) {
 	}
 
 	return strings.TrimRight(output, "\n"), err
+}
+
+// ── /init, /commit, /diff, /compact ─────────────────────────────────────────
+
+// handleInit bootstraps .polypod.md and the .polypod/ directory using the
+// initcmd package. Supports --force to re-run on already-inited projects.
+func handleInit(parts []string) commandResult {
+	wd, err := os.Getwd()
+	if err != nil {
+		return commandResult{
+			output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()),
+			handled: true,
+		}
+	}
+
+	force := false
+	for _, p := range parts[1:] {
+		if p == "--force" || p == "-f" {
+			force = true
+		}
+	}
+
+	mdPath := filepath.Join(wd, ".polypod.md")
+	polypodDir := filepath.Join(wd, ".polypod")
+	_, mdStatErr := os.Stat(mdPath)
+	_, dirStatErr := os.Stat(polypodDir)
+	mdExists := mdStatErr == nil
+	dirExists := dirStatErr == nil
+
+	if (mdExists || dirExists) && !force {
+		var b strings.Builder
+		b.WriteString(cmdTitleStyle.Render("Projeto ja inicializado"))
+		b.WriteString("\n\n")
+		b.WriteString("  ")
+		b.WriteString(cmdLabelStyle.Render(".polypod.md  "))
+		if mdExists {
+			b.WriteString(cmdActiveStyle.Render("presente"))
+		} else {
+			b.WriteString(cmdInactiveStyle.Render("ausente"))
+		}
+		b.WriteString("\n  ")
+		b.WriteString(cmdLabelStyle.Render(".polypod/    "))
+		if dirExists {
+			b.WriteString(cmdActiveStyle.Render("presente"))
+		} else {
+			b.WriteString(cmdInactiveStyle.Render("ausente"))
+		}
+		b.WriteString("\n\n")
+		b.WriteString(cmdLabelStyle.Render("  use "))
+		b.WriteString(cmdValueStyle.Render("/init --force"))
+		b.WriteString(cmdLabelStyle.Render(" para completar arquivos faltantes"))
+		return commandResult{output: b.String(), handled: true}
+	}
+
+	stack := initcmd.Detect(wd)
+	created, err := initcmd.WriteInit(wd, stack)
+	if err != nil {
+		return commandResult{
+			output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()),
+			handled: true,
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(cmdTitleStyle.Render("Projeto inicializado"))
+	b.WriteString("\n\n")
+
+	// Stack detection summary
+	rows := []struct{ label, value string }{}
+	if stack.Language != "" {
+		rows = append(rows, struct{ label, value string }{"linguagem", stack.Language})
+	}
+	if stack.Framework != "" {
+		rows = append(rows, struct{ label, value string }{"framework", stack.Framework})
+	}
+	if stack.BuildTool != "" {
+		rows = append(rows, struct{ label, value string }{"build", stack.BuildTool})
+	}
+	if stack.TestCmd != "" {
+		rows = append(rows, struct{ label, value string }{"testes", stack.TestCmd})
+	}
+	if stack.LintCmd != "" {
+		rows = append(rows, struct{ label, value string }{"lint", stack.LintCmd})
+	}
+
+	maxLabel := 0
+	for _, r := range rows {
+		if len(r.label) > maxLabel {
+			maxLabel = len(r.label)
+		}
+	}
+	for _, r := range rows {
+		padding := strings.Repeat(" ", maxLabel-len(r.label))
+		b.WriteString("  ")
+		b.WriteString(cmdLabelStyle.Render(r.label + padding + "  "))
+		b.WriteString(cmdValueStyle.Render(r.value))
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n")
+	if len(created) == 0 {
+		b.WriteString("  ")
+		b.WriteString(cmdLabelStyle.Render("nenhum arquivo novo criado (tudo ja existia)"))
+	} else {
+		b.WriteString("  ")
+		b.WriteString(cmdLabelStyle.Render(fmt.Sprintf("criados (%d):", len(created))))
+		b.WriteString("\n")
+		for _, f := range created {
+			rel, err := filepath.Rel(wd, f)
+			if err != nil {
+				rel = f
+			}
+			b.WriteString("  ")
+			b.WriteString(cmdBadgeStyle.Render("▸ "))
+			b.WriteString(cmdValueStyle.Render(rel))
+			b.WriteString("\n")
+		}
+	}
+
+	return commandResult{output: b.String(), handled: true}
+}
+
+// handleCommit creates a git commit, generating the message via AI when
+// no explicit message is provided by the user.
+func handleCommit(deps commandDeps, userMsg string) commandResult {
+	if !pgit.IsInsideRepo() {
+		return commandResult{
+			output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render("nao esta em um repositorio git"),
+			handled: true,
+		}
+	}
+
+	// If nothing staged, auto-stage everything so we have something to commit.
+	autoStaged := false
+	if !pgit.HasStagedChanges() {
+		if err := pgit.StageAll(); err != nil {
+			return commandResult{
+				output:  errorStyle.Render("erro ao stageing: ") + cmdLabelStyle.Render(err.Error()),
+				handled: true,
+			}
+		}
+		autoStaged = true
+		if !pgit.HasStagedChanges() {
+			return commandResult{
+				output:  cmdLabelStyle.Render("nenhuma mudanca para commitar (working tree limpo)"),
+				handled: true,
+			}
+		}
+	}
+
+	diff, changes, err := commitai.GetStagedDiff()
+	if err != nil {
+		return commandResult{
+			output:  errorStyle.Render("erro git diff: ") + cmdLabelStyle.Render(err.Error()),
+			handled: true,
+		}
+	}
+	if len(changes) == 0 {
+		return commandResult{
+			output:  cmdLabelStyle.Render("nenhum arquivo no staging area"),
+			handled: true,
+		}
+	}
+
+	// Determine commit message
+	message := strings.TrimSpace(userMsg)
+	aiUsed := false
+	if message == "" {
+		if deps.generateCommitMsg != nil {
+			prompt := commitai.GenerateCommitPrompt(diff, changes, false)
+			gen, gerr := deps.generateCommitMsg(prompt)
+			if gerr == nil && strings.TrimSpace(gen) != "" {
+				message = strings.TrimSpace(gen)
+				aiUsed = true
+			}
+		}
+		if message == "" {
+			// Fallback: heuristic message from file list.
+			scope := commitai.DetectScope(changes)
+			if scope != "" {
+				message = fmt.Sprintf("chore(%s): update %d file(s)", scope, len(changes))
+			} else {
+				message = fmt.Sprintf("chore: update %d file(s)", len(changes))
+			}
+		}
+	}
+
+	// Strip code fences/quotes that the model sometimes wraps around.
+	message = stripCommitMessageFences(message)
+
+	if err := pgit.CreateCommit(message); err != nil {
+		return commandResult{
+			output:  errorStyle.Render("erro git commit: ") + cmdLabelStyle.Render(err.Error()),
+			handled: true,
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(cmdTitleStyle.Render("Commit criado"))
+	b.WriteString("\n\n")
+	if autoStaged {
+		b.WriteString("  ")
+		b.WriteString(cmdBadgeStyle.Render("▸ "))
+		b.WriteString(cmdLabelStyle.Render("git add -A (auto)"))
+		b.WriteString("\n")
+	}
+	if aiUsed {
+		b.WriteString("  ")
+		b.WriteString(cmdBadgeStyle.Render("▸ "))
+		b.WriteString(cmdLabelStyle.Render("mensagem gerada pela AI"))
+		b.WriteString("\n")
+	}
+	b.WriteString("  ")
+	b.WriteString(cmdBadgeStyle.Render("▸ "))
+	b.WriteString(cmdLabelStyle.Render(fmt.Sprintf("%d arquivo(s) commitado(s)", len(changes))))
+	b.WriteString("\n\n")
+	b.WriteString(cmdLabelStyle.Render("  mensagem:"))
+	b.WriteString("\n    ")
+	b.WriteString(cmdValueStyle.Render(firstLine(message)))
+	if rest := tailLines(message); rest != "" {
+		b.WriteString("\n    ")
+		b.WriteString(cmdPreviewStyle.Render(rest))
+	}
+
+	return commandResult{output: b.String(), handled: true}
+}
+
+// handleDiff shows uncommitted diffs with ANSI color highlighting.
+func handleDiff(parts []string) commandResult {
+	if !pgit.IsInsideRepo() {
+		return commandResult{
+			output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render("nao esta em um repositorio git"),
+			handled: true,
+		}
+	}
+
+	staged := false
+	var targetFile string
+	for _, p := range parts[1:] {
+		switch p {
+		case "--staged", "--cached":
+			staged = true
+		default:
+			if !strings.HasPrefix(p, "-") {
+				targetFile = p
+			}
+		}
+	}
+
+	var args []string
+	args = append(args, "diff")
+	if staged {
+		args = append(args, "--cached")
+	}
+	if targetFile != "" {
+		args = append(args, "--", targetFile)
+	}
+
+	cmdStr := "git " + strings.Join(args, " ")
+	output, err := runShellCmd(cmdStr)
+	if err != nil && output == "" {
+		return commandResult{
+			output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()),
+			handled: true,
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(cmdLabelStyle.Render("$ "))
+	b.WriteString(cmdValueStyle.Render(cmdStr))
+	b.WriteString("\n\n")
+
+	if strings.TrimSpace(output) == "" {
+		b.WriteString(cmdLabelStyle.Render("(sem diferencas)"))
+		return commandResult{output: b.String(), handled: true}
+	}
+
+	// Colorize each line: + green, - red, @@ cyan, file headers bold.
+	for _, line := range strings.Split(output, "\n") {
+		switch {
+		case strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---"):
+			b.WriteString(cmdTitleStyle.Render(line))
+		case strings.HasPrefix(line, "@@"):
+			b.WriteString(cmdBadgeStyle.Render(line))
+		case strings.HasPrefix(line, "+"):
+			b.WriteString(diffAddStyle.Render(line))
+		case strings.HasPrefix(line, "-"):
+			b.WriteString(diffDelStyle.Render(line))
+		case strings.HasPrefix(line, "diff --git") || strings.HasPrefix(line, "index "):
+			b.WriteString(subtleStyle.Render(line))
+		default:
+			b.WriteString(cmdPreviewStyle.Render(line))
+		}
+		b.WriteString("\n")
+	}
+
+	return commandResult{output: strings.TrimRight(b.String(), "\n"), handled: true}
+}
+
+// handleCompact triggers context-window compaction. Right now the command
+// pipeline lacks a direct hook into the compact.CompactService; this handler
+// reports what a full compaction would do and asks the user to use auto-
+// compact (which is wired at the AI-service level) for actual summarization.
+func handleCompact(deps commandDeps, messages []chatEntry) commandResult {
+	// Rough token estimate: ~4 chars per token with a small overhead.
+	totalChars := 0
+	for _, m := range messages {
+		totalChars += len(m.content) + 4
+	}
+	estTokens := (totalChars * 4) / 12 // /4 for tokens, *4/3 for padding
+
+	var b strings.Builder
+	b.WriteString(cmdTitleStyle.Render("Compactacao de contexto"))
+	b.WriteString("\n\n")
+
+	rows := []struct{ label, value string }{
+		{"mensagens", fmt.Sprintf("%d", len(messages))},
+		{"tokens (est.)", fmt.Sprintf("~%d", estTokens)},
+	}
+	maxLabel := 0
+	for _, r := range rows {
+		if len(r.label) > maxLabel {
+			maxLabel = len(r.label)
+		}
+	}
+	for _, r := range rows {
+		padding := strings.Repeat(" ", maxLabel-len(r.label))
+		b.WriteString("  ")
+		b.WriteString(cmdLabelStyle.Render(r.label + padding + "  "))
+		b.WriteString(cmdValueStyle.Render(r.value))
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n")
+	if deps.compactAvailable != nil && deps.compactAvailable() {
+		b.WriteString("  ")
+		b.WriteString(cmdBadgeStyle.Render("▸ "))
+		b.WriteString(cmdLabelStyle.Render("auto-compact esta ativo; a AI ira resumir automaticamente quando o contexto encher"))
+		b.WriteString("\n")
+		b.WriteString("  ")
+		b.WriteString(cmdBadgeStyle.Render("▸ "))
+		b.WriteString(cmdLabelStyle.Render("para forcar agora, use "))
+		b.WriteString(cmdValueStyle.Render("/clear"))
+		b.WriteString(cmdLabelStyle.Render(" (apaga historico) ou aguarde o limite"))
+	} else {
+		b.WriteString("  ")
+		b.WriteString(cmdBadgeStyle.Render("▸ "))
+		b.WriteString(cmdLabelStyle.Render("servico de compact nao esta conectado neste build"))
+		b.WriteString("\n")
+		b.WriteString("  ")
+		b.WriteString(cmdBadgeStyle.Render("▸ "))
+		b.WriteString(cmdLabelStyle.Render("uma implementacao completa chamaria "))
+		b.WriteString(cmdValueStyle.Render("compact.CompactService.Compact()"))
+		b.WriteString("\n")
+		b.WriteString("  ")
+		b.WriteString(cmdBadgeStyle.Render("▸ "))
+		b.WriteString(cmdLabelStyle.Render("use "))
+		b.WriteString(cmdValueStyle.Render("/clear"))
+		b.WriteString(cmdLabelStyle.Render(" para limpar o historico manualmente"))
+	}
+
+	return commandResult{output: b.String(), handled: true}
+}
+
+// stripCommitMessageFences removes code fences and wrapping quotes that LLMs
+// sometimes add around the commit message.
+func stripCommitMessageFences(msg string) string {
+	msg = strings.TrimSpace(msg)
+	// Strip surrounding code fences
+	if strings.HasPrefix(msg, "```") {
+		if idx := strings.Index(msg, "\n"); idx >= 0 {
+			msg = msg[idx+1:]
+		}
+		msg = strings.TrimSuffix(msg, "```")
+		msg = strings.TrimSpace(msg)
+	}
+	// Strip surrounding quotes
+	if len(msg) >= 2 {
+		first, last := msg[0], msg[len(msg)-1]
+		if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+			msg = msg[1 : len(msg)-1]
+		}
+	}
+	return strings.TrimSpace(msg)
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+func tailLines(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return strings.TrimSpace(s[i+1:])
+	}
+	return ""
 }
 
 // buildTree recursively builds a tree representation of a directory.
@@ -825,5 +1589,752 @@ func buildTree(b *strings.Builder, dir string, prefix string, depth int, maxDept
 			b.WriteString(cmdPreviewStyle.Render(name))
 			b.WriteString("\n")
 		}
+	}
+}
+
+// fileExists is a small helper used by /init (and friends) to check
+// whether a given path is already present on disk.
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// shortID returns the first 8 characters of a session ID (or the full ID
+// if it's already short), stripping a leading "ses_" if present.
+func shortID(id string) string {
+	s := strings.TrimPrefix(id, "ses_")
+	if len(s) > 8 {
+		s = s[:8]
+	}
+	return s
+}
+
+// timeAgo formats the duration between t and now in a compact form
+// (e.g. "2h atras", "3d atras", "agora").
+func timeAgo(t time.Time) string {
+	if t.IsZero() {
+		return "?"
+	}
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "agora"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm atras", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh atras", int(d.Hours()))
+	case d < 30*24*time.Hour:
+		return fmt.Sprintf("%dd atras", int(d.Hours()/24))
+	default:
+		return t.Format("2006-01-02")
+	}
+}
+
+func parsePositiveInt(s string) (int, error) {
+	var n int
+	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
+		return 0, err
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("negative")
+	}
+	return n, nil
+}
+
+// stripMarkdown removes simple markdown emphasis markers for clean display.
+func stripMarkdown(s string) string {
+	s = strings.ReplaceAll(s, "**", "")
+	s = strings.ReplaceAll(s, "__", "")
+	s = strings.ReplaceAll(s, "`", "")
+	return s
+}
+
+// ── /resume ─────────────────────────────────────────────────────────────────
+
+// handleResume lists recent persisted sessions or loads a specific one by
+// ID (or 1-based index into the listing) into the current conversation.
+func handleResume(deps commandDeps, arg string) commandResult {
+	if deps.listSessions == nil {
+		return commandResult{
+			output:  cmdLabelStyle.Render("armazenamento de sessoes nao disponivel"),
+			handled: true,
+		}
+	}
+
+	sessions, err := deps.listSessions(10)
+	if err != nil {
+		return commandResult{
+			output:  errorStyle.Render(fmt.Sprintf("erro: %v", err)),
+			handled: true,
+		}
+	}
+	if len(sessions) == 0 {
+		return commandResult{
+			output:  cmdLabelStyle.Render("nenhuma sessao persistida encontrada"),
+			handled: true,
+		}
+	}
+
+	// No arg: show the interactive list.
+	if arg == "" {
+		return formatResumeList(sessions)
+	}
+
+	// Arg might be a 1-based index into the list or a (possibly short) ID.
+	target := ""
+	if n, err := parsePositiveInt(arg); err == nil && n >= 1 && n <= len(sessions) {
+		target = sessions[n-1].id
+	} else {
+		for _, s := range sessions {
+			if s.id == arg || strings.HasPrefix(s.id, arg) ||
+				strings.HasPrefix(shortID(s.id), arg) {
+				target = s.id
+				break
+			}
+		}
+	}
+
+	if target == "" {
+		return commandResult{
+			output: errorStyle.Render("sessao nao encontrada: ") +
+				cmdValueStyle.Render(arg),
+			handled: true,
+		}
+	}
+
+	if deps.loadSession == nil {
+		return commandResult{
+			output:  cmdLabelStyle.Render("carregamento de sessao nao disponivel"),
+			handled: true,
+		}
+	}
+
+	entries, err := deps.loadSession(target)
+	if err != nil {
+		return commandResult{
+			output:  errorStyle.Render(fmt.Sprintf("erro ao carregar: %v", err)),
+			handled: true,
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(notifySuccessStyle.Render("sessao restaurada: "))
+	b.WriteString(cmdValueStyle.Render(shortID(target)))
+	b.WriteString(cmdLabelStyle.Render(fmt.Sprintf(" (%d mensagens)", len(entries))))
+
+	return commandResult{
+		output:          b.String(),
+		handled:         true,
+		replaceMessages: entries,
+	}
+}
+
+func formatResumeList(sessions []sessionEntry) commandResult {
+	var b strings.Builder
+	b.WriteString(cmdTitleStyle.Render("Sessoes recentes"))
+	b.WriteString("\n\n")
+
+	for i, s := range sessions {
+		b.WriteString("  ")
+		b.WriteString(cmdLabelStyle.Render(fmt.Sprintf("%2d.", i+1)))
+		b.WriteString(" ")
+		b.WriteString(cmdBadgeStyle.Render(shortID(s.id)))
+		b.WriteString("  ")
+		b.WriteString(subtleStyle.Render(timeAgo(s.updatedAt)))
+		b.WriteString("  ")
+		b.WriteString(subtleStyle.Render(fmt.Sprintf("%d msgs", s.messages)))
+		b.WriteString("\n      ")
+		title := s.title
+		if title == "" {
+			title = s.preview
+		}
+		if title == "" {
+			title = "(sem titulo)"
+		}
+		b.WriteString(cmdPreviewStyle.Render(truncate(title, 72)))
+		b.WriteString("\n\n")
+	}
+
+	b.WriteString(cmdLabelStyle.Render("  use "))
+	b.WriteString(cmdValueStyle.Render("/resume <numero|id>"))
+	b.WriteString(cmdLabelStyle.Render(" para restaurar uma sessao"))
+
+	return commandResult{output: strings.TrimRight(b.String(), "\n"), handled: true}
+}
+
+// ── /rewind ─────────────────────────────────────────────────────────────────
+
+// handleRewind rewinds the conversation by N user+assistant pairs.
+// With no argument, shows the last 10 message pairs with numbers.
+func handleRewind(deps commandDeps, messages []chatEntry, arg string) commandResult {
+	// Count only user and assistant messages for pair accounting.
+	var pairs [][2]int // user index, assistant index (−1 if no reply yet)
+	lastUser := -1
+	for i, m := range messages {
+		switch m.role {
+		case "user":
+			if lastUser >= 0 {
+				pairs = append(pairs, [2]int{lastUser, -1})
+			}
+			lastUser = i
+		case "assistant":
+			if lastUser >= 0 {
+				pairs = append(pairs, [2]int{lastUser, i})
+				lastUser = -1
+			}
+		}
+	}
+	if lastUser >= 0 {
+		pairs = append(pairs, [2]int{lastUser, -1})
+	}
+
+	// No arg: preview the last 10 pairs.
+	if arg == "" {
+		if len(pairs) == 0 {
+			return commandResult{
+				output:  cmdLabelStyle.Render("nenhuma troca de mensagens ainda"),
+				handled: true,
+			}
+		}
+
+		start := 0
+		if len(pairs) > 10 {
+			start = len(pairs) - 10
+		}
+
+		var b strings.Builder
+		b.WriteString(cmdTitleStyle.Render("Ultimos turnos"))
+		b.WriteString(cmdLabelStyle.Render(fmt.Sprintf(" (%d)", len(pairs)-start)))
+		b.WriteString("\n\n")
+
+		for i := start; i < len(pairs); i++ {
+			num := len(pairs) - i
+			p := pairs[i]
+			b.WriteString("  ")
+			b.WriteString(cmdLabelStyle.Render(fmt.Sprintf("-%d.", num)))
+			b.WriteString(" ")
+			userMsg := truncate(strings.ReplaceAll(messages[p[0]].content, "\n", " "), 60)
+			b.WriteString(cmdValueStyle.Render("> "))
+			b.WriteString(cmdPreviewStyle.Render(userMsg))
+			b.WriteString("\n")
+			if p[1] >= 0 {
+				asst := truncate(strings.ReplaceAll(messages[p[1]].content, "\n", " "), 60)
+				b.WriteString("      ")
+				b.WriteString(cmdBadgeStyle.Render("← "))
+				b.WriteString(cmdPreviewStyle.Render(asst))
+				b.WriteString("\n")
+			}
+		}
+
+		b.WriteString("\n")
+		b.WriteString(cmdLabelStyle.Render("  use "))
+		b.WriteString(cmdValueStyle.Render("/rewind <n>"))
+		b.WriteString(cmdLabelStyle.Render(" para remover os ultimos N pares"))
+		return commandResult{output: strings.TrimRight(b.String(), "\n"), handled: true}
+	}
+
+	// Parse N.
+	n, err := parsePositiveInt(arg)
+	if err != nil || n <= 0 {
+		return commandResult{
+			output: cmdLabelStyle.Render("uso: ") +
+				cmdValueStyle.Render("/rewind <n>"),
+			handled: true,
+		}
+	}
+
+	if n > len(pairs) {
+		return commandResult{
+			output: errorStyle.Render("nao ha ") +
+				cmdValueStyle.Render(fmt.Sprintf("%d", n)) +
+				errorStyle.Render(" pares para remover (temos ") +
+				cmdValueStyle.Render(fmt.Sprintf("%d", len(pairs))) +
+				errorStyle.Render(")"),
+			handled: true,
+		}
+	}
+
+	// Determine the first message index that will be cut away.
+	cutFrom := pairs[len(pairs)-n][0]
+	removedCount := len(messages) - cutFrom
+	kept := append([]chatEntry{}, messages[:cutFrom]...)
+
+	// Persist the truncation in the conversation store if wired.
+	if deps.truncateMessages != nil {
+		if _, terr := deps.truncateMessages(removedCount); terr != nil {
+			return commandResult{
+				output: errorStyle.Render("aviso: ") +
+					cmdLabelStyle.Render(fmt.Sprintf("falha ao persistir rewind: %v", terr)),
+				handled:         true,
+				replaceMessages: kept,
+			}
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(notifySuccessStyle.Render("rewind aplicado"))
+	b.WriteString("\n\n")
+	b.WriteString("  ")
+	b.WriteString(cmdLabelStyle.Render("pares removidos:     "))
+	b.WriteString(cmdValueStyle.Render(fmt.Sprintf("%d", n)))
+	b.WriteString("\n  ")
+	b.WriteString(cmdLabelStyle.Render("mensagens cortadas:  "))
+	b.WriteString(cmdValueStyle.Render(fmt.Sprintf("%d", removedCount)))
+	b.WriteString("\n  ")
+	b.WriteString(cmdLabelStyle.Render("restantes:           "))
+	b.WriteString(cmdValueStyle.Render(fmt.Sprintf("%d", len(kept))))
+
+	return commandResult{
+		output:          b.String(),
+		handled:         true,
+		replaceMessages: kept,
+	}
+}
+
+// ── /permissions ────────────────────────────────────────────────────────────
+
+// handlePermissions dispatches the /permissions subcommand.
+func handlePermissions(parts []string, deps commandDeps) commandResult {
+	if deps.permissionsList == nil {
+		return commandResult{
+			output:  cmdLabelStyle.Render("sistema de permissoes nao disponivel"),
+			handled: true,
+		}
+	}
+
+	sub := "list"
+	if len(parts) >= 2 {
+		sub = strings.ToLower(parts[1])
+	}
+
+	switch sub {
+	case "list", "":
+		return handlePermissionsList(deps)
+
+	case "allow", "deny", "ask":
+		if len(parts) < 3 {
+			return commandResult{
+				output: cmdLabelStyle.Render("uso: ") +
+					cmdValueStyle.Render("/permissions "+sub+" <tool> [pattern]"),
+				handled: true,
+			}
+		}
+		pattern := parts[2]
+		if len(parts) > 3 {
+			pattern = strings.Join(parts[2:], " ")
+		}
+		if deps.permissionsAdd == nil {
+			return commandResult{
+				output:  cmdLabelStyle.Render("permissionsAdd nao disponivel"),
+				handled: true,
+			}
+		}
+		if err := deps.permissionsAdd(sub, pattern); err != nil {
+			return commandResult{
+				output:  errorStyle.Render(fmt.Sprintf("erro: %v", err)),
+				handled: true,
+			}
+		}
+		return commandResult{
+			output: notifySuccessStyle.Render("regra adicionada: ") +
+				cmdValueStyle.Render(sub+" "+pattern),
+			handled: true,
+		}
+
+	case "remove", "rm", "del":
+		if len(parts) < 3 {
+			return commandResult{
+				output: cmdLabelStyle.Render("uso: ") +
+					cmdValueStyle.Render("/permissions remove <tool>"),
+				handled: true,
+			}
+		}
+		if deps.permissionsRemove == nil {
+			return commandResult{
+				output:  cmdLabelStyle.Render("permissionsRemove nao disponivel"),
+				handled: true,
+			}
+		}
+		removed, err := deps.permissionsRemove(parts[2])
+		if err != nil {
+			return commandResult{
+				output:  errorStyle.Render(fmt.Sprintf("erro: %v", err)),
+				handled: true,
+			}
+		}
+		return commandResult{
+			output: notifySuccessStyle.Render(fmt.Sprintf("regras removidas: %d ", removed)) +
+				cmdLabelStyle.Render("para ") +
+				cmdValueStyle.Render(parts[2]),
+			handled: true,
+		}
+
+	case "reset":
+		if deps.permissionsReset == nil {
+			return commandResult{
+				output:  cmdLabelStyle.Render("permissionsReset nao disponivel"),
+				handled: true,
+			}
+		}
+		if err := deps.permissionsReset(); err != nil {
+			return commandResult{
+				output:  errorStyle.Render(fmt.Sprintf("erro: %v", err)),
+				handled: true,
+			}
+		}
+		return commandResult{
+			output:  notifySuccessStyle.Render("permissoes resetadas ao padrao"),
+			handled: true,
+		}
+
+	default:
+		return commandResult{
+			output: cmdLabelStyle.Render("uso: ") +
+				cmdValueStyle.Render("/permissions [list|allow|deny|ask|remove|reset]"),
+			handled: true,
+		}
+	}
+}
+
+func handlePermissionsList(deps commandDeps) commandResult {
+	rules := deps.permissionsList()
+
+	allow := map[string]string{}
+	deny := map[string]string{}
+	ask := map[string]string{}
+
+	for _, r := range rules {
+		pattern, decision, source := r[0], r[1], r[2]
+		label := pattern
+		if source != "" {
+			label = pattern + "  [" + source + "]"
+		}
+		switch decision {
+		case "allow":
+			allow[pattern] = label
+		case "deny":
+			deny[pattern] = label
+		case "ask":
+			ask[pattern] = label
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(cmdTitleStyle.Render("Permissoes"))
+	b.WriteString("\n\n")
+
+	writeSection := func(title string, section map[string]string) {
+		b.WriteString("  ")
+		b.WriteString(cmdTopicStyle.Render(title + ":"))
+		b.WriteString("\n")
+		if len(section) == 0 {
+			b.WriteString("    ")
+			b.WriteString(cmdLabelStyle.Render("(nenhum)"))
+			b.WriteString("\n")
+			return
+		}
+		keys := make([]string, 0, len(section))
+		for k := range section {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			b.WriteString("    ")
+			b.WriteString(cmdBadgeStyle.Render("- "))
+			b.WriteString(cmdValueStyle.Render(section[k]))
+			b.WriteString("\n")
+		}
+	}
+
+	writeSection("ALLOW", allow)
+	b.WriteString("\n")
+	writeSection("ASK", ask)
+	b.WriteString("\n")
+	writeSection("DENY", deny)
+
+	b.WriteString("\n")
+	b.WriteString(cmdLabelStyle.Render("  uso: "))
+	b.WriteString(cmdValueStyle.Render("/permissions allow|deny|ask <tool>"))
+
+	return commandResult{output: strings.TrimRight(b.String(), "\n"), handled: true}
+}
+
+// ── /plan ───────────────────────────────────────────────────────────────────
+
+// handlePlan toggles and inspects plan mode.
+func handlePlan(deps commandDeps, sub string) commandResult {
+	if deps.planCurrent == nil {
+		return commandResult{
+			output:  cmdLabelStyle.Render("plan mode nao disponivel"),
+			handled: true,
+		}
+	}
+
+	switch sub {
+	case "", "status":
+		return handlePlanStatus(deps)
+
+	case "on":
+		if deps.planSet == nil {
+			return commandResult{
+				output:  cmdLabelStyle.Render("planSet nao disponivel"),
+				handled: true,
+			}
+		}
+		desc, err := deps.planSet("plan")
+		if err != nil {
+			return commandResult{
+				output:  errorStyle.Render(fmt.Sprintf("erro: %v", err)),
+				handled: true,
+			}
+		}
+		return commandResult{
+			output: notifySuccessStyle.Render("plan mode: ON") + "\n  " +
+				cmdLabelStyle.Render(stripMarkdown(desc)),
+			handled: true,
+		}
+
+	case "off":
+		if deps.planSet == nil {
+			return commandResult{
+				output:  cmdLabelStyle.Render("planSet nao disponivel"),
+				handled: true,
+			}
+		}
+		desc, err := deps.planSet("edit")
+		if err != nil {
+			return commandResult{
+				output:  errorStyle.Render(fmt.Sprintf("erro: %v", err)),
+				handled: true,
+			}
+		}
+		return commandResult{
+			output: notifySuccessStyle.Render("plan mode: OFF") + "\n  " +
+				cmdLabelStyle.Render(stripMarkdown(desc)),
+			handled: true,
+		}
+
+	case "show":
+		if deps.planSummary == nil {
+			return commandResult{
+				output:  cmdLabelStyle.Render("planSummary nao disponivel"),
+				handled: true,
+			}
+		}
+		summary := deps.planSummary()
+		if strings.TrimSpace(summary) == "" {
+			summary = "nenhuma operacao simulada ainda"
+		}
+		var b strings.Builder
+		b.WriteString(cmdTitleStyle.Render("Plano atual"))
+		b.WriteString("\n\n")
+		for _, line := range strings.Split(summary, "\n") {
+			b.WriteString("  ")
+			b.WriteString(cmdPreviewStyle.Render(line))
+			b.WriteString("\n")
+		}
+		return commandResult{output: strings.TrimRight(b.String(), "\n"), handled: true}
+
+	case "execute", "exec", "run":
+		if deps.planExecute == nil {
+			return commandResult{
+				output:  cmdLabelStyle.Render("planExecute nao disponivel"),
+				handled: true,
+			}
+		}
+		summary, err := deps.planExecute()
+		if err != nil {
+			return commandResult{
+				output:  errorStyle.Render(fmt.Sprintf("erro: %v", err)),
+				handled: true,
+			}
+		}
+		var b strings.Builder
+		b.WriteString(notifySuccessStyle.Render("plan mode: executando"))
+		b.WriteString("\n\n")
+		if strings.TrimSpace(summary) != "" {
+			for _, line := range strings.Split(summary, "\n") {
+				b.WriteString("  ")
+				b.WriteString(cmdPreviewStyle.Render(line))
+				b.WriteString("\n")
+			}
+		} else {
+			b.WriteString("  ")
+			b.WriteString(cmdLabelStyle.Render("(nada a executar)"))
+		}
+		return commandResult{output: strings.TrimRight(b.String(), "\n"), handled: true}
+
+	default:
+		return commandResult{
+			output: cmdLabelStyle.Render("uso: ") +
+				cmdValueStyle.Render("/plan [on|off|show|execute]"),
+			handled: true,
+		}
+	}
+}
+
+func handlePlanStatus(deps commandDeps) commandResult {
+	current := deps.planCurrent()
+
+	var b strings.Builder
+	b.WriteString(cmdTitleStyle.Render("Plan mode"))
+	b.WriteString("\n\n")
+	b.WriteString("  ")
+	b.WriteString(cmdLabelStyle.Render("modo atual:  "))
+	if current == "plan" {
+		b.WriteString(cmdActiveStyle.Render("● plan"))
+	} else {
+		b.WriteString(cmdInactiveStyle.Render("○ " + current))
+	}
+	b.WriteString("\n")
+
+	if deps.planSummary != nil {
+		summary := strings.TrimSpace(deps.planSummary())
+		if summary != "" {
+			b.WriteString("\n  ")
+			b.WriteString(cmdTopicStyle.Render("Operacoes simuladas:"))
+			b.WriteString("\n")
+			for _, line := range strings.Split(summary, "\n") {
+				b.WriteString("    ")
+				b.WriteString(cmdPreviewStyle.Render(line))
+				b.WriteString("\n")
+			}
+		}
+	}
+
+	b.WriteString("\n  ")
+	b.WriteString(cmdLabelStyle.Render("uso: "))
+	b.WriteString(cmdValueStyle.Render("/plan [on|off|show|execute]"))
+
+	return commandResult{output: strings.TrimRight(b.String(), "\n"), handled: true}
+}
+
+// ── /config ─────────────────────────────────────────────────────────────────
+
+// handleConfig implements the /config command. It supports:
+//
+//	/config              -> open the interactive form overlay
+//	/config get <key>    -> print the current value of a dotted-path key
+//	/config set <k> <v>  -> update a value in memory (does not persist)
+//	/config save         -> persist current in-memory config to disk
+//	/config reload       -> reread the config from disk
+func handleConfig(parts []string, rawInput string, deps commandDeps) commandResult {
+	if len(parts) == 1 {
+		// Bare /config: open the interactive form. The host model
+		// instantiates the overlay using the live config snapshot.
+		return commandResult{handled: true, openConfigForm: true}
+	}
+
+	sub := strings.ToLower(parts[1])
+	switch sub {
+	case "get":
+		if len(parts) < 3 {
+			return commandResult{
+				output:  cmdLabelStyle.Render("uso: ") + cmdValueStyle.Render("/config get <chave>"),
+				handled: true,
+			}
+		}
+		key := parts[2]
+		if deps.configGet == nil {
+			return commandResult{
+				output:  cmdLabelStyle.Render("acesso a config nao disponivel"),
+				handled: true,
+			}
+		}
+		val, ok := deps.configGet(key)
+		if !ok {
+			return commandResult{
+				output:  errorStyle.Render("chave desconhecida: ") + cmdValueStyle.Render(key),
+				handled: true,
+			}
+		}
+		var b strings.Builder
+		b.WriteString(cmdLabelStyle.Render(key + " = "))
+		if val == "" {
+			b.WriteString(cmdInactiveStyle.Render("(vazio)"))
+		} else {
+			b.WriteString(cmdValueStyle.Render(val))
+		}
+		return commandResult{output: b.String(), handled: true}
+
+	case "set":
+		if len(parts) < 4 {
+			return commandResult{
+				output:  cmdLabelStyle.Render("uso: ") + cmdValueStyle.Render("/config set <chave> <valor>"),
+				handled: true,
+			}
+		}
+		if deps.configSet == nil {
+			return commandResult{
+				output:  cmdLabelStyle.Render("escrita de config nao disponivel"),
+				handled: true,
+			}
+		}
+		key := parts[2]
+		// Preserve the rest of the original line as the value to allow
+		// values containing spaces (e.g. file paths).
+		value := strings.TrimSpace(strings.TrimPrefix(rawInput,
+			parts[0]+" "+parts[1]+" "+parts[2]))
+		if err := deps.configSet(key, value); err != nil {
+			return commandResult{
+				output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()),
+				handled: true,
+			}
+		}
+		var b strings.Builder
+		b.WriteString(notifySuccessStyle.Render("ok "))
+		b.WriteString(cmdLabelStyle.Render(key + " = "))
+		b.WriteString(cmdValueStyle.Render(value))
+		b.WriteString(cmdLabelStyle.Render("  (use "))
+		b.WriteString(cmdValueStyle.Render("/config save"))
+		b.WriteString(cmdLabelStyle.Render(" para persistir)"))
+		return commandResult{output: b.String(), handled: true}
+
+	case "save":
+		if deps.configSave == nil {
+			return commandResult{
+				output:  cmdLabelStyle.Render("salvar config nao disponivel"),
+				handled: true,
+			}
+		}
+		if err := deps.configSave(); err != nil {
+			return commandResult{
+				output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()),
+				handled: true,
+			}
+		}
+		path := ""
+		if deps.configPath != nil {
+			path = deps.configPath()
+		}
+		return commandResult{
+			output: notifySuccessStyle.Render("config salva ") +
+				cmdLabelStyle.Render(path),
+			handled: true,
+		}
+
+	case "reload":
+		if deps.configReload == nil {
+			return commandResult{
+				output:  cmdLabelStyle.Render("reload de config nao disponivel"),
+				handled: true,
+			}
+		}
+		if err := deps.configReload(); err != nil {
+			return commandResult{
+				output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()),
+				handled: true,
+			}
+		}
+		return commandResult{
+			output:  notifySuccessStyle.Render("config recarregada do disco"),
+			handled: true,
+		}
+	}
+
+	return commandResult{
+		output: cmdLabelStyle.Render("uso: ") +
+			cmdValueStyle.Render("/config [get|set|save|reload] [...]"),
+		handled: true,
 	}
 }

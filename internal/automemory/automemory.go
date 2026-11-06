@@ -15,16 +15,16 @@ import (
 type Fact struct {
 	Content   string    `json:"content"`
 	Category  string    `json:"category"` // "decision", "preference", "pattern", "context"
-	Source    string    `json:"source"`    // session ID or description
+	Source    string    `json:"source"`   // session ID or description
 	CreatedAt time.Time `json:"created_at"`
 	Relevance float64   `json:"relevance"` // 0-1
 }
 
 // Store manages auto-extracted memories.
 type Store struct {
-	dataDir string
-	facts   []Fact
-	logger  *slog.Logger
+	dataDir  string
+	facts    []Fact
+	logger   *slog.Logger
 	maxFacts int
 }
 

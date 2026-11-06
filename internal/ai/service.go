@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	"github.com/costa/polypod/internal/agent"
+	"github.com/costa/polypod/internal/compact"
 	"github.com/costa/polypod/internal/conversation"
 	"github.com/costa/polypod/internal/memory"
 )
@@ -32,12 +33,13 @@ type AnswerResponse struct {
 
 // Service orchestrates prompt building, knowledge retrieval, and AI completion.
 type Service struct {
-	client    *Client
-	knowledge KnowledgeSearcher
-	agentReg  *agent.Registry
-	agentName string
-	memStore  memory.Store
-	logger    *slog.Logger
+	client      *Client
+	knowledge   KnowledgeSearcher
+	agentReg    *agent.Registry
+	agentName   string
+	memStore    memory.Store
+	logger      *slog.Logger
+	autoCompact *compact.AutoCompactService
 }
 
 // NewService creates a new AI service.
@@ -65,9 +67,41 @@ func (s *Service) ActiveAgent() string {
 	return s.agentName
 }
 
+// SetModel switches the underlying client's model. Used by the
+// interactive model picker so users can swap models mid-session
+// without restarting polypod.
+func (s *Service) SetModel(model string) {
+	if s.client != nil {
+		s.client.SetModel(model)
+	}
+}
+
+// CurrentModel returns the model ID currently configured on the
+// underlying client. Returns "" when no client is wired.
+func (s *Service) CurrentModel() string {
+	if s.client == nil {
+		return ""
+	}
+	return s.client.Model()
+}
+
 // AgentRegistry returns the agent registry.
 func (s *Service) AgentRegistry() *agent.Registry {
 	return s.agentReg
+}
+
+// SetAutoCompact attaches an AutoCompactService to the AI service.
+// When set, buildMessages will check whether the conversation history needs
+// compaction before sending messages to the model.
+func (s *Service) SetAutoCompact(svc *compact.AutoCompactService) {
+	s.autoCompact = svc
+}
+
+// SetToolEventCallback sets a callback for tool lifecycle events on the
+// underlying client. This allows adapters (e.g. CLI) to display real-time
+// tool execution progress.
+func (s *Service) SetToolEventCallback(cb ToolEventCallback) {
+	s.client.SetToolEventCallback(cb)
 }
 
 // buildMessages assembles the full message list for a request.
@@ -95,8 +129,30 @@ func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) []ChatMe
 	systemPrompt := BuildSystemPrompt(ag.Persona, knowledgeCtx, memoryCtx)
 	messages := []ChatMessage{{Role: "system", Content: systemPrompt}}
 
+	// Auto-compact conversation history if needed
+	history := req.History
+	if s.autoCompact != nil && s.autoCompact.IsEnabled() {
+		tokenEstimate := compact.EstimateTokens(history)
+		if s.autoCompact.Check(tokenEstimate) {
+			s.logger.Info("auto-compacting conversation history",
+				"history_len", len(history),
+				"estimated_tokens", tokenEstimate,
+			)
+			compacted, err := s.autoCompact.CompactHistory(ctx, history)
+			if err != nil {
+				s.logger.Warn("auto-compact failed, using original history", "error", err)
+			} else {
+				s.logger.Info("auto-compact succeeded",
+					"original_messages", len(history),
+					"compacted_messages", len(compacted),
+				)
+				history = compacted
+			}
+		}
+	}
+
 	// Add conversation history
-	for _, m := range req.History {
+	for _, m := range history {
 		messages = append(messages, ChatMessage{
 			Role:    string(m.Role),
 			Content: m.Content,

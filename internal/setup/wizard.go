@@ -80,40 +80,16 @@ func Run(configPath string) error {
 	fmt.Println(cB + cW + "--- Ferramentas ---" + cR)
 	cfg.AI.Tools = askBool(scanner, "Habilitar tools (ler arquivos, executar comandos)?", true)
 
-	// --- Channels ---
+	// --- Channels (CLI-only build) ---
 	fmt.Println()
 	fmt.Println(cB + cW + "--- Canais ---" + cR)
-	fmt.Println(cW + "CLI ja vem habilitado." + cR)
-	fmt.Println()
-
-	// Telegram
-	if askBool(scanner, "Habilitar Telegram?", false) {
-		cfg.Telegram.Enabled = true
-		cfg.Telegram.Token = askSecret(scanner, "Token do bot:")
-	}
-
-	// WhatsApp
-	if askBool(scanner, "Habilitar WhatsApp (GREEN-API)?", false) {
-		cfg.WhatsApp.Enabled = true
-		cfg.WhatsApp.IDInstance = askString(scanner, "ID da instancia:", "")
-		cfg.WhatsApp.APIToken = askSecret(scanner, "Token da API:")
-	}
-
-	// REST
-	if askBool(scanner, "Habilitar API REST?", false) {
-		cfg.REST.Enabled = true
-		key := askString(scanner, "API key (Enter = gerar):", "")
-		if key == "" {
-			key = generateAPIKey()
-			fmt.Printf("%s  Chave gerada: %s%s\n", cW, key, cR)
-		}
-		cfg.REST.APIKeys = []string{key}
-	}
+	fmt.Println(cW + "CLI e o unico canal disponivel neste build." + cR)
+	cfg.CLI.Enabled = true
 
 	// --- Database ---
 	fmt.Println()
 	fmt.Println(cB + cW + "--- Armazenamento ---" + cR)
-	storageChoices := []string{"SQLite local (recomendado)", "PostgreSQL", "Nenhum (JSON local)"}
+	storageChoices := []string{"SQLite local (recomendado)", "Nenhum (JSON local)"}
 	storageIdx := askChoice(scanner, "Onde guardar conversas e dados?", storageChoices, 1)
 
 	switch storageIdx {
@@ -121,19 +97,7 @@ func Run(configPath string) error {
 		cfg.Database.Enabled = true
 		cfg.Database.Driver = "sqlite"
 		cfg.Database.Path = askString(scanner, "Caminho do banco SQLite:", "data/polypod.db")
-	case 2: // PostgreSQL
-		cfg.Database.Enabled = true
-		cfg.Database.Driver = "postgres"
-		cfg.Database.Host = askString(scanner, "Host:", "localhost")
-		portStr := askString(scanner, "Porta:", "5432")
-		cfg.Database.Port, _ = strconv.Atoi(portStr)
-		if cfg.Database.Port == 0 {
-			cfg.Database.Port = 5432
-		}
-		cfg.Database.User = askString(scanner, "Usuario:", "polypod")
-		cfg.Database.Password = askSecret(scanner, "Senha:")
-		cfg.Database.Name = askString(scanner, "Nome do banco:", "polypod")
-	case 3: // None
+	case 2: // None
 		cfg.Database.Enabled = false
 	}
 
@@ -147,23 +111,10 @@ func Run(configPath string) error {
 		fmt.Println(cW + "  Tools: desabilitadas" + cR)
 	}
 
-	var canais []string
-	canais = append(canais, "CLI")
-	if cfg.Telegram.Enabled {
-		canais = append(canais, "Telegram")
-	}
-	if cfg.WhatsApp.Enabled {
-		canais = append(canais, "WhatsApp")
-	}
-	if cfg.REST.Enabled {
-		canais = append(canais, "REST")
-	}
-	fmt.Printf("%s  Canais: %s%s\n", cW, strings.Join(canais, ", "), cR)
+	fmt.Printf("%s  Canais: CLI%s\n", cW, cR)
 
-	if cfg.Database.Enabled && cfg.Database.Driver == "sqlite" {
+	if cfg.Database.Enabled {
 		fmt.Printf("%s  Banco: SQLite (%s)%s\n", cW, cfg.Database.Path, cR)
-	} else if cfg.Database.Enabled {
-		fmt.Printf("%s  Banco: PostgreSQL %s@%s:%d/%s%s\n", cW, cfg.Database.User, cfg.Database.Host, cfg.Database.Port, cfg.Database.Name, cR)
 	} else {
 		fmt.Println(cW + "  Banco: desabilitado (JSON local)" + cR)
 	}

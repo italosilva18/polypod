@@ -58,3 +58,35 @@ func (m *Manager) ClearSession(ctx context.Context, sess *Session) error {
 	}
 	return nil
 }
+
+// TruncateMessages removes the last n messages from the session and persists.
+// Returns the messages that were removed (in original order). If n exceeds the
+// session length, all messages are removed.
+func (m *Manager) TruncateMessages(ctx context.Context, sess *Session, n int) ([]Message, error) {
+	if n <= 0 || len(sess.Messages) == 0 {
+		return nil, nil
+	}
+	if n > len(sess.Messages) {
+		n = len(sess.Messages)
+	}
+	cut := len(sess.Messages) - n
+	removed := make([]Message, n)
+	copy(removed, sess.Messages[cut:])
+	sess.Messages = sess.Messages[:cut]
+	if err := m.store.Save(ctx, sess); err != nil {
+		m.logger.Warn("failed to persist truncated session", "session", sess.ID, "error", err)
+		return removed, err
+	}
+	return removed, nil
+}
+
+// ReplaceMessages replaces the session messages wholesale and persists.
+// Used by /resume to load a persisted session into the active conversation.
+func (m *Manager) ReplaceMessages(ctx context.Context, sess *Session, msgs []Message) error {
+	sess.Messages = append(sess.Messages[:0], msgs...)
+	if err := m.store.Save(ctx, sess); err != nil {
+		m.logger.Warn("failed to persist replaced session", "session", sess.ID, "error", err)
+		return err
+	}
+	return nil
+}

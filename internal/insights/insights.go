@@ -9,13 +9,13 @@ import (
 
 // SessionData holds data for analysis.
 type SessionData struct {
-	Duration     time.Duration
-	Requests     int
-	Tokens       int
-	Cost         float64
-	ToolCalls    map[string]int // tool name → count
-	ErrorCount   int
-	TopFiles     map[string]int // file → edit count
+	Duration   time.Duration
+	Requests   int
+	Tokens     int
+	Cost       float64
+	ToolCalls  map[string]int // tool name → count
+	ErrorCount int
+	TopFiles   map[string]int // file → edit count
 }
 
 // GenerateInsightsPrompt creates an AI prompt to analyze session data.

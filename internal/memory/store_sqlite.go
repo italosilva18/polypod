@@ -72,6 +72,38 @@ func (s *SQLiteStore) Delete(ctx context.Context, topic string) error {
 	return nil
 }
 
+func (s *SQLiteStore) SaveWithMeta(ctx context.Context, mem Memory) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO memories (topic, content, created_at, updated_at)
+		 VALUES (?, ?, datetime('now'), datetime('now'))
+		 ON CONFLICT(topic) DO UPDATE SET content = excluded.content, updated_at = datetime('now')`,
+		mem.Topic, mem.Content,
+	)
+	if err != nil {
+		return fmt.Errorf("saving memory with meta: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) SearchRelevant(ctx context.Context, query string, maxResults int, minScore float64) ([]Memory, error) {
+	// Use Search as fallback and score in memory
+	memories, err := s.Search(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	var results []Memory
+	for _, m := range memories {
+		relevant, score := m.IsRelevant(query)
+		if relevant && score >= minScore {
+			results = append(results, m)
+		}
+	}
+	if maxResults > 0 && len(results) > maxResults {
+		results = results[:maxResults]
+	}
+	return results, nil
+}
+
 type scannable interface {
 	Scan(dest ...any) error
 }

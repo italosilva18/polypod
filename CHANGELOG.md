@@ -2,6 +2,15 @@
 
 All notable changes to Polypod will be documented in this file.
 
+## [0.6.0] - 2026-11-06
+
+### Changed
+- Wired `bypassPermissions` into the normal startup path.
+- Unrestricted mode now activates the permission manager, enforcer, TUI approval handler, and autonomous system prompt together.
+- Unrestricted mode is the default for generated and existing configurations without an explicit permission mode.
+- Unified the reported application, build, documentation, and MCP client version.
+- Kept the command sandbox disabled in the unrestricted profile.
+
 ## [0.5.0] - 2026-03-31
 
 ### Added

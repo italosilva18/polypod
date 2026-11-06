@@ -2,24 +2,49 @@ package ai
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"github.com/costa/polypod/internal/config"
+	"github.com/costa/polypod/internal/tracking"
 	openai "github.com/sashabaranov/go-openai"
 )
 
 // Client wraps the OpenAI-compatible API client for DeepSeek.
 type Client struct {
-	client     *openai.Client
-	model      string
-	maxTok     int
-	temp       float32
-	toolsOn    bool
-	skills     SkillRegistry
-	skillNames []string
+	client           *openai.Client
+	model            string
+	maxTok           int
+	temp             float32
+	toolsOn          bool
+	skills           SkillRegistry
+	skillNames       []string
+	costEngine       *tracking.CostEngine
+	toolEventCB      ToolEventCallback
+	streamingToolMgr *StreamingToolManager
+}
+
+// SetCostEngine attaches a CostEngine for automatic cost tracking on every
+// API call made through this client.
+func (c *Client) SetCostEngine(ce *tracking.CostEngine) {
+	c.costEngine = ce
+}
+
+// SetToolEventCallback sets a callback that is invoked for each tool
+// lifecycle event (start, complete, error) during streaming tool execution.
+func (c *Client) SetToolEventCallback(cb ToolEventCallback) {
+	c.toolEventCB = cb
+}
+
+// SetStreamingToolManager attaches a StreamingToolManager that enables
+// intelligent parallel execution of tool calls during streaming. When set,
+// read-only tools are executed concurrently while write tools run serially.
+func (c *Client) SetStreamingToolManager(stm *StreamingToolManager) {
+	c.streamingToolMgr = stm
 }
 
 // NewClient creates a DeepSeek client using OpenAI-compatible API.
@@ -39,6 +64,38 @@ func NewClient(cfg config.AIConfig, skills SkillRegistry) *Client {
 // SetSkillNames sets the active skill names for tool definitions.
 func (c *Client) SetSkillNames(names []string) {
 	c.skillNames = names
+}
+
+// Model returns the configured model name.
+func (c *Client) Model() string {
+	return c.model
+}
+
+// SetModel changes the model used for subsequent API calls.
+func (c *Client) SetModel(model string) {
+	if model == "" {
+		return
+	}
+	c.model = model
+}
+
+// MaxTokens returns the configured max tokens limit.
+func (c *Client) MaxTokens() int {
+	return c.maxTok
+}
+
+// Temperature returns the configured temperature.
+func (c *Client) Temperature() float32 {
+	return c.temp
+}
+
+// CreateChatCompletion sends a raw chat completion request to the underlying API
+// with retry logic. This is used by sub-agent executors that manage their own
+// tool-calling loop.
+func (c *Client) CreateChatCompletion(ctx context.Context, req openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+	return retry(ctx, func() (openai.ChatCompletionResponse, error) {
+		return c.client.CreateChatCompletion(ctx, req)
+	})
 }
 
 // ChatMessage mirrors openai.ChatCompletionMessage.
@@ -82,6 +139,10 @@ func (c *Client) Complete(ctx context.Context, messages []ChatMessage) (*ChatRes
 
 	if len(resp.Choices) == 0 {
 		return nil, fmt.Errorf("no choices in response")
+	}
+
+	if c.costEngine != nil {
+		c.costEngine.RecordCompletion(c.model, resp.Usage.PromptTokens, resp.Usage.CompletionTokens, 0, 0)
 	}
 
 	return &ChatResponse{
@@ -132,6 +193,10 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 		totalPrompt += resp.Usage.PromptTokens
 		totalCompletion += resp.Usage.CompletionTokens
 
+		if c.costEngine != nil {
+			c.costEngine.RecordCompletion(c.model, resp.Usage.PromptTokens, resp.Usage.CompletionTokens, 0, 0)
+		}
+
 		choice := resp.Choices[0]
 
 		if choice.FinishReason != openai.FinishReasonToolCalls || len(choice.Message.ToolCalls) == 0 {
@@ -151,6 +216,10 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 				"args", tc.Function.Arguments,
 				"iter", iter,
 			)
+
+			if c.costEngine != nil {
+				c.costEngine.RecordToolUse(tc.Function.Name, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+			}
 
 			result, execErr := c.skills.Execute(tc.Function.Name, tc.Function.Arguments)
 			if execErr != nil {
@@ -288,25 +357,160 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 		}
 		msgs = append(msgs, assistantMsg)
 
-		// Execute tool calls
-		for _, tc := range toolCalls {
-			logger.Debug("executing tool (stream)",
-				"tool", tc.Function.Name,
-				"args", tc.Function.Arguments,
+		// Execute tool calls — use StreamingToolManager for intelligent
+		// parallelism when available, fall back to sequential execution.
+		if c.streamingToolMgr != nil {
+			// Convert accumulated tool calls to ToolCallInfo
+			calls := make([]ToolCallInfo, 0, len(toolCalls))
+			for _, tc := range toolCalls {
+				calls = append(calls, ToolCallInfo{
+					ID:        tc.ID,
+					Name:      tc.Function.Name,
+					Arguments: tc.Function.Arguments,
+				})
+
+				// Fire ToolEventStart for each tool
+				if c.toolEventCB != nil {
+					var parsedArgs map[string]any
+					if err := json.Unmarshal([]byte(tc.Function.Arguments), &parsedArgs); err != nil {
+						parsedArgs = map[string]any{"raw": tc.Function.Arguments}
+					}
+					c.toolEventCB(ToolEvent{
+						Type:     ToolEventStart,
+						ToolName: tc.Function.Name,
+						ToolID:   tc.ID,
+						Args:     parsedArgs,
+					})
+				}
+
+				if c.costEngine != nil {
+					c.costEngine.RecordToolUse(tc.Function.Name, 0, 0)
+				}
+			}
+
+			// Execute with parallel partitioning
+			batchStart := time.Now()
+			results := c.streamingToolMgr.ExecuteToolCalls(ctx, calls)
+			batchElapsed := time.Since(batchStart)
+
+			logger.Debug("streaming tool batch complete",
+				"total", len(results),
+				"elapsed", batchElapsed,
 				"iter", iter,
 			)
 
-			result, execErr := c.skills.Execute(tc.Function.Name, tc.Function.Arguments)
-			if execErr != nil {
-				result = fmt.Sprintf("Erro executando tool: %v", execErr)
-			}
+			// Convert results back to messages
+			for _, r := range results {
+				content := r.Content
+				if r.IsError {
+					content = fmt.Sprintf("Erro executando tool: %s", r.Content)
+				}
 
-			msgs = append(msgs, openai.ChatCompletionMessage{
-				Role:       openai.ChatMessageRoleTool,
-				Content:    result,
-				Name:       tc.Function.Name,
-				ToolCallID: tc.ID,
-			})
+				// Fire ToolEventComplete/Error
+				if c.toolEventCB != nil {
+					if r.IsError {
+						c.toolEventCB(ToolEvent{
+							Type:     ToolEventError,
+							ToolName: r.Name,
+							ToolID:   r.ID,
+							Error:    r.Content,
+							Elapsed:  batchElapsed,
+						})
+					} else {
+						displayResult := r.Content
+						if len(displayResult) > 200 {
+							displayResult = displayResult[:197] + "..."
+						}
+						c.toolEventCB(ToolEvent{
+							Type:     ToolEventComplete,
+							ToolName: r.Name,
+							ToolID:   r.ID,
+							Result:   displayResult,
+							Elapsed:  batchElapsed,
+						})
+					}
+				}
+
+				msgs = append(msgs, openai.ChatCompletionMessage{
+					Role:       openai.ChatMessageRoleTool,
+					Content:    content,
+					Name:       r.Name,
+					ToolCallID: r.ID,
+				})
+			}
+		} else {
+			// Fallback: sequential execution
+			for _, tc := range toolCalls {
+				logger.Debug("executing tool (stream)",
+					"tool", tc.Function.Name,
+					"args", tc.Function.Arguments,
+					"iter", iter,
+				)
+
+				// Parse args for the tool event
+				var parsedArgs map[string]any
+				if err := json.Unmarshal([]byte(tc.Function.Arguments), &parsedArgs); err != nil {
+					parsedArgs = map[string]any{"raw": tc.Function.Arguments}
+				}
+
+				// Fire ToolEventStart
+				if c.toolEventCB != nil {
+					c.toolEventCB(ToolEvent{
+						Type:     ToolEventStart,
+						ToolName: tc.Function.Name,
+						ToolID:   tc.ID,
+						Args:     parsedArgs,
+					})
+				}
+
+				toolStart := time.Now()
+
+				if c.costEngine != nil {
+					c.costEngine.RecordToolUse(tc.Function.Name, 0, 0)
+				}
+
+				result, execErr := c.skills.Execute(tc.Function.Name, tc.Function.Arguments)
+
+				toolElapsed := time.Since(toolStart)
+
+				if execErr != nil {
+					result = fmt.Sprintf("Erro executando tool: %v", execErr)
+					// Fire ToolEventError
+					if c.toolEventCB != nil {
+						c.toolEventCB(ToolEvent{
+							Type:     ToolEventError,
+							ToolName: tc.Function.Name,
+							ToolID:   tc.ID,
+							Args:     parsedArgs,
+							Error:    execErr.Error(),
+							Elapsed:  toolElapsed,
+						})
+					}
+				} else {
+					// Fire ToolEventComplete
+					if c.toolEventCB != nil {
+						displayResult := result
+						if len(displayResult) > 200 {
+							displayResult = displayResult[:197] + "..."
+						}
+						c.toolEventCB(ToolEvent{
+							Type:     ToolEventComplete,
+							ToolName: tc.Function.Name,
+							ToolID:   tc.ID,
+							Args:     parsedArgs,
+							Result:   displayResult,
+							Elapsed:  toolElapsed,
+						})
+					}
+				}
+
+				msgs = append(msgs, openai.ChatCompletionMessage{
+					Role:       openai.ChatMessageRoleTool,
+					Content:    result,
+					Name:       tc.Function.Name,
+					ToolCallID: tc.ID,
+				})
+			}
 		}
 
 		// Notify callback that tool execution happened (optional separator)

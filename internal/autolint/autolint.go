@@ -13,23 +13,23 @@ import (
 
 // Config controls auto-lint/test behavior.
 type Config struct {
-	Enabled     bool   `yaml:"enabled"`
-	LintCmd     string `yaml:"lint_cmd"`
-	TestCmd     string `yaml:"test_cmd"`
-	MaxRetries  int    `yaml:"max_retries"`  // default: 3
-	AutoFix     bool   `yaml:"auto_fix"`     // feed errors back to AI
-	RunTests    bool   `yaml:"run_tests"`    // also run tests after lint
+	Enabled    bool   `yaml:"enabled"`
+	LintCmd    string `yaml:"lint_cmd"`
+	TestCmd    string `yaml:"test_cmd"`
+	MaxRetries int    `yaml:"max_retries"` // default: 3
+	AutoFix    bool   `yaml:"auto_fix"`    // feed errors back to AI
+	RunTests   bool   `yaml:"run_tests"`   // also run tests after lint
 }
 
 // Result of an auto-lint/test run.
 type Result struct {
-	LintPassed  bool
-	TestPassed  bool
-	LintOutput  string
-	TestOutput  string
-	LintCmd     string
-	TestCmd     string
-	FixPrompt   string // prompt for AI to fix errors (if AutoFix)
+	LintPassed bool
+	TestPassed bool
+	LintOutput string
+	TestOutput string
+	LintCmd    string
+	TestCmd    string
+	FixPrompt  string // prompt for AI to fix errors (if AutoFix)
 }
 
 // Runner executes lint/test after file changes.

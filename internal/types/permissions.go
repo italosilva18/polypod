@@ -20,6 +20,9 @@ const (
 	ModeBypass PermissionMode = "bypassPermissions"
 )
 
+// ModeAuto is the auto mode (YOLO mode) for auto-approving safe operations.
+const ModeAuto PermissionMode = "auto"
+
 // PermissionRuleSource indicates where a permission rule came from.
 type PermissionRuleSource string
 

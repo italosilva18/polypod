@@ -29,7 +29,8 @@ type Skill struct {
 
 // Registry holds all registered skills.
 type Registry struct {
-	skills map[string]*Skill
+	skills  map[string]*Skill
+	patches *PatchRegistry
 }
 
 // NewRegistry creates a registry with all built-in skills.
@@ -39,9 +40,22 @@ func NewRegistry() *Registry {
 	return r
 }
 
-// Get returns a skill by name.
+// SetPatchRegistry wires a PatchRegistry into the skill Registry so that
+// patches are applied transparently on every Get and ToolDefinitions call.
+func (r *Registry) SetPatchRegistry(pr *PatchRegistry) {
+	r.patches = pr
+}
+
+// Get returns a skill by name, with any runtime patches applied.
 func (r *Registry) Get(name string) (*Skill, bool) {
 	s, ok := r.skills[name]
+	if !ok {
+		return nil, false
+	}
+	if r.patches != nil {
+		patched := ApplyPatches(*s, r.patches)
+		return &patched, true
+	}
 	return s, ok
 }
 
@@ -66,12 +80,17 @@ func (r *Registry) ToolDefinitions(names []string) []openai.Tool {
 		if !ok {
 			continue
 		}
+		effective := s
+		if r.patches != nil {
+			patched := ApplyPatches(*s, r.patches)
+			effective = &patched
+		}
 		tools = append(tools, openai.Tool{
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
-				Name:        s.Name,
-				Description: s.Description,
-				Parameters:  s.Parameters,
+				Name:        effective.Name,
+				Description: effective.Description,
+				Parameters:  effective.Parameters,
 			},
 		})
 	}
@@ -217,6 +236,14 @@ func (r *Registry) registerBuiltins() {
 			return strings.Join(matches, "\n"), nil
 		},
 	})
+
+	// Bundled prompt-template skills (code review, test generation,
+	// documentation summarization, dependency audit). Each constructor
+	// returns a *Skill that wraps a structured prompt template.
+	r.Register(newCodeReviewSkill())
+	r.Register(newTestGenSkill())
+	r.Register(NewDocSummarySkill())
+	r.Register(newDepAuditSkill())
 }
 
 func truncate(s string) string {

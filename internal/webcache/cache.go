@@ -23,11 +23,11 @@ type CachedResult struct {
 
 // Cache stores web results on disk with TTL.
 type Cache struct {
-	mu       sync.RWMutex
-	dir      string
-	ttl      time.Duration
-	entries  map[string]*CachedResult
-	maxSize  int
+	mu      sync.RWMutex
+	dir     string
+	ttl     time.Duration
+	entries map[string]*CachedResult
+	maxSize int
 }
 
 // New creates a web cache.

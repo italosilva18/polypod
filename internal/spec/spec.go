@@ -21,11 +21,11 @@ type Spec struct {
 
 // Task is a single implementation step.
 type Task struct {
-	ID          int    `json:"id"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	Status      string `json:"status"` // "pending", "in_progress", "done"
-	Files       []string `json:"files"` // files to create/modify
+	ID          int      `json:"id"`
+	Title       string   `json:"title"`
+	Description string   `json:"description"`
+	Status      string   `json:"status"` // "pending", "in_progress", "done"
+	Files       []string `json:"files"`  // files to create/modify
 }
 
 // GenerateRequirementsPrompt creates an AI prompt to generate requirements from a description.

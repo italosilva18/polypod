@@ -26,8 +26,8 @@ type Trigger struct {
 
 // WatchConfig configures the file watcher.
 type WatchConfig struct {
-	Paths      []string // directories to watch (default: ["."])
-	Extensions []string // file extensions to watch (default: common code files)
+	Paths      []string      // directories to watch (default: ["."])
+	Extensions []string      // file extensions to watch (default: common code files)
 	Interval   time.Duration // poll interval (default: 2s)
 	IgnoreDirs []string
 }

@@ -129,6 +129,40 @@ func (m *Manager) AddRule(rule Rule) {
 	m.rules = append(m.rules, rule)
 }
 
+// Rules returns a copy of all configured permission rules.
+func (m *Manager) Rules() []Rule {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]Rule, len(m.rules))
+	copy(out, m.rules)
+	return out
+}
+
+// RemoveRulesForTool removes all rules whose pattern exactly matches toolName.
+// Returns the number of rules removed.
+func (m *Manager) RemoveRulesForTool(toolName string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var kept []Rule
+	removed := 0
+	for _, r := range m.rules {
+		if r.Pattern == toolName {
+			removed++
+			continue
+		}
+		kept = append(kept, r)
+	}
+	m.rules = kept
+	return removed
+}
+
+// ResetRules clears all in-memory permission rules.
+func (m *Manager) ResetRules() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rules = nil
+}
+
 // SetModeBlocked sets tools blocked by the current mode.
 func (m *Manager) SetModeBlocked(tools []string) {
 	m.mu.Lock()

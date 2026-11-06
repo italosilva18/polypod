@@ -40,20 +40,21 @@ func TestValidateGoodConfig(t *testing.T) {
 	}
 }
 
-func TestValidateInvalidPort(t *testing.T) {
+func TestValidateInvalidDriver(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.AI.APIKey = "sk-test"
-	cfg.Server.Port = 99999
+	cfg.Database.Enabled = true
+	cfg.Database.Driver = "postgres" // no longer supported in CLI build
 
 	errs := Validate(cfg)
-	hasPortError := false
+	hasDriverError := false
 	for _, e := range errs {
-		if e.Field == "server.port" {
-			hasPortError = true
+		if e.Field == "database.driver" {
+			hasDriverError = true
 		}
 	}
-	if !hasPortError {
-		t.Error("expected port validation error")
+	if !hasDriverError {
+		t.Error("expected database.driver validation error")
 	}
 }
 

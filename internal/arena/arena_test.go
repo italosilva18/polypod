@@ -16,7 +16,7 @@ type mockProvider struct {
 	delay    time.Duration
 }
 
-func (m *mockProvider) Name() string                  { return m.name }
+func (m *mockProvider) Name() string                   { return m.name }
 func (m *mockProvider) SupportsVision() bool           { return false }
 func (m *mockProvider) SupportsTools() bool            { return false }
 func (m *mockProvider) SupportsStructuredOutput() bool { return false }

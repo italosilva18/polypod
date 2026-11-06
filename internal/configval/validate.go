@@ -73,55 +73,25 @@ func Validate(cfg *config.Config) []ConfigError {
 		})
 	}
 
-	// Server config
-	if cfg.Server.Port < 1 || cfg.Server.Port > 65535 {
-		errs = append(errs, ConfigError{
-			Field:      "server.port",
-			Message:    fmt.Sprintf("porta invalida (%d)", cfg.Server.Port),
-			Suggestion: "use porta entre 1 e 65535",
-			Severity:   "error",
-		})
-	}
-
-	// Database
+	// Database (sqlite-only in CLI build)
 	if cfg.Database.Enabled {
-		validDrivers := map[string]bool{"sqlite": true, "postgres": true, "": true}
+		validDrivers := map[string]bool{"sqlite": true, "": true}
 		if !validDrivers[cfg.Database.Driver] {
 			errs = append(errs, ConfigError{
 				Field:      "database.driver",
 				Message:    fmt.Sprintf("driver desconhecido: %s", cfg.Database.Driver),
-				Suggestion: "use 'sqlite' ou 'postgres'",
+				Suggestion: "use 'sqlite' (unico driver suportado no build CLI)",
 				Severity:   "error",
 			})
 		}
 	}
 
-	// Channels — at least one enabled
-	if !cfg.CLI.Enabled && !cfg.REST.Enabled && !cfg.Telegram.Enabled && !cfg.WhatsApp.Enabled {
+	// CLI is the only channel in this build
+	if !cfg.CLI.Enabled {
 		errs = append(errs, ConfigError{
-			Field:      "channels",
-			Message:    "nenhum canal habilitado",
-			Suggestion: "habilite pelo menos cli.enabled: true",
-			Severity:   "warning",
-		})
-	}
-
-	// Telegram
-	if cfg.Telegram.Enabled && cfg.Telegram.Token == "" {
-		errs = append(errs, ConfigError{
-			Field:      "telegram.token",
-			Message:    "token vazio mas telegram habilitado",
-			Suggestion: "defina TELEGRAM_BOT_TOKEN",
-			Severity:   "error",
-		})
-	}
-
-	// Rate limiting
-	if cfg.Rate.RequestsPerMinute < 1 {
-		errs = append(errs, ConfigError{
-			Field:      "rate.requests_per_minute",
-			Message:    "requests_per_minute deve ser >= 1",
-			Suggestion: "use pelo menos 5",
+			Field:      "cli.enabled",
+			Message:    "CLI desabilitado em build CLI-only",
+			Suggestion: "habilite cli.enabled: true",
 			Severity:   "warning",
 		})
 	}
@@ -139,16 +109,16 @@ func Validate(cfg *config.Config) []ConfigError {
 		}
 		if m.Transport == "stdio" && m.Command == "" {
 			errs = append(errs, ConfigError{
-				Field:      fmt.Sprintf("mcp[%d].command", i),
-				Message:    "command vazio para transport stdio",
-				Severity:   "error",
+				Field:    fmt.Sprintf("mcp[%d].command", i),
+				Message:  "command vazio para transport stdio",
+				Severity: "error",
 			})
 		}
 		if (m.Transport == "sse" || m.Transport == "http") && m.URL == "" {
 			errs = append(errs, ConfigError{
-				Field:      fmt.Sprintf("mcp[%d].url", i),
-				Message:    "url vazio para transport sse/http",
-				Severity:   "error",
+				Field:    fmt.Sprintf("mcp[%d].url", i),
+				Message:  "url vazio para transport sse/http",
+				Severity: "error",
 			})
 		}
 	}

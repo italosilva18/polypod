@@ -16,11 +16,11 @@ import (
 
 var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(api[_-]?key|secret|password|token|credential)\s*[:=]\s*['"][^'"]{8,}['"]`),
-	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),                                    // AWS Access Key
-	regexp.MustCompile(`-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----`),          // Private keys
-	regexp.MustCompile(`ghp_[0-9a-zA-Z]{36}`),                                  // GitHub PAT
-	regexp.MustCompile(`sk-[0-9a-zA-Z]{32,}`),                                  // OpenAI/Stripe
-	regexp.MustCompile(`(?i)postgres://[^:]+:[^@]+@`),                           // DB connection strings
+	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),                            // AWS Access Key
+	regexp.MustCompile(`-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----`), // Private keys
+	regexp.MustCompile(`ghp_[0-9a-zA-Z]{36}`),                         // GitHub PAT
+	regexp.MustCompile(`sk-[0-9a-zA-Z]{32,}`),                         // OpenAI/Stripe
+	regexp.MustCompile(`(?i)postgres://[^:]+:[^@]+@`),                 // DB connection strings
 	regexp.MustCompile(`(?i)mongodb\+srv://[^:]+:[^@]+@`),
 }
 

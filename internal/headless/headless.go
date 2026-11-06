@@ -35,12 +35,12 @@ type Config struct {
 
 // Result is the structured output of a headless run.
 type Result struct {
-	Content   string  `json:"content"`
-	SessionID string  `json:"session_id"`
-	Model     string  `json:"model"`
-	CostUSD   float64 `json:"cost_usd"`
-	DurationMS int64  `json:"duration_ms"`
-	Tokens    struct {
+	Content    string  `json:"content"`
+	SessionID  string  `json:"session_id"`
+	Model      string  `json:"model"`
+	CostUSD    float64 `json:"cost_usd"`
+	DurationMS int64   `json:"duration_ms"`
+	Tokens     struct {
 		Prompt     int `json:"prompt"`
 		Completion int `json:"completion"`
 		Total      int `json:"total"`
@@ -110,8 +110,8 @@ func Run(ctx context.Context, cfg Config, handler adapter.MessageHandler, stream
 			}
 			if chunk.Done {
 				data, _ := json.Marshal(map[string]any{
-					"type":       "done",
-					"content":    content.String(),
+					"type":        "done",
+					"content":     content.String(),
 					"duration_ms": time.Since(start).Milliseconds(),
 				})
 				fmt.Println(string(data))

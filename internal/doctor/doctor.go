@@ -57,10 +57,7 @@ func RunDiagnostics(cfg *config.Config) []Check {
 	// 8. Templates
 	checks = append(checks, checkDir("Templates", cfg.Templates.Dir))
 
-	// 9. Plugins
-	checks = append(checks, checkDir("Plugins", cfg.Plugins.Dir))
-
-	// 10. MCP servers
+	// 9. MCP servers
 	for _, mcp := range cfg.MCP {
 		if mcp.Transport == "stdio" {
 			checks = append(checks, checkCommand("MCP: "+mcp.Name, mcp.Command, "--version"))

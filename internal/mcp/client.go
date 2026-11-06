@@ -26,25 +26,27 @@ type ServerConfig struct {
 
 // Manager manages multiple MCP server connections using the official SDK.
 type Manager struct {
-	mu       sync.RWMutex
-	sessions map[string]*mcpsdk.ClientSession
-	tools    map[string][]*mcpsdk.Tool
-	client   *mcpsdk.Client
-	logger   *slog.Logger
+	mu        sync.RWMutex
+	sessions  map[string]*mcpsdk.ClientSession
+	tools     map[string][]*mcpsdk.Tool
+	client    *mcpsdk.Client
+	logger    *slog.Logger
+	reconnect *ReconnectManager
 }
 
 // NewManager creates an MCP manager.
 func NewManager(logger *slog.Logger) *Manager {
 	client := mcpsdk.NewClient(&mcpsdk.Implementation{
 		Name:    "polypod",
-		Version: "0.4.0",
+		Version: "0.6.0",
 	}, nil)
 
 	return &Manager{
-		sessions: make(map[string]*mcpsdk.ClientSession),
-		tools:    make(map[string][]*mcpsdk.Tool),
-		client:   client,
-		logger:   logger,
+		sessions:  make(map[string]*mcpsdk.ClientSession),
+		tools:     make(map[string][]*mcpsdk.Tool),
+		client:    client,
+		logger:    logger,
+		reconnect: NewReconnectManager(DefaultReconnectConfig()),
 	}
 }
 
@@ -68,7 +70,12 @@ func (m *Manager) Connect(ctx context.Context, cfg ServerConfig) error {
 		return fmt.Errorf("mcp: transport desconhecido %q (use 'stdio' ou 'sse')", cfg.Transport)
 	}
 
-	session, err := m.client.Connect(ctx, transport, nil)
+	var session *mcpsdk.ClientSession
+	err := m.reconnect.Connect(ctx, cfg.Name, func(innerCtx context.Context) error {
+		var dialErr error
+		session, dialErr = m.client.Connect(innerCtx, transport, nil)
+		return dialErr
+	})
 	if err != nil {
 		return fmt.Errorf("mcp connect %s: %w", cfg.Name, err)
 	}
@@ -186,6 +193,70 @@ func (m *Manager) toolToSkill(serverName string, tool *mcpsdk.Tool, session *mcp
 	}
 }
 
+// CallTool implements MCPCaller so that Manager can be passed to WrapMCPTool.
+func (m *Manager) CallTool(ctx context.Context, server, name string, args map[string]any) (any, bool, error) {
+	m.mu.RLock()
+	session, ok := m.sessions[server]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, false, fmt.Errorf("mcp: servidor %q nao conectado", server)
+	}
+
+	result, err := session.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name:      name,
+		Arguments: args,
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("mcp call %s/%s: %w", server, name, err)
+	}
+
+	if result.IsError {
+		var errTexts []string
+		for _, c := range result.Content {
+			if tc, ok := c.(*mcpsdk.TextContent); ok {
+				errTexts = append(errTexts, tc.Text)
+			}
+		}
+		return nil, true, fmt.Errorf("mcp tool error: %s", strings.Join(errTexts, "; "))
+	}
+
+	var texts []string
+	for _, c := range result.Content {
+		if tc, ok := c.(*mcpsdk.TextContent); ok {
+			texts = append(texts, tc.Text)
+		}
+	}
+	return strings.Join(texts, "\n"), false, nil
+}
+
+// RegisterWrappedTools registers all MCP tools from connected servers into both
+// the skill registry (legacy) and a types.ToolRegistry (new-style tools).
+// Pass nil for typesReg to skip types.Tool registration.
+func (m *Manager) RegisterWrappedTools(reg *skill.Registry, typesReg ToolRegistry) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	count := 0
+	for serverName, tools := range m.tools {
+		session := m.sessions[serverName]
+		for _, tool := range tools {
+			// Legacy skill registration.
+			s := m.toolToSkill(serverName, tool, session)
+			reg.Register(s)
+
+			// New-style types.Tool registration via WrapMCPTool.
+			if typesReg != nil {
+				schema, _ := tool.InputSchema.(map[string]any)
+				wrapped := WrapMCPTool(m, serverName, tool.Name, tool.Description, schema)
+				typesReg.Register(wrapped)
+			}
+
+			count++
+		}
+	}
+	return count
+}
+
 // ListServers returns info about connected servers and their tools.
 func (m *Manager) ListServers() map[string][]string {
 	m.mu.RLock()
@@ -204,6 +275,8 @@ func (m *Manager) ListServers() map[string][]string {
 
 // Close disconnects all servers.
 func (m *Manager) Close() error {
+	m.reconnect.StopAll()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

@@ -33,7 +33,7 @@ func NewAnthropic(apiKey, baseURL string) *Anthropic {
 	}
 }
 
-func (a *Anthropic) Name() string                  { return "anthropic" }
+func (a *Anthropic) Name() string                   { return "anthropic" }
 func (a *Anthropic) SupportsVision() bool           { return true }
 func (a *Anthropic) SupportsTools() bool            { return true }
 func (a *Anthropic) SupportsStructuredOutput() bool { return true }

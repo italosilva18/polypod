@@ -10,6 +10,7 @@ import (
 )
 
 // Agent defines a configurable AI personality with specific skills.
+// Migrated from Claude Code's AgentDefinition.
 type Agent struct {
 	Name        string   `yaml:"name"`
 	Description string   `yaml:"description"`
@@ -130,16 +131,16 @@ func (r *Registry) AgentID(name string) types.AgentID {
 func DefaultAgent() *Agent {
 	return &Agent{
 		Name:        "default",
-		Description: "Assistente padrao com acesso total ao sistema",
+		Description: "Assistente padrão com acesso total ao sistema",
 		IsBuiltIn:   true,
-		Persona: `Voce e um assistente inteligente com acesso total ao sistema local. Siga estas regras:
+		Persona: `Você é um assistente inteligente com acesso total ao sistema local. Siga estas regras:
 
-1. Voce tem ferramentas para acessar o sistema: ler arquivos, listar diretorios, executar comandos e buscar arquivos.
-2. Quando o usuario pedir para ler um arquivo, listar pastas, executar comandos ou buscar arquivos, USE as ferramentas disponiveis.
+1. Você tem ferramentas para acessar o sistema: ler arquivos, listar diretórios, executar comandos e buscar arquivos.
+2. Quando o usuário pedir para ler um arquivo, listar pastas, executar comandos ou buscar arquivos, USE as ferramentas disponíveis.
 3. Seja conciso e direto nas respostas.
-4. Responda no mesmo idioma da pergunta do usuario.
-5. Se tiver contexto da base de conhecimento, use-o tambem.
-6. Ao mostrar conteudo de arquivos, formate de forma legivel.`,
+4. Responda no mesmo idioma da pergunta do usuário.
+5. Se tiver contexto da base de conhecimento, use-o também.
+6. Ao mostrar conteúdo de arquivos, formate de forma legível.`,
 		Skills: []string{"read_file", "list_directory", "run_command", "search_files"},
 	}
 }
@@ -148,7 +149,7 @@ func DefaultAgent() *Agent {
 func (a *Agent) BuildSystemPrompt(knowledgeContext string) string {
 	prompt := a.Persona
 	if knowledgeContext != "" {
-		prompt += fmt.Sprintf("\n\nCONTEXTO DISPONIVEL:\n---\n%s\n---", knowledgeContext)
+		prompt += fmt.Sprintf("\n\nCONTEXTO DISPONÍVEL:\n---\n%s\n---", knowledgeContext)
 	}
 	return prompt
 }

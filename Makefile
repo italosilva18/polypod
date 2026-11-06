@@ -1,6 +1,6 @@
 BINARY := polypod
-VERSION := 0.4.0
-GOFLAGS := -trimpath -ldflags="-s -w -X main.version=$(VERSION)"
+VERSION := 0.6.0
+GOFLAGS := -trimpath -ldflags="-s -w -X github.com/costa/polypod/internal/autoupdate.currentVersion=$(VERSION)"
 
 .PHONY: build build-linux build-arm test clean run run-setup run-headless ingest fmt vet check
 

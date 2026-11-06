@@ -9,8 +9,8 @@ import (
 // CompactionConfig controls when and how context compaction happens.
 type CompactionConfig struct {
 	MaxTokens      int `yaml:"max_tokens"`      // Trigger compaction above this (default: 8000)
-	TargetTokens   int `yaml:"target_tokens"`    // Target after compaction (default: 4000)
-	PreserveRecent int `yaml:"preserve_recent"`  // Keep N most recent message pairs (default: 4)
+	TargetTokens   int `yaml:"target_tokens"`   // Target after compaction (default: 4000)
+	PreserveRecent int `yaml:"preserve_recent"` // Keep N most recent message pairs (default: 4)
 }
 
 // Message mirrors the conversation message type.

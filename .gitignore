@@ -2,3 +2,6 @@ polypod
 .env
 config.yaml
 *.log
+data/conversations/auto-memory/
+data/conversations/credentials.enc
+data/conversations/usage.json

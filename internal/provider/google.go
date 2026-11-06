@@ -31,16 +31,16 @@ func NewGoogle(apiKey, baseURL string) *Google {
 	}
 }
 
-func (g *Google) Name() string                  { return "google" }
+func (g *Google) Name() string                   { return "google" }
 func (g *Google) SupportsVision() bool           { return true }
 func (g *Google) SupportsTools() bool            { return true }
 func (g *Google) SupportsStructuredOutput() bool { return true }
 
 type geminiReq struct {
-	Contents         []geminiContent        `json:"contents"`
-	SystemInstruct   *geminiContent         `json:"systemInstruction,omitempty"`
-	Tools            []geminiToolDecl       `json:"tools,omitempty"`
-	GenerationConfig *geminiGenConfig       `json:"generationConfig,omitempty"`
+	Contents         []geminiContent  `json:"contents"`
+	SystemInstruct   *geminiContent   `json:"systemInstruction,omitempty"`
+	Tools            []geminiToolDecl `json:"tools,omitempty"`
+	GenerationConfig *geminiGenConfig `json:"generationConfig,omitempty"`
 }
 
 type geminiContent struct {
@@ -87,8 +87,8 @@ type geminiGenConfig struct {
 }
 
 type geminiResp struct {
-	Candidates []geminiCandidate `json:"candidates"`
-	UsageMetadata *geminiUsage   `json:"usageMetadata"`
+	Candidates    []geminiCandidate `json:"candidates"`
+	UsageMetadata *geminiUsage      `json:"usageMetadata"`
 }
 
 type geminiCandidate struct {

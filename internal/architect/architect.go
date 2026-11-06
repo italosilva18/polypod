@@ -11,11 +11,11 @@ import (
 
 // LintFixConfig controls the lint-then-fix loop.
 type LintFixConfig struct {
-	Enabled    bool     `yaml:"enabled"`
-	LintCmd    string   `yaml:"lint_cmd"`    // e.g., "golangci-lint run"
-	TestCmd    string   `yaml:"test_cmd"`    // e.g., "go test ./..."
-	MaxRetries int     `yaml:"max_retries"` // default: 3
-	AutoFix    bool     `yaml:"auto_fix"`    // feed errors back to AI
+	Enabled    bool   `yaml:"enabled"`
+	LintCmd    string `yaml:"lint_cmd"`    // e.g., "golangci-lint run"
+	TestCmd    string `yaml:"test_cmd"`    // e.g., "go test ./..."
+	MaxRetries int    `yaml:"max_retries"` // default: 3
+	AutoFix    bool   `yaml:"auto_fix"`    // feed errors back to AI
 }
 
 // LintResult holds the outcome of a lint check.

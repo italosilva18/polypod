@@ -18,10 +18,10 @@ type ToolCall struct {
 
 // ToolResult holds the result of a tool execution.
 type ToolResult struct {
-	ID     string
-	Name   string
-	Result string
-	Error  error
+	ID       string
+	Name     string
+	Result   string
+	Error    error
 	Duration time.Duration
 }
 

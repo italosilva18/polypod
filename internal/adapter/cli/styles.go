@@ -96,6 +96,11 @@ var (
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(colorCyan).
 				Padding(0, 1)
+
+	inputBorderQuestionStyle = lipgloss.NewStyle().
+					Border(lipgloss.RoundedBorder()).
+					BorderForeground(colorYellow).
+					Padding(0, 1)
 )
 
 // ── Messages ────────────────────────────────────────────────────────────────
@@ -200,4 +205,72 @@ var (
 
 	notifyErrorStyle = lipgloss.NewStyle().
 				Foreground(colorRed)
+)
+
+// diffAddStyle and diffDelStyle are declared in display.go alongside other
+// diff-related styles (diffHunkStyle, diffHeaderStyle).
+
+// ── Approval overlay modal ──────────────────────────────────────────────────
+
+var (
+	approvalOverlayStyle = lipgloss.NewStyle().
+				BorderStyle(lipgloss.DoubleBorder()).
+				BorderForeground(lipgloss.Color("#FF4040")).
+				Padding(1, 2).
+				Width(70)
+
+	approvalOverlayMediumStyle = lipgloss.NewStyle().
+					BorderStyle(lipgloss.RoundedBorder()).
+					BorderForeground(lipgloss.Color("#F3F99D")).
+					Padding(1, 2).
+					Width(70)
+
+	approvalOverlayLowStyle = lipgloss.NewStyle().
+				BorderStyle(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("#57C7FF")).
+				Padding(1, 2).
+				Width(70)
+
+	approvalTitleStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("#FFCC00"))
+
+	approvalLabelStyle = lipgloss.NewStyle().
+				Foreground(colorDim)
+
+	approvalValueStyle = lipgloss.NewStyle().
+				Foreground(colorWhite)
+
+	approvalHighRiskStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("#FFFFFF")).
+				Background(lipgloss.Color("#FF0000")).
+				Padding(0, 1)
+
+	approvalMediumRiskStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("#000000")).
+				Background(lipgloss.Color("#F3F99D")).
+				Padding(0, 1)
+
+	approvalLowRiskStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("#FFFFFF")).
+				Background(lipgloss.Color("#0F3460")).
+				Padding(0, 1)
+
+	approvalSelectedStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("#00FF00"))
+
+	approvalUnselectedStyle = lipgloss.NewStyle().
+				Foreground(colorWhiteDim)
+
+	approvalCommandStyle = lipgloss.NewStyle().
+				Foreground(colorCyan).
+				Bold(true)
+
+	approvalExplanationStyle = lipgloss.NewStyle().
+					Foreground(colorWhiteDim).
+					Italic(true)
 )

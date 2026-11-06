@@ -9,14 +9,14 @@ import (
 
 // DetectedStack holds info about the detected project stack.
 type DetectedStack struct {
-	Language   string
-	Framework  string
-	BuildTool  string
-	TestCmd    string
-	LintCmd    string
-	HasGit     bool
-	HasDocker  bool
-	HasCI      bool
+	Language  string
+	Framework string
+	BuildTool string
+	TestCmd   string
+	LintCmd   string
+	HasGit    bool
+	HasDocker bool
+	HasCI     bool
 }
 
 // Detect analyzes the current directory to detect project stack.

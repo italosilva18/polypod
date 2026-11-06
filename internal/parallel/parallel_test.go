@@ -62,7 +62,7 @@ func TestExecuteSequentialForWrites(t *testing.T) {
 
 	calls := []ToolCall{
 		{ID: "1", Name: "read_file", Arguments: "{}"},
-		{ID: "2", Name: "edit_file", Arguments: "{}"},  // write: forces sequential
+		{ID: "2", Name: "edit_file", Arguments: "{}"}, // write: forces sequential
 		{ID: "3", Name: "read_file", Arguments: "{}"},
 	}
 

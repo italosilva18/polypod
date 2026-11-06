@@ -230,4 +230,3 @@ func saveAgentYAML(agentsDir, name string, ag *agent.Agent) error {
 	}
 	return nil
 }
-

@@ -151,8 +151,8 @@ func parseOpenAPI(data []byte) []APIEndpoint {
 						continue
 					}
 					param := APIParam{
-						Name: getString(pm, "name"),
-						In:   getString(pm, "in"),
+						Name:        getString(pm, "name"),
+						In:          getString(pm, "in"),
 						Description: getString(pm, "description"),
 					}
 					if req, ok := pm["required"].(bool); ok {

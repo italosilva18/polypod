@@ -34,19 +34,19 @@ type UsageRecord struct {
 
 // PricingTable maps model → [input_per_1M, output_per_1M] in USD.
 var PricingTable = map[string][2]float64{
-	"deepseek-chat":           {0.14, 0.28},
-	"deepseek-coder":          {0.14, 0.28},
-	"gpt-4o":                  {2.50, 10.00},
-	"gpt-4o-mini":             {0.15, 0.60},
-	"gpt-3.5-turbo":           {0.50, 1.50},
+	"deepseek-chat":            {0.14, 0.28},
+	"deepseek-coder":           {0.14, 0.28},
+	"gpt-4o":                   {2.50, 10.00},
+	"gpt-4o-mini":              {0.15, 0.60},
+	"gpt-3.5-turbo":            {0.50, 1.50},
 	"claude-3-5-sonnet-latest": {3.00, 15.00},
 	"claude-3-haiku-20240307":  {0.25, 1.25},
 	"claude-3-opus-latest":     {15.00, 75.00},
-	"gemini-1.5-pro":          {1.25, 5.00},
-	"gemini-1.5-flash":        {0.075, 0.30},
-	"llama3.1":                {0, 0},
-	"mistral-large-latest":    {2.00, 6.00},
-	"qwen2.5":                 {0, 0},
+	"gemini-1.5-pro":           {1.25, 5.00},
+	"gemini-1.5-flash":         {0.075, 0.30},
+	"llama3.1":                 {0, 0},
+	"mistral-large-latest":     {2.00, 6.00},
+	"qwen2.5":                  {0, 0},
 }
 
 // CalculateCost computes USD cost from token counts and model name.

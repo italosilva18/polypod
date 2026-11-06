@@ -24,7 +24,7 @@ type CustomSkillDef struct {
 	Name        string            `yaml:"name"`
 	Description string            `yaml:"description"`
 	Parameters  map[string]string `yaml:"parameters"` // name -> description
-	Script      string            `yaml:"script"`      // bash template with {{.param}}
+	Script      string            `yaml:"script"`     // bash template with {{.param}}
 	CreatedAt   time.Time         `yaml:"created_at"`
 }
 
@@ -167,4 +167,3 @@ func DeleteCustomSkill(dir, name string) error {
 	}
 	return nil
 }
-

@@ -9,8 +9,8 @@ type Complexity int
 
 const (
 	ComplexityLow    Complexity = iota // simple factual, extraction, formatting
-	ComplexityMedium                    // moderate reasoning, code explanation
-	ComplexityHigh                      // complex reasoning, architecture, debugging
+	ComplexityMedium                   // moderate reasoning, code explanation
+	ComplexityHigh                     // complex reasoning, architecture, debugging
 )
 
 // ModelTier maps complexity to model categories.
@@ -22,11 +22,11 @@ type ModelTier struct {
 
 // DefaultTiers for common providers.
 var DefaultTiers = map[string]ModelTier{
-	"deepseek": {Low: "deepseek-chat", Medium: "deepseek-chat", High: "deepseek-reasoner"},
-	"openai":   {Low: "gpt-4o-mini", Medium: "gpt-4o", High: "gpt-4o"},
+	"deepseek":  {Low: "deepseek-chat", Medium: "deepseek-chat", High: "deepseek-reasoner"},
+	"openai":    {Low: "gpt-4o-mini", Medium: "gpt-4o", High: "gpt-4o"},
 	"anthropic": {Low: "claude-3-haiku-20240307", Medium: "claude-3-5-sonnet-latest", High: "claude-3-opus-latest"},
-	"google":   {Low: "gemini-1.5-flash", Medium: "gemini-1.5-pro", High: "gemini-1.5-pro"},
-	"ollama":   {Low: "llama3.1:8b", Medium: "llama3.1:70b", High: "llama3.1:70b"},
+	"google":    {Low: "gemini-1.5-flash", Medium: "gemini-1.5-pro", High: "gemini-1.5-pro"},
+	"ollama":    {Low: "llama3.1:8b", Medium: "llama3.1:70b", High: "llama3.1:70b"},
 }
 
 // ClassifyComplexity analyzes a prompt and returns its complexity level.

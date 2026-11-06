@@ -273,11 +273,11 @@ func RegisterSkills(reg *skill.Registry, sched *Scheduler) {
 		},
 		Execute: func(args map[string]string) (string, error) {
 			task := &Task{
-				Name:    args["name"],
+				Name:     args["name"],
 				Schedule: args["schedule"],
-				Command: args["command"],
-				Channel: args["channel"],
-				UserID:  args["user_id"],
+				Command:  args["command"],
+				Channel:  args["channel"],
+				UserID:   args["user_id"],
 			}
 			if err := sched.AddTask(task); err != nil {
 				return "", err

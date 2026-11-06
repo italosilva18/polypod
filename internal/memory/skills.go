@@ -79,7 +79,7 @@ func RegisterSkills(reg *skill.Registry, store Store) {
 		Name:        "list_memories",
 		Description: "Listar todas as memorias persistentes salvas.",
 		Parameters: jsonschema.Definition{
-			Type: jsonschema.Object,
+			Type:       jsonschema.Object,
 			Properties: map[string]jsonschema.Definition{},
 		},
 		Execute: func(args map[string]string) (string, error) {

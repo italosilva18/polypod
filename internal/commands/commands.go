@@ -13,19 +13,19 @@ import (
 type Command struct {
 	Name        string `yaml:"name"`
 	Description string `yaml:"description"`
-	Disabled    bool   `yaml:"disabled"`    // if true, can't be invoked
-	AIOnly      bool   `yaml:"ai_only"`     // if true, only AI can invoke
-	Content     string `yaml:"-"`           // the markdown body (prompt)
+	Disabled    bool   `yaml:"disabled"` // if true, can't be invoked
+	AIOnly      bool   `yaml:"ai_only"`  // if true, only AI can invoke
+	Content     string `yaml:"-"`        // the markdown body (prompt)
 	FilePath    string `yaml:"-"`
 }
 
 // Recipe is a multi-step automation workflow.
 type Recipe struct {
-	Name        string       `yaml:"name"`
-	Description string       `yaml:"description"`
+	Name        string        `yaml:"name"`
+	Description string        `yaml:"description"`
 	Parameters  []RecipeParam `yaml:"parameters"`
-	Steps       []RecipeStep `yaml:"steps"`
-	FilePath    string       `yaml:"-"`
+	Steps       []RecipeStep  `yaml:"steps"`
+	FilePath    string        `yaml:"-"`
 }
 
 // RecipeParam is a recipe parameter.
@@ -39,8 +39,8 @@ type RecipeParam struct {
 // RecipeStep is a single step in a recipe.
 type RecipeStep struct {
 	Name    string `yaml:"name"`
-	Prompt  string `yaml:"prompt"`  // AI prompt for this step
-	Command string `yaml:"command"` // shell command (alternative to prompt)
+	Prompt  string `yaml:"prompt"`   // AI prompt for this step
+	Command string `yaml:"command"`  // shell command (alternative to prompt)
 	OnError string `yaml:"on_error"` // "stop", "continue", "retry"
 }
 
