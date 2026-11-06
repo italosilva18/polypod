@@ -30,7 +30,7 @@ const (
 	stateStreaming
 )
 
-const version = "0.3.0"
+const version = "0.6.0"
 
 // streamMsg carries a streaming chunk for Bubbletea.
 type streamMsg struct {
