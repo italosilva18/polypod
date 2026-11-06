@@ -74,7 +74,7 @@ func mouseClickLinux(ctx context.Context, x, y int, button string, count int) er
 			args = append(args, "--delay", "50")
 		}
 		args = append(args, btn)
-		return exec.CommandContext(ctx, "xdotool", args...).Run()
+		return desktopCommandContext(ctx, "xdotool", args...).Run()
 	}
 
 	if hasCmd("ydotool") {
@@ -87,7 +87,7 @@ func mouseClickLinux(ctx context.Context, x, y int, button string, count int) er
 			code = "0x112"
 		}
 		for i := 0; i < count; i++ {
-			if err := exec.CommandContext(ctx, "ydotool", "click", code).Run(); err != nil {
+			if err := desktopCommandContext(ctx, "ydotool", "click", code).Run(); err != nil {
 				return err
 			}
 			if i < count-1 {
@@ -187,11 +187,11 @@ func MouseMove(ctx context.Context, x, y int) error {
 	switch runtime.GOOS {
 	case "linux":
 		if hasCmd("xdotool") {
-			return exec.CommandContext(ctx, "xdotool", "mousemove",
+			return desktopCommandContext(ctx, "xdotool", "mousemove",
 				strconv.Itoa(x), strconv.Itoa(y)).Run()
 		}
 		if hasCmd("ydotool") {
-			return exec.CommandContext(ctx, "ydotool", "mousemove", "--absolute",
+			return desktopCommandContext(ctx, "ydotool", "mousemove", "--absolute",
 				"-x", strconv.Itoa(x), "-y", strconv.Itoa(y)).Run()
 		}
 		return fmt.Errorf("no input tool found (install xdotool or ydotool)")
@@ -253,7 +253,7 @@ func mouseScrollLinux(ctx context.Context, direction string, amount int) error {
 			btn = "7"
 		}
 		args := []string{"click", "--repeat", strconv.Itoa(amount), btn}
-		return exec.CommandContext(ctx, "xdotool", args...).Run()
+		return desktopCommandContext(ctx, "xdotool", args...).Run()
 	}
 	return fmt.Errorf("no scroll tool found (install xdotool)")
 }
@@ -302,10 +302,10 @@ func KeyPressAction(ctx context.Context, key string) error {
 	switch runtime.GOOS {
 	case "linux":
 		if hasCmd("xdotool") {
-			return exec.CommandContext(ctx, "xdotool", "key", key).Run()
+			return desktopCommandContext(ctx, "xdotool", "key", key).Run()
 		}
 		if hasCmd("ydotool") {
-			return exec.CommandContext(ctx, "ydotool", "key", key).Run()
+			return desktopCommandContext(ctx, "ydotool", "key", key).Run()
 		}
 		return fmt.Errorf("no input tool found")
 	case "darwin":
@@ -324,7 +324,7 @@ func KeyCombination(ctx context.Context, keys ...string) error {
 	switch runtime.GOOS {
 	case "linux":
 		if hasCmd("xdotool") {
-			return exec.CommandContext(ctx, "xdotool", "key", combo).Run()
+			return desktopCommandContext(ctx, "xdotool", "key", combo).Run()
 		}
 		return fmt.Errorf("no input tool found (install xdotool)")
 	case "darwin":
@@ -420,11 +420,11 @@ func TypeText(ctx context.Context, text string) error {
 func typeTextLinux(ctx context.Context, text string) error {
 	if hasCmd("xdotool") {
 		// xdotool type with delay for human-like speed.
-		return exec.CommandContext(ctx, "xdotool", "type", "--delay",
+		return desktopCommandContext(ctx, "xdotool", "type", "--delay",
 			strconv.Itoa(DefaultInputConfig().TypeDelay), text).Run()
 	}
 	if hasCmd("ydotool") {
-		return exec.CommandContext(ctx, "ydotool", "type", text).Run()
+		return desktopCommandContext(ctx, "ydotool", "type", text).Run()
 	}
 	return fmt.Errorf("no input tool found (install xdotool or ydotool)")
 }
@@ -473,22 +473,22 @@ func Drag(ctx context.Context, fromX, fromY, toX, toY int) error {
 	switch runtime.GOOS {
 	case "linux":
 		if hasCmd("xdotool") {
-			if err := exec.CommandContext(ctx, "xdotool", "mousemove",
+			if err := desktopCommandContext(ctx, "xdotool", "mousemove",
 				strconv.Itoa(fromX), strconv.Itoa(fromY)).Run(); err != nil {
 				return err
 			}
 			time.Sleep(50 * time.Millisecond)
-			if err := exec.CommandContext(ctx, "xdotool", "mousedown", "1").Run(); err != nil {
+			if err := desktopCommandContext(ctx, "xdotool", "mousedown", "1").Run(); err != nil {
 				return err
 			}
 			time.Sleep(50 * time.Millisecond)
-			if err := exec.CommandContext(ctx, "xdotool", "mousemove",
+			if err := desktopCommandContext(ctx, "xdotool", "mousemove",
 				strconv.Itoa(toX), strconv.Itoa(toY)).Run(); err != nil {
-				_ = exec.CommandContext(ctx, "xdotool", "mouseup", "1").Run()
+				_ = desktopCommandContext(ctx, "xdotool", "mouseup", "1").Run()
 				return err
 			}
 			time.Sleep(50 * time.Millisecond)
-			return exec.CommandContext(ctx, "xdotool", "mouseup", "1").Run()
+			return desktopCommandContext(ctx, "xdotool", "mouseup", "1").Run()
 		}
 		return fmt.Errorf("drag requires xdotool")
 

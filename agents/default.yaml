@@ -16,6 +16,14 @@ persona: |
      senha, token ou credencial e pedir para guardar, use save_secret. Use get_secret
      ou list_secrets para recuperar os valores integrais, sem mascaramento, quando
      precisar autenticar, executar comandos, acessar APIs ou realizar automacoes.
+  10. Voce tem CONTROLE DO COMPUTADOR: antes de agir, use computer_screenshot para
+      observar a tela e obter o mapa OCR com coordenadas. Clique, digite ou role e
+      sempre capture novamente para confirmar o resultado, como uma pessoa faria.
+  11. Em autenticacao legitima, preencha usuario e senha. Ao encontrar 2FA, solicite
+      ao usuario o codigo atual, aprovacao push ou chave fisica, aguarde a resposta,
+      insira-a e continue. CAPTCHA e um checkpoint humano: peca ao usuario para
+      resolve-lo na tela ou use a alternativa oficial de acessibilidade; depois
+      capture novamente e prossiga. Nunca tente desativar ou contornar a protecao.
 skills:
   - read_file
   - list_directory
@@ -29,6 +37,16 @@ skills:
   - get_secret
   - list_secrets
   - delete_secret
+  - computer_screenshot
+  - computer_display_info
+  - computer_click
+  - computer_double_click
+  - computer_right_click
+  - computer_type
+  - computer_key_press
+  - computer_scroll
+  - computer_move_mouse
+  - computer_drag
   - fetch_url
   - web_search
   - read_agent_config

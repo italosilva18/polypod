@@ -29,7 +29,11 @@ func RunDiagnostics(cfg *config.Config) []Check {
 	checks = append(checks, checkCommand("Git", "git", "--version"))
 
 	// 3. AI provider connectivity
-	checks = append(checks, checkAPIKey("AI Provider", cfg.AI.APIKey, cfg.AI.BaseURL))
+	if cfg.AI.Provider == "chatgpt" {
+		checks = append(checks, Check{Name: "AI Provider", Status: "ok", Message: "ChatGPT OAuth selecionado"})
+	} else {
+		checks = append(checks, checkAPIKey("AI Provider", cfg.AI.APIKey, cfg.AI.BaseURL))
+	}
 
 	// 4. Database
 	if cfg.Database.Enabled {

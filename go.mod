@@ -14,6 +14,7 @@ require (
 	github.com/jackc/pgx/v5 v5.8.0
 	github.com/modelcontextprotocol/go-sdk v1.4.1
 	github.com/muesli/termenv v0.16.0
+	github.com/openai/openai-go/v3 v3.22.0
 	github.com/sashabaranov/go-openai v1.41.2
 	golang.org/x/crypto v0.49.0
 	golang.org/x/image v0.38.0

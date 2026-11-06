@@ -99,33 +99,85 @@ func CaptureRegion(ctx context.Context, x, y, w, h int) ([]byte, error) {
 
 func captureScreenLinux(ctx context.Context, outPath string) error {
 	// Try tools in order of preference.
+	if hasCmd("cosmic-screenshot") {
+		return captureScreenCOSMIC(ctx, outPath)
+	}
 	if hasCmd("gnome-screenshot") {
-		cmd := exec.CommandContext(ctx, "gnome-screenshot", "-f", outPath)
+		cmd := desktopCommandContext(ctx, "gnome-screenshot", "-f", outPath)
 		return cmd.Run()
 	}
 	if hasCmd("scrot") {
-		cmd := exec.CommandContext(ctx, "scrot", outPath)
+		cmd := desktopCommandContext(ctx, "scrot", outPath)
 		return cmd.Run()
 	}
 	if hasCmd("maim") {
-		cmd := exec.CommandContext(ctx, "maim", outPath)
+		cmd := desktopCommandContext(ctx, "maim", outPath)
 		return cmd.Run()
 	}
 	if hasCmd("import") { // ImageMagick
-		cmd := exec.CommandContext(ctx, "import", "-window", "root", outPath)
+		cmd := desktopCommandContext(ctx, "import", "-window", "root", outPath)
 		return cmd.Run()
 	}
 	if hasCmd("grim") { // Wayland
-		cmd := exec.CommandContext(ctx, "grim", outPath)
+		cmd := desktopCommandContext(ctx, "grim", outPath)
 		return cmd.Run()
 	}
-	return fmt.Errorf("no screenshot tool found (install scrot, maim, gnome-screenshot, or grim)")
+	return fmt.Errorf("no screenshot tool found (install cosmic-screenshot, scrot, maim, gnome-screenshot, or grim)")
+}
+
+func captureScreenCOSMIC(ctx context.Context, outPath string) error {
+	dir, err := os.MkdirTemp("", "polypod-cosmic-screenshot-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	// A root Polypod delegates the portal call to the desktop user, who must
+	// be able to create the dynamically named screenshot inside this directory.
+	if os.Geteuid() == 0 && os.Getenv("POLYPOD_DESKTOP_USER") != "" {
+		if err := os.Chmod(dir, 0o777); err != nil {
+			return err
+		}
+	}
+
+	cmd := desktopCommandContext(ctx, "cosmic-screenshot",
+		"--interactive=false",
+		"--modal=false",
+		"--notify=false",
+		"--save-dir", dir,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("cosmic-screenshot: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	var newestPath string
+	var newestTime time.Time
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".png") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if newestPath == "" || info.ModTime().After(newestTime) {
+			newestPath = filepath.Join(dir, entry.Name())
+			newestTime = info.ModTime()
+		}
+	}
+	if newestPath == "" {
+		return fmt.Errorf("cosmic-screenshot nao produziu uma imagem")
+	}
+	return os.Rename(newestPath, outPath)
 }
 
 func captureWindowLinux(ctx context.Context, title, outPath string) error {
 	// Get window ID from title.
 	if hasCmd("xdotool") {
-		idOut, err := exec.CommandContext(ctx, "xdotool", "search", "--name", title).Output()
+		idOut, err := desktopCommandContext(ctx, "xdotool", "search", "--name", title).Output()
 		if err != nil {
 			return fmt.Errorf("window '%s' not found: %w", title, err)
 		}
@@ -136,15 +188,15 @@ func captureWindowLinux(ctx context.Context, title, outPath string) error {
 		windowID := windowIDs[0]
 
 		if hasCmd("import") {
-			cmd := exec.CommandContext(ctx, "import", "-window", windowID, outPath)
+			cmd := desktopCommandContext(ctx, "import", "-window", windowID, outPath)
 			return cmd.Run()
 		}
 		if hasCmd("scrot") {
 			// scrot -u captures focused window; we can't target by ID directly.
 			// Focus the window first.
-			_ = exec.CommandContext(ctx, "xdotool", "windowactivate", windowID).Run()
+			_ = desktopCommandContext(ctx, "xdotool", "windowactivate", windowID).Run()
 			time.Sleep(200 * time.Millisecond)
-			cmd := exec.CommandContext(ctx, "scrot", "-u", outPath)
+			cmd := desktopCommandContext(ctx, "scrot", "-u", outPath)
 			return cmd.Run()
 		}
 	}
@@ -156,20 +208,20 @@ func captureRegionLinux(ctx context.Context, x, y, w, h int, outPath string) err
 	geometry := fmt.Sprintf("%dx%d+%d+%d", w, h, x, y)
 
 	if hasCmd("maim") {
-		cmd := exec.CommandContext(ctx, "maim", "-g", geometry, outPath)
+		cmd := desktopCommandContext(ctx, "maim", "-g", geometry, outPath)
 		return cmd.Run()
 	}
 	if hasCmd("import") {
-		cmd := exec.CommandContext(ctx, "import", "-window", "root", "-crop", geometry, outPath)
+		cmd := desktopCommandContext(ctx, "import", "-window", "root", "-crop", geometry, outPath)
 		return cmd.Run()
 	}
 	if hasCmd("scrot") {
-		cmd := exec.CommandContext(ctx, "scrot", "-a",
+		cmd := desktopCommandContext(ctx, "scrot", "-a",
 			fmt.Sprintf("%d,%d,%d,%d", x, y, w, h), outPath)
 		return cmd.Run()
 	}
 	if hasCmd("grim") {
-		cmd := exec.CommandContext(ctx, "grim", "-g",
+		cmd := desktopCommandContext(ctx, "grim", "-g",
 			fmt.Sprintf("%d,%d %dx%d", x, y, w, h), outPath)
 		return cmd.Run()
 	}

@@ -28,7 +28,7 @@ func Validate(cfg *config.Config) []ConfigError {
 	var errs []ConfigError
 
 	// AI config
-	if cfg.AI.APIKey == "" || strings.HasPrefix(cfg.AI.APIKey, "sk-your") || cfg.AI.APIKey == "${DEEPSEEK_API_KEY}" {
+	if cfg.AI.Provider != "chatgpt" && (cfg.AI.APIKey == "" || strings.HasPrefix(cfg.AI.APIKey, "sk-your") || cfg.AI.APIKey == "${DEEPSEEK_API_KEY}") {
 		errs = append(errs, ConfigError{
 			Field:      "ai.api_key",
 			Message:    "API key nao configurada",

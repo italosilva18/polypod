@@ -90,10 +90,10 @@ func GetDisplaySize() (*DisplayGeometry, error) {
 }
 
 func getDisplaySizeX11() (*DisplayGeometry, error) {
-	out, err := exec.Command("xdpyinfo").Output()
+	out, err := desktopCommand("xdpyinfo").Output()
 	if err != nil {
 		// Fallback: xdotool getdisplaygeometry
-		out2, err2 := exec.Command("xdotool", "getdisplaygeometry").Output()
+		out2, err2 := desktopCommand("xdotool", "getdisplaygeometry").Output()
 		if err2 != nil {
 			return nil, fmt.Errorf("xdpyinfo and xdotool both failed: %w", err)
 		}
@@ -127,7 +127,7 @@ func getDisplaySizeX11() (*DisplayGeometry, error) {
 
 func getDisplaySizeWayland() (*DisplayGeometry, error) {
 	// Try wlr-randr (wlroots-based compositors).
-	if out, err := exec.Command("wlr-randr").Output(); err == nil {
+	if out, err := desktopCommand("wlr-randr").Output(); err == nil {
 		for _, line := range strings.Split(string(out), "\n") {
 			line = strings.TrimSpace(line)
 			if strings.Contains(line, "current") && strings.Contains(line, "x") {

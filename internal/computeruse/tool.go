@@ -146,11 +146,7 @@ func (t *ComputerUseTool) actionScreenshot(ctx context.Context) (*ToolResult, er
 	if t.lastScreenshot != nil && time.Since(t.lastScreenTime) < t.screenshotCache {
 		cached := t.lastScreenshot
 		t.mu.Unlock()
-		return &ToolResult{
-			Success:    true,
-			Screenshot: base64.StdEncoding.EncodeToString(cached),
-			Message:    "Screenshot captured (cached)",
-		}, nil
+		return screenshotResult(ctx, cached, true), nil
 	}
 	t.mu.Unlock()
 
@@ -165,11 +161,24 @@ func (t *ComputerUseTool) actionScreenshot(ctx context.Context) (*ToolResult, er
 	t.lastScreenTime = time.Now()
 	t.mu.Unlock()
 
+	return screenshotResult(ctx, data, false), nil
+}
+
+func screenshotResult(ctx context.Context, data []byte, cached bool) *ToolResult {
+	message := "Screenshot captured"
+	if cached {
+		message += " (cached)"
+	}
+	if description, err := DescribeScreenshot(ctx, data); err == nil {
+		message += "\n" + description
+	} else {
+		message += "\nOCR indisponivel: " + err.Error()
+	}
 	return &ToolResult{
 		Success:    true,
 		Screenshot: base64.StdEncoding.EncodeToString(data),
-		Message:    "Screenshot captured",
-	}, nil
+		Message:    message,
+	}
 }
 
 func (t *ComputerUseTool) actionClick(ctx context.Context, action ToolAction) (*ToolResult, error) {

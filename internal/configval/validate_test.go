@@ -40,6 +40,19 @@ func TestValidateGoodConfig(t *testing.T) {
 	}
 }
 
+func TestValidateChatGPTDoesNotRequireAPIKey(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.AI.Provider = "chatgpt"
+	cfg.AI.APIKey = ""
+	cfg.AI.BaseURL = "https://api.openai.com/v1"
+
+	for _, err := range Validate(cfg) {
+		if err.Field == "ai.api_key" {
+			t.Fatalf("ChatGPT OAuth nao deve exigir API key: %s", err)
+		}
+	}
+}
+
 func TestValidateInvalidDriver(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.AI.APIKey = "sk-test"

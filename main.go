@@ -23,10 +23,12 @@ import (
 	"github.com/costa/polypod/internal/auth"
 	"github.com/costa/polypod/internal/automemory"
 	"github.com/costa/polypod/internal/autoupdate"
+	"github.com/costa/polypod/internal/chatgptauth"
 	"github.com/costa/polypod/internal/codemap"
 	"github.com/costa/polypod/internal/commands"
 	"github.com/costa/polypod/internal/compact"
 	"github.com/costa/polypod/internal/completion"
+	"github.com/costa/polypod/internal/computeruse"
 	"github.com/costa/polypod/internal/config"
 	"github.com/costa/polypod/internal/configmerge"
 	"github.com/costa/polypod/internal/configval"
@@ -218,6 +220,52 @@ func handleSubcommand() bool {
 			} else {
 				fmt.Printf("Hooks ativos: %s\n", strings.Join(active, ", "))
 			}
+		}
+		return true
+	case "auth":
+		if len(os.Args) < 4 || os.Args[2] != "chatgpt" {
+			fmt.Println("uso: polypod auth chatgpt <login|status|models|logout>")
+			return true
+		}
+		manager := chatgptauth.NewManager(chatgptauth.DefaultCredentialPath())
+		switch os.Args[3] {
+		case "login":
+			ctx, cancel := context.WithTimeout(context.Background(), 11*time.Minute)
+			defer cancel()
+			cred, err := manager.Login(ctx)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "erro conectando ChatGPT: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("ChatGPT conectado ao Polypod: %s\n", cred.Email)
+		case "status":
+			cred, err := manager.Status()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "erro lendo sessao ChatGPT: %v\n", err)
+				os.Exit(1)
+			}
+			if cred == nil {
+				fmt.Println("ChatGPT: nao conectado")
+			} else {
+				fmt.Printf("ChatGPT: conectado (%s), expira em %s\n", cred.Email, cred.ExpiresAt.Local().Format(time.RFC3339))
+			}
+		case "models":
+			models, err := manager.Models(context.Background())
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "erro listando modelos: %v\n", err)
+				os.Exit(1)
+			}
+			for _, model := range models {
+				fmt.Println(model.Name())
+			}
+		case "logout":
+			if err := manager.Logout(); err != nil {
+				fmt.Fprintf(os.Stderr, "erro desconectando ChatGPT: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("Sessao ChatGPT removida do Polypod.")
+		default:
+			fmt.Println("uso: polypod auth chatgpt <login|status|models|logout>")
 		}
 		return true
 	case "--version", "-v":
@@ -440,11 +488,16 @@ RESUMO:`
 func buildProviderRegistry(cfg *config.Config, multiAuth *auth.MultiProviderAuth) (*provider.Registry, []provider.Provider) {
 	reg := provider.NewRegistry()
 
-	primaryKey := cfg.AI.APIKey
-	if cred, err := multiAuth.GetCredentials(cfg.AI.Provider); err == nil {
-		primaryKey = cred.Token()
+	if cfg.AI.Provider == "chatgpt" {
+		manager := chatgptauth.NewManager(chatgptauth.DefaultCredentialPath())
+		reg.Register(provider.NewChatGPT(manager.AccessToken))
+	} else {
+		primaryKey := cfg.AI.APIKey
+		if cred, err := multiAuth.GetCredentials(cfg.AI.Provider); err == nil {
+			primaryKey = cred.Token()
+		}
+		reg.Register(provider.NewOpenAICompat(cfg.AI.Provider, primaryKey, cfg.AI.BaseURL))
 	}
-	reg.Register(provider.NewOpenAICompat(cfg.AI.Provider, primaryKey, cfg.AI.BaseURL))
 
 	for _, p := range cfg.Providers {
 		key := p.APIKey
@@ -634,6 +687,10 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	})
 
 	tool.RegisterAdvancedTools(sys.ToolRegistry, ".")
+	computerUseTools := computeruse.RegisterComputerUseTools(sys.ToolRegistry)
+	if computerUseTools == 0 {
+		logger.Warn("computer use tools unavailable", "reason", "no graphical display environment")
+	}
 	// New Wave 1 tools
 	for _, t := range tool.NewSendMessageTools() {
 		sys.ToolRegistry.Register(t)
@@ -900,6 +957,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		"tools", sys.ToolRegistry.Count(),
 		"providers", len(providerReg.List()),
 		"mcp_tools", mcpToolCount,
+		"computer_use_tools", computerUseTools,
 		"mode", string(modeState.Current),
 		"debug", debugState.Enabled,
 		"hooks", len(hookMgr.List()),

@@ -70,8 +70,10 @@ func RegisterComputerUseTools(reg ToolRegistry) int {
 
 func newScreenshotTool(cu *ComputerUseTool) types.ToolDef {
 	return types.ToolDef{
-		NameFn:        func() string { return "computer_screenshot" },
-		DescriptionFn: func() string { return "Capture a screenshot of the current screen" },
+		NameFn: func() string { return "computer_screenshot" },
+		DescriptionFn: func() string {
+			return "Capture the current screen and return an OCR visual map with text bounding boxes and click-center coordinates"
+		},
 		InputSchemaFn: func() map[string]any {
 			return map[string]any{
 				"type":       "object",

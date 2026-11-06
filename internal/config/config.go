@@ -80,13 +80,17 @@ type DatabaseConfig struct {
 }
 
 type AIConfig struct {
-	Provider string  `yaml:"provider"`
-	BaseURL  string  `yaml:"base_url"`
-	APIKey   string  `yaml:"api_key"`
-	Model    string  `yaml:"model"`
-	MaxToks  int     `yaml:"max_tokens"`
-	Temp     float32 `yaml:"temperature"`
-	Tools    bool    `yaml:"tools"`
+	Provider         string  `yaml:"provider"`
+	BaseURL          string  `yaml:"base_url"`
+	APIKey           string  `yaml:"api_key"`
+	Model            string  `yaml:"model"`
+	MaxToks          int     `yaml:"max_tokens"`
+	Temp             float32 `yaml:"temperature"`
+	Tools            bool    `yaml:"tools"`
+	FallbackProvider string  `yaml:"fallback_provider,omitempty"`
+	FallbackBaseURL  string  `yaml:"fallback_base_url,omitempty"`
+	FallbackAPIKey   string  `yaml:"fallback_api_key,omitempty"`
+	FallbackModel    string  `yaml:"fallback_model,omitempty"`
 }
 
 type EmbeddingConfig struct {

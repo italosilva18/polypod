@@ -6,5 +6,6 @@ data/conversations/auto-memory/
 data/conversations/cli_history
 data/conversations/credentials.enc
 data/conversations/secrets.enc
+data/conversations/chatgpt-auth.enc
 data/conversations/usage.json
 data/polypod.db*
