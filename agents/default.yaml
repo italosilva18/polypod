@@ -32,10 +32,12 @@ persona: |
       para comandos mecanicos exatos. Consulte scheduler_list para acompanhar resultados.
 skills:
   - read_file
+  - document_extract
   - list_directory
   - run_command
   - search_files
   - save_memory
+  - review_memories
   - recall_memory
   - list_memories
   - delete_memory
@@ -51,6 +53,10 @@ skills:
   - scheduler_run
   - scheduler_history
   - scheduler_toggle
+  - goal_create
+  - goal_list
+  - goal_update
+  - goal_review
   - heartbeat_status
   - inbox_list
   - notify_user
@@ -64,6 +70,9 @@ skills:
   - computer_scroll
   - computer_move_mouse
   - computer_drag
+  - browser_observe
+  - browser_act
+  - grok_delegate
   - fetch_url
   - web_search
   - read_agent_config

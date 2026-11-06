@@ -211,16 +211,15 @@ func NewNotifier(logger *slog.Logger) *Notifier {
 }
 
 // Notify sends a notification with the given title and body.
-// Calls that arrive within the debounce window are silently dropped.
+// Calls within the debounce window return an error so durable callers can retry.
 func (n *Notifier) Notify(ctx context.Context, title, body string) error {
 	n.mu.Lock()
 	if time.Since(n.lastSent) < n.debounce {
 		n.mu.Unlock()
 		n.logger.Debug("notification debounced", "title", title)
-		return nil
+		return fmt.Errorf("notificacao adiada pelo intervalo minimo")
 	}
-	n.lastSent = time.Now()
-	n.mu.Unlock()
+	defer n.mu.Unlock()
 
 	notif := Notification{
 		Title:   title,
@@ -232,6 +231,7 @@ func (n *Notifier) Notify(ctx context.Context, title, body string) error {
 		n.logger.Warn("notification failed", "error", err)
 		return err
 	}
+	n.lastSent = time.Now()
 	n.logger.Debug("notification sent", "title", title)
 	return nil
 }

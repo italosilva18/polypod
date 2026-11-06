@@ -3,6 +3,7 @@ package automemory
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -15,7 +16,11 @@ Extraia somente informacoes duraveis e explicitamente sustentadas pelo USUARIO:
 Nao memorize respostas inventadas pelo assistente, resultados temporarios, conversa casual,
 senhas, tokens, chaves, codigos 2FA, cookies ou qualquer outro segredo.
 Retorne APENAS um array JSON. Cada item deve ter:
-{"type":"fact|preference|skill|context","content":"...","tags":["..."],"importance":1-5}
+{"type":"fact|preference|skill|context","fact_key":"sujeito.propriedade","content":"...","tags":["..."],"importance":1-5}
+Use fact_key estavel e especifica, sem incluir o valor: usuario.cidade, usuario.linguagem_preferida,
+projeto_polypod.banco_de_dados. Uma mudanca do mesmo fato deve reutilizar a mesma chave.
+Se o mesmo fato mudar no lote, retorne apenas a ultima declaracao explicita do usuario.
+Nao deduza contradicoes entre propriedades diferentes. Nunca use chaves genericas como fato ou contexto.
 Se nada merecer memoria de longo prazo, retorne [].`
 
 // ParseExtractedMemories validates the model's JSON before anything reaches
@@ -36,6 +41,10 @@ func ParseExtractedMemories(content string) ([]ExtractedMemory, error) {
 	for _, memory := range candidates {
 		memory.Type = strings.ToLower(strings.TrimSpace(memory.Type))
 		memory.Content = strings.TrimSpace(memory.Content)
+		memory.FactKey = strings.ToLower(strings.TrimSpace(memory.FactKey))
+		if memory.FactKey != "" && (!factKeyPattern.MatchString(memory.FactKey) || looksSensitive(memory.FactKey)) {
+			continue
+		}
 		if !allowed[memory.Type] || len(memory.Content) < 10 || len(memory.Content) > 800 || looksSensitive(memory.Content) {
 			continue
 		}
@@ -78,7 +87,14 @@ func extractJSONArray(content string) string {
 	return content
 }
 
+var factKeyPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{1,60}\.[a-z][a-z0-9_.]{1,100}$`)
+
+var credentialPattern = regexp.MustCompile(`(?i)(?:sk-[a-z0-9_-]{16,}|gh[pousr]_[a-z0-9]{20,}|github_pat_[a-z0-9_]{20,}|xox[baprs]-[a-z0-9-]+|AKIA[A-Z0-9]{16}|eyJ[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+|(?:token|secret|senha|password)\s*[:=]\s*\S+)`)
+
 func looksSensitive(value string) bool {
+	if credentialPattern.MatchString(value) {
+		return true
+	}
 	lower := strings.ToLower(value)
 	markers := []string{
 		"password", "senha", "passphrase", "api key", "api_key", "access token",

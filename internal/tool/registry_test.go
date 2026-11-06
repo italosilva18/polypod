@@ -97,6 +97,21 @@ func TestRegistry_RegisterGet(t *testing.T) {
 	}
 }
 
+func TestFilterByNamesResolvesBridgedSkillsWithoutReplacingBuiltins(t *testing.T) {
+	r := NewRegistry()
+	r.Register(buildStubTool("skill_recall_memory"))
+	r.Register(buildStubTool("read_file"))
+	r.Register(buildStubTool("skill_read_file"))
+	got := r.FilterByNames([]string{"recall_memory", "read_file"})
+	seen := map[string]bool{}
+	for _, item := range got {
+		seen[item.Name()] = true
+	}
+	if len(got) != 2 || !seen["skill_recall_memory"] || !seen["read_file"] || seen["skill_read_file"] {
+		t.Fatalf("filtered tools = %v", seen)
+	}
+}
+
 func TestRegistry_GetMissing(t *testing.T) {
 	r := NewRegistry()
 	if _, ok := r.Get("missing"); ok {

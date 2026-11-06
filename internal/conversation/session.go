@@ -2,6 +2,8 @@ package conversation
 
 import (
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const MaxMessages = 20
@@ -17,6 +19,7 @@ const (
 
 // Message is a single entry in a conversation.
 type Message struct {
+	ID        string    `json:"id,omitempty" yaml:"id,omitempty"`
 	Role      Role      `json:"role" yaml:"role"`
 	Content   string    `json:"content" yaml:"content"`
 	Timestamp time.Time `json:"timestamp" yaml:"timestamp"`
@@ -24,6 +27,7 @@ type Message struct {
 
 // Session holds conversation state as a ring buffer of messages.
 type Session struct {
+	pending   []Message
 	ID        string    `json:"id" yaml:"id"`
 	Channel   string    `json:"channel" yaml:"channel"`
 	UserID    string    `json:"user_id" yaml:"user_id"`
@@ -48,11 +52,13 @@ func NewSession(id, channel, userID string) *Session {
 // AddMessage appends a message, evicting the oldest if at capacity.
 func (s *Session) AddMessage(role Role, content string) {
 	msg := Message{
+		ID:        uuid.NewString(),
 		Role:      role,
 		Content:   content,
 		Timestamp: time.Now(),
 	}
 
+	s.pending = append(s.pending, msg)
 	if len(s.Messages) >= MaxMessages {
 		// Keep system messages, evict oldest non-system
 		s.Messages = append(s.Messages[1:], msg)

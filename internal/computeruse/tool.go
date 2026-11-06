@@ -13,7 +13,9 @@ import (
 
 // ComputerUseTool implements the tool interface for computer interaction.
 type ComputerUseTool struct {
+	actionMu        sync.Mutex // serializes actions and their observations
 	mu              sync.Mutex
+	captureScreen   func(context.Context) ([]byte, error)
 	service         *ComputerUseService
 	lastScreenshot  []byte
 	lastScreenTime  time.Time
@@ -67,13 +69,30 @@ func (t *ComputerUseTool) Execute(ctx context.Context, actionJSON string) (*Tool
 }
 
 // ExecuteAction runs a parsed computer use action with safety checks.
-func (t *ComputerUseTool) ExecuteAction(ctx context.Context, action ToolAction) (*ToolResult, error) {
+func (t *ComputerUseTool) ExecuteAction(ctx context.Context, action ToolAction) (result *ToolResult, err error) {
+	t.actionMu.Lock()
+	defer t.actionMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err == nil && result != nil && result.Success && action.Action != "screenshot" {
+			t.observeAfterAction(ctx, result)
+		}
+	}()
 	// Rate limiting.
 	t.mu.Lock()
 	if !t.lastAction.IsZero() {
 		elapsed := time.Since(t.lastAction)
 		if elapsed < t.rateLimit {
-			time.Sleep(t.rateLimit - elapsed)
+			timer := time.NewTimer(t.rateLimit - elapsed)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				t.mu.Unlock()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
 		}
 	}
 	t.lastAction = time.Now()
@@ -86,6 +105,11 @@ func (t *ComputerUseTool) ExecuteAction(ctx context.Context, action ToolAction) 
 		}
 	}
 
+	if action.Action == "drag" {
+		if err := t.validateCoordinates(action.ToX, action.ToY); err != nil {
+			return &ToolResult{Error: err.Error()}, nil
+		}
+	}
 	switch action.Action {
 	case "screenshot":
 		return t.actionScreenshot(ctx)
@@ -122,16 +146,16 @@ func needsCoordinates(action string) bool {
 }
 
 func (t *ComputerUseTool) validateCoordinates(x, y int) error {
+	if x < 0 || y < 0 {
+		return fmt.Errorf("coordinates (%d, %d) are negative", x, y)
+	}
 	display, err := t.service.GetDisplay()
 	if err != nil {
 		// Can't validate if display info unavailable — allow through.
 		return nil
 	}
 
-	if x < 0 || y < 0 {
-		return fmt.Errorf("coordinates (%d, %d) are negative", x, y)
-	}
-	if x > display.Width || y > display.Height {
+	if x >= display.Width || y >= display.Height {
 		return fmt.Errorf("coordinates (%d, %d) are outside screen bounds (%dx%d)",
 			x, y, display.Width, display.Height)
 	}
@@ -150,7 +174,11 @@ func (t *ComputerUseTool) actionScreenshot(ctx context.Context) (*ToolResult, er
 	}
 	t.mu.Unlock()
 
-	data, err := CaptureScreen(ctx)
+	capture := t.captureScreen
+	if capture == nil {
+		capture = CaptureScreen
+	}
+	data, err := capture(ctx)
 	if err != nil {
 		return &ToolResult{Success: false, Error: err.Error()}, nil
 	}
@@ -315,4 +343,24 @@ func (t *ComputerUseTool) invalidateCache() {
 	t.mu.Lock()
 	t.lastScreenshot = nil
 	t.mu.Unlock()
+}
+
+// observeAfterAction always bypasses the cache: a successful input event does
+// not prove its intended effect. Capture failures preserve the action outcome
+// and explicitly report that verification is still needed (never replay input).
+func (t *ComputerUseTool) observeAfterAction(ctx context.Context, result *ToolResult) {
+	t.invalidateCache()
+	observation, err := t.actionScreenshot(ctx)
+	if err != nil || observation == nil || !observation.Success {
+		detail := "captura indisponível"
+		if err != nil {
+			detail = err.Error()
+		} else if observation != nil {
+			detail = observation.Error
+		}
+		result.Message += "\nAção executada; verificação visual pendente: " + detail
+		return
+	}
+	result.Screenshot = observation.Screenshot
+	result.Message += "\nObservação após a ação (verifique o efeito esperado):\n" + observation.Message
 }

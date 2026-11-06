@@ -20,6 +20,7 @@ import (
 type Client struct {
 	client           *openai.Client
 	responseProvider providerapi.Provider
+	textOnly         bool
 	model            string
 	maxTok           int
 	temp             float32
@@ -29,25 +30,18 @@ type Client struct {
 	costEngine       *tracking.CostEngine
 	toolEventCB      ToolEventCallback
 	streamingToolMgr *StreamingToolManager
-	fallback         *Client
 }
 
 // SetCostEngine attaches a CostEngine for automatic cost tracking on every
 // API call made through this client.
 func (c *Client) SetCostEngine(ce *tracking.CostEngine) {
 	c.costEngine = ce
-	if c.fallback != nil {
-		c.fallback.SetCostEngine(ce)
-	}
 }
 
 // SetToolEventCallback sets a callback that is invoked for each tool
 // lifecycle event (start, complete, error) during streaming tool execution.
 func (c *Client) SetToolEventCallback(cb ToolEventCallback) {
 	c.toolEventCB = cb
-	if c.fallback != nil {
-		c.fallback.SetToolEventCallback(cb)
-	}
 }
 
 // SetStreamingToolManager attaches a StreamingToolManager that enables
@@ -55,9 +49,6 @@ func (c *Client) SetToolEventCallback(cb ToolEventCallback) {
 // read-only tools are executed concurrently while write tools run serially.
 func (c *Client) SetStreamingToolManager(stm *StreamingToolManager) {
 	c.streamingToolMgr = stm
-	if c.fallback != nil {
-		c.fallback.SetStreamingToolManager(stm)
-	}
 }
 
 // NewClient creates a DeepSeek client using OpenAI-compatible API.
@@ -65,24 +56,31 @@ func NewClient(cfg config.AIConfig, skills SkillRegistry) *Client {
 	ocfg := openai.DefaultConfig(cfg.APIKey)
 	ocfg.BaseURL = cfg.BaseURL
 	c := &Client{
-		client:  openai.NewClientWithConfig(ocfg),
-		model:   cfg.Model,
-		maxTok:  cfg.MaxToks,
-		temp:    cfg.Temp,
-		toolsOn: cfg.Tools,
-		skills:  skills,
+		client:   openai.NewClientWithConfig(ocfg),
+		model:    cfg.Model,
+		maxTok:   cfg.MaxToks,
+		temp:     cfg.Temp,
+		toolsOn:  cfg.Tools,
+		skills:   skills,
+		textOnly: cfg.Provider == "deepseek",
 	}
 	if cfg.Provider == "chatgpt" {
 		manager := chatgptauth.NewManager(chatgptauth.DefaultCredentialPath())
 		c.responseProvider = providerapi.NewChatGPT(manager.AccessToken)
 	}
-	if cfg.FallbackProvider != "" && cfg.FallbackProvider != cfg.Provider {
-		fallbackCfg := config.AIConfig{
-			Provider: cfg.FallbackProvider, BaseURL: cfg.FallbackBaseURL,
-			APIKey: cfg.FallbackAPIKey, Model: cfg.FallbackModel,
-			MaxToks: cfg.MaxToks, Temp: cfg.Temp, Tools: cfg.Tools,
+	if cfg.FallbackProvider != "" && cfg.FallbackProvider != cfg.Provider && cfg.FallbackModel != "" {
+		primary := c.responseProvider
+		if primary == nil {
+			primary = providerapi.ProviderFactory(cfg.Provider, cfg.APIKey, cfg.BaseURL)
 		}
-		c.fallback = NewClient(fallbackCfg, skills)
+		var secondary providerapi.Provider
+		if cfg.FallbackProvider == "chatgpt" {
+			manager := chatgptauth.NewManager(chatgptauth.DefaultCredentialPath())
+			secondary = providerapi.NewChatGPT(manager.AccessToken)
+		} else {
+			secondary = providerapi.ProviderFactory(cfg.FallbackProvider, cfg.FallbackAPIKey, cfg.FallbackBaseURL)
+		}
+		c.responseProvider = providerapi.NewFailover(primary, secondary, cfg.FallbackModel, nil)
 	}
 	return c
 }
@@ -90,9 +88,6 @@ func NewClient(cfg config.AIConfig, skills SkillRegistry) *Client {
 // SetSkillNames sets the active skill names for tool definitions.
 func (c *Client) SetSkillNames(names []string) {
 	c.skillNames = names
-	if c.fallback != nil {
-		c.fallback.SetSkillNames(names)
-	}
 }
 
 // Model returns the configured model name.
@@ -124,8 +119,25 @@ func (c *Client) Temperature() float32 {
 func (c *Client) CreateChatCompletion(ctx context.Context, req openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
 	if c.responseProvider != nil {
 		genericReq := providerapi.ChatRequest{Model: req.Model, MaxTokens: req.MaxTokens, Temperature: req.Temperature}
+		genericReq.Stop = req.Stop
+		if req.ResponseFormat != nil {
+			genericReq.ResponseFormat = &providerapi.ResponseFormat{Type: string(req.ResponseFormat.Type)}
+			if req.ResponseFormat.JSONSchema != nil {
+				genericReq.ResponseFormat.Schema = responseToolParameters(req.ResponseFormat.JSONSchema.Schema)
+			}
+		}
 		for _, msg := range req.Messages {
 			m := providerapi.Message{Role: msg.Role, Content: msg.Content, ToolCallID: msg.ToolCallID, Name: msg.Name}
+			for _, part := range msg.MultiContent {
+				switch part.Type {
+				case openai.ChatMessagePartTypeText:
+					m.Parts = append(m.Parts, providerapi.ContentPart{Type: "text", Text: part.Text})
+				case openai.ChatMessagePartTypeImageURL:
+					if part.ImageURL != nil {
+						m.Parts = append(m.Parts, providerapi.ContentPart{Type: "image_url", ImageURL: part.ImageURL.URL})
+					}
+				}
+			}
 			for _, tc := range msg.ToolCalls {
 				m.ToolCalls = append(m.ToolCalls, providerapi.ToolCall{ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments})
 			}
@@ -138,9 +150,6 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req openai.ChatComple
 		}
 		resp, err := c.responseProvider.Chat(ctx, genericReq)
 		if err != nil {
-			if c.fallback != nil {
-				return c.fallback.CreateChatCompletion(ctx, req)
-			}
 			return openai.ChatCompletionResponse{}, err
 		}
 		message := openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, Content: resp.Content}
@@ -163,6 +172,7 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req openai.ChatComple
 
 // ChatMessage mirrors openai.ChatCompletionMessage.
 type ChatMessage struct {
+	Parts   []providerapi.ContentPart
 	Role    string
 	Content string
 }
@@ -183,23 +193,17 @@ func (c *Client) Complete(ctx context.Context, messages []ChatMessage) (*ChatRes
 	if c.responseProvider != nil {
 		req := providerapi.ChatRequest{Model: c.model, MaxTokens: c.maxTok, Temperature: c.temp}
 		for _, msg := range messages {
-			req.Messages = append(req.Messages, providerapi.Message{Role: msg.Role, Content: msg.Content})
+			req.Messages = append(req.Messages, providerapi.Message{Role: msg.Role, Content: msg.Content, Parts: msg.Parts})
 		}
 		resp, err := c.responseProvider.Chat(ctx, req)
 		if err != nil {
-			if c.fallback != nil {
-				return c.fallback.Complete(ctx, messages)
-			}
 			return nil, err
 		}
 		return &ChatResponse{Content: resp.Content, PromptTokens: resp.PromptTokens, CompletionTokens: resp.CompletionTokens, TotalTokens: resp.TotalTokens}, nil
 	}
 	msgs := make([]openai.ChatCompletionMessage, len(messages))
 	for i, m := range messages {
-		msgs[i] = openai.ChatCompletionMessage{
-			Role:    m.Role,
-			Content: m.Content,
-		}
+		msgs[i] = openAIChatMessage(m)
 	}
 
 	resp, err := retry(ctx, func() (openai.ChatCompletionResponse, error) {
@@ -234,9 +238,6 @@ func (c *Client) Complete(ctx context.Context, messages []ChatMessage) (*ChatRes
 func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, logger *slog.Logger) (*ChatResponse, error) {
 	if c.responseProvider != nil {
 		resp, err := c.completeWithResponseTools(ctx, messages, nil, logger)
-		if err != nil && c.fallback != nil {
-			return c.fallback.CompleteWithTools(ctx, messages, logger)
-		}
 		return resp, err
 	}
 	var tools []openai.Tool
@@ -249,10 +250,7 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 
 	msgs := make([]openai.ChatCompletionMessage, len(messages))
 	for i, m := range messages {
-		msgs[i] = openai.ChatCompletionMessage{
-			Role:    m.Role,
-			Content: m.Content,
-		}
+		msgs[i] = openAIChatMessage(m)
 	}
 
 	var totalPrompt, totalCompletion int
@@ -294,6 +292,7 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 
 		msgs = append(msgs, choice.Message)
 
+		var observations []ToolCallResult
 		for _, tc := range choice.Message.ToolCalls {
 			logger.Debug("executing tool",
 				"tool", tc.Function.Name,
@@ -305,7 +304,9 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 				c.costEngine.RecordToolUse(tc.Function.Name, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
 			}
 
-			result, execErr := c.skills.Execute(tc.Function.Name, tc.Function.Arguments)
+			richResult, execErr := executeSkillResult(c.skills, tc.Function.Name, tc.Function.Arguments)
+			result := richResult.Content
+			observations = append(observations, ToolCallResult{ID: tc.ID, Name: tc.Function.Name, Images: richResult.Images, IsError: richResult.IsError || execErr != nil})
 			if execErr != nil {
 				result = fmt.Sprintf("Erro executando tool: %v", execErr)
 			}
@@ -317,6 +318,9 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 				ToolCallID: tc.ID,
 			})
 		}
+		if !c.textOnly {
+			msgs = append(msgs, openAIImageObservations(observations)...)
+		}
 	}
 
 	return nil, fmt.Errorf("tool calling exceeded max iterations (%d)", maxToolIter)
@@ -327,9 +331,6 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMessage, callback StreamCallback, logger *slog.Logger) (*ChatResponse, error) {
 	if c.responseProvider != nil {
 		resp, err := c.completeWithResponseTools(ctx, messages, callback, logger)
-		if err != nil && c.fallback != nil {
-			return c.fallback.CompleteWithToolsStream(ctx, messages, callback, logger)
-		}
 		return resp, err
 	}
 	var tools []openai.Tool
@@ -339,10 +340,7 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 
 	msgs := make([]openai.ChatCompletionMessage, len(messages))
 	for i, m := range messages {
-		msgs[i] = openai.ChatCompletionMessage{
-			Role:    m.Role,
-			Content: m.Content,
-		}
+		msgs[i] = openAIChatMessage(m)
 	}
 
 	var totalPrompt, totalCompletion int
@@ -450,6 +448,7 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 
 		// Execute tool calls — use StreamingToolManager for intelligent
 		// parallelism when available, fall back to sequential execution.
+		var observations []ToolCallResult
 		if c.streamingToolMgr != nil {
 			// Convert accumulated tool calls to ToolCallInfo
 			calls := make([]ToolCallInfo, 0, len(toolCalls))
@@ -482,6 +481,7 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 			// Execute with parallel partitioning
 			batchStart := time.Now()
 			results := c.streamingToolMgr.ExecuteToolCalls(ctx, calls)
+			observations = append(observations, results...)
 			batchElapsed := time.Since(batchStart)
 
 			logger.Debug("streaming tool batch complete",
@@ -560,7 +560,9 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 					c.costEngine.RecordToolUse(tc.Function.Name, 0, 0)
 				}
 
-				result, execErr := c.skills.Execute(tc.Function.Name, tc.Function.Arguments)
+				richResult, execErr := executeSkillResult(c.skills, tc.Function.Name, tc.Function.Arguments)
+				result := richResult.Content
+				observations = append(observations, ToolCallResult{ID: tc.ID, Name: tc.Function.Name, Images: richResult.Images, IsError: richResult.IsError || execErr != nil})
 
 				toolElapsed := time.Since(toolStart)
 
@@ -602,6 +604,10 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 					ToolCallID: tc.ID,
 				})
 			}
+		}
+
+		if !c.textOnly {
+			msgs = append(msgs, openAIImageObservations(observations)...)
 		}
 
 		// Notify callback that tool execution happened (optional separator)

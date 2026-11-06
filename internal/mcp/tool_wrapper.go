@@ -2,8 +2,12 @@ package mcp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"strings"
+
 	"fmt"
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/costa/polypod/internal/types"
 )
@@ -85,11 +89,9 @@ func WrapMCPTool(caller MCPCaller, server, name, description string, inputSchema
 				}, err
 			}
 
-			content := renderMCPResult(result)
-			return types.ToolResult{
-				Content: content,
-				IsError: isError,
-			}, nil
+			converted := mcpToolResult(result)
+			converted.IsError = converted.IsError || isError
+			return converted, nil
 		},
 		// Conservative defaults: not read-only, not destructive, but
 		// concurrency-safe (each call goes through its own request id).
@@ -174,4 +176,50 @@ func renderMCPResult(result any) string {
 		return fmt.Sprintf("%v", result)
 	}
 	return string(b)
+}
+
+// mcpToolResult keeps binary images outside text truncation and logs.
+func mcpToolResult(result any) types.ToolResult {
+	var out types.ToolResult
+	var texts []string
+	switch value := result.(type) {
+	case *mcpsdk.CallToolResult:
+		if value == nil {
+			return out
+		}
+		out.IsError = value.IsError
+		for _, content := range value.Content {
+			switch c := content.(type) {
+			case *mcpsdk.TextContent:
+				texts = append(texts, c.Text)
+			case *mcpsdk.ImageContent:
+				out.Images = append(out.Images, types.ToolImage{MIMEType: c.MIMEType, Base64: base64.StdEncoding.EncodeToString(c.Data)})
+			}
+		}
+		if value.StructuredContent != nil {
+			if data, err := json.Marshal(value.StructuredContent); err == nil {
+				texts = append(texts, string(data))
+			}
+		}
+	case *ToolCallResult:
+		if value == nil {
+			return out
+		}
+		out.IsError = value.IsError
+		for _, c := range value.Content {
+			if c.Type == "text" {
+				texts = append(texts, c.Text)
+			}
+			if c.Type == "image" {
+				out.Images = append(out.Images, types.ToolImage{MIMEType: c.MimeType, Base64: c.Data})
+			}
+		}
+	case ToolCallResult:
+		return mcpToolResult(&value)
+	default:
+		out.Content = renderMCPResult(result)
+		return out
+	}
+	out.Content = strings.Join(texts, "\n")
+	return out
 }

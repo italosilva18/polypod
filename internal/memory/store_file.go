@@ -52,10 +52,13 @@ func (s *FileStore) persist() error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.path), 0700); err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, data, 0644)
+	if err := os.WriteFile(s.path+".tmp", data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(s.path+".tmp", s.path)
 }
 
 func (s *FileStore) Save(_ context.Context, topic, content string) error {

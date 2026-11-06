@@ -77,6 +77,9 @@ func seededSessionStore(t *testing.T, msgs []conversation.Message) *conversation
 	for _, m := range msgs {
 		sess.AddMessage(m.Role, m.Content)
 	}
+	if err := store.Save(context.Background(), sess); err != nil {
+		t.Fatal(err)
+	}
 	return store
 }
 
@@ -386,7 +389,7 @@ func TestDreamService_RunNow_EmptySessionsIsNoop(t *testing.T) {
 
 func TestDreamService_RunNow_SavesExtractedMemories(t *testing.T) {
 	msgs := []conversation.Message{
-		{Role: conversation.RoleUser, Content: "oi", Timestamp: time.Now().Add(-2 * time.Minute)},
+		{Role: conversation.RoleUser, Content: "uso postgres", Timestamp: time.Now().Add(-2 * time.Minute)},
 		{Role: conversation.RoleAssistant, Content: "vou usar postgres", Timestamp: time.Now().Add(-1 * time.Minute)},
 	}
 	sessStore := seededSessionStore(t, msgs)
@@ -459,8 +462,8 @@ func TestDreamService_RunNow_SavesExtractedMemories(t *testing.T) {
 	if stats.MemoriesAdded != 2 {
 		t.Errorf("expected MemoriesAdded=2, got %d", stats.MemoriesAdded)
 	}
-	if stats.MessagesProcessed != 2 {
-		t.Errorf("expected MessagesProcessed=2, got %d", stats.MessagesProcessed)
+	if stats.MessagesProcessed != 1 {
+		t.Errorf("expected MessagesProcessed=1, got %d", stats.MessagesProcessed)
 	}
 	if stats.LastError != "" {
 		t.Errorf("expected empty LastError, got %q", stats.LastError)
@@ -472,7 +475,7 @@ func TestDreamService_RunNow_SavesExtractedMemories(t *testing.T) {
 
 func TestDreamService_RunNow_ExtractFnErrorRecorded(t *testing.T) {
 	msgs := []conversation.Message{
-		{Role: conversation.RoleAssistant, Content: "hello"},
+		{Role: conversation.RoleUser, Content: "hello"},
 	}
 	d := NewDreamService(DreamConfig{
 		Logger:       quietLogger(),

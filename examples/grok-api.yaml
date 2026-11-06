@@ -1,0 +1,13 @@
+# API alternativa à sessão da conta do Grok Build.
+# Execute: ./polypod examples/grok-api.yaml
+ai:
+  provider: xai
+  base_url: https://api.x.ai/v1
+  api_key: "${XAI_API_KEY:}"
+  model: "${XAI_MODEL:grok-4.7}"
+  max_tokens: 4096
+  temperature: 0.3
+  tools: true
+
+cli:
+  enabled: true

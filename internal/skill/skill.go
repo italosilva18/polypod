@@ -12,6 +12,8 @@ import (
 
 	openai "github.com/sashabaranov/go-openai"
 	"github.com/sashabaranov/go-openai/jsonschema"
+
+	"github.com/costa/polypod/internal/types"
 )
 
 const (
@@ -25,6 +27,9 @@ type Skill struct {
 	Description string
 	Parameters  jsonschema.Definition
 	Execute     func(args map[string]string) (string, error)
+	// InputSchema and ExecuteResult support typed, multimodal external tools.
+	InputSchema   map[string]any
+	ExecuteResult func(context.Context, map[string]any) (types.ToolResult, error)
 }
 
 // Registry holds all registered skills.
@@ -85,12 +90,16 @@ func (r *Registry) ToolDefinitions(names []string) []openai.Tool {
 			patched := ApplyPatches(*s, r.patches)
 			effective = &patched
 		}
+		var parameters any = effective.Parameters
+		if effective.InputSchema != nil {
+			parameters = effective.InputSchema
+		}
 		tools = append(tools, openai.Tool{
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
 				Name:        effective.Name,
 				Description: effective.Description,
-				Parameters:  effective.Parameters,
+				Parameters:  parameters,
 			},
 		})
 	}
@@ -99,21 +108,36 @@ func (r *Registry) ToolDefinitions(names []string) []openai.Tool {
 
 // Execute runs a skill by name with JSON arguments.
 func (r *Registry) Execute(name string, argsJSON string) (string, error) {
+	result, err := r.ExecuteResult(name, argsJSON)
+	return result.Content, err
+}
+
+// ExecuteResult preserves images and native JSON arguments for rich skills.
+func (r *Registry) ExecuteResult(name string, argsJSON string) (types.ToolResult, error) {
 	s, ok := r.skills[name]
 	if !ok {
-		return "", fmt.Errorf("skill desconhecida: %s", name)
+		return types.ToolResult{}, fmt.Errorf("skill desconhecida: %s", name)
 	}
-
-	var args map[string]string
-	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return "", fmt.Errorf("parsing args: %w", err)
+	var result types.ToolResult
+	var err error
+	if s.ExecuteResult != nil {
+		var args map[string]any
+		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+			return result, fmt.Errorf("parsing args: %w", err)
+		}
+		result, err = s.ExecuteResult(context.Background(), args)
+	} else {
+		var args map[string]string
+		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+			return result, fmt.Errorf("parsing args: %w", err)
+		}
+		result.Content, err = s.Execute(args)
 	}
-
-	result, err := s.Execute(args)
 	if err != nil {
-		return fmt.Sprintf("Erro: %v", err), nil
+		return types.ToolResult{Content: fmt.Sprintf("Erro: %v", err), IsError: true}, nil
 	}
-	return truncate(result), nil
+	result.Content = truncate(result.Content)
+	return result, nil
 }
 
 // Register adds a skill to the registry.

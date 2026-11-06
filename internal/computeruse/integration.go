@@ -1,6 +1,6 @@
 // Package computeruse integration provides registration of computer use tools
 // (screenshot, click, type, scroll, etc.) with the tool.Registry system.
-// Tools are only registered when a display is available.
+// Desktop tools require a display; browser tools can use a headless CDP session.
 package computeruse
 
 import (
@@ -43,14 +43,14 @@ func IsDisplayAvailable() bool {
 }
 
 // RegisterComputerUseTools registers all computer use tools with the given registry.
-// Returns the number of tools registered. If no display is available, returns 0
-// and registers nothing.
+// Returns the number of tools registered. Browser tools are available without
+// a display; desktop tools are added only when a display is available.
 func RegisterComputerUseTools(reg ToolRegistry) int {
-	if !IsDisplayAvailable() {
-		return 0
-	}
-
 	cuTool := NewComputerUseTool()
+	registerBrowserTools(reg, cuTool)
+	if !IsDisplayAvailable() {
+		return 2
+	}
 
 	reg.RegisterDef(newScreenshotTool(cuTool))
 	reg.RegisterDef(newClickTool(cuTool))
@@ -63,7 +63,7 @@ func RegisterComputerUseTools(reg ToolRegistry) int {
 	reg.RegisterDef(newRightClickTool(cuTool))
 	reg.RegisterDef(newDisplayInfoTool(cuTool))
 
-	return 10
+	return 12
 }
 
 // ─── Tool definitions ──────────────────────────────────────────────────
@@ -72,7 +72,7 @@ func newScreenshotTool(cu *ComputerUseTool) types.ToolDef {
 	return types.ToolDef{
 		NameFn: func() string { return "computer_screenshot" },
 		DescriptionFn: func() string {
-			return "Capture the current screen and return an OCR visual map with text bounding boxes and click-center coordinates"
+			return "Capture a screen image and OCR visual map with text bounding boxes and click-center coordinates"
 		},
 		InputSchemaFn: func() map[string]any {
 			return map[string]any{
@@ -430,17 +430,13 @@ func toolResultFromCU(result *ToolResult) types.ToolResult {
 	}
 
 	content := result.Message
-	if result.Screenshot != "" {
-		// Include screenshot as base64 in the content.
-		// The model can interpret this as an image.
-		if content != "" {
-			content += "\n"
-		}
-		content += fmt.Sprintf("[screenshot: %d bytes base64]", len(result.Screenshot))
-	}
 	if content == "" {
 		content = "OK"
 	}
 
-	return types.ToolResult{Content: content}
+	output := types.ToolResult{Content: content}
+	if result.Screenshot != "" {
+		output.Images = []types.ToolImage{{MIMEType: "image/png", Base64: result.Screenshot}}
+	}
+	return output
 }

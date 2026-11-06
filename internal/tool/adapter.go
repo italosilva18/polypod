@@ -1,6 +1,8 @@
 package tool
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/costa/polypod/internal/skill"
@@ -35,15 +37,49 @@ func (a *SkillAdapter) Name() string {
 func (a *SkillAdapter) Description() string { return a.skill.Description }
 
 func (a *SkillAdapter) InputSchema() map[string]any {
-	// Convert jsonschema.Definition to map[string]any
-	return map[string]any{
-		"type":       "object",
-		"properties": a.skill.Parameters.Properties,
-		"required":   a.skill.Parameters.Required,
+	if a.skill.InputSchema != nil {
+		return normalizedSkillSchema(a.skill.InputSchema)
 	}
+	// Marshal the definition to preserve nested schema details. Building the
+	// map manually serialized a nil []string as JSON null, which the Responses
+	// API rejects for functions without required arguments.
+	raw, err := json.Marshal(a.skill.Parameters)
+	if err == nil {
+		var schema map[string]any
+		if json.Unmarshal(raw, &schema) == nil {
+			return normalizedSkillSchema(schema)
+		}
+	}
+	return map[string]any{"type": "object", "properties": map[string]any{}, "required": []string{}}
+}
+
+func normalizedSkillSchema(input map[string]any) map[string]any {
+	schema := make(map[string]any, len(input)+3)
+	for key, value := range input {
+		schema[key] = value
+	}
+	if schema["type"] == nil {
+		schema["type"] = "object"
+	}
+	if schema["type"] == "object" {
+		if schema["properties"] == nil {
+			schema["properties"] = map[string]any{}
+		}
+		if schema["required"] == nil {
+			schema["required"] = []string{}
+		}
+	}
+	return schema
 }
 
 func (a *SkillAdapter) Execute(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
+	if a.skill.ExecuteResult != nil {
+		callCtx := ctx.Context
+		if callCtx == nil {
+			callCtx = context.Background()
+		}
+		return a.skill.ExecuteResult(callCtx, args)
+	}
 	// Convert map[string]any to map[string]string for the old interface
 	strArgs := make(map[string]string, len(args))
 	for k, v := range args {

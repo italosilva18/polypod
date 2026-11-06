@@ -15,6 +15,10 @@ type ProcessFunc func(ctx context.Context, msg Message) (string, error)
 // DeliverFunc sends one outbound message through its remote relay or notifier.
 type DeliverFunc func(ctx context.Context, msg Message) error
 
+// ErrRemoteUnavailable marks a disconnected relay. Delivery remains pending
+// without spending a normal attempt; the remote may reconnect later.
+var ErrRemoteUnavailable = errors.New("remote relay unavailable")
+
 // ProcessorConfig controls the durable heartbeat worker.
 type ProcessorConfig struct {
 	Store        *Store
@@ -155,19 +159,20 @@ func (p *Processor) handle(parent context.Context, msg Message) error {
 	defer cancel()
 
 	if msg.Direction == DirectionInbound {
+		if msg.ResponseReady {
+			return p.cfg.Store.CompleteInbound(msg.ID, msg.Response, time.Now())
+		}
 		if p.cfg.Process == nil {
 			return p.fail(msg, errors.New("processador do agente nao configurado"))
 		}
 		response, err := p.cfg.Process(ctx, msg)
 		if err != nil {
+			if errors.Is(err, ErrRemoteUnavailable) {
+				return p.deferRemote(msg, err)
+			}
 			return p.fail(msg, err)
 		}
-		if response != "" {
-			if _, err := p.cfg.Store.EnqueueOutbound(msg.Channel, msg.UserID, response, msg.ID); err != nil {
-				return p.fail(msg, fmt.Errorf("enfileirando resposta: %w", err))
-			}
-		}
-		return p.cfg.Store.Complete(msg.ID, response, time.Now())
+		return p.cfg.Store.CompleteInbound(msg.ID, response, time.Now())
 	}
 
 	if msg.Direction == DirectionOutbound {
@@ -175,11 +180,30 @@ func (p *Processor) handle(parent context.Context, msg Message) error {
 			return p.fail(msg, errors.New("entregador remoto nao configurado"))
 		}
 		if err := p.cfg.Deliver(ctx, msg); err != nil {
+			if errors.Is(err, ErrRemoteUnavailable) {
+				return p.deferRemote(msg, err)
+			}
 			return p.fail(msg, err)
 		}
 		return p.cfg.Store.Complete(msg.ID, "", time.Now())
 	}
 	return p.fail(msg, fmt.Errorf("direcao invalida: %s", msg.Direction))
+}
+
+func (p *Processor) deferRemote(msg Message, cause error) error {
+	// 15s, 30s, 1m, 2m, 4m, then 5m until the relay reconnects.
+	shift := msg.OfflineDefers
+	if shift > 5 {
+		shift = 5
+	}
+	delay := 15 * time.Second * time.Duration(1<<shift)
+	if delay > 5*time.Minute {
+		delay = 5 * time.Minute
+	}
+	if err := p.cfg.Store.DeferUnavailable(msg.ID, cause, time.Now().Add(delay)); err != nil {
+		return errors.Join(cause, err)
+	}
+	return fmt.Errorf("mensagem %s aguardando conexao remota: %w", msg.ID, cause)
 }
 
 func (p *Processor) fail(msg Message, cause error) error {

@@ -9,6 +9,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
+
+	"golang.org/x/term"
 
 	"github.com/costa/polypod/internal/config"
 )
@@ -47,8 +50,8 @@ func Run(configPath string) error {
 	// --- Provider ---
 	fmt.Println()
 	fmt.Println(cB + cW + "--- Provedor de IA ---" + cR)
-	choices := []string{"DeepSeek (recomendado)", "Kimi (Moonshot)", "OpenAI (GPT)", "Claude (via OpenRouter)", "Outro (compativel OpenAI)"}
-	provIdx := askChoice(scanner, "Qual provedor?", choices, 1)
+	choices := []string{"DeepSeek", "Kimi (Moonshot)", "OpenAI (GPT)", "Claude (via OpenRouter)", "Outro (compativel OpenAI)", "ChatGPT (OAuth; sem API key, recomendado)"}
+	provIdx := askChoice(scanner, "Qual provedor?", choices, 6)
 
 	switch provIdx {
 	case 1:
@@ -71,20 +74,59 @@ func Run(configPath string) error {
 		cfg.AI.Provider = "custom"
 		cfg.AI.BaseURL = askString(scanner, "URL base da API:", "")
 		cfg.AI.Model = askString(scanner, "Nome do modelo:", "")
+	case 6:
+		model := askString(scanner, "Modelo ChatGPT (consulte polypod auth chatgpt models):", "")
+		if err := configureChatGPT(cfg, model); err != nil {
+			return err
+		}
 	}
 
-	cfg.AI.APIKey = askSecret(scanner, "Sua API key:")
+	if cfg.AI.Provider != "chatgpt" {
+		variable := askString(scanner, "Nome da variavel de ambiente da API key (nao cole a chave):", "POLYPOD_AI_API_KEY")
+		reference, err := environmentReference(variable)
+		if err != nil {
+			return err
+		}
+		cfg.AI.APIKey = reference
+		fmt.Println(cW + "Defina essa variavel no ambiente ou no arquivo .env privado (0600)." + cR)
+	}
 
 	// --- Tools ---
 	fmt.Println()
 	fmt.Println(cB + cW + "--- Ferramentas ---" + cR)
 	cfg.AI.Tools = askBool(scanner, "Habilitar tools (ler arquivos, executar comandos)?", true)
 
-	// --- Channels (CLI-only build) ---
+	// --- Optional authenticated gateway ---
 	fmt.Println()
 	fmt.Println(cB + cW + "--- Canais ---" + cR)
-	fmt.Println(cW + "CLI e o unico canal disponivel neste build." + cR)
+	fmt.Println(cW + "CLI e o nucleo; Telegram opcional utiliza inbox e respostas duraveis." + cR)
+	cfg.Remote.Enabled = askBool(scanner, "Habilitar gateway Telegram?", false)
+	if cfg.Remote.Enabled {
+		cfg.Remote.BotToken = "${POLYPOD_TELEGRAM_BOT_TOKEN:}"
+		cfg.Remote.ChatID = askString(scanner, "Chat ID numerico ou @canal:", "")
+		users := askString(scanner, "IDs de usuarios permitidos separados por virgula (obrigatorio para grupos):", "")
+		allowed, err := parseAllowedUsers(users)
+		if err != nil {
+			return err
+		}
+		cfg.Remote.AllowedUserIDs = allowed
+		if err := cfg.Remote.Validate(); err != nil {
+			return err
+		}
+		fmt.Println(cW + "Defina POLYPOD_TELEGRAM_BOT_TOKEN no ambiente ou .env privado; inicie uma conversa com o bot." + cR)
+	}
 	cfg.CLI.Enabled = true
+
+	// --- Periodic review ---
+	cfg.Scheduler.HeartbeatEnabled = askBool(scanner, "Habilitar heartbeat de revisao periodica?", true)
+	if cfg.Scheduler.HeartbeatEnabled {
+		interval := askString(scanner, "Intervalo do heartbeat:", "1h")
+		duration, err := time.ParseDuration(interval)
+		if err != nil || duration <= 0 {
+			return fmt.Errorf("intervalo de heartbeat deve ser uma duracao positiva")
+		}
+		cfg.Scheduler.Enabled, cfg.Scheduler.HeartbeatInterval = true, interval
+	}
 
 	// --- Database ---
 	fmt.Println()
@@ -111,7 +153,14 @@ func Run(configPath string) error {
 		fmt.Println(cW + "  Tools: desabilitadas" + cR)
 	}
 
-	fmt.Printf("%s  Canais: CLI%s\n", cW, cR)
+	if cfg.Remote.Enabled {
+		fmt.Printf("%s  Canais: CLI e gateway Telegram autenticado%s\n", cW, cR)
+	} else {
+		fmt.Printf("%s  Canais: CLI%s\n", cW, cR)
+	}
+	if cfg.Scheduler.HeartbeatEnabled {
+		fmt.Printf("  Heartbeat: %s\n", cfg.Scheduler.HeartbeatInterval)
+	}
 
 	if cfg.Database.Enabled {
 		fmt.Printf("%s  Banco: SQLite (%s)%s\n", cW, cfg.Database.Path, cR)
@@ -131,8 +180,11 @@ func Run(configPath string) error {
 		return fmt.Errorf("erro ao serializar config: %w", err)
 	}
 
-	if err := os.WriteFile(configPath, data, 0644); err != nil {
+	if err := os.WriteFile(configPath, data, 0600); err != nil {
 		return fmt.Errorf("erro ao gravar %s: %w", configPath, err)
+	}
+	if err := os.Chmod(configPath, 0600); err != nil {
+		return fmt.Errorf("protegendo config: %w", err)
 	}
 	fmt.Printf("\n%sConfig salva em %s%s\n", cW, configPath, cR)
 
@@ -168,6 +220,12 @@ skills:
 		}
 	}
 
+	fmt.Println(cW + "Proximos passos:" + cR)
+	if cfg.AI.Provider == "chatgpt" {
+		fmt.Println("  polypod auth chatgpt login\n  polypod auth chatgpt models")
+	}
+	fmt.Println("  polypod doctor --live (OAuth, Telegram, captura, entrada, heartbeat e boot)")
+	fmt.Println("  Para boot, use a mesma sessao desktop e diretorio de dados; confira systemctl is-enabled e is-active.")
 	fmt.Println(cW + "Iniciando Polypod..." + cR)
 	return nil
 }
@@ -188,9 +246,17 @@ func askString(scanner *bufio.Scanner, prompt, defaultVal string) string {
 	return defaultVal
 }
 
-// askSecret prompts for a secret value (shown as typed — no masking in terminal).
+// askSecret disables terminal echo; piped input is consumed without printing.
 func askSecret(scanner *bufio.Scanner, prompt string) string {
 	fmt.Printf("%s%s %s", cW, prompt, cR)
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		raw, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Println()
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(string(raw))
+	}
 	if scanner.Scan() {
 		return strings.TrimSpace(scanner.Text())
 	}
@@ -241,4 +307,40 @@ func generateAPIKey() string {
 		return "pk-change-me"
 	}
 	return "pk-" + hex.EncodeToString(b)
+}
+
+func configureChatGPT(cfg *config.Config, model string) error {
+	if strings.TrimSpace(model) == "" {
+		return fmt.Errorf("informe o modelo disponivel em polypod auth chatgpt models")
+	}
+	cfg.AI.Provider, cfg.AI.BaseURL, cfg.AI.Model, cfg.AI.APIKey = "chatgpt", "https://api.openai.com/v1", strings.TrimSpace(model), ""
+	return nil
+}
+
+func environmentReference(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", fmt.Errorf("nome da variavel obrigatorio")
+	}
+	for index, ch := range name {
+		if !(ch == '_' || ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z' || index > 0 && ch >= '0' && ch <= '9') {
+			return "", fmt.Errorf("informe apenas o nome da variavel, sem o valor secreto")
+		}
+	}
+	return "${" + name + ":}", nil
+}
+
+func parseAllowedUsers(value string) ([]int64, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+	var ids []int64
+	for _, part := range strings.Split(value, ",") {
+		id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("IDs permitidos devem ser numeros positivos separados por virgula")
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
 }

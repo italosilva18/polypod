@@ -4,7 +4,7 @@ Guidance for agentic coding agents working in the Polypod repository.
 
 ## Project Overview
 
-Polypod is a CLI-only AI coding agent in Go (port of Claude Code patterns). Single binary, Bubbletea TUI, multi-provider LLM support, MCP client, tool orchestration, plan mode, sessions, hooks, permissions. ~750 .go files, ~235k LOC, 192 packages. Module: `github.com/costa/polypod`. Go 1.26.
+Polypod is a CLI-first AI coding agent in Go (port of Claude Code patterns). Single binary, Bubbletea TUI, multi-provider LLM support, MCP client, tool orchestration, plan mode, sessions, hooks, permissions. ~750 .go files, ~235k LOC, 192 packages. Module: `github.com/costa/polypod`. Go 1.26.
 
 ## Build / Lint / Test Commands
 
@@ -38,7 +38,7 @@ go build ./internal/tool/
 
 Always run `make check` (or at least `go vet ./... && go test ./...`) before committing.
 
-## Architecture (CLI-only)
+## Architecture (CLI core with optional gateways)
 
 ```
 User input -> Bubbletea TUI (internal/adapter/cli/)
@@ -123,7 +123,7 @@ Wiring lives in `internal/wiring/wiring.go` (`WireAll`). `main.go` is the only f
 
 - Don't add new top-level slash commands by editing `commands.go` blindly — read it first; many already exist.
 - Don't introduce new global mutable state outside `internal/wiring/` except for opt-in stores.
-- Don't reintroduce removed adapters (REST, Telegram, WhatsApp, WebUI, IoT, Voice, Vision, Notebook). The user explicitly chose CLI-only.
+- Keep the CLI/TUI as the core runtime. The user has explicitly authorized the native WhatsApp gateway, an optional Telegram gateway, durable inbox/outbox and human-question relay. Feed remote channels into the existing agent and permission path. Do not restore unrelated removed adapters (REST, WebUI, IoT, Voice or Notebook) without a concrete request.
 - Don't add Postgres back. SQLite is the only DB driver.
 - Don't run `git push --force`, `git reset --hard`, or destructive git ops without explicit instruction.
 - Don't add new dependencies without explaining why in the PR/commit. Prefer stdlib + existing deps.

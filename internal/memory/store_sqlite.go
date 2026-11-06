@@ -5,17 +5,28 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 )
 
 // SQLiteStore implements Store using a SQLite database.
 type SQLiteStore struct {
 	db *sql.DB
+	// ftsMu protects ftsReady. A failed setup is retried so a temporary
+	// migration or lock failure cannot permanently disable the index.
+	ftsMu    sync.Mutex
+	ftsReady bool
 }
 
 // NewSQLiteStore creates a new SQLite-backed memory store.
 func NewSQLiteStore(db *sql.DB) *SQLiteStore {
-	return &SQLiteStore{db: db}
+	s := &SQLiteStore{db: db}
+	// The constructor cannot return an error without changing the Store API.
+	// Retrieval falls back to the existing scan if this setup is unavailable.
+	s.ensureFTS(context.Background())
+	return s
 }
 
 func (s *SQLiteStore) Save(ctx context.Context, topic, content string) error {
@@ -93,9 +104,24 @@ func (s *SQLiteStore) SaveWithMeta(ctx context.Context, mem Memory) error {
 }
 
 func (s *SQLiteStore) SearchRelevant(ctx context.Context, query string, maxResults int, minScore float64) ([]Memory, error) {
-	memories, err := s.List(ctx)
-	if err != nil {
-		return nil, err
+	if strings.TrimSpace(query) == "" {
+		return nil, nil
+	}
+	var memories []Memory
+	var err error
+	ftsQuery, usable := buildMemoryFTSQuery(query)
+	useFTS := usable && s.ensureFTS(ctx)
+	if useFTS {
+		memories, err = s.searchFTSCandidates(ctx, ftsQuery)
+	}
+	if !useFTS || err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		memories, err = s.List(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 	var results []Memory
 	for _, m := range memories {
@@ -104,6 +130,11 @@ func (s *SQLiteStore) SearchRelevant(ctx context.Context, query string, maxResul
 			results = append(results, m)
 		}
 	}
+	sort.SliceStable(results, func(i, j int) bool {
+		_, a := results[i].IsRelevant(query)
+		_, b := results[j].IsRelevant(query)
+		return a > b
+	})
 	if maxResults > 0 && len(results) > maxResults {
 		results = results[:maxResults]
 	}

@@ -61,6 +61,8 @@ Headless usage:
 ./polypod -p "analyze this repository and fix the failing tests"
 ```
 
+The local root systemd deployment is documented in [scripts/README.md](scripts/README.md).
+
 ## Core capabilities
 
 - streaming tool execution with parallel read-only operations;

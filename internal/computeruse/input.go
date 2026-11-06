@@ -67,7 +67,7 @@ func mouseClickLinux(ctx context.Context, x, y int, button string, count int) er
 		btn = "2"
 	}
 
-	if hasCmd("xdotool") {
+	if DetectDisplayServer() != DisplayWayland && hasCmd("xdotool") {
 		args := []string{"click"}
 		if count > 1 {
 			args = append(args, "--repeat", strconv.Itoa(count))
@@ -78,13 +78,13 @@ func mouseClickLinux(ctx context.Context, x, y int, button string, count int) er
 	}
 
 	if hasCmd("ydotool") {
-		// ydotool uses different button codes: 0x110=left, 0x111=right, 0x112=middle
-		code := "0x110"
+		// ydotool >= 1.0: 0xC0 combines button 0 with press and release.
+		code := "0xC0"
 		switch button {
 		case "right":
-			code = "0x111"
+			code = "0xC1"
 		case "middle":
-			code = "0x112"
+			code = "0xC2"
 		}
 		for i := 0; i < count; i++ {
 			if err := desktopCommandContext(ctx, "ydotool", "click", code).Run(); err != nil {
@@ -186,7 +186,7 @@ public class MouseOps {
 func MouseMove(ctx context.Context, x, y int) error {
 	switch runtime.GOOS {
 	case "linux":
-		if hasCmd("xdotool") {
+		if DetectDisplayServer() != DisplayWayland && hasCmd("xdotool") {
 			return desktopCommandContext(ctx, "xdotool", "mousemove",
 				strconv.Itoa(x), strconv.Itoa(y)).Run()
 		}
@@ -241,7 +241,7 @@ func MouseScroll(ctx context.Context, x, y int, direction string, amount int) er
 }
 
 func mouseScrollLinux(ctx context.Context, direction string, amount int) error {
-	if hasCmd("xdotool") {
+	if DetectDisplayServer() != DisplayWayland && hasCmd("xdotool") {
 		// xdotool: button 4=up, 5=down, 6=left, 7=right
 		btn := "5" // down
 		switch direction {
@@ -255,7 +255,23 @@ func mouseScrollLinux(ctx context.Context, direction string, amount int) error {
 		args := []string{"click", "--repeat", strconv.Itoa(amount), btn}
 		return desktopCommandContext(ctx, "xdotool", args...).Run()
 	}
-	return fmt.Errorf("no scroll tool found (install xdotool)")
+	if hasCmd("ydotool") {
+		x, y := 0, 0
+		switch direction {
+		case "up":
+			y = amount
+		case "down":
+			y = -amount
+		case "left":
+			x = -amount
+		case "right":
+			x = amount
+		default:
+			return fmt.Errorf("direcao de rolagem invalida: %s", direction)
+		}
+		return desktopCommandContext(ctx, "ydotool", "mousemove", "--wheel", "-x", strconv.Itoa(x), "-y", strconv.Itoa(y)).Run()
+	}
+	return fmt.Errorf("instale ydotool >= 1.0 para rolagem Wayland")
 }
 
 func mouseScrollMacOS(ctx context.Context, direction string, amount int) error {
@@ -301,11 +317,11 @@ public class MouseOps {
 func KeyPressAction(ctx context.Context, key string) error {
 	switch runtime.GOOS {
 	case "linux":
-		if hasCmd("xdotool") {
+		if DetectDisplayServer() != DisplayWayland && hasCmd("xdotool") {
 			return desktopCommandContext(ctx, "xdotool", "key", key).Run()
 		}
 		if hasCmd("ydotool") {
-			return desktopCommandContext(ctx, "ydotool", "key", key).Run()
+			return keyPressYdotool(ctx, key)
 		}
 		return fmt.Errorf("no input tool found")
 	case "darwin":
@@ -323,10 +339,13 @@ func KeyCombination(ctx context.Context, keys ...string) error {
 
 	switch runtime.GOOS {
 	case "linux":
-		if hasCmd("xdotool") {
+		if DetectDisplayServer() != DisplayWayland && hasCmd("xdotool") {
 			return desktopCommandContext(ctx, "xdotool", "key", combo).Run()
 		}
-		return fmt.Errorf("no input tool found (install xdotool)")
+		if hasCmd("ydotool") {
+			return keyPressYdotool(ctx, combo)
+		}
+		return fmt.Errorf("instale ydotool >= 1.0 para entrada Wayland")
 	case "darwin":
 		return keyPressMacOS(ctx, combo)
 	case "windows":
@@ -418,13 +437,19 @@ func TypeText(ctx context.Context, text string) error {
 }
 
 func typeTextLinux(ctx context.Context, text string) error {
-	if hasCmd("xdotool") {
+	if DetectDisplayServer() != DisplayWayland && hasCmd("xdotool") {
 		// xdotool type with delay for human-like speed.
 		return desktopCommandContext(ctx, "xdotool", "type", "--delay",
 			strconv.Itoa(DefaultInputConfig().TypeDelay), text).Run()
 	}
 	if hasCmd("ydotool") {
-		return desktopCommandContext(ctx, "ydotool", "type", text).Run()
+		// Upstream type uses an ASCII/US key table; never silently drop UTF-8.
+		for _, r := range text {
+			if r > 127 {
+				return pasteTextWayland(ctx, text)
+			}
+		}
+		return desktopCommandContext(ctx, "ydotool", "type", "--key-delay", strconv.Itoa(DefaultInputConfig().TypeDelay), "--escape=0", "--", text).Run()
 	}
 	return fmt.Errorf("no input tool found (install xdotool or ydotool)")
 }
@@ -472,7 +497,7 @@ Add-Type -AssemblyName System.Windows.Forms
 func Drag(ctx context.Context, fromX, fromY, toX, toY int) error {
 	switch runtime.GOOS {
 	case "linux":
-		if hasCmd("xdotool") {
+		if DetectDisplayServer() != DisplayWayland && hasCmd("xdotool") {
 			if err := desktopCommandContext(ctx, "xdotool", "mousemove",
 				strconv.Itoa(fromX), strconv.Itoa(fromY)).Run(); err != nil {
 				return err
@@ -490,7 +515,24 @@ func Drag(ctx context.Context, fromX, fromY, toX, toY int) error {
 			time.Sleep(50 * time.Millisecond)
 			return desktopCommandContext(ctx, "xdotool", "mouseup", "1").Run()
 		}
-		return fmt.Errorf("drag requires xdotool")
+		if hasCmd("ydotool") {
+			if err := MouseMove(ctx, fromX, fromY); err != nil {
+				return err
+			}
+			if err := desktopCommandContext(ctx, "ydotool", "click", "0x40").Run(); err != nil {
+				return err
+			}
+			moveErr := MouseMove(ctx, toX, toY)
+			// Always release, even when the original action was cancelled.
+			releaseCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			releaseErr := desktopCommandContext(releaseCtx, "ydotool", "click", "0x80").Run()
+			if moveErr != nil {
+				return moveErr
+			}
+			return releaseErr
+		}
+		return fmt.Errorf("instale ydotool >= 1.0 para arrastar no Wayland")
 
 	case "darwin":
 		if hasCmd("cliclick") {

@@ -1,0 +1,14 @@
+{
+ "schema_version":1,
+ "manifest_id":"polypod-capabilities-smoke",
+ "manifest_version":"1.0.0",
+ "metadata":{
+  "run_id":"synthetic-fixture-only", "agent":"polypod", "agent_version":"fixture-not-a-release", "model":"scripted-fixture", "model_settings":"temperature=0; no inference", "hardware":"fixture; no hardware benchmark", "environment":"offline synthetic unit test", "dataset_revision":"local-smoke-1.0.0", "evaluator_version":"fixture-1", "seed":42, "budget":{"max_steps":20,"max_seconds":60,"max_usd":1}, "synthetic":true
+ },
+ "outcomes":[
+  {"task_id":"gui-save","status":"success","evidence":"synthetic assertion: saved content matches","verified_by":"fixture","latency_ms":1000,"cost_usd":0,"steps":2,"trace":"session.jsonl"},
+  {"task_id":"memory-recall","status":"failure","evidence":"synthetic assertion: outdated preference","verified_by":"fixture","latency_ms":2000},
+  {"task_id":"routine-restart","status":"success","evidence":"synthetic assertion: exactly one run","verified_by":"fixture","latency_ms":3000,"cost_usd":0,"steps":3,"recovered":true},
+  {"task_id":"channels-retry","status":"timeout","latency_ms":60000,"recovered":false}
+ ]
+}

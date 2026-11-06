@@ -16,11 +16,16 @@ import (
 
 // Store persists sessions. Supports PostgreSQL, SQLite, YAML file, or in-memory only.
 type Store struct {
-	mu       sync.RWMutex
-	sessions map[string]*Session
-	pool     *pgxpool.Pool // nil = no postgres
-	sqliteDB *sql.DB       // nil = no sqlite
-	dataDir  string        // non-empty = YAML file persistence
+	journalInitErr error
+	journalMu      sync.Mutex
+	journal        []JournalEntry
+	journalLoaded  bool
+	journalIDs     map[string]bool
+	mu             sync.RWMutex
+	sessions       map[string]*Session
+	pool           *pgxpool.Pool // nil = no postgres
+	sqliteDB       *sql.DB       // nil = no sqlite
+	dataDir        string        // non-empty = YAML file persistence
 }
 
 // NewStore creates a new session store.
@@ -46,6 +51,12 @@ func NewStore(pool *pgxpool.Pool, sqliteDB *sql.DB, dataDir string) *Store {
 		s.loadAllFromDisk()
 	}
 
+	for _, sess := range s.GetAllSessions() {
+		if err := s.appendJournal(context.Background(), sess); err != nil {
+			s.journalInitErr = err
+			break
+		}
+	}
 	return s
 }
 
@@ -102,6 +113,9 @@ func (s *Store) Get(ctx context.Context, channel, userID string) (*Session, erro
 
 // Save persists a session (to DB, SQLite, and/or YAML file).
 func (s *Store) Save(ctx context.Context, sess *Session) error {
+	if err := s.appendJournal(ctx, sess); err != nil {
+		return err
+	}
 	if s.pool != nil {
 		if err := s.saveToDB(ctx, sess); err != nil {
 			return err
@@ -195,7 +209,7 @@ func (s *Store) sessionFilePath(sess *Session) string {
 }
 
 func (s *Store) saveToDisk(sess *Session) error {
-	if err := os.MkdirAll(s.dataDir, 0755); err != nil {
+	if err := os.MkdirAll(s.dataDir, 0700); err != nil {
 		return fmt.Errorf("creating data dir: %w", err)
 	}
 
@@ -205,7 +219,7 @@ func (s *Store) saveToDisk(sess *Session) error {
 	}
 
 	path := s.sessionFilePath(sess)
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := os.WriteFile(path, data, 0600); err != nil {
 		return fmt.Errorf("writing session file: %w", err)
 	}
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // Memory represents a persistent memory entry.
@@ -24,16 +25,19 @@ type Memory struct {
 
 // IsRelevant returns true if the memory matches a query with relevance scoring.
 func (m *Memory) IsRelevant(query string) (bool, float64) {
-	queryLower := strings.ToLower(query)
+	queryLower := strings.ToLower(strings.TrimSpace(query))
+	if queryLower == "" {
+		return false, 0
+	}
 	contentLower := strings.ToLower(m.Content)
 	topicLower := strings.ToLower(m.Topic)
 
 	score := 0.0
 
 	// Topic match (highest weight)
-	if strings.Contains(topicLower, queryLower) {
+	if topicLower != "" && strings.Contains(topicLower, queryLower) {
 		score += 0.6
-	} else if strings.Contains(queryLower, topicLower) {
+	} else if topicLower != "" && strings.Contains(queryLower, topicLower) {
 		score += 0.4
 	}
 
@@ -43,8 +47,8 @@ func (m *Memory) IsRelevant(query string) (bool, float64) {
 	}
 
 	// Word overlap
-	queryWords := strings.Fields(queryLower)
-	contentWords := strings.Fields(contentLower)
+	queryWords := strings.FieldsFunc(queryLower, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsNumber(r) })
+	contentWords := strings.FieldsFunc(contentLower+" "+topicLower+" "+strings.Join(m.Tags, " "), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsNumber(r) })
 	matches := 0
 	for _, qw := range queryWords {
 		for _, cw := range contentWords {
@@ -61,9 +65,13 @@ func (m *Memory) IsRelevant(query string) (bool, float64) {
 	// Tag match
 	for _, tag := range m.Tags {
 		tagLower := strings.ToLower(tag)
-		if strings.Contains(queryLower, tagLower) {
+		if tagLower != "" && !strings.HasPrefix(tagLower, "journal:") && strings.Contains(queryLower, tagLower) {
 			score += 0.2
 		}
+	}
+
+	if score == 0 {
+		return false, 0
 	}
 
 	// Priority boost

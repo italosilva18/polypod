@@ -193,6 +193,40 @@ func TestRemoveTask(t *testing.T) {
 	}
 }
 
+func TestQueuedTaskDoesNotRunAfterRemovalOrReplacement(t *testing.T) {
+	s := newTestScheduler(t)
+	stale := &Task{ID: "queued", Name: "removed", Schedule: "@every 1h", Prompt: "old"}
+	if err := s.AddTask(stale); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	s.SetPromptRunner(func(_ context.Context, _ *Task) (string, error) {
+		calls++
+		return "done", nil
+	})
+	if err := s.RemoveTask(stale.ID); err != nil {
+		t.Fatal(err)
+	}
+	// A scheduler tick can retain the old pointer while RemoveTask runs.
+	s.runTaskAt(stale, time.Now(), false)
+	if calls != 0 || stale.RunCount != 0 {
+		t.Fatalf("removed queued task ran: calls=%d task=%+v", calls, stale)
+	}
+
+	replacement := &Task{ID: stale.ID, Name: "replacement", Schedule: "@every 1h", Prompt: "new"}
+	if err := s.AddTask(replacement); err != nil {
+		t.Fatal(err)
+	}
+	s.runTaskAt(stale, time.Now(), false)
+	if calls != 0 || stale.RunCount != 0 || replacement.RunCount != 0 {
+		t.Fatalf("replaced queued task ran: calls=%d stale=%+v replacement=%+v", calls, stale, replacement)
+	}
+	s.runTaskAt(replacement, time.Now(), true)
+	if calls != 1 || replacement.RunCount != 1 {
+		t.Fatalf("replacement failed to run: calls=%d task=%+v", calls, replacement)
+	}
+}
+
 func TestRemoveTask_NonExistent(t *testing.T) {
 	s := newTestScheduler(t)
 	// Removing non-existent task should not error (delete is a no-op on missing keys).

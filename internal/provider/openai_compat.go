@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -27,7 +28,7 @@ func NewOpenAICompat(name, apiKey, baseURL string) *OpenAICompat {
 }
 
 func (o *OpenAICompat) Name() string                   { return o.name }
-func (o *OpenAICompat) SupportsVision() bool           { return true }
+func (o *OpenAICompat) SupportsVision() bool           { return o.name != "deepseek" }
 func (o *OpenAICompat) SupportsTools() bool            { return true }
 func (o *OpenAICompat) SupportsStructuredOutput() bool { return true }
 
@@ -61,7 +62,16 @@ func (o *OpenAICompat) Chat(ctx context.Context, req ChatRequest) (*ChatResponse
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		time.Sleep(time.Duration(math.Pow(2, float64(attempt))) * time.Second)
+		if !IsFailoverError(err) || attempt == 2 {
+			break
+		}
+		timer := time.NewTimer(time.Duration(math.Pow(2, float64(attempt))) * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("openai chat: %w", err)
@@ -97,6 +107,9 @@ func (o *OpenAICompat) ChatStream(ctx context.Context, req ChatRequest, callback
 	}
 	if len(req.Stop) > 0 {
 		oReq.Stop = req.Stop
+	}
+	if req.ResponseFormat != nil {
+		oReq.ResponseFormat = convertResponseFormat(req.ResponseFormat)
 	}
 
 	stream, err := o.client.CreateChatCompletionStream(ctx, oReq)
@@ -242,6 +255,12 @@ func convertResponseFormat(rf *ResponseFormat) *openai.ChatCompletionResponseFor
 		return nil
 	}
 	switch rf.Type {
+	case "json_schema":
+		schema, err := json.Marshal(rf.Schema)
+		if err != nil {
+			return nil
+		}
+		return &openai.ChatCompletionResponseFormat{Type: openai.ChatCompletionResponseFormatTypeJSONSchema, JSONSchema: &openai.ChatCompletionResponseFormatJSONSchema{Name: "response", Schema: json.RawMessage(schema), Strict: true}}
 	case "json_object":
 		return &openai.ChatCompletionResponseFormat{Type: openai.ChatCompletionResponseFormatTypeJSONObject}
 	default:

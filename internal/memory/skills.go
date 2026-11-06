@@ -14,13 +14,48 @@ import (
 // Uses SQLite if db is provided, otherwise falls back to file-based storage.
 func NewStoreFromDB(sqlDB *sql.DB, dataDir string) Store {
 	if sqlDB != nil {
-		return NewSQLiteStore(sqlDB)
+		return NewManagedStore(NewSQLiteStore(sqlDB))
 	}
-	return NewFileStore(dataDir)
+	return NewManagedStore(NewFileStore(dataDir))
 }
 
 // RegisterSkills registers memory-related skills in the skill registry.
 func RegisterSkills(reg *skill.Registry, store Store) {
+	reg.Register(&skill.Skill{
+		Name:        "review_memories",
+		Description: "Revisar fatos atuais, alteracoes temporais, proveniencia e marcadores de esquecimento. Use antes de corrigir ou esquecer uma memoria.",
+		Parameters:  jsonschema.Definition{Type: jsonschema.Object, Properties: map[string]jsonschema.Definition{"topic": {Type: jsonschema.String, Description: "Topico opcional para filtrar a revisao"}}},
+		Execute: func(args map[string]string) (string, error) {
+			var memories []Memory
+			var err error
+			if reviewer, ok := store.(interface {
+				Review(context.Context, string) ([]Memory, error)
+			}); ok {
+				memories, err = reviewer.Review(context.Background(), args["topic"])
+			} else {
+				memories, err = store.List(context.Background())
+			}
+			if err != nil {
+				return "", err
+			}
+			var out strings.Builder
+			for _, m := range memories {
+				state := "ativa"
+				if hasTag(m, forgottenTag) {
+					state = "esquecida"
+				}
+				if hasTag(m, supersededTag) {
+					state = "substituida"
+				}
+				fmt.Fprintf(&out, "[%s] %s | %s | fonte=%s | evidencias=%s | atualizada=%s\n", m.Topic, state, m.Content, m.Source, strings.Join(m.Tags, ","), m.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"))
+			}
+			if out.Len() == 0 {
+				return "Nenhuma memoria para revisar.", nil
+			}
+			return out.String(), nil
+		},
+	})
+
 	reg.Register(&skill.Skill{
 		Name:        "save_memory",
 		Description: "Salvar uma memoria persistente. Use para lembrar fatos, preferencias e informacoes importantes entre sessoes.",
@@ -60,7 +95,7 @@ func RegisterSkills(reg *skill.Registry, store Store) {
 			if query == "" {
 				return "", fmt.Errorf("query e obrigatoria")
 			}
-			memories, err := store.Search(context.Background(), query)
+			memories, err := store.SearchRelevant(context.Background(), query, 20, 0.2)
 			if err != nil {
 				return "", err
 			}
@@ -101,7 +136,7 @@ func RegisterSkills(reg *skill.Registry, store Store) {
 
 	reg.Register(&skill.Skill{
 		Name:        "delete_memory",
-		Description: "Deletar uma memoria persistente por topico.",
+		Description: "Esquecer uma memoria derivada e suas revisoes, bloqueando reaprendizado automatico. O diario bruto privado permanece separado.",
 		Parameters: jsonschema.Definition{
 			Type: jsonschema.Object,
 			Properties: map[string]jsonschema.Definition{

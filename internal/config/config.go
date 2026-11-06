@@ -23,6 +23,7 @@ type Config struct {
 	Sandbox     SandboxConfig      `yaml:"sandbox"`
 	Scheduler   SchedulerConfig    `yaml:"scheduler"`
 	Remote      RemoteConfig       `yaml:"remote"`
+	WhatsApp    WhatsAppConfig     `yaml:"whatsapp"`
 	Templates   TemplatesConfig    `yaml:"templates"`
 	Hooks       []HookConfig       `yaml:"hooks"`
 	Permissions *PermissionsConfig `yaml:"permissions,omitempty"`
@@ -48,12 +49,13 @@ type ProviderConfig struct {
 
 type MCPServerConf struct {
 	Name      string            `yaml:"name"`
-	Transport string            `yaml:"transport"` // "stdio" or "sse"
+	Transport string            `yaml:"transport"` // "stdio", "sse", or "http" (Streamable HTTP)
 	Command   string            `yaml:"command"`
 	Args      []string          `yaml:"args"`
 	URL       string            `yaml:"url"`
 	Env       map[string]string `yaml:"env"`
 	AutoStart bool              `yaml:"auto_start"`
+	Headers   map[string]string `yaml:"headers"`
 }
 
 type SandboxConfig struct {
@@ -66,17 +68,29 @@ type SandboxConfig struct {
 }
 
 type SchedulerConfig struct {
-	Enabled  bool   `yaml:"enabled"`
-	DataFile string `yaml:"data_file"`
+	Enabled           bool   `yaml:"enabled"`
+	DataFile          string `yaml:"data_file"`
+	HeartbeatEnabled  bool   `yaml:"heartbeat_enabled"`
+	HeartbeatInterval string `yaml:"heartbeat_interval"`
 }
 
-// RemoteConfig configures an optional human-question and notification relay.
-// It is a relay for the CLI runtime, not a general chat adapter.
+// RemoteConfig configures the optional authenticated inbox and human relay.
 type RemoteConfig struct {
-	Enabled        bool   `yaml:"enabled"`
-	BotToken       string `yaml:"bot_token"`
-	ChatID         string `yaml:"chat_id"`
-	TimeoutSeconds int    `yaml:"timeout_seconds"`
+	Enabled        bool    `yaml:"enabled"`
+	BotToken       string  `yaml:"bot_token"`
+	ChatID         string  `yaml:"chat_id"`
+	AllowedUserIDs []int64 `yaml:"allowed_user_ids"`
+	TimeoutSeconds int     `yaml:"timeout_seconds"`
+}
+
+// WhatsAppConfig enables the native bridge to a separately migrated linked-device session.
+// The allowlists are exact JIDs; the existing PolyClaw session is never opened directly.
+type WhatsAppConfig struct {
+	Enabled        bool     `yaml:"enabled"`
+	SessionDir     string   `yaml:"session_dir"`
+	OwnerChat      string   `yaml:"owner_chat"`
+	AllowedChats   []string `yaml:"allowed_chats"`
+	AllowedSenders []string `yaml:"allowed_senders"`
 }
 
 type TemplatesConfig struct {
@@ -150,6 +164,9 @@ func Load(path string) (*Config, error) {
 	if err := cfg.Permissions.Validate(); err != nil {
 		return nil, fmt.Errorf("validating permissions: %w", err)
 	}
+	if err := cfg.WhatsApp.Validate(); err != nil {
+		return nil, fmt.Errorf("validating whatsapp: %w", err)
+	}
 	return cfg, nil
 }
 
@@ -202,6 +219,9 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Scheduler.DataFile == "" {
 		cfg.Scheduler.DataFile = "data/scheduler.json"
+	}
+	if cfg.Scheduler.HeartbeatInterval == "" {
+		cfg.Scheduler.HeartbeatInterval = "1h"
 	}
 	if cfg.Remote.TimeoutSeconds == 0 {
 		cfg.Remote.TimeoutSeconds = 300

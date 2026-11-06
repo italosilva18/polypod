@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+export HOME=/root
+export USER=root
+export LOGNAME=root
+export TERM="${TERM:-xterm-256color}"
+
+umask 0000
+cd '/home/costa/Área de trabalho/CLI/polypod'
+
+exec /usr/local/libexec/polypod-root "$@"

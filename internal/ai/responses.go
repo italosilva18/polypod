@@ -13,7 +13,7 @@ import (
 func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatMessage, callback StreamCallback, logger *slog.Logger) (*ChatResponse, error) {
 	req := providerapi.ChatRequest{Model: c.model, MaxTokens: c.maxTok, Temperature: c.temp}
 	for _, msg := range messages {
-		req.Messages = append(req.Messages, providerapi.Message{Role: msg.Role, Content: msg.Content})
+		req.Messages = append(req.Messages, providerapi.Message{Role: msg.Role, Content: msg.Content, Parts: msg.Parts})
 	}
 	if c.toolsOn && c.skills != nil {
 		for _, tool := range c.skills.ToolDefinitions(c.skillNames) {
@@ -44,7 +44,11 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 		totalPrompt += resp.PromptTokens
 		totalCompletion += resp.CompletionTokens
 		if c.costEngine != nil {
-			c.costEngine.RecordCompletion(c.model, resp.PromptTokens, resp.CompletionTokens, 0, 0)
+			model := resp.Model
+			if model == "" {
+				model = c.model
+			}
+			c.costEngine.RecordCompletion(model, resp.PromptTokens, resp.CompletionTokens, 0, 0)
 		}
 		if len(resp.ToolCalls) == 0 {
 			return &ChatResponse{Content: resp.Content, PromptTokens: totalPrompt, CompletionTokens: totalCompletion, TotalTokens: totalPrompt + totalCompletion}, nil
@@ -53,6 +57,7 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 		assistant := providerapi.Message{Role: "assistant", Content: resp.Content, ToolCalls: resp.ToolCalls}
 		req.Messages = append(req.Messages, assistant)
 
+		var observations []ToolCallResult
 		if c.streamingToolMgr != nil {
 			calls := make([]ToolCallInfo, 0, len(resp.ToolCalls))
 			for _, tc := range resp.ToolCalls {
@@ -64,6 +69,7 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 			}
 			started := time.Now()
 			results := c.streamingToolMgr.ExecuteToolCalls(ctx, calls)
+			observations = append(observations, results...)
 			elapsed := time.Since(started)
 			for _, result := range results {
 				content := result.Content
@@ -78,13 +84,18 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 				logger.Debug("executing Responses API tool", "tool", tc.Name, "iter", iter)
 				c.fireResponseToolStart(tc)
 				started := time.Now()
-				result, execErr := c.skills.Execute(tc.Name, tc.Arguments)
+				richResult, execErr := executeSkillResult(c.skills, tc.Name, tc.Arguments)
+				result := richResult.Content
+				observations = append(observations, ToolCallResult{ID: tc.ID, Name: tc.Name, Images: richResult.Images, IsError: richResult.IsError || execErr != nil})
 				if execErr != nil {
 					result = fmt.Sprintf("Erro executando tool: %v", execErr)
 				}
 				c.fireResponseToolDone(ToolCallResult{ID: tc.ID, Name: tc.Name, Content: result, IsError: execErr != nil}, time.Since(started))
 				req.Messages = append(req.Messages, providerapi.Message{Role: "tool", Content: result, ToolCallID: tc.ID, Name: tc.Name})
 			}
+		}
+		if c.responseProvider.SupportsVision() {
+			req.Messages = append(req.Messages, imageObservations(observations)...)
 		}
 		if callback != nil {
 			callback("\n")

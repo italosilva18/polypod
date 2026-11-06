@@ -1,14 +1,7 @@
 polypod
 .env
+.env.*
 config.yaml
+config.local.yaml
 *.log
-data/conversations/auto-memory/
-data/conversations/cli_history
-data/conversations/credentials.enc
-data/conversations/secrets.enc
-data/conversations/chatgpt-auth.enc
-data/conversations/usage.json
-data/conversations/humanloop.json
-data/conversations/dream-state.json
-data/scheduler.json
-data/polypod.db*
+data/

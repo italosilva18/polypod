@@ -3,7 +3,9 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/openai/openai-go/v3"
@@ -69,9 +71,12 @@ func (p *ChatGPT) ChatStream(ctx context.Context, req ChatRequest, callback Stre
 		return nil, fmt.Errorf("ChatGPT Responses stream: %w", err)
 	}
 	if final == nil {
-		return nil, fmt.Errorf("ChatGPT Responses stream terminou sem resposta final")
+		return nil, fmt.Errorf("ChatGPT Responses stream terminou sem resposta final: %w", io.ErrUnexpectedEOF)
 	}
 	if final.Status != responses.ResponseStatusCompleted {
+		if final.Error.Code == responses.ResponseErrorCodeServerError || final.Error.Code == responses.ResponseErrorCodeRateLimitExceeded {
+			return nil, fmt.Errorf("ChatGPT Responses %s: %w", final.Error.Code, ErrProviderUnavailable)
+		}
 		if final.Error.Message != "" {
 			return nil, fmt.Errorf("ChatGPT Responses %s: %s", final.Status, final.Error.Message)
 		}
@@ -93,7 +98,7 @@ func (p *ChatGPT) ChatStream(ctx context.Context, req ChatRequest, callback Stre
 func (p *ChatGPT) request(ctx context.Context, req ChatRequest) (*openai.Client, responses.ResponseNewParams, error) {
 	token, err := p.tokenSource(ctx)
 	if err != nil {
-		return nil, responses.ResponseNewParams{}, err
+		return nil, responses.ResponseNewParams{}, errors.Join(ErrProviderUnavailable, err)
 	}
 	client := openai.NewClient(
 		option.WithAPIKey(token),
@@ -144,7 +149,7 @@ func translateChatGPTMessages(messages []Message) (responses.ResponseInputParam,
 		default:
 			input = append(input, responses.ResponseInputItemUnionParam{OfMessage: &responses.EasyInputMessageParam{
 				Role:    responses.EasyInputMessageRoleUser,
-				Content: responses.EasyInputMessageContentUnionParam{OfString: openai.Opt(msg.Content)},
+				Content: chatGPTMessageContent(msg),
 			}})
 		}
 	}
@@ -155,7 +160,7 @@ func translateChatGPTTools(tools []Tool) []responses.ToolUnionParam {
 	result := make([]responses.ToolUnionParam, 0, len(tools))
 	for _, tool := range tools {
 		fn := responses.FunctionToolParam{
-			Name: tool.Name, Parameters: tool.Parameters, Strict: openai.Opt(false),
+			Name: tool.Name, Parameters: normalizeChatGPTToolSchema(tool.Parameters), Strict: openai.Opt(false),
 		}
 		if tool.Description != "" {
 			fn.Description = openai.Opt(tool.Description)
@@ -163,6 +168,50 @@ func translateChatGPTTools(tools []Tool) []responses.ToolUnionParam {
 		result = append(result, responses.ToolUnionParam{OfFunction: &fn})
 	}
 	return result
+}
+
+// The Responses API validates `required` as an array and `properties` as an
+// object when either field is present. Some legacy tools provide typed nils,
+// which otherwise become JSON null. Normalize only JSON Schema object nodes
+// and leave the caller's schema untouched for other providers.
+func normalizeChatGPTToolSchema(input map[string]interface{}) map[string]interface{} {
+	if input == nil {
+		return map[string]interface{}{"type": "object", "properties": map[string]interface{}{}, "required": []interface{}{}}
+	}
+	raw, err := json.Marshal(input)
+	if err != nil {
+		return map[string]interface{}{"type": "object", "properties": map[string]interface{}{}, "required": []interface{}{}}
+	}
+	var schema map[string]interface{}
+	if err := json.Unmarshal(raw, &schema); err != nil || schema == nil {
+		return map[string]interface{}{"type": "object", "properties": map[string]interface{}{}, "required": []interface{}{}}
+	}
+	if schema["type"] == nil {
+		schema["type"] = "object"
+	}
+	normalizeChatGPTSchemaNode(schema)
+	return schema
+}
+
+func normalizeChatGPTSchemaNode(value any) {
+	switch node := value.(type) {
+	case map[string]interface{}:
+		if node["type"] == "object" {
+			if node["properties"] == nil {
+				node["properties"] = map[string]interface{}{}
+			}
+			if node["required"] == nil {
+				node["required"] = []interface{}{}
+			}
+		}
+		for _, child := range node {
+			normalizeChatGPTSchemaNode(child)
+		}
+	case []interface{}:
+		for _, child := range node {
+			normalizeChatGPTSchemaNode(child)
+		}
+	}
 }
 
 func parseChatGPTResponse(resp *responses.Response) *ChatResponse {
@@ -194,4 +243,27 @@ func parseChatGPTResponse(resp *responses.Response) *ChatResponse {
 	result.CompletionTokens = int(resp.Usage.OutputTokens)
 	result.TotalTokens = int(resp.Usage.TotalTokens)
 	return result
+}
+
+func chatGPTMessageContent(msg Message) responses.EasyInputMessageContentUnionParam {
+	if len(msg.Parts) == 0 {
+		return responses.EasyInputMessageContentUnionParam{OfString: openai.Opt(msg.Content)}
+	}
+	var parts responses.ResponseInputMessageContentListParam
+	if msg.Content != "" {
+		parts = append(parts, responses.ResponseInputContentUnionParam{OfInputText: &responses.ResponseInputTextParam{Text: msg.Content}})
+	}
+	for _, p := range msg.Parts {
+		switch p.Type {
+		case "text":
+			parts = append(parts, responses.ResponseInputContentUnionParam{OfInputText: &responses.ResponseInputTextParam{Text: p.Text}})
+		case "image_base64", "image_url":
+			url := p.ImageURL
+			if p.Type == "image_base64" {
+				url = "data:" + p.MimeType + ";base64," + p.ImageB64
+			}
+			parts = append(parts, responses.ResponseInputContentUnionParam{OfInputImage: &responses.ResponseInputImageParam{ImageURL: openai.Opt(url), Detail: "auto"}})
+		}
+	}
+	return responses.EasyInputMessageContentUnionParam{OfInputItemContentList: parts}
 }

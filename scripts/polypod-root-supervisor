@@ -1,0 +1,40 @@
+#!/bin/sh
+set -eu
+
+session=polypod-root
+tmux_bin=${POLYPOD_TMUX_BIN:-/usr/bin/tmux}
+poll_seconds=${POLYPOD_SUPERVISOR_POLL_SECONDS:-2}
+rapid_seconds=${POLYPOD_SUPERVISOR_RAPID_SECONDS:-15}
+max_rapid_failures=${POLYPOD_SUPERVISOR_MAX_RAPID_FAILURES:-3}
+last_start=0
+rapid_failures=0
+
+cleanup() {
+    "$tmux_bin" kill-session -t "$session" 2>/dev/null || true
+}
+
+trap cleanup EXIT
+trap 'exit 0' INT TERM HUP
+
+while :; do
+    if ! "$tmux_bin" has-session -t "$session" 2>/dev/null; then
+        now=$(date +%s)
+        if [ "$last_start" -gt 0 ]; then
+            elapsed=$((now - last_start))
+            if [ "$elapsed" -lt "$rapid_seconds" ]; then
+                rapid_failures=$((rapid_failures + 1))
+            else
+                rapid_failures=0
+            fi
+            if [ "$rapid_failures" -ge "$max_rapid_failures" ]; then
+                printf 'Polypod saiu %s vezes em menos de %ss; encerrando o supervisor para sinalizar falha ao systemd.\n' \
+                    "$rapid_failures" "$rapid_seconds" >&2
+                exit 1
+            fi
+        fi
+        "$tmux_bin" new-session -d -s "$session" /usr/local/sbin/polypod-root-session
+        last_start=$now
+    fi
+    sleep "$poll_seconds" &
+    wait $!
+done

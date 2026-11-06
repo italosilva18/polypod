@@ -12,6 +12,8 @@ import (
 // Note: task/todo tools are registered separately via RegisterTaskTools in tasktools.go.
 // Note: plan mode tools are registered separately via RegisterPlanModeTools in plantools.go.
 func RegisterRemainingTools(reg *Registry) {
+	RegisterGrokTool(reg)
+	RegisterDocumentTool(reg)
 	registerSleepTool(reg)
 	// ask_user_question is now registered by RegisterAskUserTool (askuser.go)
 	registerBriefTool(reg)

@@ -37,6 +37,7 @@ type ToolCallInfo struct {
 
 // ToolCallResult holds the outcome of executing a single tool call.
 type ToolCallResult struct {
+	Images  []types.ToolImage
 	ID      string
 	Name    string
 	Content string
@@ -303,6 +304,7 @@ func (m *StreamingToolManager) executeSingle(ctx context.Context, call ToolCallI
 		ID:      call.ID,
 		Name:    call.Name,
 		Content: truncateToolResult(result.Content),
+		Images:  result.Images,
 		IsError: result.IsError,
 	}
 }

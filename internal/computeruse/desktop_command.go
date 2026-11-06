@@ -34,6 +34,7 @@ func desktopCommandContext(ctx context.Context, name string, args ...string) *ex
 		"PATH=" + os.Getenv("PATH"),
 	}
 	for _, key := range []string{
+		"YDOTOOL_SOCKET",
 		"DISPLAY",
 		"WAYLAND_DISPLAY",
 		"XDG_RUNTIME_DIR",

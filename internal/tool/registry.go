@@ -175,6 +175,14 @@ func (r *Registry) FilterByNames(names []string) []types.Tool {
 	nameSet := make(map[string]bool, len(names))
 	for _, n := range names {
 		nameSet[n] = true
+		// Agent YAML uses skill names without the registry's collision-safe
+		// prefix. Prefer a real builtin when one exists; otherwise expose the
+		// bridged skill under its actual tool name.
+		if _, direct := r.tools[n]; !direct {
+			if _, bridged := r.tools["skill_"+n]; bridged {
+				nameSet["skill_"+n] = true
+			}
+		}
 	}
 	var result []types.Tool
 	for name, t := range r.tools {

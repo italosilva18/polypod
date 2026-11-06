@@ -77,3 +77,30 @@ func TestNewQuestionIDIsCorrelatedAndDistinct(t *testing.T) {
 		t.Fatalf("unexpected IDs: %q %q", first, second)
 	}
 }
+
+func TestAskWaitingForSlotHonorsCancellation(t *testing.T) {
+	handler := NewUserPromptHandler()
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	defer cancelFirst()
+	firstDone := make(chan struct{})
+	go func() { defer close(firstDone); _, _ = handler.Ask(firstCtx, UserQuestion{Question: "primeira"}) }()
+	select {
+	case <-handler.QuestionCh:
+	case <-time.After(time.Second):
+		t.Fatal("first question not delivered")
+	}
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	cancelSecond()
+	secondDone := make(chan error, 1)
+	go func() { _, err := handler.Ask(secondCtx, UserQuestion{Question: "segunda"}); secondDone <- err }()
+	select {
+	case err := <-secondDone:
+		if err == nil {
+			t.Fatal("expected cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled ask blocked behind another question")
+	}
+	cancelFirst()
+	<-firstDone
+}

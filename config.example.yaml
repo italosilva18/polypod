@@ -4,6 +4,8 @@ database:
   path: data/polypod.db
 
 ai:
+  # Grok pela API: veja examples/grok-api.yaml (XAI_API_KEY).
+  # Grok pela conta: grok login + ferramenta grok_delegate; docs/integrations/grok.md.
   provider: deepseek
   base_url: https://api.deepseek.com/v1
   api_key: "${DEEPSEEK_API_KEY}"
@@ -53,6 +55,29 @@ permissions:
 scheduler:
   enabled: false
   data_file: data/scheduler.json
+  heartbeat_enabled: false
+  heartbeat_interval: 1h
+
+# Optional Telegram relay.
+remote:
+  enabled: false
+  bot_token: "${POLYPOD_TELEGRAM_BOT_TOKEN:}"
+  chat_id: "${POLYPOD_TELEGRAM_CHAT_ID:}"
+  allowed_user_ids: []
+  timeout_seconds: 300
+
+# Native WhatsApp bridge. Keep disabled until PolyClaw's linked-device store has
+# been backed up after stopping its gateway and copied to a separate session_dir.
+# Use exact WhatsApp JIDs for chats and senders (for example, user@s.whatsapp.net).
+# Keep the private session outside the source tree (for example,
+# /var/lib/polypod/whatsapp for the root service).
+whatsapp:
+  enabled: false
+  session_dir: "${POLYPOD_WHATSAPP_SESSION_DIR:}"
+  # Optional direct chat for the whatsapp_notify skill; must appear in allowed_chats.
+  owner_chat: ""
+  allowed_chats: []
+  allowed_senders: []
 
 templates:
   dir: templates

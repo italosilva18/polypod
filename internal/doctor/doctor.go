@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/costa/polypod/internal/config"
+	"github.com/costa/polypod/internal/whatsappgateway"
 )
 
 // Check represents a single diagnostic check.
@@ -20,7 +22,13 @@ type Check struct {
 
 // RunDiagnostics performs all health checks and returns results.
 func RunDiagnostics(cfg *config.Config) []Check {
+	return RunDiagnosticsContext(context.Background(), cfg, false)
+}
+
+func runBasicDiagnostics(cfg *config.Config) []Check {
 	var checks []Check
+	checks = append(checks, checkRemote(cfg.Remote))
+	checks = append(checks, checkWhatsApp(cfg.WhatsApp, cfg.Data.Dir))
 
 	// 1. Go version
 	checks = append(checks, checkCommand("Go", "go", "version"))
@@ -30,7 +38,7 @@ func RunDiagnostics(cfg *config.Config) []Check {
 
 	// 3. AI provider connectivity
 	if cfg.AI.Provider == "chatgpt" {
-		checks = append(checks, Check{Name: "AI Provider", Status: "ok", Message: "ChatGPT OAuth selecionado"})
+		checks = append(checks, Check{Name: "AI Provider", Status: "ok", Message: "ChatGPT selecionado; autenticacao verificada separadamente"})
 	} else {
 		checks = append(checks, checkAPIKey("AI Provider", cfg.AI.APIKey, cfg.AI.BaseURL))
 	}
@@ -101,8 +109,10 @@ func FormatReport(checks []Check) string {
 	}
 
 	sb.WriteString(fmt.Sprintf("\nResultado: %d ok, %d avisos, %d falhas\n", okCount, warnCount, failCount))
-	if failCount == 0 {
+	if failCount == 0 && warnCount == 0 {
 		sb.WriteString("Polypod esta funcionando corretamente.\n")
+	} else if failCount == 0 {
+		sb.WriteString("Polypod esta ativo, com avisos que precisam de verificacao.\n")
 	}
 	return sb.String()
 }
@@ -130,10 +140,10 @@ func checkOptionalTool(name, cmd string) Check {
 }
 
 func checkAPIKey(name, key, baseURL string) Check {
-	if key == "" || key == "${DEEPSEEK_API_KEY}" || strings.HasPrefix(key, "sk-your") {
+	if key == "" || strings.HasPrefix(key, "${") || strings.HasPrefix(key, "sk-your") {
 		return Check{Name: name, Status: "fail", Message: "API key nao configurada"}
 	}
-	return Check{Name: name, Status: "ok", Message: fmt.Sprintf("configurada (%s...)", key[:8])}
+	return Check{Name: name, Status: "ok", Message: "configurada; valor omitido"}
 }
 
 func checkFile(name, path string) Check {
@@ -150,4 +160,51 @@ func checkDir(name, path string) Check {
 		return Check{Name: name, Status: "fail", Message: fmt.Sprintf("%s nao e diretorio", path)}
 	}
 	return Check{Name: name, Status: "ok", Message: path}
+}
+
+func checkRemote(cfg config.RemoteConfig) Check {
+	check := Check{Name: "Telegram remoto", Status: "ok", Message: "desativado"}
+	if !cfg.Enabled {
+		return check
+	}
+	if err := cfg.Validate(); err != nil {
+		check.Status, check.Message = "fail", err.Error()
+		return check
+	}
+	check.Message = "configurado com filtro de chat e remetente; conectividade nao verificada"
+	return check
+}
+
+func checkWhatsApp(cfg config.WhatsAppConfig, dataDir string) Check {
+	c := Check{Name: "WhatsApp nativo", Status: "ok", Message: "desativado"}
+	if !cfg.Enabled {
+		return c
+	}
+	if len(cfg.AllowedChats) == 0 || len(cfg.AllowedSenders) == 0 {
+		c.Status, c.Message = "fail", "configure allowed_chats e allowed_senders antes de ativar"
+		return c
+	}
+	if err := (&whatsappgateway.Native{SessionDir: cfg.SessionDir}).Preflight(); err != nil {
+		c.Status, c.Message = "fail", "sessao isolada indisponivel; confira session_dir e o backup da sessao pareada"
+		return c
+	}
+	status, err := whatsappgateway.ReadStatus(filepath.Join(dataDir, "whatsapp-status.json"))
+	if err != nil {
+		c.Status, c.Message = "warn", "sessao isolada preparada; nenhuma conexao recente foi registrada"
+		return c
+	}
+	if status.CheckedAt.IsZero() || time.Since(status.CheckedAt) > time.Minute || time.Until(status.CheckedAt) > time.Minute {
+		c.Status, c.Message = "warn", "estado do canal desatualizado; confira o processo e os logs"
+		return c
+	}
+	if status.State != "connected" || !status.Authenticated || !status.SocketConnected {
+		if status.SocketConnected && !status.Authenticated {
+			c.Status, c.Message = "warn", "websocket aberto, mas sessao WhatsApp ainda nao autenticada"
+		} else {
+			c.Status, c.Message = "warn", "canal sem conexao ativa; reconexao automatica em andamento"
+		}
+		return c
+	}
+	c.Message = "conexao ativa; confirme recebimento e resposta em teste real"
+	return c
 }

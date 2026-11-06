@@ -47,6 +47,7 @@ type DreamConfig struct {
 // ExtractedMemory is the structured output the AI callback returns for each
 // memory worth persisting.
 type ExtractedMemory struct {
+	FactKey    string `json:"fact_key,omitempty"` // stable subject/property key, never a value
 	Type       string // "fact", "preference", "skill", "context"
 	Content    string
 	Tags       []string
@@ -67,6 +68,8 @@ type DreamStats struct {
 type DreamService struct {
 	config DreamConfig
 
+	runMu         sync.Mutex
+	lastSequence  uint64
 	mu            sync.Mutex
 	lastRun       time.Time
 	lastActivity  time.Time
@@ -179,13 +182,14 @@ func (d *DreamService) loop(ctx context.Context) {
 		d.mu.Lock()
 		idleFor := time.Since(d.lastActivity)
 		sinceLastRun := time.Since(d.lastRun)
+		firstRun := d.lastRun.IsZero()
 		d.mu.Unlock()
 
-		if idleFor < d.config.IdleThreshold {
+		if idleFor < d.config.IdleThreshold && !firstRun && sinceLastRun < d.config.Interval {
 			// User is still active, keep waiting.
 			continue
 		}
-		if !d.lastRun.IsZero() && sinceLastRun < d.config.Interval {
+		if !firstRun && sinceLastRun < d.config.Interval {
 			// Too soon since last run.
 			continue
 		}
@@ -208,6 +212,8 @@ func (d *DreamService) loop(ctx context.Context) {
 // extractMemories pulls recent messages from the session store, asks the AI
 // callback to distill memories, and persists them to the memory store.
 func (d *DreamService) extractMemories(ctx context.Context) error {
+	d.runMu.Lock()
+	defer d.runMu.Unlock()
 	logger := d.config.Logger
 
 	d.mu.Lock()
@@ -227,33 +233,63 @@ func (d *DreamService) extractMemories(ctx context.Context) error {
 		return err
 	}
 
-	transcript, msgCount, processedThrough := d.collectTranscript()
-	if msgCount == 0 {
+	transcript, msgCount, sequence, provenance, err := d.collectTranscript(ctx)
+	if err != nil {
+		d.recordError(err)
+		return err
+	}
+	if sequence == 0 {
 		logger.Debug("dream: no messages to process")
 		return nil
 	}
 
 	logger.Info("dream: extracting memories", "messages", msgCount)
 
-	memories, err := d.config.ExtractFn(ctx, transcript)
+	memories, cached, err := d.loadPending(sequence)
+	if err != nil {
+		d.recordError(err)
+		return err
+	}
+	if !cached && msgCount > 0 {
+		memories, err = d.config.ExtractFn(ctx, transcript)
+	}
 	if err != nil {
 		d.recordError(err)
 		return fmt.Errorf("extract callback: %w", err)
 	}
 
+	if !cached {
+		clean := make([]ExtractedMemory, 0, len(memories))
+		for _, m := range memories {
+			if strings.TrimSpace(m.Content) != "" && !looksSensitive(m.Content) && !looksSensitive(strings.Join(m.Tags, " ")) {
+				clean = append(clean, m)
+			}
+		}
+		memories = clean
+		if err := d.savePending(sequence, memories); err != nil {
+			d.recordError(err)
+			return err
+		}
+	}
+
 	added := 0
 	saveFailed := false
 	for _, m := range memories {
-		if strings.TrimSpace(m.Content) == "" {
+		if strings.TrimSpace(m.Content) == "" || looksSensitive(m.Content) || looksSensitive(strings.Join(m.Tags, " ")) {
 			continue
 		}
 		if d.config.Memory == nil {
+			saveFailed = true
 			continue
+		}
+		tags := append(append([]string(nil), m.Tags...), provenance...)
+		if m.FactKey != "" {
+			tags = append(tags, "fact_key:"+m.FactKey)
 		}
 		mem := memory.Memory{
 			Topic:      d.topicFor(m),
 			Content:    m.Content,
-			Tags:       m.Tags,
+			Tags:       tags,
 			Priority:   normalisePriority(m.Importance),
 			Source:     "dream",
 			Confidence: float64(m.Importance) / 5.0,
@@ -265,14 +301,17 @@ func (d *DreamService) extractMemories(ctx context.Context) error {
 		}
 		added++
 	}
-	if !processedThrough.IsZero() && !saveFailed {
+	if !saveFailed {
 		d.mu.Lock()
-		if processedThrough.After(d.lastProcessed) {
-			d.lastProcessed = processedThrough
-		}
+		previous := d.lastSequence
+		d.lastSequence = sequence
 		d.mu.Unlock()
 		if err := d.saveState(); err != nil {
-			logger.Warn("dream: failed saving consolidation state", "error", err)
+			d.mu.Lock()
+			d.lastSequence = previous
+			d.mu.Unlock()
+			d.recordError(err)
+			return fmt.Errorf("persisting dream cursor: %w", err)
 		}
 	}
 
@@ -296,68 +335,55 @@ func (d *DreamService) extractMemories(ctx context.Context) error {
 
 // collectTranscript gathers recent messages from all sessions, capped at
 // MaxMessages, and renders them as a single transcript string.
-func (d *DreamService) collectTranscript() (string, int, time.Time) {
-	store := d.config.SessionStore
-	sessions := store.GetAllSessions()
-	if len(sessions) == 0 {
-		return "", 0, time.Time{}
-	}
+func (d *DreamService) collectTranscript(ctx context.Context) (string, int, uint64, []string, error) {
 	d.mu.Lock()
-	lastProcessed := d.lastProcessed
+	cursor := d.lastSequence
 	d.mu.Unlock()
-
-	// Flatten all messages with timestamps so we can sort newest-first.
-	type stamped struct {
-		sessionID string
-		msg       conversation.Message
+	entries, err := d.config.SessionStore.JournalAfter(ctx, cursor, d.config.MaxMessages)
+	if err != nil {
+		return "", 0, 0, nil, err
 	}
-	var all []stamped
-	for _, sess := range sessions {
-		// Background-generated prompts are operational artifacts, not evidence
-		// of user preferences. Excluding them prevents self-reinforcing memory.
-		if sess.Channel == "scheduler" || sess.Channel == "heartbeat" || sess.Channel == "inbox" {
+	// Keep an unacknowledged batch boundary stable if new turns arrived after
+	// an interrupted write. Its cached extraction must remain replayable.
+	if d.config.StateFile != "" {
+		raw, readErr := os.ReadFile(d.config.StateFile + ".pending")
+		if readErr != nil && !os.IsNotExist(readErr) {
+			return "", 0, 0, nil, readErr
+		}
+		if readErr == nil {
+			var pending pendingDream
+			if err := json.Unmarshal(raw, &pending); err != nil {
+				return "", 0, 0, nil, err
+			}
+			if pending.Cursor == cursor {
+				for i, e := range entries {
+					if e.Sequence > pending.Through {
+						entries = entries[:i]
+						break
+					}
+				}
+			}
+		}
+	}
+	var sb strings.Builder
+	var sequence uint64
+	var provenance []string
+	count := 0
+	for _, e := range entries {
+		sequence = e.Sequence
+		if e.Channel == "scheduler" || e.Channel == "heartbeat" || e.Channel == "inbox" {
 			continue
 		}
-		for _, m := range sess.Messages {
-			if !m.Timestamp.IsZero() && !m.Timestamp.After(lastProcessed) {
-				continue
-			}
-			all = append(all, stamped{sessionID: sess.ID, msg: m})
+		// Only explicit user statements are evidence. Secrets never leave the
+		// private journal through automatic extraction, including assistant echoes.
+		if e.Message.Role != conversation.RoleUser || looksSensitive(e.Message.Content) {
+			continue
 		}
+		fmt.Fprintf(&sb, "[%s message=%s] user: %s\n", e.SessionID, e.Message.ID, strings.TrimSpace(e.Message.Content))
+		provenance = append(provenance, "journal:"+e.Message.ID)
+		count++
 	}
-	if len(all) == 0 {
-		return "", 0, time.Time{}
-	}
-
-	// Sort chronologically. Processing the oldest unseen batch first ensures
-	// that a busy conversation cannot permanently skip messages beyond the cap.
-	for i := 0; i < len(all); i++ {
-		for j := i + 1; j < len(all); j++ {
-			if all[j].msg.Timestamp.Before(all[i].msg.Timestamp) {
-				all[i], all[j] = all[j], all[i]
-			}
-		}
-	}
-
-	// Cap.
-	max := d.config.MaxMessages
-	if len(all) > max {
-		all = all[:max]
-	}
-
-	var sb strings.Builder
-	var processedThrough time.Time
-	for _, s := range all {
-		fmt.Fprintf(&sb, "[%s] %s: %s\n",
-			s.sessionID,
-			string(s.msg.Role),
-			strings.TrimSpace(s.msg.Content),
-		)
-		if s.msg.Timestamp.After(processedThrough) {
-			processedThrough = s.msg.Timestamp
-		}
-	}
-	return sb.String(), len(all), processedThrough
+	return sb.String(), count, sequence, provenance, nil
 }
 
 func (d *DreamService) recordError(err error) {
@@ -371,11 +397,17 @@ func (d *DreamService) topicFor(m ExtractedMemory) string {
 	if t == "" {
 		t = "context"
 	}
-	sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(m.Content))))
+	identity := strings.ToLower(strings.TrimSpace(m.Content))
+	if m.FactKey != "" {
+		identity = "fact_key:" + m.FactKey
+		t = "fact"
+	}
+	sum := sha256.Sum256([]byte(identity))
 	return "dream_" + t + "_" + hex.EncodeToString(sum[:6])
 }
 
 type dreamState struct {
+	LastSequence  uint64    `json:"last_sequence"`
 	LastProcessed time.Time `json:"last_processed"`
 }
 
@@ -390,6 +422,7 @@ func (d *DreamService) loadState() {
 	var state dreamState
 	if json.Unmarshal(raw, &state) == nil {
 		d.lastProcessed = state.LastProcessed
+		d.lastSequence = state.LastSequence
 	}
 }
 
@@ -398,7 +431,7 @@ func (d *DreamService) saveState() error {
 		return nil
 	}
 	d.mu.Lock()
-	state := dreamState{LastProcessed: d.lastProcessed}
+	state := dreamState{LastProcessed: d.lastProcessed, LastSequence: d.lastSequence}
 	d.mu.Unlock()
 	raw, err := json.Marshal(state)
 	if err != nil {
@@ -423,4 +456,57 @@ func normalisePriority(importance int) int {
 	default:
 		return 0
 	}
+}
+
+// Persist model output before applying it. A crash after a partial memory write
+// reuses the same topics/content instead of invoking a nondeterministic model.
+type pendingDream struct {
+	Cursor   uint64            `json:"cursor"`
+	Through  uint64            `json:"through"`
+	Memories []ExtractedMemory `json:"memories"`
+}
+
+func (d *DreamService) loadPending(through uint64) ([]ExtractedMemory, bool, error) {
+	if d.config.StateFile == "" {
+		return nil, false, nil
+	}
+	raw, err := os.ReadFile(d.config.StateFile + ".pending")
+	if os.IsNotExist(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	var p pendingDream
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return nil, false, fmt.Errorf("reading pending dream batch: %w", err)
+	}
+	d.mu.Lock()
+	cursor := d.lastSequence
+	d.mu.Unlock()
+	if p.Cursor != cursor || p.Through != through {
+		return nil, false, nil
+	}
+	return p.Memories, true, nil
+}
+
+func (d *DreamService) savePending(through uint64, memories []ExtractedMemory) error {
+	if d.config.StateFile == "" {
+		return nil
+	}
+	d.mu.Lock()
+	cursor := d.lastSequence
+	d.mu.Unlock()
+	raw, err := json.Marshal(pendingDream{Cursor: cursor, Through: through, Memories: memories})
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(d.config.StateFile), 0700); err != nil {
+		return err
+	}
+	path := d.config.StateFile + ".pending"
+	if err := os.WriteFile(path+".tmp", raw, 0600); err != nil {
+		return err
+	}
+	return os.Rename(path+".tmp", path)
 }

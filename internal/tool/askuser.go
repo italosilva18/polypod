@@ -37,7 +37,8 @@ type UserPromptHandler struct {
 
 	mu        sync.RWMutex
 	remoteAsk RemoteAskFunc
-	askMu     sync.Mutex
+	resolved  func(requestID, answer string) error
+	askGate   chan struct{}
 }
 
 // RemoteAskFunc forwards a correlated question to a remote human channel.
@@ -49,6 +50,7 @@ func NewUserPromptHandler() *UserPromptHandler {
 	return &UserPromptHandler{
 		QuestionCh: make(chan UserQuestion, 1),
 		AnswerCh:   make(chan string, 1),
+		askGate:    make(chan struct{}, 1),
 	}
 }
 
@@ -58,6 +60,13 @@ func (h *UserPromptHandler) SetRemoteAsk(fn RemoteAskFunc) {
 	h.mu.Lock()
 	h.remoteAsk = fn
 	h.mu.Unlock()
+}
+
+// SetQuestionResolved records the winning local or remote answer durably.
+func (h *UserPromptHandler) SetQuestionResolved(fn func(requestID, answer string) error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.resolved = fn
 }
 
 func (h *UserPromptHandler) getRemoteAsk() RemoteAskFunc {
@@ -73,13 +82,29 @@ type askResult struct {
 
 // Ask delivers a question locally and, when configured, remotely. Only one
 // ask is active at a time because the legacy TUI answer channel is untagged.
-func (h *UserPromptHandler) Ask(ctx context.Context, question UserQuestion) (string, error) {
-	h.askMu.Lock()
-	defer h.askMu.Unlock()
+func (h *UserPromptHandler) Ask(ctx context.Context, question UserQuestion) (answer string, err error) {
+	select {
+	case h.askGate <- struct{}{}:
+		defer func() { <-h.askGate }()
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 
 	if question.ID == "" {
 		question.ID = newQuestionID()
 	}
+	defer h.discardQueuedQuestion(question.ID)
+	defer func() {
+		if err != nil || answer == "" {
+			return
+		}
+		h.mu.RLock()
+		resolved := h.resolved
+		h.mu.RUnlock()
+		if resolved != nil {
+			err = resolved(question.ID, answer)
+		}
+	}()
 	raceCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -147,7 +172,7 @@ func (h *UserPromptHandler) discardQueuedQuestion(id string) {
 }
 
 func newQuestionID() string {
-	var raw [4]byte
+	var raw [8]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return fmt.Sprintf("q_%d", time.Now().UnixNano())
 	}

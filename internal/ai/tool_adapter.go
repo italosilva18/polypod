@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 
@@ -43,35 +44,10 @@ func (a *ToolRegistryAdapter) ToolDefinitions(names []string) []openai.Tool {
 	for _, t := range tools {
 		schema := t.InputSchema()
 
-		// Build properties for jsonschema
-		properties := make(map[string]any)
-		required := make([]string, 0)
-
-		if props, ok := schema["properties"]; ok {
-			if pm, ok := props.(map[string]any); ok {
-				properties = pm
-			}
-		}
-		if req, ok := schema["required"]; ok {
-			switch r := req.(type) {
-			case []string:
-				required = r
-			case []any:
-				for _, v := range r {
-					if s, ok := v.(string); ok {
-						required = append(required, s)
-					}
-				}
-			}
-		}
-
-		// Build function parameters as raw JSON for go-openai
-		params := map[string]any{
-			"type":       "object",
-			"properties": properties,
-		}
-		if len(required) > 0 {
-			params["required"] = required
+		// Preserve the complete schema, including $defs and combinators.
+		params := schema
+		if params == nil {
+			params = map[string]any{"type": "object", "properties": map[string]any{}}
 		}
 
 		result = append(result, openai.Tool{
@@ -90,45 +66,32 @@ func (a *ToolRegistryAdapter) ToolDefinitions(names []string) []openai.Tool {
 // If an orchestrate function was provided, it routes through the full
 // Orchestrator pipeline. Otherwise, it calls the tool directly.
 func (a *ToolRegistryAdapter) Execute(name string, argsJSON string) (string, error) {
+	result, err := a.ExecuteResult(name, argsJSON)
+	return result.Content, err
+}
+
+// ExecuteResult preserves multimodal output while Execute remains compatible
+// with older text-only skill registries.
+func (a *ToolRegistryAdapter) ExecuteResult(name string, argsJSON string) (types.ToolResult, error) {
 	var args map[string]any
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		// Try as map[string]string fallback
-		var strArgs map[string]string
-		if err2 := json.Unmarshal([]byte(argsJSON), &strArgs); err2 != nil {
-			return "", fmt.Errorf("parsing tool args: %w", err)
-		}
-		args = make(map[string]any, len(strArgs))
-		for k, v := range strArgs {
-			args[k] = v
-		}
+		return types.ToolResult{}, fmt.Errorf("parsing tool args: %w", err)
 	}
-
-	// Route through orchestrator if available
+	var result types.ToolResult
+	var err error
 	if a.orchestrate != nil {
-		result, err := a.orchestrate(name, args)
-		if err != nil {
-			return fmt.Sprintf("Erro: %v", err), nil
-		}
-		return truncateToolResult(result.Content), nil
+		result, err = a.orchestrate(name, args)
+	} else {
+		result, err = a.registry.Execute(name, args, types.ToolContext{Context: context.Background(), WorkingDir: "."})
 	}
-
-	// Direct execution via tool.Registry
-	t, ok := a.registry.Get(name)
-	if !ok {
-		return fmt.Sprintf("ferramenta desconhecida: %s", name), nil
-	}
-
-	ctx := types.ToolContext{
-		WorkingDir: ".",
-	}
-	result, err := t.Execute(ctx, args)
 	if err != nil {
-		return fmt.Sprintf("Erro: %v", err), nil
+		return types.ToolResult{Content: fmt.Sprintf("Erro: %v", err), IsError: true}, nil
 	}
+	result.Content = truncateToolResult(result.Content)
 	if result.IsError {
-		return fmt.Sprintf("Erro: %s", result.Content), nil
+		result.Content = "Erro: " + result.Content
 	}
-	return truncateToolResult(result.Content), nil
+	return result, nil
 }
 
 // truncateToolResult truncates long tool results to 50KB.

@@ -67,6 +67,7 @@ type ResponseFormat struct {
 
 // ChatResponse is the unified response from any provider.
 type ChatResponse struct {
+	Model            string // Actual model used, when routing overrides the requested model.
 	Content          string
 	ToolCalls        []ToolCall
 	FinishReason     string

@@ -124,6 +124,9 @@ func (g *Google) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
+		if failoverStatus(resp.StatusCode) {
+			return nil, fmt.Errorf("google HTTP %d: %w", resp.StatusCode, ErrProviderUnavailable)
+		}
 		return nil, fmt.Errorf("google HTTP %d: %s", resp.StatusCode, string(b))
 	}
 
@@ -157,6 +160,9 @@ func (g *Google) ChatStream(ctx context.Context, req ChatRequest, callback Strea
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
+		if failoverStatus(resp.StatusCode) {
+			return nil, fmt.Errorf("google HTTP %d: %w", resp.StatusCode, ErrProviderUnavailable)
+		}
 		return nil, fmt.Errorf("google HTTP %d: %s", resp.StatusCode, string(b))
 	}
 

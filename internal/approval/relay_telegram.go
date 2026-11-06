@@ -40,7 +40,8 @@ type TelegramRelayConfig struct {
 	// ChatID is the Telegram chat ID to send messages to and read replies from.
 	// Stored as a string for flexibility (supports both numeric IDs and
 	// @username channel handles that start with "@").
-	ChatID string
+	ChatID         string
+	AllowedUserIDs []int64
 
 	// Timeout caps the total time spent waiting for a human reply. A zero
 	// value means "no extra deadline beyond whatever the caller's context
@@ -54,6 +55,12 @@ type TelegramRelayConfig struct {
 	// BaseURL overrides the Bot API endpoint for tests or compatible gateways.
 	// Empty uses the official Telegram endpoint.
 	BaseURL string
+
+	// StatePath persists the acknowledged update offset and human questions.
+	StatePath string
+	// Inbound must durably accept an authenticated message before returning.
+	// externalID is stable across retries and process restarts.
+	Inbound func(externalID, userID, text string) error
 }
 
 // -------------------------------------------------------------------
@@ -78,23 +85,28 @@ type TelegramApprovalRelay struct {
 
 	// offset is the Telegram update offset, advanced as we consume updates.
 	// Protected by mu.
-	offset int64
+	offset    int64
+	questions map[string]telegramQuestion
+	stateErr  error
 }
 
 // NewTelegramApprovalRelay builds a relay ready for use. The returned relay
-// does not start any background goroutines; polling happens inside AwaitReply.
+// does not start goroutines; Run enables continuous inbound polling, while
+// standalone question and approval callers can also poll on demand.
 func NewTelegramApprovalRelay(cfg TelegramRelayConfig) *TelegramApprovalRelay {
 	log := cfg.Logger
 	if log == nil {
 		log = slog.Default()
 	}
-	return &TelegramApprovalRelay{
+	r := &TelegramApprovalRelay{
 		cfg:         cfg,
 		log:         log,
 		client:      &http.Client{Timeout: 30 * time.Second},
 		pending:     make(map[string]chan Reply),
 		textPending: make(map[string]chan string),
 	}
+	r.stateErr = r.loadState()
+	return r
 }
 
 // -------------------------------------------------------------------
@@ -113,17 +125,56 @@ func (r *TelegramApprovalRelay) SendApprovalRequest(ctx context.Context, req Rel
 }
 
 // SendNotification delivers a one-way operational notification through the
-// configured relay. It deliberately does not expose a general chat adapter.
+// configured relay. Incoming messages are handled by the optional inbox callback.
 func (r *TelegramApprovalRelay) SendNotification(ctx context.Context, title, body string) error {
-	if err := r.validateConfig(); err != nil {
-		return err
-	}
-	var text strings.Builder
+	return r.SendNotificationChunks(ctx, title, body, nil, nil)
+}
+
+// SendNotificationChunks sends plain-text chunks and checkpoints each accepted
+// part independently. A resumed delivery skips parts already acknowledged.
+func (r *TelegramApprovalRelay) SendNotificationChunks(ctx context.Context, title, body string, delivered func(int) bool, acknowledge func(int) error) error {
+	text := strings.TrimSpace(body)
 	if strings.TrimSpace(title) != "" {
-		fmt.Fprintf(&text, "*%s*\n\n", escapeMarkdown(strings.TrimSpace(title)))
+		text = strings.TrimSpace(title) + "\n\n" + text
 	}
-	text.WriteString(escapeMarkdown(strings.TrimSpace(body)))
-	return r.sendMessage(ctx, text.String())
+	for index, part := range telegramChunks(text) {
+		if delivered != nil && delivered(index) {
+			continue
+		}
+		if err := r.sendText(ctx, part, ""); err != nil {
+			return err
+		}
+		if acknowledge != nil {
+			if err := acknowledge(index); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// Telegram counts UTF-16 units in its message/entity limits. Splitting at rune
+// boundaries preserves UTF-8 and supplementary characters without exceeding
+// 4096 units, even when text contains arbitrary Markdown/code fences.
+func telegramChunks(text string) []string {
+	const limit = 4096
+	var chunks []string
+	start, units := 0, 0
+	for offset, ch := range text {
+		width := 1
+		if ch > 0xffff {
+			width = 2
+		}
+		if units+width > limit {
+			chunks = append(chunks, text[start:offset])
+			start, units = offset, 0
+		}
+		units += width
+	}
+	if start < len(text) {
+		chunks = append(chunks, text[start:])
+	}
+	return chunks
 }
 
 // AskQuestion sends a correlated free-form question and waits for a reply in
@@ -146,6 +197,21 @@ func (r *TelegramApprovalRelay) AskQuestion(ctx context.Context, requestID, ques
 	if _, exists := r.textPending[requestID]; exists {
 		r.mu.Unlock()
 		return "", fmt.Errorf("telegram relay: request ID ja esta pendente")
+	}
+	if saved, exists := r.questions[requestID]; exists && saved.Answer != "" {
+		r.mu.Unlock()
+		return saved.Answer, nil
+	}
+	previous, existed := r.questions[requestID]
+	r.questions[requestID] = telegramQuestion{Text: question}
+	if err := r.saveStateLocked(); err != nil {
+		if existed {
+			r.questions[requestID] = previous
+		} else {
+			delete(r.questions, requestID)
+		}
+		r.mu.Unlock()
+		return "", err
 	}
 	r.textPending[requestID] = ch
 	r.mu.Unlock()
@@ -297,8 +363,7 @@ func (r *TelegramApprovalRelay) pollAndDispatch(ctx context.Context, textCh <-ch
 	if err != nil {
 		return err
 	}
-	r.dispatchUpdates(updates)
-	return nil
+	return r.dispatchUpdates(updates)
 }
 
 // -------------------------------------------------------------------
@@ -307,64 +372,82 @@ func (r *TelegramApprovalRelay) pollAndDispatch(ctx context.Context, textCh <-ch
 
 // dispatchUpdates scans the received Telegram updates and delivers any
 // matching replies to the registered pending channels.
-func (r *TelegramApprovalRelay) dispatchUpdates(updates []tgUpdate) {
+func (r *TelegramApprovalRelay) dispatchUpdates(updates []tgUpdate) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
 	for _, u := range updates {
-		// Advance the offset so we don't re-process this update.
-		if u.UpdateID >= r.offset {
-			r.offset = u.UpdateID + 1
-		}
-
-		if u.Message == nil {
+		if u.UpdateID < r.offset {
 			continue
 		}
-		if !r.allowedChat(u.Message.Chat) {
-			continue
-		}
-		text := strings.TrimSpace(u.Message.Text)
-		if text == "" {
-			continue
-		}
-
-		if answer, id, ok := parseTextReply(text); ok {
-			if ch, waiting := r.textPending[id]; waiting {
-				select {
-				case ch <- answer:
-				default:
+		var textCh chan string
+		var approvalCh chan Reply
+		var answer string
+		var reply Reply
+		var questionID string
+		var previous telegramQuestion
+		if u.Message != nil && r.allowedChat(u.Message.Chat) && r.allowedSender(u.Message) {
+			text := strings.TrimSpace(u.Message.Text)
+			correlated := false
+			if parsed, id, ok := parseTextReply(text); ok {
+				textCh = r.textPending[id]
+				if saved, exists := r.questions[id]; exists {
+					correlated = true
+					if saved.Answer == "" {
+						questionID, previous, answer = id, saved, parsed
+						saved.Answer = parsed
+						r.questions[id] = saved
+						// A late answer resumes work through the inbox after its waiter exited.
+						if textCh == nil {
+							text = fmt.Sprintf("Resposta à pergunta %s (%s): %s", id, saved.Text, parsed)
+							correlated = false
+						}
+					}
+				} else if textCh != nil {
+					correlated, answer = true, parsed
 				}
-				continue
+			}
+			if decision, id, ok := parseReplyText(text); ok {
+				// Approval syntax is never converted into an unsolicited agent command.
+				correlated = true
+				approvalCh = r.pending[id]
+				reply = Reply{Decision: decision}
+				if u.Message.From != nil {
+					reply.RepliedBy = u.Message.From.Username
+				}
+			}
+			if !correlated && text != "" && r.cfg.Inbound != nil {
+				userID := strconv.FormatInt(u.Message.Chat.ID, 10)
+				if err := r.cfg.Inbound(strconv.FormatInt(u.UpdateID, 10), userID, text); err != nil {
+					if questionID != "" {
+						r.questions[questionID] = previous
+					}
+					return err
+				}
 			}
 		}
-
-		decision, id, ok := parseReplyText(text)
-		if !ok {
-			continue
+		oldOffset := r.offset
+		r.offset = u.UpdateID + 1
+		if err := r.saveStateLocked(); err != nil {
+			r.offset = oldOffset
+			if questionID != "" {
+				r.questions[questionID] = previous
+			}
+			return err
 		}
-
-		ch, waiting := r.pending[id]
-		if !waiting {
-			continue
-		}
-
-		repliedBy := ""
-		if u.Message.From != nil {
-			repliedBy = u.Message.From.Username
-			if repliedBy == "" {
-				repliedBy = strings.TrimSpace(u.Message.From.FirstName + " " + u.Message.From.LastName)
+		if textCh != nil && answer != "" {
+			select {
+			case textCh <- answer:
+			default:
 			}
 		}
-
-		select {
-		case ch <- Reply{
-			Decision:  decision,
-			RepliedBy: repliedBy,
-		}:
-		default:
-			// Channel already has a reply (shouldn't happen, but be defensive).
+		if approvalCh != nil {
+			select {
+			case approvalCh <- reply:
+			default:
+			}
 		}
 	}
+	return nil
 }
 
 func parseTextReply(text string) (answer, requestID string, ok bool) {
@@ -392,6 +475,21 @@ func (r *TelegramApprovalRelay) allowedChat(chat *tgChat) bool {
 		return strings.EqualFold(strings.TrimPrefix(want, "@"), strings.TrimPrefix(chat.Username, "@"))
 	}
 	return strconv.FormatInt(chat.ID, 10) == want
+}
+
+func (r *TelegramApprovalRelay) allowedSender(message *tgMessage) bool {
+	if len(r.cfg.AllowedUserIDs) == 0 {
+		return message.Chat != nil && message.Chat.ID > 0 && !strings.HasPrefix(r.cfg.ChatID, "@")
+	}
+	if message.From == nil {
+		return false
+	}
+	for _, id := range r.cfg.AllowedUserIDs {
+		if id > 0 && message.From.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // parseReplyText extracts a decision and request ID from a raw Telegram
@@ -451,15 +549,21 @@ func escapeMarkdown(s string) string {
 
 // sendMessage calls the Telegram Bot API sendMessage endpoint.
 func (r *TelegramApprovalRelay) sendMessage(ctx context.Context, text string) error {
+	return r.sendText(ctx, text, "Markdown")
+}
+
+func (r *TelegramApprovalRelay) sendText(ctx context.Context, text, parseMode string) error {
 	if err := r.validateConfig(); err != nil {
 		return err
 	}
 	apiURL := r.apiURL("sendMessage")
 
 	payload := map[string]string{
-		"chat_id":    r.cfg.ChatID,
-		"text":       text,
-		"parse_mode": "Markdown",
+		"chat_id": r.cfg.ChatID,
+		"text":    text,
+	}
+	if parseMode != "" {
+		payload["parse_mode"] = parseMode
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -494,7 +598,7 @@ func (r *TelegramApprovalRelay) sendMessage(ctx context.Context, text string) er
 }
 
 // getUpdates calls the Telegram Bot API getUpdates endpoint with a long-poll
-// timeout of `longPollSecs` seconds. It advances r.offset automatically.
+// timeout of `longPollSecs` seconds. Dispatch checkpoints accepted updates.
 func (r *TelegramApprovalRelay) getUpdates(ctx context.Context, longPollSecs int) ([]tgUpdate, error) {
 	r.mu.Lock()
 	offset := r.offset
@@ -534,8 +638,19 @@ func (r *TelegramApprovalRelay) getUpdates(ctx context.Context, longPollSecs int
 }
 
 func (r *TelegramApprovalRelay) validateConfig() error {
+	if r.stateErr != nil {
+		return r.stateErr
+	}
 	if strings.TrimSpace(r.cfg.BotToken) == "" {
 		return fmt.Errorf("telegram relay: token nao configurado")
+	}
+	if (strings.HasPrefix(r.cfg.ChatID, "-") || strings.HasPrefix(r.cfg.ChatID, "@")) && len(r.cfg.AllowedUserIDs) == 0 {
+		return fmt.Errorf("telegram relay: allowed_user_ids obrigatorio para grupos")
+	}
+	for _, id := range r.cfg.AllowedUserIDs {
+		if id <= 0 {
+			return fmt.Errorf("telegram relay: allowed_user_ids deve conter IDs positivos")
+		}
 	}
 	if strings.TrimSpace(r.cfg.ChatID) == "" {
 		return fmt.Errorf("telegram relay: chat ID nao configurado")

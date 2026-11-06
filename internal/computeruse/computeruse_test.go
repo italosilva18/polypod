@@ -619,8 +619,11 @@ func TestToolResultFromCU_SuccessWithScreenshot(t *testing.T) {
 	if !strings.Contains(r.Content, "Screenshot captured") {
 		t.Errorf("content should contain message: %q", r.Content)
 	}
-	if !strings.Contains(r.Content, "screenshot") {
-		t.Errorf("content should mention screenshot marker: %q", r.Content)
+	if len(r.Images) != 1 || r.Images[0].Base64 != "aGVsbG8=" || r.Images[0].MIMEType != "image/png" {
+		t.Fatalf("image payload lost: %+v", r.Images)
+	}
+	if strings.Contains(r.Content, "aGVsbG8=") {
+		t.Fatal("base64 leaked into text")
 	}
 }
 

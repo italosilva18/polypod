@@ -84,8 +84,17 @@ type Tool interface {
 	IsEnabled() bool
 }
 
+// ToolImage carries image data separately from text so logs and text truncation
+// never expose or corrupt the image payload.
+type ToolImage struct {
+	MIMEType string
+	Base64   string
+}
+
 // ToolResult is the output of a tool execution.
 type ToolResult struct {
+	Images []ToolImage
+
 	// Content is the text result returned to the model.
 	Content string
 

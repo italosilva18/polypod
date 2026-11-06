@@ -2,26 +2,30 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"os"
 	"os/exec"
-	"strings"
 	"sync"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/sashabaranov/go-openai/jsonschema"
 
 	"github.com/costa/polypod/internal/skill"
-	"github.com/sashabaranov/go-openai/jsonschema"
+	"github.com/costa/polypod/internal/types"
 )
 
 // ServerConfig describes how to connect to an MCP server.
 type ServerConfig struct {
 	Name      string            `yaml:"name"`
-	Transport string            `yaml:"transport"` // "stdio" or "sse"
+	Transport string            `yaml:"transport"` // "stdio", "sse", or "http" (Streamable HTTP)
 	Command   string            `yaml:"command"`
 	Args      []string          `yaml:"args"`
 	URL       string            `yaml:"url"`
 	Env       map[string]string `yaml:"env"`
+	Headers   map[string]string `yaml:"headers"`
 }
 
 // Manager manages multiple MCP server connections using the official SDK.
@@ -52,26 +56,40 @@ func NewManager(logger *slog.Logger) *Manager {
 
 // Connect connects to an MCP server using the given config.
 func (m *Manager) Connect(ctx context.Context, cfg ServerConfig) error {
-	var transport mcpsdk.Transport
+	newTransport := func() (mcpsdk.Transport, error) {
+		var transport mcpsdk.Transport
 
-	switch cfg.Transport {
-	case "stdio":
-		args := cfg.Args
-		cmd := exec.Command(cfg.Command, args...)
-		if len(cfg.Env) > 0 {
-			for k, v := range cfg.Env {
-				cmd.Env = append(cmd.Env, k+"="+v)
+		switch cfg.Transport {
+		case "", "stdio":
+			args := cfg.Args
+			cmd := exec.Command(cfg.Command, args...)
+			if len(cfg.Env) > 0 {
+				cmd.Env = os.Environ()
+				for k, v := range cfg.Env {
+					cmd.Env = append(cmd.Env, k+"="+v)
+				}
 			}
+			transport = &mcpsdk.CommandTransport{Command: cmd}
+		case "sse":
+			transport = &mcpsdk.SSEClientTransport{Endpoint: cfg.URL, HTTPClient: mcpHTTPClient(cfg.Headers)}
+		case "http", "streamable-http":
+			transport = &mcpsdk.StreamableClientTransport{Endpoint: cfg.URL, HTTPClient: mcpHTTPClient(cfg.Headers)}
+		default:
+			return nil, fmt.Errorf("mcp: transport desconhecido %q (use 'stdio', 'sse' ou 'http')", cfg.Transport)
 		}
-		transport = &mcpsdk.CommandTransport{Command: cmd}
-	case "sse":
-		transport = &mcpsdk.SSEClientTransport{Endpoint: cfg.URL}
-	default:
-		return fmt.Errorf("mcp: transport desconhecido %q (use 'stdio' ou 'sse')", cfg.Transport)
+
+		return transport, nil
+	}
+	if _, err := newTransport(); err != nil {
+		return err
 	}
 
 	var session *mcpsdk.ClientSession
 	err := m.reconnect.Connect(ctx, cfg.Name, func(innerCtx context.Context) error {
+		transport, err := newTransport()
+		if err != nil {
+			return err
+		}
 		var dialErr error
 		session, dialErr = m.client.Connect(innerCtx, transport, nil)
 		return dialErr
@@ -136,61 +154,56 @@ func (m *Manager) RegisterTools(reg *skill.Registry) int {
 func (m *Manager) toolToSkill(serverName string, tool *mcpsdk.Tool, session *mcpsdk.ClientSession) *skill.Skill {
 	skillName := fmt.Sprintf("mcp_%s_%s", serverName, tool.Name)
 
-	params := jsonschema.Definition{
-		Type:       jsonschema.Object,
-		Properties: make(map[string]jsonschema.Definition),
-	}
-
-	// Convert MCP inputSchema (any) to jsonschema.Definition
-	if tool.InputSchema != nil {
-		if schemaMap, ok := tool.InputSchema.(map[string]any); ok {
-			if props, ok := schemaMap["properties"].(map[string]any); ok {
-				for name := range props {
-					params.Properties[name] = jsonschema.Definition{
-						Type: jsonschema.String,
-					}
-				}
-			}
+	schema := schemaMap(tool.InputSchema)
+	params := jsonschema.Definition{Type: jsonschema.Object}
+	// Keep a best-effort typed definition for callers inspecting Parameters;
+	// InputSchema is authoritative and retains JSON Schema extensions.
+	if data, err := json.Marshal(schema); err == nil {
+		if err := json.Unmarshal(data, &params); err != nil {
+			params = jsonschema.Definition{Type: jsonschema.Object}
 		}
 	}
-
+	execute := func(ctx context.Context, args map[string]any) (types.ToolResult, error) {
+		result, err := session.CallTool(ctx, &mcpsdk.CallToolParams{Name: tool.Name, Arguments: args})
+		if err != nil {
+			return types.ToolResult{}, fmt.Errorf("mcp call %s/%s: %w", serverName, tool.Name, err)
+		}
+		return mcpToolResult(result), nil
+	}
 	return &skill.Skill{
-		Name:        skillName,
-		Description: fmt.Sprintf("[MCP:%s] %s", serverName, tool.Description),
-		Parameters:  params,
+		Name:          skillName,
+		Description:   fmt.Sprintf("[MCP:%s] %s", serverName, tool.Description),
+		Parameters:    params,
+		InputSchema:   schema,
+		ExecuteResult: execute,
 		Execute: func(args map[string]string) (string, error) {
-			mcpArgs := make(map[string]any, len(args))
+			typed := make(map[string]any, len(args))
 			for k, v := range args {
-				mcpArgs[k] = v
+				typed[k] = v
 			}
-
-			result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
-				Name:      tool.Name,
-				Arguments: mcpArgs,
-			})
-			if err != nil {
-				return "", fmt.Errorf("mcp call %s/%s: %w", serverName, tool.Name, err)
+			result, err := execute(context.Background(), typed)
+			if err == nil && result.IsError {
+				err = fmt.Errorf("mcp tool error: %s", result.Content)
 			}
-
-			if result.IsError {
-				var errTexts []string
-				for _, c := range result.Content {
-					if tc, ok := c.(*mcpsdk.TextContent); ok {
-						errTexts = append(errTexts, tc.Text)
-					}
-				}
-				return "", fmt.Errorf("mcp tool error: %s", strings.Join(errTexts, "; "))
-			}
-
-			var texts []string
-			for _, c := range result.Content {
-				if tc, ok := c.(*mcpsdk.TextContent); ok {
-					texts = append(texts, tc.Text)
-				}
-			}
-			return strings.Join(texts, "\n"), nil
+			return result.Content, err
 		},
 	}
+}
+
+func schemaMap(schema any) map[string]any {
+	if value, ok := schema.(map[string]any); ok {
+		return value
+	}
+	var result map[string]any
+	if data, err := json.Marshal(schema); err == nil {
+		if err := json.Unmarshal(data, &result); err != nil {
+			result = nil
+		}
+	}
+	if result == nil {
+		result = map[string]any{"type": "object", "properties": map[string]any{}}
+	}
+	return result
 }
 
 // CallTool implements MCPCaller so that Manager can be passed to WrapMCPTool.
@@ -210,23 +223,7 @@ func (m *Manager) CallTool(ctx context.Context, server, name string, args map[st
 		return nil, false, fmt.Errorf("mcp call %s/%s: %w", server, name, err)
 	}
 
-	if result.IsError {
-		var errTexts []string
-		for _, c := range result.Content {
-			if tc, ok := c.(*mcpsdk.TextContent); ok {
-				errTexts = append(errTexts, tc.Text)
-			}
-		}
-		return nil, true, fmt.Errorf("mcp tool error: %s", strings.Join(errTexts, "; "))
-	}
-
-	var texts []string
-	for _, c := range result.Content {
-		if tc, ok := c.(*mcpsdk.TextContent); ok {
-			texts = append(texts, tc.Text)
-		}
-	}
-	return strings.Join(texts, "\n"), false, nil
+	return result, result.IsError, nil
 }
 
 // RegisterWrappedTools registers all MCP tools from connected servers into both
@@ -246,7 +243,7 @@ func (m *Manager) RegisterWrappedTools(reg *skill.Registry, typesReg ToolRegistr
 
 			// New-style types.Tool registration via WrapMCPTool.
 			if typesReg != nil {
-				schema, _ := tool.InputSchema.(map[string]any)
+				schema := schemaMap(tool.InputSchema)
 				wrapped := WrapMCPTool(m, serverName, tool.Name, tool.Description, schema)
 				typesReg.Register(wrapped)
 			}
@@ -290,4 +287,30 @@ func (m *Manager) Close() error {
 	m.sessions = make(map[string]*mcpsdk.ClientSession)
 	m.tools = make(map[string][]*mcpsdk.Tool)
 	return lastErr
+}
+
+// mcpHTTPClient attaches configured credentials without forwarding them through
+// redirects. A fresh immutable header copy is shared by concurrent SDK requests.
+func mcpHTTPClient(headers map[string]string) *http.Client {
+	values := make(http.Header, len(headers))
+	for key, value := range headers {
+		values.Set(key, value)
+	}
+	return &http.Client{
+		Transport:     &mcpHeaderTransport{headers: values, base: http.DefaultTransport},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+}
+
+type mcpHeaderTransport struct {
+	headers http.Header
+	base    http.RoundTripper
+}
+
+func (t *mcpHeaderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	cloned := req.Clone(req.Context())
+	for key, values := range t.headers {
+		cloned.Header[key] = append([]string(nil), values...)
+	}
+	return t.base.RoundTrip(cloned)
 }

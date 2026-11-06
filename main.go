@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -41,6 +42,7 @@ import (
 	"github.com/costa/polypod/internal/dotenv"
 	"github.com/costa/polypod/internal/git"
 	"github.com/costa/polypod/internal/githook"
+	"github.com/costa/polypod/internal/goals"
 	"github.com/costa/polypod/internal/headless"
 	"github.com/costa/polypod/internal/hooks"
 	"github.com/costa/polypod/internal/humanloop"
@@ -73,6 +75,7 @@ import (
 	"github.com/costa/polypod/internal/tracking"
 	"github.com/costa/polypod/internal/types"
 	"github.com/costa/polypod/internal/web"
+	"github.com/costa/polypod/internal/whatsappgateway"
 	"github.com/costa/polypod/internal/wiring"
 )
 
@@ -169,11 +172,23 @@ func handleSubcommand() bool {
 	}
 	switch os.Args[1] {
 	case "doctor":
-		cfg, _ := config.Load(defaultConfigPath)
-		if cfg == nil {
-			cfg = config.DefaultConfig()
+		dotenv.Load(".")
+		configPath, live := defaultConfigPath, false
+		for _, arg := range os.Args[2:] {
+			if arg == "--live" {
+				live = true
+			} else if !strings.HasPrefix(arg, "-") {
+				configPath = arg
+			}
 		}
-		fmt.Print(doctor.FormatReport(doctor.RunDiagnostics(cfg)))
+		cfg, err := config.Load(configPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "configuracao indisponivel; confira o caminho informado")
+			return true
+		}
+		diagnosticCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		fmt.Print(doctor.FormatReport(doctor.RunDiagnosticsContext(diagnosticCtx, cfg, live)))
 		return true
 	case "init":
 		stack := initcmd.Detect(".")
@@ -794,9 +809,14 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	// Scheduler
 	sched := scheduler.New(cfg.Scheduler.DataFile, logger)
 	if err := sched.Load(); err != nil {
-		logger.Warn("scheduler state load failed", "error", err)
+		return fmt.Errorf("loading scheduler state: %w", err)
 	}
 	scheduler.RegisterSkills(skills, sched)
+	goalStore, err := goals.Open(filepath.Join(cfg.Data.Dir, "goals.json"))
+	if err != nil {
+		return fmt.Errorf("initializing operational goals: %w", err)
+	}
+	goals.RegisterSkills(skills, goalStore)
 	humanStore, err := humanloop.NewStore(filepath.Join(cfg.Data.Dir, "humanloop.json"), 500)
 	if err != nil {
 		return fmt.Errorf("initializing durable human loop: %w", err)
@@ -822,7 +842,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		if err := mcpMgr.Connect(ctx, mcp.ServerConfig{
 			Name: mcpCfg.Name, Transport: mcpCfg.Transport,
 			Command: mcpCfg.Command, Args: mcpCfg.Args,
-			URL: mcpCfg.URL, Env: mcpCfg.Env,
+			URL: mcpCfg.URL, Env: mcpCfg.Env, Headers: mcpCfg.Headers,
 		}); err != nil {
 			logger.Warn("mcp server failed", "name", mcpCfg.Name, "error", err)
 		}
@@ -1012,45 +1032,184 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	// come from environment-expanded config and are never written by Polypod.
 	var remoteRelay *approval.TelegramApprovalRelay
 	if cfg.Remote.Enabled {
-		if strings.TrimSpace(cfg.Remote.BotToken) == "" || strings.TrimSpace(cfg.Remote.ChatID) == "" {
-			logger.Warn("remote relay disabled", "reason", "bot_token or chat_id missing")
+		if remoteErr := cfg.Remote.Validate(); remoteErr != nil {
+			logger.Warn("remote relay disabled", "reason", remoteErr)
 		} else {
 			remoteRelay = approval.NewTelegramApprovalRelay(approval.TelegramRelayConfig{
-				BotToken: cfg.Remote.BotToken,
-				ChatID:   cfg.Remote.ChatID,
-				Timeout:  time.Duration(cfg.Remote.TimeoutSeconds) * time.Second,
-				Logger:   logger,
-			})
-			sys.UserPromptHandler.SetRemoteAsk(func(questionCtx context.Context, requestID string, question tool.UserQuestion) (string, error) {
-				return remoteRelay.AskQuestion(questionCtx, requestID, question.Question)
+				BotToken:       cfg.Remote.BotToken,
+				ChatID:         cfg.Remote.ChatID,
+				AllowedUserIDs: cfg.Remote.AllowedUserIDs,
+				Timeout:        time.Duration(cfg.Remote.TimeoutSeconds) * time.Second,
+				Logger:         logger,
+				StatePath:      filepath.Join(cfg.Data.Dir, "telegram-relay.json"),
+				Inbound: func(externalID, userID, text string) error {
+					_, err := humanStore.EnqueueInboundOnce("telegram", userID, text, externalID)
+					if err == nil && heartbeat != nil {
+						heartbeat.Wake()
+					}
+					return err
+				},
 			})
 			logger.Info("remote human relay active", "channel", "telegram", "chat_id", cfg.Remote.ChatID)
 		}
 	}
 
 	localNotifier := notifier.NewNotifier(logger)
+	var whatsapp *whatsappgateway.Gateway
+	var whatsappNative *whatsappgateway.Native
+	var whatsappMedia *whatsappgateway.MediaInterpreter
+	var whatsappQuestions *whatsappgateway.QuestionRelay
+	if cfg.WhatsApp.Enabled {
+		whatsappNative = &whatsappgateway.Native{
+			SessionDir: cfg.WhatsApp.SessionDir,
+			StatusPath: filepath.Join(cfg.Data.Dir, "whatsapp-status.json"),
+			Logger:     logger,
+		}
+		if err := whatsappNative.Preflight(); err != nil {
+			return fmt.Errorf("checking whatsapp session: %w", err)
+		}
+		whatsapp, err = whatsappgateway.New(humanStore, whatsappNative,
+			cfg.WhatsApp.AllowedChats, cfg.WhatsApp.AllowedSenders, func() {
+				if heartbeat != nil {
+					heartbeat.Wake()
+				}
+			})
+		if err != nil {
+			return fmt.Errorf("initializing whatsapp: %w", err)
+		}
+		whatsappQuestions, err = whatsappgateway.NewQuestionRelay(humanStore, whatsapp,
+			filepath.Join(cfg.Data.Dir, "whatsapp-questions.json"), cfg.WhatsApp.OwnerChat)
+		if err != nil {
+			return fmt.Errorf("initializing whatsapp questions: %w", err)
+		}
+		whatsapp.SetQuestionRelay(whatsappQuestions)
+		if cfg.WhatsApp.OwnerChat != "" {
+			if err := whatsappgateway.RegisterNotificationSkill(skills, whatsapp, cfg.WhatsApp.OwnerChat); err != nil {
+				return fmt.Errorf("registering whatsapp notification: %w", err)
+			}
+			tool.RegisterAllSkills(sys.ToolRegistry, skills)
+			activeAgent := agents.Get("default")
+			activeAgent.Skills = append(activeAgent.Skills, "whatsapp_notify")
+		}
+		vision, _ := providerReg.Get(cfg.AI.Provider)
+		whatsappMedia = &whatsappgateway.MediaInterpreter{
+			MediaDir:    filepath.Join(cfg.WhatsApp.SessionDir, "media"),
+			Vision:      vision,
+			VisionModel: cfg.AI.Model,
+		}
+	}
+	if remoteRelay != nil || whatsappQuestions != nil {
+		sys.UserPromptHandler.SetQuestionResolved(func(requestID, answer string) error {
+			if whatsappQuestions != nil && whatsappQuestions.Owns(requestID) {
+				return whatsappQuestions.ResolveQuestion(requestID, answer)
+			}
+			if remoteRelay != nil {
+				return remoteRelay.ResolveQuestion(requestID, answer)
+			}
+			return nil
+		})
+		sys.UserPromptHandler.SetRemoteAsk(func(questionCtx context.Context, requestID string, question tool.UserQuestion) (string, error) {
+			var prompt strings.Builder
+			if question.Header != "" {
+				fmt.Fprintf(&prompt, "%s\n\n", question.Header)
+			}
+			prompt.WriteString(question.Question)
+			for _, option := range question.Options {
+				fmt.Fprintf(&prompt, "\n- %s: %s", option.Label, option.Description)
+			}
+			if _, fromWhatsApp := whatsappgateway.InboundFromContext(questionCtx); fromWhatsApp {
+				if whatsappQuestions == nil {
+					return "", errors.New("whatsapp question relay is unavailable")
+				}
+				return whatsappQuestions.Ask(questionCtx, requestID, prompt.String())
+			}
+			if remoteRelay != nil {
+				return remoteRelay.AskQuestion(questionCtx, requestID, prompt.String())
+			}
+			return whatsappQuestions.Ask(questionCtx, requestID, prompt.String())
+		})
+	}
 	heartbeat, err = humanloop.NewProcessor(humanloop.ProcessorConfig{
 		Store:       humanStore,
 		Interval:    30 * time.Second,
 		Timeout:     30 * time.Minute,
 		MaxAttempts: 4,
 		Process: func(processCtx context.Context, msg humanloop.Message) (string, error) {
+			messageText := msg.Text
+			var askStatus *whatsappgateway.AskDeliveryStatus
+			if msg.Channel == whatsappgateway.Channel {
+				event, decodeErr := whatsappgateway.Decode(msg)
+				if decodeErr != nil {
+					return "", fmt.Errorf("decoding whatsapp inbox: %w", decodeErr)
+				}
+				var cancel context.CancelFunc
+				processCtx, cancel = context.WithCancel(processCtx)
+				defer cancel()
+				askStatus = whatsappgateway.NewAskDeliveryStatus(cancel)
+				processCtx = whatsappgateway.WithInboundContext(processCtx, whatsappgateway.InboundContext{
+					MessageID: msg.ID, ChatID: event.ChatID, SenderID: event.SenderID, AskStatus: askStatus,
+				})
+				messageText, decodeErr = whatsappMedia.Render(processCtx, event)
+				if decodeErr != nil {
+					return "", fmt.Errorf("interpreting whatsapp media: %w", decodeErr)
+				}
+			}
 			out, processErr := handler(processCtx, adapter.InMessage{
 				ID:        msg.ID,
-				Channel:   "inbox",
+				Channel:   msg.Channel,
 				UserID:    msg.UserID,
-				Text:      msg.Text,
+				Text:      messageText,
 				Timestamp: msg.CreatedAt,
 			})
+			if whatsappQuestions != nil && whatsappQuestions.ShouldDeferUnavailable(askStatus) {
+				return "", humanloop.ErrRemoteUnavailable
+			}
 			return out.Text, processErr
 		},
 		Deliver: func(deliverCtx context.Context, msg humanloop.Message) error {
-			if remoteRelay != nil {
-				if err := remoteRelay.SendNotification(deliverCtx, "Polypod", msg.Text); err != nil {
+			if msg.Channel == whatsappgateway.Channel {
+				if whatsapp == nil {
+					return errors.New("whatsapp delivery is not configured")
+				}
+				if humanStore.DeliveredTo(msg.ID, whatsappgateway.Channel) {
+					return nil
+				}
+				if err := whatsapp.Deliver(deliverCtx, msg); err != nil {
 					return err
 				}
+				return humanStore.MarkDelivered(msg.ID, whatsappgateway.Channel)
 			}
-			return localNotifier.Notify(deliverCtx, "Polypod", msg.Text)
+			var deliveryErr error
+			if whatsapp != nil && cfg.WhatsApp.OwnerChat != "" &&
+				(msg.Channel == "notification" || msg.Channel == "scheduler") &&
+				!humanStore.DeliveredTo(msg.ID, whatsappgateway.Channel) {
+				copy := msg
+				copy.Channel, copy.UserID, copy.ReplyTo = whatsappgateway.Channel, cfg.WhatsApp.OwnerChat, ""
+				err := whatsapp.Deliver(deliverCtx, copy)
+				if err == nil {
+					err = humanStore.MarkDelivered(msg.ID, whatsappgateway.Channel)
+				}
+				deliveryErr = errors.Join(deliveryErr, err)
+			}
+			if remoteRelay != nil && !humanStore.DeliveredTo(msg.ID, "telegram") {
+				err := remoteRelay.SendNotificationChunks(deliverCtx, "Polypod", msg.Text,
+					func(index int) bool { return humanStore.DeliveredTo(msg.ID, fmt.Sprintf("telegram:chunk:%d", index)) },
+					func(index int) error {
+						return humanStore.MarkDelivered(msg.ID, fmt.Sprintf("telegram:chunk:%d", index))
+					})
+				if err == nil {
+					err = humanStore.MarkDelivered(msg.ID, "telegram")
+				}
+				deliveryErr = errors.Join(deliveryErr, err)
+			}
+			if !humanStore.DeliveredTo(msg.ID, "local") {
+				err := localNotifier.Notify(deliverCtx, "Polypod", msg.Text)
+				if err == nil {
+					err = humanStore.MarkDelivered(msg.ID, "local")
+				}
+				deliveryErr = errors.Join(deliveryErr, err)
+			}
+			return deliveryErr
 		},
 		Logger: logger,
 	})
@@ -1059,6 +1218,49 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	}
 	heartbeat.Start(ctx)
 	defer heartbeat.Stop()
+	if whatsappQuestions != nil {
+		go whatsappQuestions.Run(ctx)
+	}
+	if whatsappNative != nil {
+		bridgeCtx, stopBridge := context.WithCancel(ctx)
+		defer stopBridge()
+		go func() {
+			backoff := 5 * time.Second
+			for bridgeCtx.Err() == nil {
+				started := time.Now()
+				err := whatsappNative.Run(bridgeCtx, whatsapp)
+				if bridgeCtx.Err() != nil {
+					return
+				}
+				logger.Error("whatsapp inbound stopped; reconnecting", "error", err, "retry_after", backoff)
+				if time.Since(started) > 5*time.Minute {
+					backoff = 5 * time.Second
+				}
+				timer := time.NewTimer(backoff)
+				select {
+				case <-bridgeCtx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				if backoff < time.Minute {
+					backoff *= 2
+					if backoff > time.Minute {
+						backoff = time.Minute
+					}
+				}
+			}
+		}()
+	}
+	if remoteRelay != nil {
+		relayCtx, stopRelay := context.WithCancel(ctx)
+		defer stopRelay()
+		go func() {
+			if err := remoteRelay.Run(relayCtx); err != nil && relayCtx.Err() == nil {
+				logger.Error("remote inbound stopped", "error", err)
+			}
+		}()
+	}
 
 	// Automatic long-term memory consolidation uses a tool-free model call
 	// and a durable watermark so restarts do not duplicate processed batches.
@@ -1085,12 +1287,39 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	dreamSvc.Start(ctx)
 	defer dreamSvc.Stop()
 
+	// The operational heartbeat is itself a full agent routine. Its persisted
+	// schedule survives restarts and uses NO_REPLY when there is nothing useful
+	// to report to the owner.
+	const heartbeatID = "system_heartbeat"
+	if cfg.Scheduler.Enabled && cfg.Scheduler.HeartbeatEnabled {
+		heartbeatSchedule := "@every " + cfg.Scheduler.HeartbeatInterval
+		const heartbeatPrompt = "Consulte goal_review, inbox_list (especialmente itens failed), scheduler_list e memoria de pendencias. Avance somente proximas acoes prontas e autorizadas; confirme o resultado e registre evidencia com goal_update. Respeite metas paused/blocked e dependencias. Avise o dono quando houver algo relevante. Se faltar uma informacao essencial, use ask_user. Se nao houver nada a fazer ou relatar, responda exatamente NO_REPLY."
+		if existing, ok := sched.GetTask(heartbeatID); !ok {
+			if err := sched.AddTask(&scheduler.Task{ID: heartbeatID, Name: "Acompanhamento operacional", Schedule: heartbeatSchedule, Prompt: heartbeatPrompt, Channel: "system", UserID: "owner", MisfirePolicy: "skip", MaxRetries: 1}); err != nil {
+				logger.Error("failed to create operational heartbeat", "error", err)
+			}
+		} else {
+			if existing.Schedule != heartbeatSchedule || existing.Prompt != heartbeatPrompt {
+				if err := sched.UpdateTask(heartbeatID, map[string]string{"schedule": heartbeatSchedule, "prompt": heartbeatPrompt}); err != nil {
+					logger.Error("failed to update operational heartbeat", "error", err)
+				}
+			}
+			if err := sched.SetEnabled(heartbeatID, true); err != nil {
+				logger.Error("failed to enable operational heartbeat", "error", err)
+			}
+		}
+	} else if _, ok := sched.GetTask(heartbeatID); ok {
+		if err := sched.SetEnabled(heartbeatID, false); err != nil {
+			logger.Error("failed to disable operational heartbeat", "error", err)
+		}
+	}
+
 	// Human-language routines wake the same complete operational agent used by
 	// the CLI, with a separate persistent conversation per routine.
 	sched.SetPromptRunner(func(runCtx context.Context, task *scheduler.Task) (string, error) {
-		prompt := fmt.Sprintf("ROTINA AGENDADA: %s\nID: %s\nObjetivo:\n%s\n\nExecute o objetivo completo, verifique o resultado e relate de forma objetiva. Nao crie outra rotina a menos que o objetivo mande explicitamente.", task.Name, task.ID, task.Prompt)
+		prompt := fmt.Sprintf("ROTINA AGENDADA: %s\nID: %s\nExecucao: %s\nTentativa: %d\nObjetivo:\n%s\n\nExecute o objetivo completo, verifique o resultado e relate de forma objetiva. Se esta for uma retomada, confirme o efeito da tentativa anterior antes de repetir a acao. Nao crie outra rotina a menos que o objetivo mande explicitamente.", task.Name, task.ID, task.CurrentRunID, task.CurrentAttempt, task.Prompt)
 		out, err := handler(runCtx, adapter.InMessage{
-			ID:        fmt.Sprintf("routine-%s-%d", task.ID, time.Now().UnixNano()),
+			ID:        fmt.Sprintf("routine-%s-%s-%d", task.ID, task.CurrentRunID, task.CurrentAttempt),
 			Channel:   "scheduler",
 			UserID:    task.ID,
 			Text:      prompt,
@@ -1098,18 +1327,21 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		})
 		return out.Text, err
 	})
-	sched.SetCallback(func(task *scheduler.Task, result string) {
-		message := fmt.Sprintf("Rotina %q concluida com status %s.", task.Name, task.LastStatus)
-		if task.LastError != "" {
-			message += " Erro: " + task.LastError
-		} else if strings.TrimSpace(result) != "" {
-			message += " Resultado: " + result
+	sched.SetDurableCallback(func(task *scheduler.Task, notice scheduler.CompletionNotice) error {
+		if task.ID == heartbeatID && notice.Error == "" && strings.TrimSpace(notice.Result) == "NO_REPLY" {
+			return nil
 		}
-		if _, err := humanStore.EnqueueOutbound("scheduler", "owner", message, task.ID); err != nil {
-			logger.Error("failed to queue routine notification", "task", task.ID, "error", err)
-			return
+		message := fmt.Sprintf("Rotina %q concluida com status %s.", task.Name, notice.Status)
+		if notice.Error != "" {
+			message += " Erro: " + notice.Error
+		} else if strings.TrimSpace(notice.Result) != "" {
+			message += " Resultado: " + notice.Result
+		}
+		if _, err := humanStore.EnqueueOutboundOnce("scheduler", "owner", message, task.ID, notice.RunID); err != nil {
+			return err
 		}
 		heartbeat.Wake()
+		return nil
 	})
 	if cfg.Scheduler.Enabled {
 		go func() {
