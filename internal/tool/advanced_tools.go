@@ -29,6 +29,7 @@ func RegisterAdvancedTools(reg *Registry, workingDir string) {
 	reg.RegisterDef(newAdvancedGrepSearchTool(workingDir))
 	reg.RegisterDef(newAdvancedGlobSearchTool(workingDir))
 	reg.RegisterDef(newAdvancedWebFetchTool())
+	reg.RegisterDef(newTorFetchTool())
 	// ask_user is now registered by RegisterAskUserTool (askuser.go)
 }
 

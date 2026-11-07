@@ -11,6 +11,7 @@ ai:
   api_key: "${DEEPSEEK_API_KEY}"
   model: deepseek-chat
   max_tokens: 4096
+  max_tool_iterations: 24 # Maximum tool rounds per response (1-200)
   temperature: 0.3
   tools: true
 

@@ -129,17 +129,35 @@ type DatabaseConfig struct {
 }
 
 type AIConfig struct {
-	Provider         string  `yaml:"provider"`
-	BaseURL          string  `yaml:"base_url"`
-	APIKey           string  `yaml:"api_key"`
-	Model            string  `yaml:"model"`
-	MaxToks          int     `yaml:"max_tokens"`
-	Temp             float32 `yaml:"temperature"`
-	Tools            bool    `yaml:"tools"`
-	FallbackProvider string  `yaml:"fallback_provider,omitempty"`
-	FallbackBaseURL  string  `yaml:"fallback_base_url,omitempty"`
-	FallbackAPIKey   string  `yaml:"fallback_api_key,omitempty"`
-	FallbackModel    string  `yaml:"fallback_model,omitempty"`
+	Provider          string  `yaml:"provider"`
+	BaseURL           string  `yaml:"base_url"`
+	APIKey            string  `yaml:"api_key"`
+	Model             string  `yaml:"model"`
+	MaxToks           int     `yaml:"max_tokens"`
+	MaxToolIterations int     `yaml:"max_tool_iterations"`
+	Temp              float32 `yaml:"temperature"`
+	Tools             bool    `yaml:"tools"`
+	FallbackProvider  string  `yaml:"fallback_provider,omitempty"`
+	FallbackBaseURL   string  `yaml:"fallback_base_url,omitempty"`
+	FallbackAPIKey    string  `yaml:"fallback_api_key,omitempty"`
+	FallbackModel     string  `yaml:"fallback_model,omitempty"`
+}
+
+const (
+	DefaultMaxToolIterations = 10
+	MaximumToolIterations    = 200
+)
+
+// ToolIterationLimit returns a finite budget even for callers that construct
+// AIConfig directly instead of loading a validated YAML file.
+func (c AIConfig) ToolIterationLimit() int {
+	if c.MaxToolIterations <= 0 {
+		return DefaultMaxToolIterations
+	}
+	if c.MaxToolIterations > MaximumToolIterations {
+		return MaximumToolIterations
+	}
+	return c.MaxToolIterations
 }
 
 type EmbeddingConfig struct {
@@ -191,6 +209,9 @@ func Load(path string) (*Config, error) {
 	}
 
 	setDefaults(cfg)
+	if cfg.AI.MaxToolIterations < 1 || cfg.AI.MaxToolIterations > MaximumToolIterations {
+		return nil, fmt.Errorf("ai.max_tool_iterations deve estar entre 1 e %d", MaximumToolIterations)
+	}
 	if err := cfg.Permissions.Validate(); err != nil {
 		return nil, fmt.Errorf("validating permissions: %w", err)
 	}
@@ -221,6 +242,9 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.AI.MaxToks == 0 {
 		cfg.AI.MaxToks = 2048
+	}
+	if cfg.AI.MaxToolIterations == 0 {
+		cfg.AI.MaxToolIterations = DefaultMaxToolIterations
 	}
 	if cfg.AI.Temp == 0 {
 		cfg.AI.Temp = 0.3

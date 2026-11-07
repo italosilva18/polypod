@@ -341,7 +341,8 @@ func NewAgentTool(runner *AgentRunner, executor *SubAgentExecutor) types.Tool {
 func isReadOnlySubAgentSkill(name string) bool {
 	switch name {
 	case "read_file", "read_file_dir", "glob", "grep", "web_search", "web_fetch",
-		"document_extract", "image_analyze", "polypod_evidence_research", "polypod_document_analysis":
+		"tor_fetch", "document_extract", "image_analyze", "polypod_evidence_research",
+		"polypod_document_analysis", "polypod_onion_research":
 		return true
 	default:
 		return false

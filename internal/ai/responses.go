@@ -26,7 +26,8 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 	}
 
 	var totalPrompt, totalCompletion int
-	for iter := 0; iter < maxToolIter; iter++ {
+	maxIterations := c.toolIterationLimit()
+	for iter := 0; iter < maxIterations; iter++ {
 		var resp *providerapi.ChatResponse
 		var err error
 		if callback == nil {
@@ -101,7 +102,7 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 			callback("\n")
 		}
 	}
-	return nil, fmt.Errorf("tool calling excedeu %d iteracoes", maxToolIter)
+	return nil, fmt.Errorf("chamadas de ferramentas atingiram ai.max_tool_iterations (%d)", maxIterations)
 }
 
 func (c *Client) fireResponseToolStart(tc providerapi.ToolCall) {

@@ -24,6 +24,7 @@ type Client struct {
 	textOnly         bool
 	model            string
 	maxTok           int
+	maxToolIter      int
 	temp             float32
 	toolsOn          bool
 	skills           SkillRegistry
@@ -58,13 +59,14 @@ func NewClient(cfg config.AIConfig, skills SkillRegistry) *Client {
 	ocfg := openai.DefaultConfig(cfg.APIKey)
 	ocfg.BaseURL = cfg.BaseURL
 	c := &Client{
-		client:   openai.NewClientWithConfig(ocfg),
-		model:    cfg.Model,
-		maxTok:   cfg.MaxToks,
-		temp:     cfg.Temp,
-		toolsOn:  cfg.Tools,
-		skills:   skills,
-		textOnly: cfg.Provider == "deepseek",
+		client:      openai.NewClientWithConfig(ocfg),
+		model:       cfg.Model,
+		maxTok:      cfg.MaxToks,
+		maxToolIter: cfg.ToolIterationLimit(),
+		temp:        cfg.Temp,
+		toolsOn:     cfg.Tools,
+		skills:      skills,
+		textOnly:    cfg.Provider == "deepseek",
 	}
 	if cfg.Provider == "chatgpt" {
 		manager := chatgptauth.NewManager(chatgptauth.DefaultCredentialPath())
@@ -85,6 +87,13 @@ func NewClient(cfg config.AIConfig, skills SkillRegistry) *Client {
 		c.responseProvider = providerapi.NewFailover(primary, secondary, cfg.FallbackModel, nil)
 	}
 	return c
+}
+
+func (c *Client) toolIterationLimit() int {
+	if c.maxToolIter <= 0 {
+		return config.DefaultMaxToolIterations
+	}
+	return c.maxToolIter
 }
 
 // SetSkillNames sets the active skill names for tool definitions.
@@ -274,7 +283,8 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 
 	var totalPrompt, totalCompletion int
 
-	for iter := 0; iter < maxToolIter; iter++ {
+	maxIterations := c.toolIterationLimit()
+	for iter := 0; iter < maxIterations; iter++ {
 		resp, err := retry(ctx, func() (openai.ChatCompletionResponse, error) {
 			return c.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 				Model:       c.model,
@@ -342,7 +352,7 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 		}
 	}
 
-	return nil, fmt.Errorf("tool calling exceeded max iterations (%d)", maxToolIter)
+	return nil, fmt.Errorf("tool calling reached ai.max_tool_iterations (%d)", maxIterations)
 }
 
 // CompleteWithToolsStream sends a streaming chat completion with tool calling loop.
@@ -364,7 +374,8 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 
 	var totalPrompt, totalCompletion int
 
-	for iter := 0; iter < maxToolIter; iter++ {
+	maxIterations := c.toolIterationLimit()
+	for iter := 0; iter < maxIterations; iter++ {
 		req := openai.ChatCompletionRequest{
 			Model:       c.model,
 			Messages:    msgs,
@@ -635,5 +646,5 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 		}
 	}
 
-	return nil, fmt.Errorf("tool calling exceeded max iterations (%d)", maxToolIter)
+	return nil, fmt.Errorf("tool calling reached ai.max_tool_iterations (%d)", maxIterations)
 }

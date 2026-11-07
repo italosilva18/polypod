@@ -8,7 +8,7 @@ mesmo provedor de IA configurado para o Polypod.
 
 | Nome no `agent_run` | Trabalho | Ferramentas principais |
 | --- | --- | --- |
-| `task` | Pesquisa em codigo, documentos e web | `read_file`, `read_file_dir`, `glob`, `grep`, `web_search`, `web_fetch`, `document_extract` |
+| `task` | Pesquisa em codigo, documentos, web e sites `.onion` | `read_file`, `read_file_dir`, `glob`, `grep`, `web_search`, `web_fetch`, `tor_fetch`, `document_extract` |
 | `architect` | Plano tecnico com contratos e dependencias | Ferramentas de leitura e pesquisa |
 | `coder` | Implementacao de codigo | Leitura, `write_file`, `edit_file`, `bash` e pesquisa |
 | `reviewer` | Verificacao independente | Ferramentas de leitura e extracao de documentos |

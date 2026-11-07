@@ -22,7 +22,9 @@ skills:
   - grep
   - web_search
   - web_fetch
+  - tor_fetch
   - document_extract
   - image_analyze
   - polypod_evidence_research
   - polypod_document_analysis
+  - polypod_onion_research
