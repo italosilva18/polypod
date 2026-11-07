@@ -10,6 +10,6 @@ Exemplo de chamada:
 {"url":"http://<endereco-v3>.onion/","start":0,"max_chars":12000}
 ```
 
-`start` e `max_chars` permitem ler trechos sucessivos de páginas longas. O corpo recebido é limitado a 512 KiB e apenas conteúdo textual é retornado. Cada chamada tem prazo de 90 segundos. A ferramenta não oferece navegação com JavaScript, cookies persistentes, login interativo ou anonimato equivalente ao Tor Browser. Para essas tarefas, use o navegador ou o controle do computador com uma sessão Tor configurada.
+`start` e `max_chars` permitem ler trechos sucessivos de páginas longas. O corpo recebido é limitado a 512 KiB e apenas conteúdo textual é retornado. Cada chamada tem prazo de 90 segundos. A ferramenta não oferece navegação com JavaScript, cookies persistentes, login interativo ou anonimato equivalente ao Tor Browser. Para essas tarefas, use o Tor Browser oficial e o controle do computador; não abra endereços `.onion` em um navegador comum.
 
 Referências: [especificação dos endereços .onion](https://spec.torproject.org/address-spec), [SOCKS5 no Tor](https://spec.torproject.org/socks-extensions.html) e [documentação do proxy no Go](https://pkg.go.dev/golang.org/x/net/proxy).
