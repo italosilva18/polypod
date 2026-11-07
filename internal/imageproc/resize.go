@@ -365,10 +365,13 @@ func decodeImage(raw []byte, ext string) (image.Image, string, error) {
 			return img, "png", nil
 		}
 	case "gif":
-		g, err := gif.DecodeAll(r)
-		if err == nil && len(g.Image) > 0 {
-			return g.Image[0], "gif", nil
+		// Only the first frame is used by resizing. DecodeAll would allocate
+		// every animation frame from an untrusted attachment before limits apply.
+		img, err := gif.Decode(r)
+		if err == nil {
+			return img, "gif", nil
 		}
+		return nil, "", fmt.Errorf("could not decode GIF: %w", err)
 	case "webp":
 		img, err := webp.Decode(r)
 		if err == nil {

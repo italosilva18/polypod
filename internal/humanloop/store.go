@@ -4,13 +4,17 @@ package humanloop
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -33,29 +37,43 @@ const (
 	StatusFailed     Status = "failed"
 )
 
+const MaxOutboundMediaBytes = 16 << 20
+
+// MediaAttachment identifies one immutable, private blob persisted beside the
+// outbox. Blob is an internal filename, never an arbitrary source path.
+type MediaAttachment struct {
+	Kind     string `json:"kind"`
+	MIME     string `json:"mime"`
+	Filename string `json:"filename,omitempty"`
+	Blob     string `json:"blob"`
+	SHA256   string `json:"sha256"`
+	Size     int64  `json:"size"`
+}
+
 // Message is one durable inbox or outbox item.
 type Message struct {
-	ID            string         `json:"id"`
-	ExternalID    string         `json:"external_id,omitempty"`
-	Delivered     []string       `json:"delivered,omitempty"`
-	Direction     Direction      `json:"direction"`
-	DeliveryOwner string         `json:"delivery_owner,omitempty"`
-	Status        Status         `json:"status"`
-	Channel       string         `json:"channel"`
-	UserID        string         `json:"user_id"`
-	Text          string         `json:"text"`
-	ReplyTo       string         `json:"reply_to,omitempty"`
-	Response      string         `json:"response,omitempty"`
-	ResponseReady bool           `json:"response_ready,omitempty"`
-	Error         string         `json:"error,omitempty"`
-	Attempts      int            `json:"attempts"`
-	OfflineDefers int            `json:"offline_defers,omitempty"`
-	CreatedAt     time.Time      `json:"created_at"`
-	UpdatedAt     time.Time      `json:"updated_at"`
-	ProcessingAt  *time.Time     `json:"processing_at,omitempty"`
-	CompletedAt   *time.Time     `json:"completed_at,omitempty"`
-	NextAttemptAt time.Time      `json:"next_attempt_at,omitempty"`
-	ReplayHistory []ReplayRecord `json:"replay_history,omitempty"`
+	ID            string           `json:"id"`
+	ExternalID    string           `json:"external_id,omitempty"`
+	Delivered     []string         `json:"delivered,omitempty"`
+	Direction     Direction        `json:"direction"`
+	DeliveryOwner string           `json:"delivery_owner,omitempty"`
+	Status        Status           `json:"status"`
+	Channel       string           `json:"channel"`
+	UserID        string           `json:"user_id"`
+	Text          string           `json:"text"`
+	Media         *MediaAttachment `json:"media,omitempty"`
+	ReplyTo       string           `json:"reply_to,omitempty"`
+	Response      string           `json:"response,omitempty"`
+	ResponseReady bool             `json:"response_ready,omitempty"`
+	Error         string           `json:"error,omitempty"`
+	Attempts      int              `json:"attempts"`
+	OfflineDefers int              `json:"offline_defers,omitempty"`
+	CreatedAt     time.Time        `json:"created_at"`
+	UpdatedAt     time.Time        `json:"updated_at"`
+	ProcessingAt  *time.Time       `json:"processing_at,omitempty"`
+	CompletedAt   *time.Time       `json:"completed_at,omitempty"`
+	NextAttemptAt time.Time        `json:"next_attempt_at,omitempty"`
+	ReplayHistory []ReplayRecord   `json:"replay_history,omitempty"`
 }
 
 // ReplayRecord preserves the previous failed run when an operator requeues it.
@@ -99,6 +117,8 @@ type Store struct {
 	messages   []Message
 	dedup      map[string]string
 	dedupOrder []string
+	// syncDir is injectable only by package tests. A nil value uses File.Sync.
+	syncDir func(*os.File) error
 }
 
 // NewStore loads or creates a durable inbox. Any item left in processing by a
@@ -189,6 +209,129 @@ func (s *Store) EnqueueOutbound(channel, userID, text, replyTo string) (Message,
 	return s.enqueue(DirectionOutbound, channel, userID, text, replyTo, "")
 }
 
+// EnqueueOutboundMedia persists the bytes before publishing the outbox item.
+// Retry and process restart therefore use the same immutable payload and ID.
+func (s *Store) EnqueueOutboundMedia(channel, userID, caption, replyTo string, media MediaAttachment, data []byte) (Message, error) {
+	if len(data) == 0 || len(data) > MaxOutboundMediaBytes {
+		return Message{}, errors.New("humanloop: tamanho de midia invalido")
+	}
+	if media.Kind == "" || media.MIME == "" || channel == "" || userID == "" {
+		return Message{}, errors.New("humanloop: metadados de midia incompletos")
+	}
+	if media.Filename != "" && (filepath.Base(media.Filename) != media.Filename || strings.ContainsAny(media.Filename, "\\/\x00")) {
+		return Message{}, errors.New("humanloop: nome de arquivo de midia invalido")
+	}
+	now := time.Now()
+	msg := Message{ID: newID(), Direction: DirectionOutbound, Status: StatusPending,
+		Channel: channel, UserID: userID, Text: caption, ReplyTo: replyTo,
+		CreatedAt: now, UpdatedAt: now, NextAttemptAt: now}
+	media.Blob = msg.ID + ".blob"
+	media.Size = int64(len(data))
+	sum := sha256.Sum256(data)
+	media.SHA256 = hex.EncodeToString(sum[:])
+	msg.Media = &media
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.writeMediaLocked(media.Blob, data); err != nil {
+		return Message{}, err
+	}
+	s.messages = append(s.messages, msg)
+	if err := s.saveLocked(); err != nil {
+		s.messages = s.messages[:len(s.messages)-1]
+		// A failed directory sync can follow a successful journal rename.
+		// Preserve the blob for crash recovery in that ambiguous case.
+		return Message{}, err
+	}
+	return cloneMediaMessage(msg), nil
+}
+
+// ReadOutboundMedia verifies the blob before it is handed to a remote driver.
+func (s *Store) ReadOutboundMedia(msg Message) ([]byte, error) {
+	if msg.Direction != DirectionOutbound || msg.Media == nil || !validMediaBlob(msg.Media.Blob) ||
+		msg.Media.Size <= 0 || msg.Media.Size > MaxOutboundMediaBytes || len(msg.Media.SHA256) != 64 {
+		return nil, errors.New("humanloop: referencia de midia invalida")
+	}
+	if info, err := os.Lstat(s.mediaDir()); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("humanloop: diretorio privado de midia indisponivel")
+	}
+	path := filepath.Join(s.mediaDir(), msg.Media.Blob)
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != msg.Media.Size {
+		return nil, errors.New("humanloop: arquivo de midia ausente ou alterado")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("humanloop: abrindo midia: %w", err)
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, MaxOutboundMediaBytes+1))
+	if err != nil || int64(len(data)) != msg.Media.Size {
+		return nil, errors.New("humanloop: midia truncada ou excede limite")
+	}
+	sum := sha256.Sum256(data)
+	if hex.EncodeToString(sum[:]) != msg.Media.SHA256 {
+		return nil, errors.New("humanloop: integridade da midia falhou")
+	}
+	return data, nil
+}
+
+func (s *Store) mediaDir() string { return s.path + ".media" }
+
+func validMediaBlob(name string) bool {
+	if !strings.HasPrefix(name, "msg_") || !strings.HasSuffix(name, ".blob") || filepath.Base(name) != name {
+		return false
+	}
+	core := strings.TrimSuffix(strings.TrimPrefix(name, "msg_"), ".blob")
+	if core == "" {
+		return false
+	}
+	for _, r := range core {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Store) writeMediaLocked(name string, data []byte) error {
+	dir := s.mediaDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("humanloop: criando diretorio de midia: %w", err)
+	}
+	info, err := os.Lstat(dir)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("humanloop: diretorio de midia inseguro")
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return fmt.Errorf("humanloop: protegendo diretorio de midia: %w", err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return fmt.Errorf("humanloop: criando midia privada: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return fmt.Errorf("humanloop: gravando midia: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return fmt.Errorf("humanloop: sincronizando midia: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(f.Name())
+		return fmt.Errorf("humanloop: fechando midia: %w", err)
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
 func (s *Store) enqueue(direction Direction, channel, userID, text, replyTo, externalID string) (Message, error) {
 	if direction != DirectionInbound && direction != DirectionOutbound {
 		return Message{}, fmt.Errorf("humanloop: direcao invalida: %s", direction)
@@ -266,7 +409,7 @@ func (s *Store) ClaimNextDue(now time.Time) (Message, bool, error) {
 		*msg = previous
 		return Message{}, false, err
 	}
-	return *msg, true, nil
+	return cloneMediaMessage(*msg), true, nil
 }
 
 // Complete marks an item successful and records any generated response.
@@ -471,10 +614,21 @@ func (s *Store) Snapshot() (State, []Message) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	messages := append([]Message(nil), s.messages...)
+	for i := range messages {
+		messages[i] = cloneMediaMessage(messages[i])
+	}
 	sort.SliceStable(messages, func(i, j int) bool {
 		return messages[i].CreatedAt.Before(messages[j].CreatedAt)
 	})
 	return s.state, messages
+}
+
+func cloneMediaMessage(msg Message) Message {
+	if msg.Media != nil {
+		media := *msg.Media
+		msg.Media = &media
+	}
+	return msg
 }
 
 func (s *Store) findLocked(id string) (*Message, error) {
@@ -608,18 +762,53 @@ func (s *Store) saveLocked() error {
 	if err := os.Rename(tmp, s.path); err != nil {
 		return fmt.Errorf("humanloop: publicando caixa de entrada: %w", err)
 	}
+	// Rename is the publication point. After it succeeds, callers must keep
+	// their in-memory mutation even if directory sync fails; rolling it back
+	// would let a subsequent save erase work that is already in the journal.
 	dir, err := os.Open(filepath.Dir(s.path))
 	if err != nil {
-		return fmt.Errorf("humanloop: abrindo diretorio da caixa: %w", err)
+		slog.Warn("humanloop: caixa publicada; sincronizacao do diretorio indisponivel", "error", err)
+		return nil
 	}
-	if err := dir.Sync(); err != nil {
+	syncDir := s.syncDir
+	if syncDir == nil {
+		syncDir = (*os.File).Sync
+	}
+	if err := syncDir(dir); err != nil {
 		_ = dir.Close()
-		return fmt.Errorf("humanloop: sincronizando diretorio da caixa: %w", err)
+		// Keep old media blobs: a power loss might restore the previous journal.
+		slog.Warn("humanloop: caixa publicada; sincronizacao do diretorio falhou", "error", err)
+		return nil
 	}
 	if err := dir.Close(); err != nil {
-		return fmt.Errorf("humanloop: fechando diretorio da caixa: %w", err)
+		slog.Warn("humanloop: caixa publicada; fechamento do diretorio falhou", "error", err)
 	}
+	s.pruneMediaLocked()
 	return nil
+}
+
+// pruneMediaLocked only removes managed blobs no longer referenced by history.
+// Cleanup is best effort after a successful journal commit; delivery state is
+// never rolled back because a stale file could not be deleted.
+func (s *Store) pruneMediaLocked() {
+	if info, err := os.Lstat(s.mediaDir()); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return
+	}
+	entries, err := os.ReadDir(s.mediaDir())
+	if err != nil {
+		return
+	}
+	referenced := make(map[string]bool)
+	for _, msg := range s.messages {
+		if msg.Media != nil && validMediaBlob(msg.Media.Blob) {
+			referenced[msg.Media.Blob] = true
+		}
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && validMediaBlob(entry.Name()) && !referenced[entry.Name()] {
+			_ = os.Remove(filepath.Join(s.mediaDir(), entry.Name()))
+		}
+	}
 }
 
 func newID() string {

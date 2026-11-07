@@ -56,11 +56,20 @@ type ExtractedMemory struct {
 
 // DreamStats exposes runtime metrics for observability.
 type DreamStats struct {
-	Runs              int
-	MemoriesAdded     int
-	MessagesProcessed int
-	LastError         string
-	LastRunTime       time.Time
+	Runs                int       `json:"runs"`
+	SuccessfulRuns      int       `json:"successful_runs"`
+	FailedRuns          int       `json:"failed_runs"`
+	MemoriesExtracted   int       `json:"memories_extracted"`
+	MemoriesAdded       int       `json:"memories_added"`
+	MessagesProcessed   int       `json:"messages_processed"`
+	NoUserBatches       int       `json:"no_user_batches"`
+	EmptyExtractions    int       `json:"empty_extractions"`
+	LastBatchMessages   int       `json:"last_batch_messages"`
+	LastBatchExtracted  int       `json:"last_batch_extracted"`
+	LastBatchSaved      int       `json:"last_batch_saved"`
+	LastError           string    `json:"last_error,omitempty"`
+	LastRunTime         time.Time `json:"last_run_time,omitempty"`
+	LastSuccessfulRunAt time.Time `json:"last_successful_run_at,omitempty"`
 }
 
 // DreamService periodically (or on idle) processes recent conversations to
@@ -221,6 +230,10 @@ func (d *DreamService) extractMemories(ctx context.Context) error {
 	d.stats.LastRunTime = d.lastRun
 	d.stats.Runs++
 	d.mu.Unlock()
+	if err := d.saveState(); err != nil {
+		d.recordError(err)
+		return fmt.Errorf("persisting dream run: %w", err)
+	}
 
 	if d.config.ExtractFn == nil {
 		err := fmt.Errorf("dream: ExtractFn not configured")
@@ -240,7 +253,7 @@ func (d *DreamService) extractMemories(ctx context.Context) error {
 	}
 	if sequence == 0 {
 		logger.Debug("dream: no messages to process")
-		return nil
+		return d.finishSuccess(0, 0, 0, 0)
 	}
 
 	logger.Info("dream: extracting memories", "messages", msgCount)
@@ -301,29 +314,18 @@ func (d *DreamService) extractMemories(ctx context.Context) error {
 		}
 		added++
 	}
-	if !saveFailed {
-		d.mu.Lock()
-		previous := d.lastSequence
-		d.lastSequence = sequence
-		d.mu.Unlock()
-		if err := d.saveState(); err != nil {
-			d.mu.Lock()
-			d.lastSequence = previous
-			d.mu.Unlock()
-			d.recordError(err)
-			return fmt.Errorf("persisting dream cursor: %w", err)
-		}
-	}
-
-	d.mu.Lock()
-	d.stats.MemoriesAdded += added
-	d.stats.MessagesProcessed += msgCount
-	d.stats.LastError = ""
-	d.mu.Unlock()
 	if saveFailed {
+		d.mu.Lock()
+		d.stats.LastBatchMessages = msgCount
+		d.stats.LastBatchExtracted = len(memories)
+		d.stats.LastBatchSaved = added
+		d.mu.Unlock()
 		err := fmt.Errorf("dream: uma ou mais memorias nao puderam ser salvas; lote sera reprocessado")
 		d.recordError(err)
 		return err
+	}
+	if err := d.finishSuccess(sequence, msgCount, len(memories), added); err != nil {
+		return fmt.Errorf("persisting dream cursor: %w", err)
 	}
 
 	logger.Info("dream: extraction complete",
@@ -389,7 +391,43 @@ func (d *DreamService) collectTranscript(ctx context.Context) (string, int, uint
 func (d *DreamService) recordError(err error) {
 	d.mu.Lock()
 	d.stats.LastError = err.Error()
+	d.stats.FailedRuns++
 	d.mu.Unlock()
+	if persistErr := d.saveState(); persistErr != nil {
+		d.config.Logger.Warn("dream: failed persisting error metrics", "error", persistErr)
+	}
+}
+
+func (d *DreamService) finishSuccess(sequence uint64, messages, extracted, added int) error {
+	d.mu.Lock()
+	previousSequence, previousProcessed, previousStats := d.lastSequence, d.lastProcessed, d.stats
+	if sequence != 0 {
+		d.lastSequence = sequence
+	}
+	d.lastProcessed = time.Now()
+	d.stats.SuccessfulRuns++
+	d.stats.MessagesProcessed += messages
+	d.stats.MemoriesExtracted += extracted
+	d.stats.MemoriesAdded += added
+	d.stats.LastBatchMessages = messages
+	d.stats.LastBatchExtracted = extracted
+	d.stats.LastBatchSaved = added
+	d.stats.LastSuccessfulRunAt = d.lastProcessed
+	d.stats.LastError = ""
+	if messages == 0 {
+		d.stats.NoUserBatches++
+	} else if extracted == 0 {
+		d.stats.EmptyExtractions++
+	}
+	d.mu.Unlock()
+	if err := d.saveState(); err != nil {
+		d.mu.Lock()
+		d.lastSequence, d.lastProcessed, d.stats = previousSequence, previousProcessed, previousStats
+		d.mu.Unlock()
+		d.recordError(err)
+		return err
+	}
+	return nil
 }
 
 func (d *DreamService) topicFor(m ExtractedMemory) string {
@@ -407,8 +445,9 @@ func (d *DreamService) topicFor(m ExtractedMemory) string {
 }
 
 type dreamState struct {
-	LastSequence  uint64    `json:"last_sequence"`
-	LastProcessed time.Time `json:"last_processed"`
+	LastSequence  uint64     `json:"last_sequence"`
+	LastProcessed time.Time  `json:"last_processed"`
+	Stats         DreamStats `json:"stats"`
 }
 
 func (d *DreamService) loadState() {
@@ -423,6 +462,8 @@ func (d *DreamService) loadState() {
 	if json.Unmarshal(raw, &state) == nil {
 		d.lastProcessed = state.LastProcessed
 		d.lastSequence = state.LastSequence
+		d.stats = state.Stats
+		d.lastRun = state.Stats.LastRunTime
 	}
 }
 
@@ -431,7 +472,7 @@ func (d *DreamService) saveState() error {
 		return nil
 	}
 	d.mu.Lock()
-	state := dreamState{LastProcessed: d.lastProcessed, LastSequence: d.lastSequence}
+	state := dreamState{LastProcessed: d.lastProcessed, LastSequence: d.lastSequence, Stats: d.stats}
 	d.mu.Unlock()
 	raw, err := json.Marshal(state)
 	if err != nil {

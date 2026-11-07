@@ -23,4 +23,4 @@ As ferramentas de conhecimento em documentos, fila de tarefas, auditoria e naveg
 - O watcher de `SKILL.md` e o callback do registro de skills atualizam ou removem a ferramenta correspondente sem reiniciar o Polypod. O agente padrão recebe automaticamente novas skills registradas em tempo de execução a partir do próximo turno; outros agentes precisam incluir o nome na própria lista.
 - `find_skills` pesquisa o snapshot local e as skills ativas; `install_skill` instala uma skill original ainda sem adaptação. Para instruções que já têm adaptação, retorna o nome ativo.
 
-Ainda são necessários testes reais de login no navegador, áudio e documentos recebidos pelo WhatsApp; e credenciais para transcrição e embeddings semânticos, se desejados. Não há benchmark comparativo que prove vantagem geral sobre PolyClaw.
+O Whisper e os embeddings FastEmbed locais estão configurados sem credenciais externas. Ainda são necessários testes reais de login no navegador, voz e documentos recebidos e enviados pelo WhatsApp, perguntas `ask_user` no telefone e comparação de desempenho com PolyClaw. Não há benchmark que prove vantagem geral sobre PolyClaw.

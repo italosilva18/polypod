@@ -20,6 +20,10 @@ data:
 
 embedding:
   enabled: false
+  backend: local           # local: FastEmbed multilingual, http: OpenAI-compatible endpoint
+  python_binary: ""        # e.g. /home/user/.local/share/polypod/embedding-venv/bin/python
+  cache_dir: ""            # directory containing the downloaded model; offline at runtime
+  timeout_seconds: 120
   api_key: ""
   base_url: ""
   model: ""
@@ -95,6 +99,13 @@ whatsapp:
     endpoint: "${POLYPOD_ASR_ENDPOINT:}"
     model: "${POLYPOD_ASR_MODEL:}"
     api_key: "${POLYPOD_ASR_API_KEY:}"
+  # Local Piper voice note synthesis for the configured owner_chat.
+  voice_output:
+    enabled: false
+    python_binary: "${POLYPOD_TTS_PYTHON:}"
+    model_path: "${POLYPOD_TTS_MODEL_PATH:}"
+    ffmpeg_binary: "${POLYPOD_TTS_FFMPEG:ffmpeg}"
+    timeout_seconds: 120
 
 templates:
   dir: templates

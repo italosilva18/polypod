@@ -42,6 +42,7 @@ skills:
   - write_file
   - edit_file
   - document_extract
+  - image_analyze
   - document_knowledge
   - audit
   - task_queue

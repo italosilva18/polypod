@@ -46,6 +46,10 @@ func TestDocumentToolRejectsInvalidPaging(t *testing.T) {
 		{"path": "a.txt", "max_chars": 0.0},
 		{"path": "a.txt", "max_chars": 100001.0},
 		{"path": "a.txt", "start": 1.5},
+		{"path": "a.txt", "page_start": 1.0},
+		{"path": "a.pdf", "page_end": 3.0},
+		{"path": "a.pdf", "page_start": 3.0, "page_end": 2.0},
+		{"path": "a.pdf", "page_start": 0.0},
 	} {
 		if tool.ValidateInput(args).Valid {
 			t.Fatalf("accepted invalid arguments: %+v", args)

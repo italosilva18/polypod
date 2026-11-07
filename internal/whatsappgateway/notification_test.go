@@ -111,3 +111,40 @@ func TestNotificationSkillDoesNotWakeWhenPersistenceFails(t *testing.T) {
 		t.Fatalf("failed persistence left messages = %d, wakes = %d", len(messages), wakes)
 	}
 }
+
+func TestMediaSkillQueuesFileWithoutSending(t *testing.T) {
+	store, err := humanloop.NewStore(filepath.Join(t.TempDir(), "inbox.json"), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const owner = "15551234567@s.whatsapp.net"
+	driver := &fakeDriver{}
+	wakes := 0
+	gateway, err := New(store, driver, []string{owner}, []string{owner}, func() { wakes++ })
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := skill.NewRegistry()
+	if err := RegisterNotificationSkill(reg, gateway, owner); err != nil {
+		t.Fatal(err)
+	}
+	mediaSkill, ok := reg.Get("whatsapp_send_media")
+	if !ok {
+		t.Fatal("media skill missing")
+	}
+	path := filepath.Join(t.TempDir(), "report.pdf")
+	if err := os.WriteFile(path, []byte("%PDF-1.7\n%%EOF"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := mediaSkill.Execute(map[string]string{"path": path, "caption": "Veja o relatorio"})
+	if err != nil || !strings.Contains(result, "enfileirada com ID") {
+		t.Fatalf("media skill result = %q, %v", result, err)
+	}
+	if wakes != 1 || len(driver.sent) != 0 {
+		t.Fatalf("wakes=%d sends=%d", wakes, len(driver.sent))
+	}
+	_, messages := store.Snapshot()
+	if len(messages) != 1 || messages[0].Media == nil || messages[0].Media.Kind != "document" {
+		t.Fatalf("media outbox = %+v", messages)
+	}
+}

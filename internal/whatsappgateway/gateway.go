@@ -28,7 +28,10 @@ type Event struct {
 	FromMe    bool   `json:"from_me,omitempty"`
 }
 
-type Outbound struct{ ChatID, Text, ID, ReplyTo, Participant, QuotedText string }
+type Outbound struct {
+	ChatID, Text, ID, ReplyTo, Participant, QuotedText string
+	Media                                              *OutboundMedia
+}
 
 // Driver must return only after the server acknowledges Send. A stable ID is
 // reused on retry; this is not a guarantee of end-to-end exactly-once delivery.
@@ -147,6 +150,17 @@ func (g *Gateway) Deliver(ctx context.Context, msg humanloop.Message) error {
 		return errors.New("whatsapp: destino ou mensagem nao autorizado")
 	}
 	out := Outbound{ChatID: msg.UserID, Text: msg.Text, ID: outboundID(msg.ID)}
+	if msg.Media != nil {
+		data, err := g.store.ReadOutboundMedia(msg)
+		if err != nil {
+			return fmt.Errorf("whatsapp: lendo midia enfileirada: %w", err)
+		}
+		validated, err := validateOutboundMedia(msg.Text, msg.Media.Filename, msg.Media.MIME, data)
+		if err != nil || validated.Kind != msg.Media.Kind {
+			return errors.New("whatsapp: midia enfileirada invalida")
+		}
+		out.Media = &validated
+	}
 	if msg.ReplyTo != "" {
 		_, messages := g.store.Snapshot()
 		for _, in := range messages {

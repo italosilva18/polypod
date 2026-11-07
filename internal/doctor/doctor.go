@@ -2,6 +2,7 @@ package doctor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/costa/polypod/internal/config"
+	"github.com/costa/polypod/internal/memory"
 	"github.com/costa/polypod/internal/whatsappgateway"
 )
 
@@ -60,11 +62,16 @@ func runBasicDiagnostics(cfg *config.Config) []Check {
 
 	// 6. Voice tools
 	checks = append(checks, checkLocalTranscription(cfg.WhatsApp.AudioTranscription))
-	checks = append(checks, checkOptionalTool("espeak-ng (TTS)", "espeak-ng"))
+	checks = append(checks, checkVoiceOutput(cfg.WhatsApp.VoiceOutput))
+	checks = append(checks, checkSemanticMemory(cfg.Embedding))
+	if !cfg.WhatsApp.VoiceOutput.Enabled {
+		checks = append(checks, checkOptionalTool("espeak-ng (TTS)", "espeak-ng"))
+	}
 
 	// 7. Data directories
 	checks = append(checks, checkDir("Data dir", cfg.Data.Dir))
 	checks = append(checks, checkDir("Agents dir", cfg.Data.AgentsDir))
+	checks = append(checks, checkDreamMemory(filepath.Join(cfg.Data.Dir, "dream-state.json")))
 
 	// 8. Templates
 	checks = append(checks, checkDir("Templates", cfg.Templates.Dir))
@@ -186,6 +193,100 @@ func checkLocalTranscription(cfg config.AudioTranscriptionConfig) Check {
 	}
 	c.Status = "ok"
 	c.Message = "backend local configurado; Python, script, modelo e ffmpeg presentes; transcrição não executada"
+	return c
+}
+
+func checkVoiceOutput(cfg config.VoiceOutputConfig) Check {
+	c := Check{Name: "Voz local", Status: "warn", Message: "desativada em whatsapp.voice_output.enabled"}
+	if !cfg.Enabled {
+		return c
+	}
+	python := cfg.PythonBinary
+	if strings.TrimSpace(python) == "" {
+		python = "python3"
+	}
+	ffmpeg := cfg.FFmpegBinary
+	if strings.TrimSpace(ffmpeg) == "" {
+		ffmpeg = "ffmpeg"
+	}
+	var missing []string
+	if !transcriptionExecutableExists(python) {
+		missing = append(missing, "Python")
+	}
+	if !transcriptionExecutableExists(ffmpeg) {
+		missing = append(missing, "ffmpeg")
+	}
+	if !transcriptionFileExists(cfg.ModelPath) || !transcriptionFileExists(cfg.ModelPath+".json") {
+		missing = append(missing, "modelo Piper")
+	}
+	if len(missing) != 0 {
+		c.Status = "fail"
+		c.Message = "dependências ausentes ou inválidas: " + strings.Join(missing, ", ")
+		return c
+	}
+	c.Status = "ok"
+	c.Message = "Piper e ffmpeg presentes; síntese não executada"
+	return c
+}
+
+func checkSemanticMemory(cfg config.EmbeddingConfig) Check {
+	c := Check{Name: "Busca semântica", Status: "warn", Message: "desativada em embedding.enabled"}
+	if !cfg.Enabled {
+		return c
+	}
+	backend := strings.ToLower(strings.TrimSpace(cfg.Backend))
+	if backend == "local" {
+		configured, err := memory.NewLocalEmbedder(memory.LocalEmbeddingConfig{
+			PythonBinary: cfg.PythonBinary, CacheDir: cfg.CacheDir,
+			Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second,
+		})
+		if err != nil {
+			return Check{Name: c.Name, Status: "fail", Message: "Python ou modelo local indisponível"}
+		}
+		_ = configured.Close()
+		return Check{Name: c.Name, Status: "ok", Message: "Python e cache locais presentes; inferência não executada neste diagnóstico"}
+	}
+	if backend == "" || backend == "http" {
+		if _, err := memory.NewHTTPEmbedder(memory.HTTPEmbeddingConfig{BaseURL: cfg.BaseURL, APIKey: cfg.APIKey, Model: cfg.Model}); err != nil {
+			return Check{Name: c.Name, Status: "fail", Message: "endpoint ou modelo HTTP inválido"}
+		}
+		return Check{Name: c.Name, Status: "ok", Message: "endpoint HTTP configurado; consulta não executada"}
+	}
+	return Check{Name: c.Name, Status: "fail", Message: "backend desconhecido"}
+}
+
+func checkDreamMemory(path string) Check {
+	c := Check{Name: "Memória automática", Status: "warn"}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		c.Message = "ainda sem estado de consolidação"
+		return c
+	}
+	var state struct {
+		Stats struct {
+			Runs           int `json:"runs"`
+			SuccessfulRuns int `json:"successful_runs"`
+			FailedRuns     int `json:"failed_runs"`
+			MemoriesAdded  int `json:"memories_added"`
+		} `json:"stats"`
+	}
+	if err := json.Unmarshal(data, &state); err != nil {
+		c.Status = "fail"
+		c.Message = "estado de consolidação inválido"
+		return c
+	}
+	if state.Stats.Runs == 0 {
+		c.Message = "serviço ligado; sem métricas de execução registradas"
+		return c
+	}
+	if state.Stats.FailedRuns > 0 {
+		c.Message = fmt.Sprintf("%d execuções; %d falhas; %d memórias salvas", state.Stats.Runs,
+			state.Stats.FailedRuns, state.Stats.MemoriesAdded)
+		return c
+	}
+	c.Status = "ok"
+	c.Message = fmt.Sprintf("%d execuções; %d concluídas; %d memórias salvas", state.Stats.Runs,
+		state.Stats.SuccessfulRuns, state.Stats.MemoriesAdded)
 	return c
 }
 

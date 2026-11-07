@@ -1,12 +1,15 @@
 package whatsappgateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"image"
 	"io"
 	"log/slog"
 	"net"
@@ -53,11 +56,18 @@ func (n *Native) Send(ctx context.Context, msg Outbound) error {
 	if err != nil || to.IsEmpty() {
 		return errors.New("whatsapp: JID invalido")
 	}
-	m := &waE2E.Message{Conversation: proto.String(msg.Text)}
-	if msg.ReplyTo != "" {
-		m = &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String(msg.Text), ContextInfo: &waE2E.ContextInfo{StanzaID: proto.String(msg.ReplyTo), Participant: proto.String(msg.Participant), QuotedMessage: &waE2E.Message{Conversation: proto.String(msg.QuotedText)}}}}
+	m, err := buildOutboundMessage(ctx, n.client, msg)
+	if err != nil {
+		return classifyNativeSendError(err)
 	}
 	_, err = n.client.SendMessage(ctx, to, m, whatsmeow.SendRequestExtra{ID: msg.ID})
+	return classifyNativeSendError(err)
+}
+
+func classifyNativeSendError(err error) error {
+	if err == nil {
+		return nil
+	}
 	var netErr net.Error
 	if errors.Is(err, whatsmeow.ErrNotConnected) || errors.Is(err, whatsmeow.ErrNotLoggedIn) ||
 		errors.Is(err, socket.ErrSocketClosed) || errors.Is(err, context.Canceled) ||
@@ -65,6 +75,109 @@ func (n *Native) Send(ctx context.Context, msg Outbound) error {
 		return fmt.Errorf("whatsapp: sessao desconectada: %w", humanloop.ErrRemoteUnavailable)
 	}
 	return err
+}
+
+type mediaUploader interface {
+	Upload(context.Context, []byte, whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
+}
+
+// buildOutboundMessage keeps upload and protobuf construction testable without
+// a paired WhatsApp session. SendMessage is still called only by Native.Send.
+func buildOutboundMessage(ctx context.Context, uploader mediaUploader, msg Outbound) (*waE2E.Message, error) {
+	var quote *waE2E.ContextInfo
+	if msg.ReplyTo != "" {
+		quote = &waE2E.ContextInfo{StanzaID: proto.String(msg.ReplyTo), Participant: proto.String(msg.Participant),
+			QuotedMessage: &waE2E.Message{Conversation: proto.String(msg.QuotedText)}}
+	}
+	if msg.Media == nil {
+		if quote == nil {
+			return &waE2E.Message{Conversation: proto.String(msg.Text)}, nil
+		}
+		return &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String(msg.Text), ContextInfo: quote}}, nil
+	}
+	validated, err := validateOutboundMedia(msg.Text, msg.Media.Filename, msg.Media.MIME, msg.Media.Data)
+	if err != nil || validated.Kind != msg.Media.Kind {
+		return nil, errors.New("whatsapp: midia de saida invalida")
+	}
+	var mediaType whatsmeow.MediaType
+	switch validated.Kind {
+	case "audio":
+		mediaType = whatsmeow.MediaAudio
+	case "image":
+		mediaType = whatsmeow.MediaImage
+	case "document":
+		mediaType = whatsmeow.MediaDocument
+	default:
+		return nil, errors.New("whatsapp: tipo de midia de saida desconhecido")
+	}
+	resp, err := uploader.Upload(ctx, validated.Data, mediaType)
+	if err != nil {
+		return nil, fmt.Errorf("whatsapp: upload de midia: %w", err)
+	}
+	switch validated.Kind {
+	case "audio":
+		var seconds *uint32
+		if duration := opusDurationSeconds(validated.Data); duration > 0 {
+			seconds = proto.Uint32(duration)
+		}
+		return &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
+			URL: &resp.URL, DirectPath: &resp.DirectPath, Mimetype: proto.String(validated.MIME),
+			FileSHA256: resp.FileSHA256, FileEncSHA256: resp.FileEncSHA256,
+			FileLength: &resp.FileLength, MediaKey: resp.MediaKey,
+			PTT: proto.Bool(true), Seconds: seconds, ContextInfo: quote,
+		}}, nil
+	case "image":
+		config, _, _ := image.DecodeConfig(bytes.NewReader(validated.Data))
+		return &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+			URL: &resp.URL, DirectPath: &resp.DirectPath, Mimetype: proto.String(validated.MIME),
+			Caption: proto.String(msg.Text), Width: proto.Uint32(uint32(config.Width)), Height: proto.Uint32(uint32(config.Height)),
+			FileSHA256: resp.FileSHA256, FileEncSHA256: resp.FileEncSHA256,
+			FileLength: &resp.FileLength, MediaKey: resp.MediaKey, ContextInfo: quote,
+		}}, nil
+	default:
+		return &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
+			URL: &resp.URL, DirectPath: &resp.DirectPath, Mimetype: proto.String(validated.MIME),
+			Caption: proto.String(msg.Text), FileName: proto.String(validated.Filename), Title: proto.String(validated.Filename),
+			FileSHA256: resp.FileSHA256, FileEncSHA256: resp.FileEncSHA256,
+			FileLength: &resp.FileLength, MediaKey: resp.MediaKey, ContextInfo: quote,
+		}}, nil
+	}
+}
+
+// Opus granule positions use a 48 kHz clock. A missing/invalid final position
+// leaves the optional WhatsApp duration unset rather than inventing one.
+func opusDurationSeconds(data []byte) uint32 {
+	var last uint64
+	for offset := 0; offset+27 <= len(data); {
+		if !bytes.Equal(data[offset:offset+4], []byte("OggS")) {
+			break
+		}
+		segments := int(data[offset+26])
+		if offset+27+segments > len(data) {
+			break
+		}
+		payload := 0
+		for _, size := range data[offset+27 : offset+27+segments] {
+			payload += int(size)
+		}
+		next := offset + 27 + segments + payload
+		if next > len(data) {
+			break
+		}
+		granule := binary.LittleEndian.Uint64(data[offset+6 : offset+14])
+		if granule != ^uint64(0) && granule > last {
+			last = granule
+		}
+		offset = next
+	}
+	if last == 0 {
+		return 0
+	}
+	seconds := (last + 47_999) / 48_000
+	if seconds > uint64(^uint32(0)) {
+		return 0
+	}
+	return uint32(seconds)
 }
 
 // Run blocks until cancellation. It serializes session ownership, waits for event

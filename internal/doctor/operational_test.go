@@ -114,6 +114,24 @@ func TestBootAndDesktopLiveProbes(t *testing.T) {
 	}
 }
 
+func TestServiceHasDelegatedDesktop(t *testing.T) {
+	p := operationalProbes{command: func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if name != "systemctl" || len(args) < 2 || args[0] != "show" || args[1] != "polypod-root.service" {
+			t.Fatalf("unexpected command: %s %v", name, args)
+		}
+		return []byte("HOME=/root DISPLAY=:1 WAYLAND_DISPLAY=wayland-1 POLYPOD_DESKTOP_USER=costa API_KEY=private"), nil
+	}}
+	if !serviceHasDelegatedDesktop(context.Background(), p) {
+		t.Fatal("expected service's Wayland session to be detected")
+	}
+	p.command = func(context.Context, string, ...string) ([]byte, error) {
+		return []byte("DISPLAY=:1 POLYPOD_DESKTOP_USER=costa"), nil
+	}
+	if serviceHasDelegatedDesktop(context.Background(), p) {
+		t.Fatal("missing Wayland display accepted")
+	}
+}
+
 func TestAPIKeyNeverAppearsInReport(t *testing.T) {
 	for _, key := range []string{"x", "sk-secret-value"} {
 		c := checkAPIKey("API", key, "")

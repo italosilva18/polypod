@@ -4,6 +4,20 @@
 
 Este documento separa cinco afirmações que não são intercambiáveis: **implementado** (há código), **ligado** (o ponto de entrada o chama), **configurado** (valores efetivos permitem a função), **implantado** (o processo usa aquele binário/configuração) e **testado ao vivo** (efeito de ponta a ponta observado). Testes unitários e documentação de arquitetura não provam as três últimas. Não foram lidos nem reproduzidos tokens, chaves ou conteúdo de conversas.
 
+## Atualização operacional de 6 de novembro de 2026, 22h21 (São Paulo)
+
+O binário SHA-256 `7fcbf1790e422225cadf8f100a6bdedf169a4f021153f01e76f1a18ef55f6e2e` foi implantado pelo script com backup e gate de processo estável por mais de 65 segundos. O serviço permaneceu ativo e habilitado; o diagnóstico no ambiente do serviço teve **21 OK, 2 avisos e 0 falhas**, incluindo WhatsApp conectado, OAuth ChatGPT acessível, captura de tela, socket de entrada desktop, Whisper, Piper e modelo local de embeddings. Os avisos são memória automática ainda sem métricas da nova versão e cinco itens antigos com falha terminal na inbox.
+
+| Área | Estado nesta versão | Evidência e limite |
+| --- | --- | --- |
+| Rotinas contínuas | Planejamento diário 09h, revisão diária 18h e revisão semanal segunda 10h em `America/Sao_Paulo`, com retomada `run_once`, turnos serializados e heartbeat de 1h. O agente completo recebe cada prompt. | As quatro rotinas aparecem habilitadas no estado persistido; testes de agendamento, recuperação e histórico passaram. Ainda não se observou cada horário real nem suas ações externas. Veja `P:docs/integrations/continuous-operations.md`. |
+| Memória | Consolidação automática ligada ao journal, métricas duráveis e busca híbrida com FastEmbed multilíngue local e cache SQLite privado de vetores. | Testes reais do modelo em português, persistência/reabertura do cache, seleção do snapshot ativo e `make check` passaram. O diagnóstico ainda não registrou uma nova execução de consolidação; não há benchmark de recall contra PolyClaw. Veja `P:docs/integrations/semantic-memory.md`. |
+| Arquivos e imagem | DOCX, XLSX, PPTX e PDF com páginas/OCR estruturados; `image_analyze` usa o provedor de visão já configurado, com limite de memória e primeiro quadro de GIF. | Fixtures locais e testes de ferramentas passaram. Recebimento de anexos reais, extração, indexação e resposta no WhatsApp ainda precisam de ensaio de ponta a ponta. |
+| Saída pelo WhatsApp | Outbox privada e persistente envia voz OGG/Opus, imagem e documento pelo cliente nativo; `whatsapp_send_media` e `whatsapp_send_voice` estão ligadas ao agente padrão. | Upload/protobuf, retenção/retry e síntese Piper → ffmpeg → Opus passaram em testes; a sessão WhatsApp está conectada. Ainda não houve envio de mídia confirmado no telefone com esta versão. |
+| Desktop | O diagnóstico de serviço captura e descarta uma imagem 1920×1080 e confirma o socket de entrada. | Isso prova acesso à sessão gráfica, não a conclusão de login, 2FA, CAPTCHA ou tarefa humana específica. |
+
+O Telegram segue desativado porque o usuário ainda não possui token e ID de chat. O WhatsApp é o canal remoto ativo. **Nenhum resultado acima demonstra que o Polypod supera todos os agentes comparados em qualidade ou velocidade**; essa afirmação exige tarefas iguais, métricas e verificação externa.
+
 ## Atualização de transcrição local em 6 de novembro de 2026
 
 O Polypod usa agora `openai-whisper` com o modelo `base.pt` e `ffmpeg` no computador. O ambiente Python e o modelo foram copiados para `/home/costa/.local/share/polypod`, sem dependência operacional do diretório PolyClaw. O backend local está habilitado no `config.yaml` privado e ligado ao interpretador de áudio recebido pelo WhatsApp. O adaptador limita duração, tamanho e concorrência, e não envia áudio para um endpoint de ASR.

@@ -81,6 +81,7 @@ import (
 	"github.com/costa/polypod/internal/testgen"
 	"github.com/costa/polypod/internal/tool"
 	"github.com/costa/polypod/internal/tracking"
+	"github.com/costa/polypod/internal/tts"
 	"github.com/costa/polypod/internal/types"
 	"github.com/costa/polypod/internal/web"
 	"github.com/costa/polypod/internal/whatsappgateway"
@@ -712,15 +713,38 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	memStore := memory.NewStoreFromDB(sqlDB, cfg.Data.Dir)
 	var embedder memory.Embedder
 	if cfg.Embedding.Enabled {
-		configured, err := memory.NewHTTPEmbedder(memory.HTTPEmbeddingConfig{
-			BaseURL: cfg.Embedding.BaseURL, APIKey: cfg.Embedding.APIKey, Model: cfg.Embedding.Model})
-		if err != nil {
-			return fmt.Errorf("configuring semantic memory: %w", err)
+		backend := strings.ToLower(strings.TrimSpace(cfg.Embedding.Backend))
+		switch backend {
+		case "", "http":
+			configured, err := memory.NewHTTPEmbedder(memory.HTTPEmbeddingConfig{
+				BaseURL: cfg.Embedding.BaseURL, APIKey: cfg.Embedding.APIKey, Model: cfg.Embedding.Model})
+			if err != nil {
+				return fmt.Errorf("configuring semantic memory: %w", err)
+			}
+			embedder = configured
+		case "local":
+			configured, err := memory.NewLocalEmbedder(memory.LocalEmbeddingConfig{
+				PythonBinary: cfg.Embedding.PythonBinary,
+				CacheDir:     cfg.Embedding.CacheDir,
+				Timeout:      time.Duration(cfg.Embedding.TimeoutSeconds) * time.Second,
+			})
+			if err != nil {
+				return fmt.Errorf("configuring local semantic memory: %w", err)
+			}
+			defer configured.Close()
+			cached, err := memory.NewCachedEmbedder(configured, filepath.Join(cfg.Data.Dir, "embedding-cache.db"))
+			if err != nil {
+				return fmt.Errorf("opening local embedding cache: %w", err)
+			}
+			defer cached.Close()
+			embedder = cached
+		default:
+			return fmt.Errorf("unknown embedding backend %q", backend)
 		}
-		embedder = configured
 		if managed, ok := memStore.(*memory.ManagedStore); ok {
 			managed.SetEmbedder(embedder)
 		}
+		logger.Info("semantic memory enabled", "backend", backend)
 	}
 	documentIndex, err := document.OpenIndex(filepath.Join(cfg.Data.Dir, "document-index.db"), embedder)
 	if err != nil {
@@ -958,6 +982,15 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	if err := sched.Load(); err != nil {
 		return fmt.Errorf("loading scheduler state: %w", err)
 	}
+	if cfg.Scheduler.Enabled {
+		created, err := scheduler.EnsureDefaultRoutines(sched)
+		if err != nil {
+			return fmt.Errorf("preparing default routines: %w", err)
+		}
+		if created > 0 {
+			logger.Info("default routines created", "count", created)
+		}
+	}
 	scheduler.RegisterSkills(skills, sched)
 	goalStore, err := goals.Open(filepath.Join(cfg.Data.Dir, "goals.json"))
 	if err != nil {
@@ -1088,6 +1121,9 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 
 	// Provider registry
 	providerReg, providerList := buildProviderRegistry(cfg, multiAuth)
+	if vision, ok := providerReg.Get(cfg.AI.Provider); ok {
+		tool.RegisterLocalImageVisionTool(sys.ToolRegistry, vision, cfg.AI.Model)
+	}
 
 	// PR status (async)
 	go func() {
@@ -1275,8 +1311,25 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 			if err := whatsappgateway.RegisterNotificationSkill(skills, whatsapp, cfg.WhatsApp.OwnerChat); err != nil {
 				return fmt.Errorf("registering whatsapp notification: %w", err)
 			}
-			tool.RegisterAllSkills(sys.ToolRegistry, skills)
 			agents.AddSkill("default", "whatsapp_notify")
+			agents.AddSkill("default", "whatsapp_send_media")
+			if cfg.WhatsApp.VoiceOutput.Enabled {
+				voice := cfg.WhatsApp.VoiceOutput
+				piper, err := tts.NewPiper(tts.PiperConfig{
+					PythonBinary: voice.PythonBinary,
+					ModelPath:    voice.ModelPath,
+					FFmpegBinary: voice.FFmpegBinary,
+					Timeout:      time.Duration(voice.TimeoutSeconds) * time.Second,
+				})
+				if err != nil {
+					return fmt.Errorf("configuring WhatsApp voice output: %w", err)
+				}
+				if err := tts.RegisterWhatsAppVoiceSkill(skills, whatsapp, cfg.WhatsApp.OwnerChat, piper); err != nil {
+					return fmt.Errorf("registering WhatsApp voice output: %w", err)
+				}
+				agents.AddSkill("default", "whatsapp_send_voice")
+			}
+			tool.RegisterAllSkills(sys.ToolRegistry, skills)
 		}
 		vision, _ := providerReg.Get(cfg.AI.Provider)
 		whatsappMedia = &whatsappgateway.MediaInterpreter{
@@ -1563,7 +1616,16 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 
 	// Human-language routines wake the same complete operational agent used by
 	// the CLI, with a separate persistent conversation per routine.
+	// Scheduler ticks may launch several due routines at once. Serialize their
+	// agent turns so two plans cannot act on the same goal or inbox item.
+	routineGate := make(chan struct{}, 1)
 	sched.SetPromptRunner(func(runCtx context.Context, task *scheduler.Task) (string, error) {
+		select {
+		case routineGate <- struct{}{}:
+			defer func() { <-routineGate }()
+		case <-runCtx.Done():
+			return "", runCtx.Err()
+		}
 		prompt := fmt.Sprintf("ROTINA AGENDADA: %s\nID: %s\nExecucao: %s\nTentativa: %d\nObjetivo:\n%s\n\nExecute o objetivo completo, verifique o resultado e relate de forma objetiva. Se esta for uma retomada, confirme o efeito da tentativa anterior antes de repetir a acao. Nao crie outra rotina a menos que o objetivo mande explicitamente.", task.Name, task.ID, task.CurrentRunID, task.CurrentAttempt, task.Prompt)
 		out, err := handler(runCtx, adapter.InMessage{
 			ID:        fmt.Sprintf("routine-%s-%s-%d", task.ID, task.CurrentRunID, task.CurrentAttempt),
@@ -1575,7 +1637,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		return out.Text, err
 	})
 	sched.SetDurableCallback(func(task *scheduler.Task, notice scheduler.CompletionNotice) error {
-		if task.ID == heartbeatID && notice.Error == "" && strings.TrimSpace(notice.Result) == "NO_REPLY" {
+		if notice.Error == "" && strings.TrimSpace(notice.Result) == "NO_REPLY" {
 			return nil
 		}
 		message := fmt.Sprintf("Rotina %q concluida com status %s.", task.Name, notice.Status)

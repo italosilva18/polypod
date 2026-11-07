@@ -17,16 +17,17 @@ func (s *Scheduler) appendHistory(task *Task, record RunRecord) error {
 	if record.TaskID == "" {
 		record.TaskID = task.ID
 	}
-	if err := s.writeRunRecord(record); err != nil {
-		return err
-	}
+	// The task snapshot is the recovery fallback if the append-only journal is
+	// temporarily unwritable. The caller still receives the journal error so it
+	// can log the degraded audit path before saving the task snapshot.
+	journalErr := s.writeRunRecord(record)
 	s.mu.Lock()
 	task.History = append(task.History, record)
 	if len(task.History) > 50 {
 		task.History = append([]RunRecord(nil), task.History[len(task.History)-50:]...)
 	}
 	s.mu.Unlock()
-	return nil
+	return journalErr
 }
 
 func (s *Scheduler) writeRunRecord(record RunRecord) error {

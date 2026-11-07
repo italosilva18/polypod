@@ -15,7 +15,7 @@ The v0.6 line is the stabilization release for the large CLI-only rewrite:
 - full `go test ./...` and `go vet ./...` validation;
 - permission enforcement on every streaming tool path;
 - native and autonomous slash commands connected to the terminal UI;
-- one binary with no Node or Python runtime requirement.
+- one Go binary for the core agent; optional local Whisper, Piper, document parsing and semantic embeddings use private Python environments.
 
 ## Unrestricted mode
 
@@ -73,7 +73,7 @@ The local root systemd deployment is documented in [scripts/README.md](scripts/R
 - built-in coder, researcher, reviewer, architect and DevOps agents;
 - subagents, task tracking and swarm coordination;
 - sessions, compaction, memory, checkpoints, undo/redo and conversation trees;
-- document knowledge index with citations and exact conversation scopes;
+- document knowledge index with citations, exact conversation scopes and optional local semantic search;
 - durable priority task queue, completion notices and tool audit trail;
 - agent-readable persistent secrets through `save_secret`, `get_secret`,
   `list_secrets` and `delete_secret`;
@@ -82,15 +82,20 @@ The local root systemd deployment is documented in [scripts/README.md](scripts/R
 - code review, security analysis, testing, linting and profiling;
 - browser/computer-use, SSH, OpenAPI tools and scheduled work;
 - managed Chrome profile for browser actions, native WhatsApp media intake and
-  local Whisper audio transcription;
+  durable outbound voice, image and document delivery, plus local Whisper audio transcription;
 - token, context-window and cost tracking.
 
 The [PolyClaw skill import](docs/integrations/polyclaw-import.md) records the
 ported catalog and its limits. See the [document index](docs/integrations/document-index.md)
+and [local semantic memory](docs/integrations/semantic-memory.md)
 and [WhatsApp audio setup](docs/integrations/audio-transcription.md) for the
-new opt-in integrations.
+new opt-in integrations. [Local voice output](docs/integrations/voice-output.md)
+documents the Piper-based OGG/Opus path for WhatsApp voice notes, and
+[WhatsApp outbound media](docs/integrations/whatsapp-outbound-media.md) covers file delivery.
 The [managed browser](docs/integrations/browser-managed.md) explains the
 isolated profile and desktop handoff.
+The [continuous operations guide](docs/integrations/continuous-operations.md)
+explains scheduled routines, inbox recovery and automatic memory.
 The [skill catalog](docs/integrations/skill-catalog.md) and
 [skill evolution cycle](docs/integrations/skill-evolution.md) cover discovery,
 import, evidence, review and application.

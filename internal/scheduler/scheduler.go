@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -18,6 +19,40 @@ import (
 	"github.com/costa/polypod/internal/skill"
 	"github.com/sashabaranov/go-openai/jsonschema"
 )
+
+const maxRoutineCommandOutputBytes = 64 << 10
+
+// routineCommandOutput bounds command output before it enters the task state,
+// audit journal or notification outbox. Canceling on overflow also stops a
+// command that would otherwise keep producing discarded output until timeout.
+type routineCommandOutput struct {
+	mu        sync.Mutex
+	data      bytes.Buffer
+	cancel    context.CancelFunc
+	truncated bool
+}
+
+func (w *routineCommandOutput) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	remaining := maxRoutineCommandOutputBytes - w.data.Len()
+	if len(p) > remaining {
+		if remaining > 0 {
+			_, _ = w.data.Write(p[:remaining])
+		}
+		w.truncated = true
+		w.cancel()
+		return len(p), nil
+	}
+	_, _ = w.data.Write(p)
+	return len(p), nil
+}
+
+func (w *routineCommandOutput) snapshot() (string, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.data.String(), w.truncated
+}
 
 // Task is a scheduled job.
 type Task struct {
@@ -651,9 +686,22 @@ func (s *Scheduler) executeAttempt(task *Task) (string, string) {
 
 	ctx, cancel := s.attemptContext(5 * time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "bash", "-c", task.Command)
-	out, err := cmd.CombinedOutput()
-	result := strings.TrimSpace(string(out))
+	commandCtx, stopCommand := context.WithCancel(ctx)
+	defer stopCommand()
+	output := &routineCommandOutput{cancel: stopCommand}
+	cmd := exec.CommandContext(commandCtx, "bash", "-c", task.Command)
+	cmd.Stdout, cmd.Stderr = output, output
+	cmd.WaitDelay = time.Second
+	err := cmd.Run()
+	raw, truncated := output.snapshot()
+	result := strings.TrimSpace(raw)
+	if truncated {
+		result += "\n[Saída da rotina truncada após 64 KiB.]"
+		if err != nil {
+			return result, fmt.Sprintf("saída da rotina excedeu 64 KiB; comando interrompido: %v", err)
+		}
+		return result, "saída da rotina excedeu 64 KiB"
+	}
 	if err != nil {
 		return result, err.Error()
 	}

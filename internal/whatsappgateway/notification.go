@@ -43,5 +43,28 @@ func RegisterNotificationSkill(reg *skill.Registry, gateway *Gateway, ownerChat 
 			return fmt.Sprintf("Notificacao WhatsApp enfileirada com ID %s", queued.ID), nil
 		},
 	})
+	reg.Register(&skill.Skill{
+		Name:        "whatsapp_send_media",
+		Description: "Enfileirar imagem, documento ou audio OGG/Opus de arquivo local para o chat pessoal configurado do usuario",
+		Parameters: jsonschema.Definition{
+			Type: jsonschema.Object,
+			Properties: map[string]jsonschema.Definition{
+				"path":    {Type: jsonschema.String, Description: "Caminho do arquivo local"},
+				"caption": {Type: jsonschema.String, Description: "Legenda opcional; deixe vazia para audio"},
+			},
+			Required: []string{"path"},
+		},
+		Execute: func(args map[string]string) (string, error) {
+			path := strings.TrimSpace(args["path"])
+			if path == "" {
+				return "", errors.New("whatsapp: caminho de midia vazio")
+			}
+			queued, err := gateway.QueueLocalFile(ownerChat, path, strings.TrimSpace(args["caption"]))
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("Midia WhatsApp enfileirada com ID %s", queued.ID), nil
+		},
+	})
 	return nil
 }

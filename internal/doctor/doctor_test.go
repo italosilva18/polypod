@@ -406,3 +406,89 @@ func TestCheckLocalTranscriptionReadOnlyAndSanitized(t *testing.T) {
 		t.Fatal(check)
 	}
 }
+
+func TestCheckVoiceOutputReadOnlyAndSanitized(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "segredo-voz")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	python := filepath.Join(dir, "python")
+	marker := filepath.Join(dir, "executed")
+	if err := os.WriteFile(python, []byte("#!/bin/sh\ntouch "+marker+"\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	model := filepath.Join(dir, "voice.onnx")
+	for _, path := range []string{model, model + ".json"} {
+		if err := os.WriteFile(path, []byte("model"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := config.VoiceOutputConfig{Enabled: true, PythonBinary: python, ModelPath: model, FFmpegBinary: python}
+	check := checkVoiceOutput(cfg)
+	if check.Status != "ok" || strings.Contains(check.Message, dir) {
+		t.Fatal(check)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("doctor executed a configured binary: %v", err)
+	}
+	cfg.ModelPath = filepath.Join(dir, "missing.onnx")
+	check = checkVoiceOutput(cfg)
+	if check.Status != "fail" || strings.Contains(check.Message, dir) {
+		t.Fatal(check)
+	}
+}
+
+func TestCheckDreamMemoryReportsDurableCounts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dream-state.json")
+	if check := checkDreamMemory(path); check.Status != "warn" {
+		t.Fatal(check)
+	}
+	data := []byte(`{"last_sequence":40,"stats":{"runs":3,"successful_runs":2,"failed_runs":1,"memories_added":4,"last_error":"segredo"}}`)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	check := checkDreamMemory(path)
+	if check.Status != "warn" || !strings.Contains(check.Message, "4 memórias salvas") || strings.Contains(check.Message, "segredo") {
+		t.Fatal(check)
+	}
+}
+
+func TestCheckSemanticMemory(t *testing.T) {
+	if got := checkSemanticMemory(config.EmbeddingConfig{}); got.Status != "warn" {
+		t.Fatalf("disabled embedding = %+v", got)
+	}
+	dir := t.TempDir()
+	python := filepath.Join(dir, "python")
+	if err := os.WriteFile(python, []byte("#!/bin/sh\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if got := checkSemanticMemory(config.EmbeddingConfig{Enabled: true, Backend: "local", PythonBinary: python, CacheDir: dir}); got.Status != "fail" {
+		t.Fatalf("empty local cache was accepted: %+v", got)
+	}
+	repo := filepath.Join(dir, "models--Qdrant--paraphrase-multilingual-MiniLM-L12-v2-onnx-Q")
+	revision := strings.Repeat("a", 40)
+	snapshot := filepath.Join(repo, "snapshots", revision)
+	if err := os.MkdirAll(filepath.Join(repo, "refs"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(snapshot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "refs", "main"), []byte(revision), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"model_optimized.onnx", "tokenizer.json", "config.json", "tokenizer_config.json", "special_tokens_map.json"} {
+		if err := os.WriteFile(filepath.Join(snapshot, name), []byte("fixture"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := checkSemanticMemory(config.EmbeddingConfig{Enabled: true, Backend: "local", PythonBinary: python, CacheDir: dir}); got.Status != "ok" {
+		t.Fatalf("valid local cache rejected: %+v", got)
+	}
+	if got := checkSemanticMemory(config.EmbeddingConfig{Enabled: true, Backend: "local", PythonBinary: python, CacheDir: filepath.Join(dir, "missing")}); got.Status != "fail" {
+		t.Fatalf("missing cache = %+v", got)
+	}
+	if got := checkSemanticMemory(config.EmbeddingConfig{Enabled: true, Backend: "http", BaseURL: "https://example.test/v1", Model: "test"}); got.Status != "ok" {
+		t.Fatalf("HTTP embedding = %+v", got)
+	}
+}

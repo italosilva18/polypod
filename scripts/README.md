@@ -13,6 +13,12 @@ desta máquina. Revise esses valores antes de usar os arquivos em outro host.
 O socket de entrada Wayland depende do serviço separado `polypod-ydotool.service`;
 sem ele, o diagnóstico marca entrada do desktop como indisponível.
 
+Para verificar a captura e o socket de entrada com o mesmo ambiente gráfico da
+unidade, execute `python3 scripts/doctor-live-service.py` no checkout. Um
+`sudo polypod doctor --live` direto perde variáveis Wayland/DBus sob `sudo` e
+pode acusar uma falha do desktop que o serviço não tem. A checagem captura a
+tela em memória e descarta a imagem; não envia cliques nem teclas.
+
 ## Implantar nesta máquina
 
 É necessário ter Go 1.26 ou superior, `make`, `sudo`, `readelf`, `systemd` e

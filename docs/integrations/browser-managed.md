@@ -9,3 +9,8 @@ Com `DISPLAY` ou Wayland disponível, o navegador abre uma janela visível. O se
 Um login pode ser preenchido pelo agente quando o usuário autorizou a credencial. Para 2FA, peça o código ou aprovação ao usuário; para CAPTCHA, o usuário precisa resolver o desafio na janela visível. O agente observa novamente e continua. O modo headless não oferece esse handoff visual.
 
 Testes automatizados cobrem ciclo de vida, abas, navegação e observação com Chrome isolado. O teste de abertura no serviço root e um login real com handoff ainda precisam ser realizados no desktop do usuário.
+
+Nesta máquina COSMIC, a captura pela sessão do usuário e o socket `ydotool`
+foram verificados com `python3 scripts/doctor-live-service.py`. Esse comando
+herda somente as variáveis gráficas declaradas na unidade systemd; um `sudo`
+direto descarta essas variáveis. A verificação não envia eventos de entrada.

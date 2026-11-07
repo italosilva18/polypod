@@ -208,6 +208,14 @@ func checkBoot(ctx context.Context, p operationalProbes) Check {
 func checkDesktop(ctx context.Context, live bool, p operationalProbes) []Check {
 	capture := Check{Name: "Desktop captura", Status: "warn", Message: "execute polypod doctor --live dentro da sessao desktop"}
 	input := Check{Name: "Desktop entrada", Status: "warn", Message: "entrada nao verificada; necessario acesso a sessao grafica"}
+	// A direct sudo invocation strips the desktop variables from the shell.
+	// The service itself has a delegated Wayland session, but this doctor
+	// process cannot observe it unless launched with the same environment.
+	if live && os.Geteuid() == 0 && os.Getenv("POLYPOD_DESKTOP_USER") == "" && serviceHasDelegatedDesktop(ctx, p) {
+		capture.Message = "diagnostico fora do ambiente grafico do servico; execute python3 scripts/doctor-live-service.py"
+		input.Message = capture.Message
+		return []Check{capture, input}
+	}
 	display := computeruse.DetectDisplayServer()
 	if display == computeruse.DisplayUnknown {
 		capture.Message = "sessao grafica indisponivel; configure DISPLAY ou WAYLAND_DISPLAY no servico"
@@ -255,6 +263,28 @@ func checkDesktop(ctx context.Context, live bool, p operationalProbes) []Check {
 		}
 	}
 	return []Check{capture, input}
+}
+
+func serviceHasDelegatedDesktop(ctx context.Context, p operationalProbes) bool {
+	if p.command == nil {
+		return false
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	raw, err := p.command(probeCtx, "systemctl", "show", "polypod-root.service", "--property=Environment", "--value", "--no-pager")
+	if err != nil {
+		return false
+	}
+	user, display := false, false
+	for _, field := range strings.Fields(string(raw)) {
+		if strings.HasPrefix(field, "POLYPOD_DESKTOP_USER=") && field != "POLYPOD_DESKTOP_USER=" {
+			user = true
+		}
+		if strings.HasPrefix(field, "WAYLAND_DISPLAY=") && field != "WAYLAND_DISPLAY=" {
+			display = true
+		}
+	}
+	return user && display
 }
 
 func checkScheduledHeartbeat(cfg *config.Config) Check {

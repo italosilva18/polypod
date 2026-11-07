@@ -92,6 +92,15 @@ type WhatsAppConfig struct {
 	AllowedChats       []string                 `yaml:"allowed_chats"`
 	AllowedSenders     []string                 `yaml:"allowed_senders"`
 	AudioTranscription AudioTranscriptionConfig `yaml:"audio_transcription"`
+	VoiceOutput        VoiceOutputConfig        `yaml:"voice_output"`
+}
+
+type VoiceOutputConfig struct {
+	Enabled        bool   `yaml:"enabled"`
+	PythonBinary   string `yaml:"python_binary"`
+	ModelPath      string `yaml:"model_path"`
+	FFmpegBinary   string `yaml:"ffmpeg_binary"`
+	TimeoutSeconds int    `yaml:"timeout_seconds"`
 }
 
 type AudioTranscriptionConfig struct {
@@ -133,10 +142,14 @@ type AIConfig struct {
 }
 
 type EmbeddingConfig struct {
-	Enabled bool   `yaml:"enabled"`
-	APIKey  string `yaml:"api_key"`
-	BaseURL string `yaml:"base_url"`
-	Model   string `yaml:"model"`
+	Enabled        bool   `yaml:"enabled"`
+	Backend        string `yaml:"backend"` // http (existing) or local
+	APIKey         string `yaml:"api_key"`
+	BaseURL        string `yaml:"base_url"`
+	Model          string `yaml:"model"`
+	PythonBinary   string `yaml:"python_binary"`
+	CacheDir       string `yaml:"cache_dir"`
+	TimeoutSeconds int    `yaml:"timeout_seconds"`
 }
 
 type DataConfig struct {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -18,6 +19,56 @@ func newTestScheduler(t *testing.T) *Scheduler {
 	dataFile := filepath.Join(dir, "tasks.json")
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return New(dataFile, logger)
+}
+
+func TestCommandRoutineBoundsOutputAndReportsFailure(t *testing.T) {
+	s := newTestScheduler(t)
+	result, runErr := s.executeAttempt(&Task{Command: "printf 'ok\\n'"})
+	if result != "ok" || runErr != "" {
+		t.Fatalf("short output = %q, %q", result, runErr)
+	}
+
+	result, runErr = s.executeAttempt(&Task{Command: "printf 'failed\\n'; exit 7"})
+	if result != "failed" || !strings.Contains(runErr, "exit status 7") {
+		t.Fatalf("failed command = %q, %q", result, runErr)
+	}
+
+	// Bash's built-in printf produces more than the cap without an external
+	// dependency. The command must fail with a bounded, visibly truncated result.
+	result, runErr = s.executeAttempt(&Task{Command: "printf '%*s' 2000000 ''"})
+	if len(result) > maxRoutineCommandOutputBytes+100 || !strings.Contains(result, "truncada") ||
+		!strings.Contains(runErr, "excedeu 64 KiB") {
+		t.Fatalf("large output length=%d, error=%q, suffix=%q", len(result), runErr, result[max(0, len(result)-80):])
+	}
+}
+
+func TestAttemptHistorySurvivesUnavailableJournal(t *testing.T) {
+	s := newTestScheduler(t)
+	task := &Task{Name: "rotina", Schedule: "0 9 * * *", Command: "true"}
+	if err := s.AddTask(task); err != nil {
+		t.Fatal(err)
+	}
+	// A directory at the journal path makes append fail while tasks.json
+	// remains writable. The snapshot must still retain the attempt.
+	if err := os.Mkdir(s.dataFile+".runs.jsonl", 0700); err != nil {
+		t.Fatal(err)
+	}
+	record := RunRecord{ID: "run_1_attempt_1", TaskID: task.ID, RunID: "run_1", Attempt: 1,
+		StartedAt: time.Now(), FinishedAt: time.Now(), Status: "success", Result: "feito"}
+	if err := s.appendHistory(task, record); err == nil {
+		t.Fatal("journal append unexpectedly succeeded")
+	}
+	if err := s.Save(); err != nil {
+		t.Fatalf("task snapshot should remain writable: %v", err)
+	}
+	restarted := New(s.dataFile, s.logger)
+	if err := restarted.Load(); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := restarted.GetTask(task.ID)
+	if !ok || len(got.History) != 1 || got.History[0].ID != record.ID || got.History[0].Result != "feito" {
+		t.Fatalf("reloaded task lost attempt: %+v", got)
+	}
 }
 
 func TestNew(t *testing.T) {
