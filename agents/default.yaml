@@ -65,6 +65,7 @@ skills:
   - ask_user_question
   - scheduler_list
   - scheduler_add
+  - scheduler_update
   - scheduler_remove
   - scheduler_run
   - scheduler_history
