@@ -287,8 +287,8 @@ func NewAgentTool(runner *AgentRunner, executor *SubAgentExecutor) types.Tool {
 				"required": []string{"prompt"},
 			}
 		},
-		IsConcurrencyFn: agentRunReadOnly,
-		IsReadOnlyFn:    agentRunReadOnly,
+		IsConcurrencyFn: executor.agentRunReadOnly,
+		IsReadOnlyFn:    executor.agentRunReadOnly,
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
 			prompt, _ := args["prompt"].(string)
 			if prompt == "" {
@@ -336,17 +336,39 @@ func NewAgentTool(runner *AgentRunner, executor *SubAgentExecutor) types.Tool {
 	})
 }
 
-// agentRunReadOnly identifies the specialist roles that expose only read
-// tools. Coder, DevOps and the default role may produce side effects and must
-// run serially with other write operations.
-func agentRunReadOnly(args map[string]any) bool {
-	name, _ := args["agent_name"].(string)
+// isReadOnlySubAgentSkill identifies tools safe for parallel research and
+// review. Newly added skills keep the role serial until classified here.
+func isReadOnlySubAgentSkill(name string) bool {
 	switch name {
-	case "", "task", "architect", "reviewer":
+	case "read_file", "read_file_dir", "glob", "grep", "web_search", "web_fetch",
+		"document_extract", "image_analyze", "polypod_evidence_research", "polypod_document_analysis":
 		return true
 	default:
 		return false
 	}
+}
+
+// agentRunReadOnly checks the current agent definition so a self-modified
+// research role cannot be treated as read-only after gaining write tools.
+func (e *SubAgentExecutor) agentRunReadOnly(args map[string]any) bool {
+	name, _ := args["agent_name"].(string)
+	switch name {
+	case "", "task", "architect", "reviewer":
+	default:
+		return false
+	}
+	if name == "" {
+		name = "task"
+	}
+	if e == nil || e.agentReg == nil || !e.agentReg.Has(name) {
+		return false
+	}
+	for _, skillName := range e.agentReg.Get(name).Skills {
+		if !isReadOnlySubAgentSkill(skillName) {
+			return false
+		}
+	}
+	return true
 }
 
 // NewAgentToolWithFunc creates a Tool that spawns sub-agents using a raw
