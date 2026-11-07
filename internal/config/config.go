@@ -95,10 +95,17 @@ type WhatsAppConfig struct {
 }
 
 type AudioTranscriptionConfig struct {
-	Enabled  bool   `yaml:"enabled"`
-	Endpoint string `yaml:"endpoint"`
-	Model    string `yaml:"model"`
-	APIKey   string `yaml:"api_key"`
+	Enabled        bool   `yaml:"enabled"`
+	Backend        string `yaml:"backend"` // local or http; empty preserves the HTTP default
+	Endpoint       string `yaml:"endpoint"`
+	Model          string `yaml:"model"`
+	APIKey         string `yaml:"api_key"`
+	PythonBinary   string `yaml:"python_binary"`
+	ScriptPath     string `yaml:"script_path"`
+	ModelPath      string `yaml:"model_path"`
+	FFmpegBinary   string `yaml:"ffmpeg_binary"`
+	Language       string `yaml:"language"`
+	TimeoutSeconds int    `yaml:"timeout_seconds"`
 }
 
 type TemplatesConfig struct {

@@ -1295,12 +1295,30 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 			},
 		}
 		if cfg.WhatsApp.AudioTranscription.Enabled {
-			transcriber, err := audio.NewHTTPTranscriber(cfg.WhatsApp.AudioTranscription.Endpoint,
-				cfg.WhatsApp.AudioTranscription.Model, cfg.WhatsApp.AudioTranscription.APIKey, nil)
-			if err != nil {
-				return fmt.Errorf("configuring WhatsApp audio transcription: %w", err)
+			asr := cfg.WhatsApp.AudioTranscription
+			switch strings.ToLower(strings.TrimSpace(asr.Backend)) {
+			case "", "http":
+				transcriber, err := audio.NewHTTPTranscriber(asr.Endpoint, asr.Model, asr.APIKey, nil)
+				if err != nil {
+					return fmt.Errorf("configuring WhatsApp HTTP audio transcription: %w", err)
+				}
+				whatsappMedia.TranscribeAudio = transcriber.Transcribe
+			case "local":
+				transcriber, err := audio.NewLocalTranscriber(audio.LocalConfig{
+					PythonBinary: asr.PythonBinary,
+					ScriptPath:   asr.ScriptPath,
+					ModelPath:    asr.ModelPath,
+					FFmpegBinary: asr.FFmpegBinary,
+					Language:     asr.Language,
+					Timeout:      time.Duration(asr.TimeoutSeconds) * time.Second,
+				})
+				if err != nil {
+					return fmt.Errorf("configuring WhatsApp local audio transcription: %w", err)
+				}
+				whatsappMedia.TranscribeAudio = transcriber.Transcribe
+			default:
+				return fmt.Errorf("unsupported WhatsApp audio transcription backend %q", asr.Backend)
 			}
-			whatsappMedia.TranscribeAudio = transcriber.Transcribe
 		}
 	}
 	for _, name := range agents.Get("default").Skills {

@@ -357,3 +357,52 @@ func TestFormatReport_Empty(t *testing.T) {
 		t.Errorf("expected zero counts, got:\n%s", report)
 	}
 }
+
+func TestCheckLocalTranscriptionReadOnlyAndSanitized(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "segredo-no-caminho")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, "executed")
+	python := filepath.Join(dir, "python")
+	if err := os.WriteFile(python, []byte("#!/bin/sh\ntouch "+marker+"\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "transcribe.py")
+	if err := os.WriteFile(script, []byte("raise RuntimeError('executed')\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	model := filepath.Join(dir, "base.pt")
+	if err := os.WriteFile(model, []byte("checkpoint"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.AudioTranscriptionConfig{
+		Enabled: true, Backend: "local", PythonBinary: python,
+		ScriptPath: script, ModelPath: model, FFmpegBinary: python,
+	}
+	check := checkLocalTranscription(cfg)
+	if check.Status != "ok" || !strings.Contains(check.Message, "não executada") {
+		t.Fatal(check)
+	}
+	if strings.Contains(check.Message, dir) {
+		t.Fatalf("doctor disclosed configured path: %q", check.Message)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("doctor executed a configured binary: %v", err)
+	}
+
+	cfg.ModelPath = filepath.Join(dir, "missing-model.pt")
+	check = checkLocalTranscription(cfg)
+	if check.Status != "fail" || !strings.Contains(check.Message, "modelo") || strings.Contains(check.Message, dir) {
+		t.Fatal(check)
+	}
+
+	cfg.Enabled = false
+	if check = checkLocalTranscription(cfg); check.Status != "warn" {
+		t.Fatal(check)
+	}
+	cfg.Enabled, cfg.Backend = true, "http"
+	if check = checkLocalTranscription(cfg); check.Status != "warn" || !strings.Contains(check.Message, "HTTP") {
+		t.Fatal(check)
+	}
+}

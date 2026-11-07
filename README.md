@@ -81,7 +81,8 @@ The local root systemd deployment is documented in [scripts/README.md](scripts/R
 - local PolyClaw skill discovery/import and reviewed evolution from verified outcomes;
 - code review, security analysis, testing, linting and profiling;
 - browser/computer-use, SSH, OpenAPI tools and scheduled work;
-- managed Chrome profile for browser actions and native WhatsApp media intake;
+- managed Chrome profile for browser actions, native WhatsApp media intake and
+  local Whisper audio transcription;
 - token, context-window and cost tracking.
 
 The [PolyClaw skill import](docs/integrations/polyclaw-import.md) records the

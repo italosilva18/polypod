@@ -79,10 +79,19 @@ whatsapp:
   owner_chat: ""
   allowed_chats: []
   allowed_senders: []
-  # OpenAI-compatible STT endpoint, e.g. Groq /openai/v1/audio/transcriptions.
-  # Requires a separate API credential; a Grok/ChatGPT app login is not an API key.
+  # Local Whisper runs on this machine. Install Python openai-whisper, ffmpeg
+  # and a model checkpoint before enabling. See docs/integrations/audio-transcription.md.
   audio_transcription:
     enabled: false
+    backend: local
+    python_binary: "${POLYPOD_ASR_PYTHON:}"
+    script_path: "${POLYPOD_ASR_SCRIPT:}"
+    model_path: "${POLYPOD_ASR_MODEL_PATH:}"
+    ffmpeg_binary: "${POLYPOD_ASR_FFMPEG:}"
+    language: pt
+    timeout_seconds: 900
+    # Alternative backend: http (OpenAI-compatible /audio/transcriptions).
+    # It needs a separate API credential; a ChatGPT or Grok login is not one.
     endpoint: "${POLYPOD_ASR_ENDPOINT:}"
     model: "${POLYPOD_ASR_MODEL:}"
     api_key: "${POLYPOD_ASR_API_KEY:}"

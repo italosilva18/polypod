@@ -59,7 +59,7 @@ func runBasicDiagnostics(cfg *config.Config) []Check {
 	checks = append(checks, checkCommand("Docker", "docker", "info"))
 
 	// 6. Voice tools
-	checks = append(checks, checkOptionalTool("Whisper (STT)", "whisper"))
+	checks = append(checks, checkLocalTranscription(cfg.WhatsApp.AudioTranscription))
 	checks = append(checks, checkOptionalTool("espeak-ng (TTS)", "espeak-ng"))
 
 	// 7. Data directories
@@ -137,6 +137,84 @@ func checkOptionalTool(name, cmd string) Check {
 		return Check{Name: name, Status: "warn", Message: "nao instalado (opcional)"}
 	}
 	return Check{Name: name, Status: "ok", Message: "disponivel"}
+}
+
+// checkLocalTranscription only inspects configuration and files. It never
+// starts Python or ffmpeg, opens audio, or prints configured paths.
+func checkLocalTranscription(cfg config.AudioTranscriptionConfig) Check {
+	c := Check{Name: "Transcrição local", Status: "warn"}
+	backend := strings.ToLower(strings.TrimSpace(cfg.Backend))
+	if !cfg.Enabled {
+		c.Message = "desativada em whatsapp.audio_transcription.enabled"
+		return c
+	}
+	if backend == "" || backend == "http" {
+		c.Message = "backend HTTP selecionado; transcrição local não configurada"
+		return c
+	}
+	if backend != "local" {
+		c.Status = "fail"
+		c.Message = "backend de transcrição desconhecido"
+		return c
+	}
+
+	python := cfg.PythonBinary
+	if strings.TrimSpace(python) == "" {
+		python = "python3"
+	}
+	ffmpeg := cfg.FFmpegBinary
+	if strings.TrimSpace(ffmpeg) == "" {
+		ffmpeg = "ffmpeg"
+	}
+	var missing []string
+	if !transcriptionExecutableExists(python) {
+		missing = append(missing, "Python")
+	}
+	if !transcriptionFileExists(cfg.ScriptPath) {
+		missing = append(missing, "script")
+	}
+	if !transcriptionFileExists(cfg.ModelPath) {
+		missing = append(missing, "modelo")
+	}
+	if !transcriptionExecutableExists(ffmpeg) {
+		missing = append(missing, "ffmpeg")
+	}
+	if len(missing) != 0 {
+		c.Status = "fail"
+		c.Message = "dependências ausentes ou inválidas: " + strings.Join(missing, ", ")
+		return c
+	}
+	c.Status = "ok"
+	c.Message = "backend local configurado; Python, script, modelo e ffmpeg presentes; transcrição não executada"
+	return c
+}
+
+func transcriptionExecutableExists(path string) bool {
+	_, err := exec.LookPath(transcriptionExpandHome(strings.TrimSpace(path)))
+	return err == nil
+}
+
+func transcriptionFileExists(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	info, err := os.Stat(transcriptionExpandHome(path))
+	return err == nil && info.Mode().IsRegular() && info.Size() > 0
+}
+
+func transcriptionExpandHome(path string) string {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	if path == "~" {
+		return home
+	}
+	return filepath.Join(home, path[2:])
 }
 
 func checkAPIKey(name, key, baseURL string) Check {
