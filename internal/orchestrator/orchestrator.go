@@ -10,6 +10,7 @@ import (
 	"github.com/costa/polypod/internal/agent"
 	"github.com/costa/polypod/internal/audit"
 	"github.com/costa/polypod/internal/command"
+	"github.com/costa/polypod/internal/evolution"
 	"github.com/costa/polypod/internal/hooks"
 	"github.com/costa/polypod/internal/memory"
 	"github.com/costa/polypod/internal/modes"
@@ -220,6 +221,9 @@ func (o *Orchestrator) ExecuteTool(ctx context.Context, toolName string, args ma
 			IsError: true,
 		}, nil
 	}
+	if !result.IsError {
+		evolution.ObserveTool(ctx, toolName)
+	}
 
 	// 8. Fire PostToolUse hooks
 	if o.hooks != nil {
@@ -236,7 +240,6 @@ func (o *Orchestrator) ExecuteTool(ctx context.Context, toolName string, args ma
 	if o.memory != nil && !result.IsError {
 		o.autoExtractMemory(toolName, args, result)
 	}
-
 	return result, nil
 }
 
@@ -244,7 +247,13 @@ func (o *Orchestrator) ExecuteTool(ctx context.Context, toolName string, args ma
 func (o *Orchestrator) ExecuteParallel(ctx context.Context, calls []tool.ToolCall) []tool.ToolCallResult {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
-	return o.tools.ExecuteParallel(calls, o.toolContext(ctx))
+	results := o.tools.ExecuteParallel(calls, o.toolContext(ctx))
+	for _, result := range results {
+		if result.Error == nil && !result.Result.IsError {
+			evolution.ObserveTool(ctx, result.Call.Name)
+		}
+	}
+	return results
 }
 
 // HandleCommand processes a slash command.

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/costa/polypod/internal/skill"
 	"github.com/sashabaranov/go-openai/jsonschema"
@@ -21,8 +22,9 @@ func RegisterSkills(reg *skill.Registry, store *Store, wake func()) {
 			for _, msg := range messages {
 				counts[msg.Status]++
 			}
-			return fmt.Sprintf("Ultimo heartbeat: %s\nPendentes: %d | processando: %d | concluidas: %d | falhas: %d\nUltimo erro: %s",
-				state.LastHeartbeat.Format("2006-01-02 15:04:05"), counts[StatusPending], counts[StatusProcessing], counts[StatusCompleted], counts[StatusFailed], state.LastError), nil
+			return fmt.Sprintf("Ultimo heartbeat: %s\nPendentes: %d | processando: %d | concluidas: %d | falhas: %d | resolvidas: %d\nUltimo erro: %s",
+				state.LastHeartbeat.Format("2006-01-02 15:04:05"), counts[StatusPending], counts[StatusProcessing],
+				counts[StatusCompleted], counts[StatusFailed], counts[StatusResolved], state.LastError), nil
 		},
 	})
 
@@ -32,7 +34,7 @@ func RegisterSkills(reg *skill.Registry, store *Store, wake func()) {
 		Parameters: jsonschema.Definition{
 			Type: jsonschema.Object,
 			Properties: map[string]jsonschema.Definition{
-				"status": {Type: jsonschema.String, Description: "Filtro opcional: pending, processing, completed ou failed"},
+				"status": {Type: jsonschema.String, Description: "Filtro opcional: pending, processing, completed, failed ou resolved"},
 			},
 		},
 		Execute: func(args map[string]string) (string, error) {
@@ -49,6 +51,37 @@ func RegisterSkills(reg *skill.Registry, store *Store, wake func()) {
 				return "", fmt.Errorf("serializando inbox: %w", err)
 			}
 			return string(raw), nil
+		},
+	})
+
+	reg.Register(&skill.Skill{
+		Name:        "inbox_resolve",
+		Description: "Revisar ou encerrar com motivo um item com falha terminal, sem reexecutar a acao nem afirmar sucesso",
+		Parameters: jsonschema.Definition{Type: jsonschema.Object,
+			Properties: map[string]jsonschema.Definition{
+				"id":     {Type: jsonschema.String, Description: "ID interno do item com falha"},
+				"mode":   {Type: jsonschema.String, Description: "preview (padrao) ou apply"},
+				"reason": {Type: jsonschema.String, Description: "Motivo objetivo obrigatorio para apply"},
+			}, Required: []string{"id"}},
+		Execute: func(args map[string]string) (string, error) {
+			id := strings.TrimSpace(args["id"])
+			preview, err := store.PreviewFailedResolution(id)
+			if err != nil {
+				return "", err
+			}
+			mode := strings.TrimSpace(args["mode"])
+			if mode == "" || mode == "preview" {
+				return fmt.Sprintf("Falha %s: direcao=%s canal=%s tentativas=%d desde=%s destinos_entregues=%s midia=%t replays=%d. Use mode=apply e reason para encerrar sem replay.",
+					id, preview.Direction, preview.Channel, preview.Attempts, preview.FailedAt.Format(time.RFC3339),
+					strings.Join(preview.Delivered, ","), preview.HasMedia, preview.PriorReplays), nil
+			}
+			if mode != "apply" {
+				return "", fmt.Errorf("modo invalido: use preview ou apply")
+			}
+			if err := store.ResolveFailed(id, "agent", args["reason"], time.Now()); err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("Falha %s resolvida com registro de motivo; nenhuma acao foi repetida", id), nil
 		},
 	})
 

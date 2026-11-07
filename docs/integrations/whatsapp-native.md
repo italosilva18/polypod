@@ -146,3 +146,28 @@ interno, a chave de deduplicação e o histórico de tentativas/erro no próprio
 arquivo privado, reiniciando apenas o contador da nova execução. O comando
 recusa entradas concluídas, saídas e entradas com resposta pronta ou já
 enfileirada. Use um ID por execução para não reprocessar mensagens sem revisão.
+
+## Encerrar uma falha antiga sem reenvio
+
+Para uma mensagem de teste obsoleta ou um aviso que já foi verificado por outro
+canal, use `inbox_resolve` com `mode=preview` para ver direção, canal, tentativas,
+horário e destinos já entregues. O modo `apply` exige um `reason` objetivo.
+Ele marca o item como `resolved`, preservando o erro original, tentativas,
+marcadores de entrega e um registro com autor, motivo e hora. **Resolved não é
+completed**: nenhuma resposta é gerada, nenhum envio é repetido e a falha sai
+do contador de itens pendentes de investigação. Entradas com resposta pronta
+ou já enfileirada não podem ser encerradas por esse caminho.
+
+Também é possível resolver com o serviço parado, pelo comando administrativo
+em modo somente leitura antes da aplicação:
+
+```bash
+sudo /tmp/polypod-humanloop-replay -store 'data/conversations/humanloop.json' -id 'msg_ID_INTERNO' -channel whatsapp -action resolve -reason 'teste antigo obsoleto'
+sudo systemctl stop polypod-root.service
+sudo /tmp/polypod-humanloop-replay -store 'data/conversations/humanloop.json' -id 'msg_ID_INTERNO' -channel whatsapp -action resolve -reason 'teste antigo obsoleto' -apply
+sudo systemctl start polypod-root.service
+```
+
+O mesmo comando aceita `-channel scheduler` para um aviso de rotina. Revise os
+destinos entregues na prévia e mantenha o arquivo privado de backup antes de
+aplicar. O fluxo nunca presume que um envio ambíguo chegou ao destinatário.

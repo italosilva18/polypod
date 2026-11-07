@@ -84,6 +84,7 @@ import (
 	"github.com/costa/polypod/internal/tts"
 	"github.com/costa/polypod/internal/types"
 	"github.com/costa/polypod/internal/web"
+	"github.com/costa/polypod/internal/webhookgateway"
 	"github.com/costa/polypod/internal/whatsappgateway"
 	"github.com/costa/polypod/internal/wiring"
 )
@@ -774,7 +775,6 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		return fmt.Errorf("opening task queue: %w", err)
 	}
 	defer taskQueue.Close()
-	tool.RegisterTaskQueueTool(sys.ToolRegistry, taskQueue)
 
 	tool.RegisterAdvancedTools(sys.ToolRegistry, ".")
 	tool.RegisterHardwareTools(sys.ToolRegistry)
@@ -805,6 +805,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		return fmt.Errorf("opening skill evolution: %w", err)
 	}
 	defer evolutionStore.Close()
+	tool.RegisterTaskQueueTool(sys.ToolRegistry, taskQueue, evolutionStore)
 	skills.SetRegistrationGuard(func(name string) error {
 		return evolutionStore.ProtectAppliedSkillName(ctx, name)
 	})
@@ -991,7 +992,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 			logger.Info("default routines created", "count", created)
 		}
 	}
-	scheduler.RegisterSkills(skills, sched)
+	scheduler.RegisterSkills(skills, sched, evolutionStore)
 	goalStore, err := goals.Open(filepath.Join(cfg.Data.Dir, "goals.json"))
 	if err != nil {
 		return fmt.Errorf("initializing operational goals: %w", err)
@@ -1239,16 +1240,49 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	// Inline handlers (replace router)
 	handler := makeHandler(convMgr, aiSvc)
 	streamHandler := makeStreamHandler(convMgr, aiSvc)
+	// Background routines and one-off tasks share the same operational state.
+	// Serialize their full agent turns while leaving interactive messages free.
+	backgroundAgentGate := make(chan struct{}, 1)
 	taskQueue.SetHandler(func(taskCtx context.Context, task taskqueue.Task) (string, error) {
+		select {
+		case backgroundAgentGate <- struct{}{}:
+			defer func() { <-backgroundAgentGate }()
+		case <-taskCtx.Done():
+			return "", taskCtx.Err()
+		}
+		runID := fmt.Sprintf("%s:terminal:%d", task.ID, task.Attempts)
+		planned, beginErr := evolutionStore.BeginVerificationRun(taskCtx, "task", task.ID, runID)
+		if beginErr != nil {
+			logger.Warn("task verification baseline unavailable", "task_id", task.ID, "attempt", task.Attempts, "error", beginErr)
+		}
 		prompt := fmt.Sprintf("TAREFA PONTUAL: %s\nID: %s\nTentativa: %d\nObjetivo:\n%s\n\nExecute o objetivo completo e confira o resultado. Em uma retomada, confira primeiro se a tentativa anterior ja produziu o efeito desejado antes de repetir a acao.",
 			task.Title, task.ID, task.Attempts, task.Prompt)
-		out, err := handler(taskCtx, adapter.InMessage{
+		turnCtx, toolTrace := evolution.WithToolTrace(taskCtx)
+		out, err := handler(turnCtx, adapter.InMessage{
 			ID:        fmt.Sprintf("task-%s-%d", task.ID, task.Attempts),
 			Channel:   "task_queue",
 			UserID:    task.ID,
 			Text:      prompt,
 			Timestamp: time.Now(),
 		})
+		if planned && (err == nil || task.Attempts >= task.MaxAttempts) {
+			// Capture the postcondition now. A delayed notification must never
+			// inspect a file that another run has since changed.
+			finishCtx, finishCancel := context.WithTimeout(context.Background(), 60*time.Second)
+			_, finishErr := evolutionStore.FinishVerificationRun(finishCtx, "task", task.ID, runID)
+			finishCancel()
+			if finishErr != nil {
+				logger.Warn("task verification final state unavailable", "task_id", task.ID, "attempt", task.Attempts, "error", finishErr)
+			}
+			// The terminal notice uses this stable key. Save before the queue
+			// persists its result so a retried notice can recover the trace.
+			traceCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			traceErr := evolutionStore.SaveToolTrace(traceCtx, "task", runID, toolTrace.Names())
+			cancel()
+			if traceErr != nil {
+				logger.Warn("task tool trace unavailable", "task_id", task.ID, "attempt", task.Attempts, "error", traceErr)
+			}
+		}
 		return out.Text, err
 	})
 
@@ -1464,6 +1498,14 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 				}
 				return humanStore.MarkDelivered(msg.ID, whatsappgateway.Channel)
 			}
+			if msg.Channel == webhookgateway.Channel {
+				// Webhook callers poll the durable inbound result by ID. Mark its
+				// companion outbox item delivered without sending a desktop alert.
+				if humanStore.DeliveredTo(msg.ID, "webhook:poll") {
+					return nil
+				}
+				return humanStore.MarkDelivered(msg.ID, "webhook:poll")
+			}
 			var deliveryErr error
 			if whatsapp != nil && cfg.WhatsApp.OwnerChat != "" &&
 				(msg.Channel == "notification" || msg.Channel == "scheduler" || msg.Channel == "task_queue") &&
@@ -1512,10 +1554,45 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 			return err
 		}
 		heartbeat.Wake()
+		planned, err := evolutionStore.HasVerificationPlan(noticeCtx, "task", notice.TaskID)
+		if err != nil {
+			return fmt.Errorf("checking task verification plan: %w", err)
+		}
+		if !planned {
+			return nil
+		}
+		attempts, err := taskQueue.History(noticeCtx, notice.TaskID)
+		if err != nil {
+			return fmt.Errorf("loading task attempts for verification: %w", err)
+		}
+		var startedAt time.Time
+		for _, attempt := range attempts {
+			if attempt.StartedAt <= 0 {
+				continue
+			}
+			started := time.UnixMilli(attempt.StartedAt)
+			if startedAt.IsZero() || started.Before(startedAt) {
+				startedAt = started
+			}
+		}
+		if _, _, err := evolutionStore.VerifyAndRecordAt(noticeCtx, "task", notice.TaskID, notice.Key, nil, startedAt); err != nil {
+			return fmt.Errorf("verifying task result: %w", err)
+		}
 		return nil
 	})
 	heartbeat.Start(ctx)
 	defer heartbeat.Stop()
+	if cfg.Webhook.Enabled {
+		webhookIngress, err := webhookgateway.New(cfg.Webhook, humanStore, heartbeat.Wake, logger)
+		if err != nil {
+			return fmt.Errorf("initializing webhook ingress: %w", err)
+		}
+		if err := webhookIngress.Start(ctx); err != nil {
+			return fmt.Errorf("starting webhook ingress: %w", err)
+		}
+		defer webhookIngress.Stop()
+		logger.Info("webhook ingress active", "listen", cfg.Webhook.Listen)
+	}
 	taskQueue.Start(ctx)
 	defer taskQueue.Stop()
 	if whatsappQuestions != nil {
@@ -1586,6 +1663,19 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	aiSvc.SetActivityCallback(dreamSvc.MarkActivity)
 	dreamSvc.Start(ctx)
 	defer dreamSvc.Stop()
+	// Preserve a compact, low-confidence history of completed user turns even
+	// when the fact extractor finds no durable preference or fact. This journal
+	// does not assert that an external action succeeded.
+	episodeSvc := automemory.NewEpisodeService(automemory.EpisodeConfig{
+		Logger:       logger,
+		Memory:       memStore,
+		SessionStore: store,
+		StateFile:    filepath.Join(cfg.Data.Dir, "episode-state.json"),
+		Interval:     time.Minute,
+		MaxMessages:  50,
+	})
+	episodeSvc.Start(ctx)
+	defer episodeSvc.Stop()
 
 	// The operational heartbeat is itself a full agent routine. Its persisted
 	// schedule survives restarts and uses NO_REPLY when there is nothing useful
@@ -1616,40 +1706,81 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 
 	// Human-language routines wake the same complete operational agent used by
 	// the CLI, with a separate persistent conversation per routine.
-	// Scheduler ticks may launch several due routines at once. Serialize their
-	// agent turns so two plans cannot act on the same goal or inbox item.
-	routineGate := make(chan struct{}, 1)
+	// Scheduler ticks may launch several due routines at once. Use the same
+	// gate as the one-off task queue so autonomous plans do not overlap.
 	sched.SetPromptRunner(func(runCtx context.Context, task *scheduler.Task) (string, error) {
 		select {
-		case routineGate <- struct{}{}:
-			defer func() { <-routineGate }()
+		case backgroundAgentGate <- struct{}{}:
+			defer func() { <-backgroundAgentGate }()
 		case <-runCtx.Done():
 			return "", runCtx.Err()
 		}
+		planned, beginErr := evolutionStore.BeginVerificationRun(runCtx, "routine", task.ID, task.CurrentRunID)
+		if beginErr != nil {
+			logger.Warn("routine verification baseline unavailable", "routine_id", task.ID, "run_id", task.CurrentRunID, "error", beginErr)
+		}
 		prompt := fmt.Sprintf("ROTINA AGENDADA: %s\nID: %s\nExecucao: %s\nTentativa: %d\nObjetivo:\n%s\n\nExecute o objetivo completo, verifique o resultado e relate de forma objetiva. Se esta for uma retomada, confirme o efeito da tentativa anterior antes de repetir a acao. Nao crie outra rotina a menos que o objetivo mande explicitamente.", task.Name, task.ID, task.CurrentRunID, task.CurrentAttempt, task.Prompt)
-		out, err := handler(runCtx, adapter.InMessage{
+		turnCtx, toolTrace := evolution.WithToolTrace(runCtx)
+		out, err := handler(turnCtx, adapter.InMessage{
 			ID:        fmt.Sprintf("routine-%s-%s-%d", task.ID, task.CurrentRunID, task.CurrentAttempt),
 			Channel:   "scheduler",
 			UserID:    task.ID,
 			Text:      prompt,
 			Timestamp: time.Now(),
 		})
+		if planned && (err == nil || task.CurrentAttempt > task.MaxRetries) {
+			finishCtx, finishCancel := context.WithTimeout(context.Background(), 60*time.Second)
+			_, finishErr := evolutionStore.FinishVerificationRun(finishCtx, "routine", task.ID, task.CurrentRunID)
+			finishCancel()
+			if finishErr != nil {
+				logger.Warn("routine verification final state unavailable", "routine_id", task.ID, "run_id", task.CurrentRunID, "error", finishErr)
+			}
+			traceCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			traceErr := evolutionStore.SaveToolTrace(traceCtx, "routine", task.CurrentRunID, toolTrace.Names())
+			cancel()
+			if traceErr != nil {
+				logger.Warn("routine tool trace unavailable", "routine_id", task.ID, "run_id", task.CurrentRunID, "error", traceErr)
+			}
+		}
 		return out.Text, err
 	})
 	sched.SetDurableCallback(func(task *scheduler.Task, notice scheduler.CompletionNotice) error {
-		if notice.Error == "" && strings.TrimSpace(notice.Result) == "NO_REPLY" {
+		if notice.Error != "" || strings.TrimSpace(notice.Result) != "NO_REPLY" {
+			message := fmt.Sprintf("Rotina %q concluida com status %s.", task.Name, notice.Status)
+			if notice.Error != "" {
+				message += " Erro: " + notice.Error
+			} else if strings.TrimSpace(notice.Result) != "" {
+				message += " Resultado: " + notice.Result
+			}
+			if _, err := humanStore.EnqueueOutboundOnce("scheduler", "owner", message, task.ID, notice.RunID); err != nil {
+				return err
+			}
+			heartbeat.Wake()
+		}
+		verifyCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		planned, err := evolutionStore.HasVerificationPlan(verifyCtx, "routine", task.ID)
+		if err != nil {
+			return fmt.Errorf("checking routine verification plan: %w", err)
+		}
+		if !planned {
 			return nil
 		}
-		message := fmt.Sprintf("Rotina %q concluida com status %s.", task.Name, notice.Status)
-		if notice.Error != "" {
-			message += " Erro: " + notice.Error
-		} else if strings.TrimSpace(notice.Result) != "" {
-			message += " Resultado: " + notice.Result
+		history, err := sched.History(task.ID)
+		if err != nil {
+			return fmt.Errorf("loading routine history for verification: %w", err)
 		}
-		if _, err := humanStore.EnqueueOutboundOnce("scheduler", "owner", message, task.ID, notice.RunID); err != nil {
-			return err
+		var startedAt time.Time
+		for _, run := range history {
+			if run.RunID == notice.RunID && !run.StartedAt.IsZero() &&
+				(startedAt.IsZero() || run.StartedAt.Before(startedAt)) {
+				startedAt = run.StartedAt
+			}
 		}
-		heartbeat.Wake()
+		_, _, err = evolutionStore.VerifyAndRecordAt(verifyCtx, "routine", task.ID, notice.RunID, nil, startedAt)
+		if err != nil {
+			return fmt.Errorf("verifying routine result: %w", err)
+		}
 		return nil
 	})
 	if cfg.Scheduler.Enabled {

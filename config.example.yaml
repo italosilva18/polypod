@@ -71,6 +71,13 @@ remote:
   allowed_user_ids: []
   timeout_seconds: 300
 
+# Optional authenticated HTTP trigger. It only listens on loopback; expose it
+# through a TLS reverse proxy if a remote system must call it.
+webhook:
+  enabled: false
+  listen: "127.0.0.1:8788"
+  token: "${POLYPOD_WEBHOOK_TOKEN:}"
+
 # Native WhatsApp bridge. Keep disabled until PolyClaw's linked-device store has
 # been backed up after stopping its gateway and copied to a separate session_dir.
 # Use exact WhatsApp JIDs for chats and senders (for example, user@s.whatsapp.net).

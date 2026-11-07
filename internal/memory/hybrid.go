@@ -20,6 +20,7 @@ func HybridSearch(ctx context.Context, store Store, embedder Embedder, query str
 	if err != nil {
 		return nil, err
 	}
+	lexical = visibleOnly(ctx, lexical)
 	if embedder == nil || strings.TrimSpace(query) == "" {
 		return capResults(lexical, max), nil
 	}
@@ -27,7 +28,7 @@ func HybridSearch(ctx context.Context, store Store, embedder Embedder, query str
 	if err != nil {
 		return nil, err
 	}
-	all = activeOnly(all)
+	all = visibleOnly(ctx, activeOnly(all))
 	texts := make([]string, 1, len(all)+1)
 	texts[0] = query
 	for _, m := range all {

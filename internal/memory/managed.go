@@ -112,7 +112,7 @@ func (s *ManagedStore) Get(ctx context.Context, topic string) (*Memory, error) {
 	if err != nil {
 		return nil, err
 	}
-	if m == nil || !active(*m) {
+	if m == nil || !active(*m) || !memoryVisible(ctx, *m) {
 		return nil, fmt.Errorf("memoria '%s' nao esta ativa", topic)
 	}
 	return m, nil
@@ -122,14 +122,14 @@ func (s *ManagedStore) List(ctx context.Context) ([]Memory, error) {
 	if err != nil {
 		return nil, err
 	}
-	return activeOnly(all), nil
+	return visibleOnly(ctx, activeOnly(all)), nil
 }
 func (s *ManagedStore) Search(ctx context.Context, q string) ([]Memory, error) {
 	all, err := s.Store.Search(ctx, q)
 	if err != nil {
 		return nil, err
 	}
-	return activeOnly(all), nil
+	return visibleOnly(ctx, activeOnly(all)), nil
 }
 func (s *ManagedStore) SearchRelevant(ctx context.Context, q string, max int, min float64) ([]Memory, error) {
 	s.mu.Lock()
@@ -139,7 +139,7 @@ func (s *ManagedStore) SearchRelevant(ctx context.Context, q string, max int, mi
 	if err != nil {
 		return nil, err
 	}
-	all = activeOnly(all)
+	all = visibleOnly(ctx, activeOnly(all))
 	if max > 0 && len(all) > max {
 		all = all[:max]
 	}
@@ -161,6 +161,7 @@ func (s *ManagedStore) Review(ctx context.Context, topic string) ([]Memory, erro
 	if err != nil {
 		return nil, err
 	}
+	all = visibleOnly(ctx, all)
 	if topic == "" {
 		return all, nil
 	}

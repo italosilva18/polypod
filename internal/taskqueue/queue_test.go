@@ -55,6 +55,26 @@ func TestPriorityOrderHistoryAndRestart(t *testing.T) {
 	}
 }
 
+func TestCreateAcceptsPreallocatedCanonicalTaskID(t *testing.T) {
+	q, err := Open(filepath.Join(t.TempDir(), "tasks.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	ctx := context.Background()
+	id := NewTaskID()
+	task, err := q.Create(ctx, CreateInput{ID: id, Prompt: "write verified report"})
+	if err != nil || task.ID != id {
+		t.Fatalf("preallocated task ID lost: %+v err=%v", task, err)
+	}
+	if _, err := q.Create(ctx, CreateInput{ID: "task_invalid", Prompt: "bad id"}); err == nil {
+		t.Fatal("noncanonical supplied ID was accepted")
+	}
+	if _, err := q.Create(ctx, CreateInput{ID: id, Prompt: "duplicate"}); err == nil {
+		t.Fatal("duplicate supplied ID was accepted")
+	}
+}
+
 func TestCrashRecoveryKeepsAttemptAndExplicitRetry(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tasks.db")
 	q, err := Open(path)

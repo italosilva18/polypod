@@ -6,6 +6,7 @@ import (
 
 	openai "github.com/sashabaranov/go-openai"
 
+	"github.com/costa/polypod/internal/evolution"
 	"github.com/costa/polypod/internal/provider"
 	"github.com/costa/polypod/internal/types"
 )
@@ -13,18 +14,31 @@ import (
 // executeSkillResult keeps legacy skill registries usable without discarding
 // structured results from registries that support images.
 func executeSkillResult(ctx context.Context, reg SkillRegistry, name, args string) (types.ToolResult, error) {
+	var result types.ToolResult
+	var err error
 	if rich, ok := reg.(interface {
 		ExecuteResultContext(context.Context, string, string) (types.ToolResult, error)
 	}); ok {
-		return rich.ExecuteResultContext(ctx, name, args)
-	}
-	if rich, ok := reg.(interface {
+		result, err = rich.ExecuteResultContext(ctx, name, args)
+	} else if rich, ok := reg.(interface {
 		ExecuteResult(string, string) (types.ToolResult, error)
 	}); ok {
-		return rich.ExecuteResult(name, args)
+		result, err = rich.ExecuteResult(name, args)
+	} else {
+		var output string
+		output, err = reg.Execute(name, args)
+		result = types.ToolResult{Content: output, IsError: err != nil}
 	}
-	text, err := reg.Execute(name, args)
-	return types.ToolResult{Content: text, IsError: err != nil}, err
+	if err == nil && !result.IsError {
+		// The context-aware adapter routes through the orchestrator, where
+		// execution is already observed. Legacy registries and direct adapter
+		// execution have no orchestrator and are observed here.
+		adapter, isAdapter := reg.(*ToolRegistryAdapter)
+		if !isAdapter || adapter.orchestrateContext == nil {
+			evolution.ObserveTool(ctx, name)
+		}
+	}
+	return result, err
 }
 
 // Observations follow ALL tool responses in a batch. Inserting a user message

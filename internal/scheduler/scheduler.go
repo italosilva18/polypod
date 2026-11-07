@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/costa/polypod/internal/evolution"
 	"github.com/costa/polypod/internal/skill"
 	"github.com/sashabaranov/go-openai/jsonschema"
 )
@@ -778,9 +779,24 @@ func (s *Scheduler) AddTask(task *Task) error {
 	task.Enabled = true
 
 	s.mu.Lock()
+	if _, exists := s.tasks[task.ID]; exists {
+		s.mu.Unlock()
+		return fmt.Errorf("rotina %s ja existe", task.ID)
+	}
 	s.tasks[task.ID] = task
 	s.mu.Unlock()
-	return s.Save()
+	if err := s.Save(); err != nil {
+		// A failed create must not leave a runnable routine in memory when the
+		// caller has been told that scheduling failed. Preserve any newer value
+		// installed under the same ID by another operation.
+		s.mu.Lock()
+		if s.tasks[task.ID] == task {
+			delete(s.tasks, task.ID)
+		}
+		s.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 func validCron(expr string) bool {
@@ -942,7 +958,11 @@ func matchCronField(field string, value int) bool {
 }
 
 // RegisterSkills registers scheduler management skills.
-func RegisterSkills(reg *skill.Registry, sched *Scheduler) {
+func RegisterSkills(reg *skill.Registry, sched *Scheduler, verificationStores ...*evolution.Store) {
+	var verificationStore *evolution.Store
+	if len(verificationStores) > 0 {
+		verificationStore = verificationStores[0]
+	}
 	reg.Register(&skill.Skill{
 		Name:        "scheduler_list",
 		Description: "Listar tarefas agendadas",
@@ -979,19 +999,22 @@ func RegisterSkills(reg *skill.Registry, sched *Scheduler) {
 
 	reg.Register(&skill.Skill{
 		Name:        "scheduler_add",
-		Description: "Adicionar uma tarefa agendada",
+		Description: "Adicionar rotina agendada; verificação SHA-256 opcional exige prompt e e registrada antes da primeira execução",
 		Parameters: jsonschema.Definition{
 			Type: jsonschema.Object,
 			Properties: map[string]jsonschema.Definition{
-				"name":           {Type: jsonschema.String, Description: "Nome humano e curto da rotina"},
-				"schedule":       {Type: jsonschema.String, Description: "Cron de cinco campos com listas/intervalos/passos, @every 30m ou @at 2026-11-06T09:00:00-03:00"},
-				"time_zone":      {Type: jsonschema.String, Description: "Fuso IANA para cron, por exemplo America/Sao_Paulo; vazio usa o fuso da maquina"},
-				"misfire_policy": {Type: jsonschema.String, Description: "run_once executa uma vez apos parada; skip ignora horarios perdidos"},
-				"prompt":         {Type: jsonschema.String, Description: "Objetivo completo para despertar o agente, incluindo contexto, verificacao de sucesso e o que fazer em caso de erro"},
-				"command":        {Type: jsonschema.String, Description: "Comando shell exato; use somente para automacoes mecanicas que nao exigem raciocinio"},
-				"max_retries":    {Type: jsonschema.Integer, Description: "Numero de novas tentativas em caso de falha (padrao 3, maximo 5)"},
-				"channel":        {Type: jsonschema.String, Description: "Canal de origem da rotina"},
-				"user_id":        {Type: jsonschema.String, Description: "Identidade dona da rotina"},
+				"name":                 {Type: jsonschema.String, Description: "Nome humano e curto da rotina"},
+				"schedule":             {Type: jsonschema.String, Description: "Cron de cinco campos com listas/intervalos/passos, @every 30m ou @at 2026-11-06T09:00:00-03:00"},
+				"time_zone":            {Type: jsonschema.String, Description: "Fuso IANA para cron, por exemplo America/Sao_Paulo; vazio usa o fuso da maquina"},
+				"misfire_policy":       {Type: jsonschema.String, Description: "run_once executa uma vez apos parada; skip ignora horarios perdidos"},
+				"prompt":               {Type: jsonschema.String, Description: "Objetivo completo para despertar o agente, incluindo contexto, verificacao de sucesso e o que fazer em caso de erro"},
+				"command":              {Type: jsonschema.String, Description: "Comando shell exato; use somente para automacoes mecanicas que nao exigem raciocinio"},
+				"max_retries":          {Type: jsonschema.Integer, Description: "Numero de novas tentativas em caso de falha (padrao 3, maximo 5)"},
+				"channel":              {Type: jsonschema.String, Description: "Canal de origem da rotina"},
+				"user_id":              {Type: jsonschema.String, Description: "Identidade dona da rotina"},
+				"verification_path":    {Type: jsonschema.String, Description: "Arquivo absoluto cujo SHA-256 deve provar o resultado; opcional com os dois campos abaixo"},
+				"verification_sha256":  {Type: jsonschema.String, Description: "SHA-256 esperado do arquivo ao concluir a rotina"},
+				"verification_pattern": {Type: jsonschema.String, Description: "Categoria estavel para aprender com resultados verificados"},
 			},
 			Required: []string{"name", "schedule"},
 		},
@@ -1014,6 +1037,47 @@ func RegisterSkills(reg *skill.Registry, sched *Scheduler) {
 				Channel:       args["channel"],
 				UserID:        args["user_id"],
 				MaxRetries:    maxRetries,
+			}
+			verificationPath := strings.TrimSpace(args["verification_path"])
+			verificationSHA := strings.TrimSpace(args["verification_sha256"])
+			verificationPattern := strings.TrimSpace(args["verification_pattern"])
+			planned := verificationPath != "" || verificationSHA != "" || verificationPattern != ""
+			if planned {
+				if verificationPath == "" || verificationSHA == "" || verificationPattern == "" {
+					return "", fmt.Errorf("verification_path, verification_sha256 e verification_pattern devem ser fornecidos juntos")
+				}
+				if strings.TrimSpace(task.Prompt) == "" {
+					return "", fmt.Errorf("verificacao planejada exige rotina com prompt; command isolado ainda nao tem captura de estado antes da execucao")
+				}
+				if verificationStore == nil {
+					return "", fmt.Errorf("verificacao de rotina indisponivel")
+				}
+				// Validate the routine before registering the immutable plan. The ID
+				// is generated first so the plan exists before AddTask can run it.
+				if err := validateScheduledTaskForPlan(task); err != nil {
+					return "", err
+				}
+				for attempt := 0; attempt < 5; attempt++ {
+					idBytes := make([]byte, 16)
+					if _, err := rand.Read(idBytes); err != nil {
+						return "", fmt.Errorf("gerando ID da rotina: %w", err)
+					}
+					task.ID = "task_" + hex.EncodeToString(idBytes)
+					if _, exists := sched.GetTask(task.ID); !exists {
+						break
+					}
+					task.ID = ""
+				}
+				if task.ID == "" {
+					return "", fmt.Errorf("nao foi possivel gerar ID unico da rotina")
+				}
+				_, err := verificationStore.RegisterVerificationPlan(context.Background(), evolution.VerificationPlanInput{
+					SourceKind: "routine", SubjectID: task.ID, PatternKey: verificationPattern,
+					Kind: evolution.FileSHA256Check, Path: verificationPath, ExpectedSHA256: verificationSHA,
+				})
+				if err != nil {
+					return "", fmt.Errorf("registrando verificacao da rotina: %w", err)
+				}
 			}
 			if err := sched.AddTask(task); err != nil {
 				return "", err
@@ -1143,4 +1207,27 @@ func RegisterSkills(reg *skill.Registry, sched *Scheduler) {
 			return fmt.Sprintf("Tarefa '%s' executada. Resultado: %s", task.Name, task.LastResult), nil
 		},
 	})
+}
+
+func validateScheduledTaskForPlan(task *Task) error {
+	if strings.TrimSpace(task.Name) == "" {
+		return fmt.Errorf("nome da rotina e obrigatorio")
+	}
+	if _, err := parseSchedule(task.Schedule); err != nil {
+		return fmt.Errorf("agendamento invalido: %w", err)
+	}
+	if task.MisfirePolicy != "" && task.MisfirePolicy != "run_once" && task.MisfirePolicy != "skip" {
+		return fmt.Errorf("misfire_policy deve ser run_once ou skip")
+	}
+	if strings.TrimSpace(task.Command) == "" && strings.TrimSpace(task.Prompt) == "" {
+		return fmt.Errorf("a rotina precisa de prompt ou command")
+	}
+	next, err := nextOccurrence(task.Schedule, time.Now(), task.TimeZone)
+	if err != nil {
+		return err
+	}
+	if next.IsZero() {
+		return fmt.Errorf("horario unico ja passou: %s", task.Schedule)
+	}
+	return nil
 }

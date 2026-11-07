@@ -35,6 +35,7 @@ const (
 	StatusProcessing Status = "processing"
 	StatusCompleted  Status = "completed"
 	StatusFailed     Status = "failed"
+	StatusResolved   Status = "resolved"
 )
 
 const MaxOutboundMediaBytes = 16 << 20
@@ -52,28 +53,29 @@ type MediaAttachment struct {
 
 // Message is one durable inbox or outbox item.
 type Message struct {
-	ID            string           `json:"id"`
-	ExternalID    string           `json:"external_id,omitempty"`
-	Delivered     []string         `json:"delivered,omitempty"`
-	Direction     Direction        `json:"direction"`
-	DeliveryOwner string           `json:"delivery_owner,omitempty"`
-	Status        Status           `json:"status"`
-	Channel       string           `json:"channel"`
-	UserID        string           `json:"user_id"`
-	Text          string           `json:"text"`
-	Media         *MediaAttachment `json:"media,omitempty"`
-	ReplyTo       string           `json:"reply_to,omitempty"`
-	Response      string           `json:"response,omitempty"`
-	ResponseReady bool             `json:"response_ready,omitempty"`
-	Error         string           `json:"error,omitempty"`
-	Attempts      int              `json:"attempts"`
-	OfflineDefers int              `json:"offline_defers,omitempty"`
-	CreatedAt     time.Time        `json:"created_at"`
-	UpdatedAt     time.Time        `json:"updated_at"`
-	ProcessingAt  *time.Time       `json:"processing_at,omitempty"`
-	CompletedAt   *time.Time       `json:"completed_at,omitempty"`
-	NextAttemptAt time.Time        `json:"next_attempt_at,omitempty"`
-	ReplayHistory []ReplayRecord   `json:"replay_history,omitempty"`
+	ID            string            `json:"id"`
+	ExternalID    string            `json:"external_id,omitempty"`
+	Delivered     []string          `json:"delivered,omitempty"`
+	Direction     Direction         `json:"direction"`
+	DeliveryOwner string            `json:"delivery_owner,omitempty"`
+	Status        Status            `json:"status"`
+	Channel       string            `json:"channel"`
+	UserID        string            `json:"user_id"`
+	Text          string            `json:"text"`
+	Media         *MediaAttachment  `json:"media,omitempty"`
+	ReplyTo       string            `json:"reply_to,omitempty"`
+	Response      string            `json:"response,omitempty"`
+	ResponseReady bool              `json:"response_ready,omitempty"`
+	Error         string            `json:"error,omitempty"`
+	Attempts      int               `json:"attempts"`
+	OfflineDefers int               `json:"offline_defers,omitempty"`
+	CreatedAt     time.Time         `json:"created_at"`
+	UpdatedAt     time.Time         `json:"updated_at"`
+	ProcessingAt  *time.Time        `json:"processing_at,omitempty"`
+	CompletedAt   *time.Time        `json:"completed_at,omitempty"`
+	NextAttemptAt time.Time         `json:"next_attempt_at,omitempty"`
+	ReplayHistory []ReplayRecord    `json:"replay_history,omitempty"`
+	Resolution    *ResolutionRecord `json:"resolution,omitempty"`
 }
 
 // ReplayRecord preserves the previous failed run when an operator requeues it.
@@ -89,6 +91,26 @@ type ReplayPreview struct {
 	Channel      string
 	Attempts     int
 	FailedAt     time.Time
+	PriorReplays int
+}
+
+// ResolutionRecord records why an operator closed a failed item without
+// replaying its action or claiming it succeeded.
+type ResolutionRecord struct {
+	At     time.Time `json:"at"`
+	Actor  string    `json:"actor"`
+	Reason string    `json:"reason"`
+}
+
+// ResolutionPreview contains only metadata needed to review a failed item.
+type ResolutionPreview struct {
+	Direction    Direction
+	Channel      string
+	Attempts     int
+	FailedAt     time.Time
+	Delivered    []string
+	HasMedia     bool
+	HasResponse  bool
 	PriorReplays int
 }
 
@@ -575,6 +597,76 @@ func (s *Store) PreviewFailedInbound(id string) (ReplayPreview, error) {
 		FailedAt: failedAt, PriorReplays: len(msg.ReplayHistory)}, nil
 }
 
+// PreviewFailedResolution reports enough non-content metadata to decide
+// whether closing a terminal failure is appropriate. It does not mutate state.
+func (s *Store) PreviewFailedResolution(id string) (ResolutionPreview, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	msg, err := s.resolutionCandidateLocked(id)
+	if err != nil {
+		return ResolutionPreview{}, err
+	}
+	failedAt := msg.UpdatedAt
+	if msg.CompletedAt != nil {
+		failedAt = *msg.CompletedAt
+	}
+	return ResolutionPreview{Direction: msg.Direction, Channel: msg.Channel,
+		Attempts: msg.Attempts, FailedAt: failedAt,
+		Delivered: append([]string(nil), msg.Delivered...), HasMedia: msg.Media != nil,
+		HasResponse: msg.Response != "" || msg.ResponseReady, PriorReplays: len(msg.ReplayHistory)}, nil
+}
+
+// ResolveFailed closes a reviewed terminal failure. It preserves the original
+// error, delivery markers, identity and attempts. No handler or remote sender
+// is called, and the status explicitly distinguishes it from success.
+func (s *Store) ResolveFailed(id, actor, reason string, now time.Time) error {
+	actor, reason = strings.TrimSpace(actor), strings.TrimSpace(reason)
+	if now.IsZero() || actor == "" || len(actor) > 80 || reason == "" || len(reason) > 500 ||
+		strings.ContainsAny(actor, "\r\n\x00") || strings.ContainsAny(reason, "\x00") {
+		return errors.New("humanloop: ator, motivo e horario validos sao obrigatorios")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	msg, err := s.resolutionCandidateLocked(id)
+	if err != nil {
+		return err
+	}
+	previous := *msg
+	msg.Status = StatusResolved
+	msg.Resolution = &ResolutionRecord{At: now, Actor: actor, Reason: reason}
+	msg.UpdatedAt = now
+	msg.NextAttemptAt = time.Time{}
+	if err := s.saveLocked(); err != nil {
+		*msg = previous
+		return err
+	}
+	return nil
+}
+
+func (s *Store) resolutionCandidateLocked(id string) (*Message, error) {
+	if id == "" {
+		return nil, errors.New("humanloop: id obrigatorio para resolver falha")
+	}
+	msg, err := s.findLocked(id)
+	if err != nil {
+		return nil, err
+	}
+	if msg.Status != StatusFailed || (msg.Direction != DirectionInbound && msg.Direction != DirectionOutbound) {
+		return nil, errors.New("humanloop: apenas item com falha terminal pode ser resolvido")
+	}
+	if msg.Direction == DirectionInbound {
+		if msg.Response != "" || msg.ResponseReady {
+			return nil, errors.New("humanloop: entrada possui resposta pendente; resolucao recusada")
+		}
+		for _, existing := range s.messages {
+			if existing.Direction == DirectionOutbound && existing.ReplyTo == id {
+				return nil, errors.New("humanloop: resposta ja enfileirada; resolucao recusada")
+			}
+		}
+	}
+	return msg, nil
+}
+
 func (s *Store) replayCandidateLocked(id string) (*Message, error) {
 	if id == "" {
 		return nil, errors.New("humanloop: id obrigatorio para reprocessar")
@@ -623,11 +715,31 @@ func (s *Store) Snapshot() (State, []Message) {
 	return s.state, messages
 }
 
+// GetByID returns a detached copy of one inbox or outbox item. It does not
+// mutate state or recover interrupted work, so status readers can call it
+// concurrently with the processor.
+func (s *Store) GetByID(id string) (Message, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, msg := range s.messages {
+		if msg.ID == id {
+			return cloneMediaMessage(msg), true
+		}
+	}
+	return Message{}, false
+}
+
 func cloneMediaMessage(msg Message) Message {
 	if msg.Media != nil {
 		media := *msg.Media
 		msg.Media = &media
 	}
+	if msg.Resolution != nil {
+		resolution := *msg.Resolution
+		msg.Resolution = &resolution
+	}
+	msg.Delivered = append([]string(nil), msg.Delivered...)
+	msg.ReplayHistory = append([]ReplayRecord(nil), msg.ReplayHistory...)
 	return msg
 }
 
@@ -643,7 +755,7 @@ func (s *Store) findLocked(id string) (*Message, error) {
 func (s *Store) trimLocked() {
 	terminal := 0
 	for _, msg := range s.messages {
-		if msg.Status == StatusCompleted || msg.Status == StatusFailed {
+		if msg.Status == StatusCompleted || msg.Status == StatusFailed || msg.Status == StatusResolved {
 			terminal++
 		}
 	}
@@ -653,7 +765,7 @@ func (s *Store) trimLocked() {
 	}
 	kept := make([]Message, 0, len(s.messages)-remove)
 	for _, msg := range s.messages {
-		isTerminal := msg.Status == StatusCompleted || msg.Status == StatusFailed
+		isTerminal := msg.Status == StatusCompleted || msg.Status == StatusFailed || msg.Status == StatusResolved
 		if isTerminal && remove > 0 {
 			remove--
 			continue

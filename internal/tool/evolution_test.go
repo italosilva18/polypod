@@ -32,15 +32,16 @@ func TestEvolutionToolReviewedApplyAndActivationRetry(t *testing.T) {
 		t.Fatal("evolution tool classification is incorrect")
 	}
 	ctx := types.ToolContext{Context: context.Background()}
+	if result, err := registry.Execute("skill_evolution", map[string]any{"action": "record"}, ctx); err != nil || !result.IsError {
+		t.Fatalf("agent could assert its own outcome: %+v, %v", result, err)
+	}
 	for _, id := range []string{"run-1", "run-2", "run-3"} {
-		result, err := registry.Execute("skill_evolution", map[string]any{
-			"action": "record", "source_kind": "task", "source_id": id,
-			"pattern_key": "browse report", "success": true,
-			"verified_by": "user-1", "evidence_ref": "task:" + id,
-			"tool_names": []any{"browser_observe", "browser_act"},
-		}, ctx)
-		if err != nil || result.IsError {
-			t.Fatalf("record %s = %+v, %v", id, result, err)
+		if _, err := store.RecordOutcome(ctx.Context, evolution.OutcomeInput{
+			SourceKind: "task", SourceID: id, PatternKey: "browse report",
+			Success: true, VerifiedBy: "user-1", EvidenceRef: "task:" + id,
+			ToolNames: []string{"browser_observe", "browser_act"},
+		}); err != nil {
+			t.Fatalf("trusted record %s: %v", id, err)
 		}
 	}
 	result, err := registry.Execute("skill_evolution", map[string]any{"action": "propose", "pattern_key": "browse report"}, ctx)

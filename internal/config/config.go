@@ -23,6 +23,7 @@ type Config struct {
 	Sandbox     SandboxConfig      `yaml:"sandbox"`
 	Scheduler   SchedulerConfig    `yaml:"scheduler"`
 	Remote      RemoteConfig       `yaml:"remote"`
+	Webhook     WebhookConfig      `yaml:"webhook"`
 	WhatsApp    WhatsAppConfig     `yaml:"whatsapp"`
 	Templates   TemplatesConfig    `yaml:"templates"`
 	Hooks       []HookConfig       `yaml:"hooks"`
@@ -195,6 +196,9 @@ func Load(path string) (*Config, error) {
 	}
 	if err := cfg.WhatsApp.Validate(); err != nil {
 		return nil, fmt.Errorf("validating whatsapp: %w", err)
+	}
+	if err := cfg.Webhook.Validate(); err != nil {
+		return nil, fmt.Errorf("validating webhook: %w", err)
 	}
 	return cfg, nil
 }

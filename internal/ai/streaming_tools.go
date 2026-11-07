@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/costa/polypod/internal/evolution"
 	"github.com/costa/polypod/internal/tool"
 	"github.com/costa/polypod/internal/types"
 )
@@ -291,6 +292,10 @@ func (m *StreamingToolManager) executeSingle(ctx context.Context, call ToolCallI
 		m.setProgress(call.ID, CallStatusFailed)
 	} else {
 		m.setProgress(call.ID, CallStatusCompleted)
+		if m.orchExec == nil {
+			// Production orchestration observes its own tool execution.
+			evolution.ObserveTool(ctx, call.Name)
+		}
 	}
 
 	m.logger.Debug("tool executed",

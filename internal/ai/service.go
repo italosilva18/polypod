@@ -128,7 +128,11 @@ func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) ([]ChatM
 	}
 
 	// Auto-inject relevant memories
-	memoryCtx := memory.AutoInject(ctx, s.memStore, req.Query)
+	memoryCtxScope := ctx
+	if req.Channel != "" && req.UserID != "" {
+		memoryCtxScope = memory.WithSessionScope(ctx, req.Channel+":"+req.UserID)
+	}
+	memoryCtx := memory.AutoInject(memoryCtxScope, s.memStore, req.Query)
 
 	// Build messages using agent persona
 	systemPrompt := BuildSystemPrompt(ag.Persona, knowledgeCtx, memoryCtx)

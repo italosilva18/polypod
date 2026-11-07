@@ -2,39 +2,50 @@ package tool
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/costa/polypod/internal/evolution"
 	"github.com/costa/polypod/internal/taskqueue"
 	"github.com/costa/polypod/internal/types"
 )
 
 // RegisterTaskQueueTool gives the agent durable, prioritized one-off work.
 // The queue's handler must be wired to the complete agent loop at startup.
-func RegisterTaskQueueTool(reg *Registry, queue *taskqueue.Queue) {
+func RegisterTaskQueueTool(reg *Registry, queue *taskqueue.Queue, evolutionStores ...*evolution.Store) {
+	var evolutionStore *evolution.Store
+	if len(evolutionStores) != 0 {
+		evolutionStore = evolutionStores[0]
+	}
 	reg.RegisterDef(types.ToolDef{
 		NameFn: func() string { return "task_queue" },
 		DescriptionFn: func() string {
-			return "Criar e acompanhar tarefas pontuais persistentes com prioridade, tentativas e recuperacao apos reinicio."
+			return "Criar e acompanhar tarefas pontuais persistentes. Opcionalmente, registre antes do despacho uma prova SHA-256 do arquivo esperado para aprender com o resultado real."
 		},
 		InputSchemaFn: func() map[string]any {
 			return map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"action":              map[string]any{"type": "string", "enum": []string{"create", "list", "get", "history", "cancel", "retry", "status"}},
-					"id":                  map[string]any{"type": "string", "description": "ID da tarefa para get, history, cancel ou retry"},
-					"title":               map[string]any{"type": "string", "description": "Nome curto da tarefa"},
-					"prompt":              map[string]any{"type": "string", "description": "Objetivo completo para o agente, incluindo verificacao"},
-					"priority":            map[string]any{"type": "integer", "minimum": -100, "maximum": 100},
-					"max_attempts":        map[string]any{"type": "integer", "minimum": 1, "maximum": 20},
-					"next_run_at":         map[string]any{"type": "string", "description": "Horario RFC3339 opcional"},
-					"status":              map[string]any{"type": "string", "enum": []string{"pending", "running", "succeeded", "failed", "canceled"}},
-					"limit":               map[string]any{"type": "integer", "minimum": 1, "maximum": 200},
-					"additional_attempts": map[string]any{"type": "integer", "minimum": 1, "maximum": 20},
+					"action":               map[string]any{"type": "string", "enum": []string{"create", "list", "get", "history", "cancel", "retry", "status"}},
+					"id":                   map[string]any{"type": "string", "description": "ID da tarefa para get, history, cancel ou retry"},
+					"title":                map[string]any{"type": "string", "description": "Nome curto da tarefa"},
+					"prompt":               map[string]any{"type": "string", "description": "Objetivo completo para o agente, incluindo verificacao"},
+					"priority":             map[string]any{"type": "integer", "minimum": -100, "maximum": 100},
+					"max_attempts":         map[string]any{"type": "integer", "minimum": 1, "maximum": 20},
+					"next_run_at":          map[string]any{"type": "string", "description": "Horario RFC3339 opcional"},
+					"verification_path":    map[string]any{"type": "string", "description": "Arquivo absoluto cujo estado final será verificado"},
+					"verification_sha256":  map[string]any{"type": "string", "description": "SHA-256 exato esperado após a tarefa"},
+					"verification_pattern": map[string]any{"type": "string", "description": "Categoria estável para agrupar resultados verificados"},
+					"status":               map[string]any{"type": "string", "enum": []string{"pending", "running", "succeeded", "failed", "canceled"}},
+					"limit":                map[string]any{"type": "integer", "minimum": 1, "maximum": 200},
+					"additional_attempts":  map[string]any{"type": "integer", "minimum": 1, "maximum": 20},
 				},
 				"required": []string{"action"},
 			}
@@ -42,6 +53,9 @@ func RegisterTaskQueueTool(reg *Registry, queue *taskqueue.Queue) {
 		ValidateFn: func(args map[string]any) types.ValidationResult {
 			if err := validateTaskQueueArgs(args); err != nil {
 				return types.ValidationResult{Message: err.Error()}
+			}
+			if args["action"] == "create" && verificationRequested(args) && evolutionStore == nil {
+				return types.ValidationResult{Message: "verificação de tarefa indisponível"}
 			}
 			return types.ValidationResult{Valid: true}
 		},
@@ -72,9 +86,32 @@ func RegisterTaskQueueTool(reg *Registry, queue *taskqueue.Queue) {
 				if raw, ok := args["next_run_at"].(string); ok && raw != "" {
 					next, _ = time.Parse(time.RFC3339, raw)
 				}
-				value, err = queue.Create(ctx, taskqueue.CreateInput{Title: stringArg(args, "title"),
+				input := taskqueue.CreateInput{Title: stringArg(args, "title"),
 					Prompt: args["prompt"].(string), Priority: priority, MaxAttempts: maxAttempts,
-					Channel: "agent", Owner: string(tc.AgentID), NextRunAt: next})
+					Channel: "agent", Owner: string(tc.AgentID), NextRunAt: next}
+				if verificationRequested(args) {
+					if evolutionStore == nil {
+						err = errors.New("verificação de tarefa indisponível")
+						break
+					}
+					input.ID = taskqueue.NewTaskID()
+					plan, planErr := evolutionStore.RegisterVerificationPlan(ctx, evolution.VerificationPlanInput{
+						SourceKind: "task", SubjectID: input.ID,
+						PatternKey: args["verification_pattern"].(string), Kind: evolution.FileSHA256Check,
+						Path: args["verification_path"].(string), ExpectedSHA256: args["verification_sha256"].(string),
+					})
+					err = planErr
+					if err != nil {
+						break
+					}
+					// The attempt history uses millisecond timestamps. Ensure its
+					// start is strictly later than the plan's millisecond.
+					minimum := time.UnixMilli(plan.CreatedAt).Add(2 * time.Millisecond)
+					if input.NextRunAt.Before(minimum) {
+						input.NextRunAt = minimum
+					}
+				}
+				value, err = queue.Create(ctx, input)
 			case "list":
 				limit, _ := integerArg(args, "limit", 50, 200)
 				value, err = queue.List(ctx, taskqueue.Status(stringArg(args, "status")), limit)
@@ -128,6 +165,21 @@ func validateTaskQueueArgs(args map[string]any) error {
 				return fmt.Errorf("next_run_at invalido: %w", err)
 			}
 		}
+		if verificationRequested(args) {
+			for _, key := range []string{"verification_path", "verification_sha256", "verification_pattern"} {
+				if err := requiredStringArg(args, key); err != nil {
+					return err
+				}
+			}
+			path := strings.TrimSpace(args["verification_path"].(string))
+			if !filepath.IsAbs(path) || strings.ContainsRune(path, '\x00') {
+				return errors.New("verification_path deve ser caminho absoluto de arquivo")
+			}
+			digest, err := hex.DecodeString(strings.TrimSpace(args["verification_sha256"].(string)))
+			if err != nil || len(digest) != sha256.Size {
+				return errors.New("verification_sha256 deve ser SHA-256 hexadecimal completo")
+			}
+		}
 	case "status":
 	case "list":
 		if _, err := integerArg(args, "limit", 50, 200); err != nil {
@@ -161,6 +213,15 @@ func validateTaskQueueArgs(args map[string]any) error {
 		return fmt.Errorf("action desconhecida: %s", action)
 	}
 	return nil
+}
+
+func verificationRequested(args map[string]any) bool {
+	for _, key := range []string{"verification_path", "verification_sha256", "verification_pattern"} {
+		if _, exists := args[key]; exists {
+			return true
+		}
+	}
+	return false
 }
 
 func stringArg(args map[string]any, key string) string {

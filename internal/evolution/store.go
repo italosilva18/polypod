@@ -36,6 +36,22 @@ CREATE TABLE IF NOT EXISTS outcomes (
  UNIQUE(source_kind,source_id)
 );
 CREATE INDEX IF NOT EXISTS outcomes_pattern_idx ON outcomes(pattern_key,created_at);
+CREATE TABLE IF NOT EXISTS verification_plans (
+ source_kind TEXT NOT NULL, subject_id TEXT NOT NULL, pattern_key TEXT NOT NULL,
+ kind TEXT NOT NULL, path TEXT NOT NULL, expected_sha256 TEXT NOT NULL,
+ baseline_sha256 TEXT NOT NULL, created_at INTEGER NOT NULL,
+ PRIMARY KEY(source_kind,subject_id)
+);
+CREATE TABLE IF NOT EXISTS verification_runs (
+ source_kind TEXT NOT NULL, run_id TEXT NOT NULL, subject_id TEXT NOT NULL,
+ baseline_sha256 TEXT NOT NULL, created_at INTEGER NOT NULL,
+ final_sha256 TEXT, finished_at INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(source_kind,run_id)
+);
+CREATE TABLE IF NOT EXISTS tool_traces (
+ source_kind TEXT NOT NULL, run_id TEXT NOT NULL, tool_names_json TEXT NOT NULL,
+ created_at INTEGER NOT NULL, PRIMARY KEY(source_kind,run_id)
+);
 CREATE TABLE IF NOT EXISTS drafts (
  id TEXT PRIMARY KEY, pattern_key TEXT NOT NULL UNIQUE, target_skill TEXT NOT NULL UNIQUE,
  body TEXT NOT NULL, body_sha256 TEXT NOT NULL, status TEXT NOT NULL,
@@ -52,6 +68,7 @@ type Store struct {
 	db        *sql.DB
 	skillsDir string
 	applyMu   sync.Mutex
+	verifyMu  sync.Mutex
 }
 
 // Open creates private state and reconciles a publication interrupted between
@@ -87,6 +104,10 @@ func Open(dbPath, skillsDir string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("criando evolução: %w", err)
 	}
+	if err := ensureVerificationRunColumns(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("atualizando execuções verificadas: %w", err)
+	}
 	s := &Store{db: db, skillsDir: absSkills}
 	if err := s.recoverApplying(context.Background()); err != nil {
 		db.Close()
@@ -95,12 +116,57 @@ func Open(dbPath, skillsDir string) (*Store, error) {
 	return s, nil
 }
 
+func ensureVerificationRunColumns(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(verification_runs)`)
+	if err != nil {
+		return err
+	}
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var position int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue sql.NullString
+		if err := rows.Scan(&position, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"final_sha256", "final_sha256 TEXT"},
+		{"finished_at", "finished_at INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if columns[column.name] {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE verification_runs ADD COLUMN ` + column.definition); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) Close() error { return s.db.Close() }
 
 // RecordOutcome accepts a caller-verified result. Verification is an assertion
 // supplied by the caller; this package never treats external page or model text
 // as verification. The source pair is idempotent and immutable.
 func (s *Store) RecordOutcome(ctx context.Context, in OutcomeInput) (Outcome, error) {
+	if strings.TrimSpace(in.VerifiedBy) == "file_sha256_v1" {
+		return Outcome{}, errors.New("file_sha256_v1 é reservado ao verificador interno")
+	}
+	return s.recordOutcome(ctx, in)
+}
+
+func (s *Store) recordOutcome(ctx context.Context, in OutcomeInput) (Outcome, error) {
 	var err error
 	in, err = validateOutcome(in)
 	if err != nil {
@@ -153,7 +219,10 @@ func validateOutcome(in OutcomeInput) (OutcomeInput, error) {
 		!evidenceTokenPattern.MatchString(in.EvidenceRef) {
 		return in, errors.New("source_id, verified_by e evidence_ref devem ser identificadores, não texto externo")
 	}
-	if len(in.ToolNames) > 24 || (in.Success && len(in.ToolNames) == 0) {
+	verifiedWithoutTrace := in.VerifiedBy == "file_sha256_v1" &&
+		strings.HasPrefix(in.EvidenceRef, "file_sha256:") &&
+		(in.SourceKind == "task" || in.SourceKind == "routine")
+	if len(in.ToolNames) > 24 || (in.Success && len(in.ToolNames) == 0 && !verifiedWithoutTrace) {
 		return in, errors.New("sucesso exige de 1 a 24 ferramentas observadas")
 	}
 	for _, name := range in.ToolNames {
@@ -253,7 +322,7 @@ func (s *Store) Propose(ctx context.Context, patternKey string) (Draft, error) {
 		return Draft{}, ErrNotEligible
 	}
 	sequence, repetitions := mostFrequentSequence(outcomes)
-	if repetitions < 2 {
+	if len(sequence) == 0 || repetitions < 2 {
 		return Draft{}, fmt.Errorf("sem sequência de ferramentas repetida: %w", ErrNotEligible)
 	}
 	if len(evidence) > 50 {
@@ -286,7 +355,7 @@ func (s *Store) Propose(ctx context.Context, patternKey string) (Draft, error) {
 func mostFrequentSequence(outcomes []Outcome) ([]string, int) {
 	counts := make(map[string]int)
 	for _, outcome := range outcomes {
-		if outcome.Success {
+		if outcome.Success && len(outcome.ToolNames) > 0 {
 			counts[strings.Join(outcome.ToolNames, "\x1f")]++
 		}
 	}

@@ -110,6 +110,7 @@ type Notice struct {
 }
 
 type CreateInput struct {
+	ID          string
 	Title       string
 	Prompt      string
 	Priority    int
@@ -118,6 +119,10 @@ type CreateInput struct {
 	Owner       string
 	NextRunAt   time.Time
 }
+
+// NewTaskID allows callers to register related durable state before a task is
+// published to the queue. Queue.Create still generates an ID when omitted.
+func NewTaskID() string { return "task_" + uuid.NewString() }
 
 // Handler must execute the complete agent turn. Task.ID and Attempts remain
 // stable for audit and application-level deduplication of external effects.
@@ -277,6 +282,14 @@ func (q *Queue) Wake() {
 }
 
 func (q *Queue) Create(ctx context.Context, in CreateInput) (Task, error) {
+	if in.ID == "" {
+		in.ID = NewTaskID()
+	} else {
+		parsed, err := uuid.Parse(strings.TrimPrefix(in.ID, "task_"))
+		if err != nil || in.ID != "task_"+parsed.String() {
+			return Task{}, errors.New("id da tarefa deve ser task_ seguido de UUID canônico")
+		}
+	}
 	in.Prompt = strings.TrimSpace(in.Prompt)
 	in.Title = strings.TrimSpace(in.Title)
 	if in.Prompt == "" {
@@ -299,7 +312,7 @@ func (q *Queue) Create(ctx context.Context, in CreateInput) (Task, error) {
 	if next.IsZero() || next.Before(now) {
 		next = now
 	}
-	t := Task{ID: "task_" + uuid.NewString(), Title: in.Title, Prompt: in.Prompt, Status: Pending,
+	t := Task{ID: in.ID, Title: in.Title, Prompt: in.Prompt, Status: Pending,
 		Priority: in.Priority, MaxAttempts: in.MaxAttempts, Channel: in.Channel, Owner: in.Owner,
 		CreatedAt: now.UnixMilli(), UpdatedAt: now.UnixMilli(), NextRunAt: next.UnixMilli()}
 	_, err := q.db.ExecContext(ctx, `INSERT INTO tasks(id,title,prompt,status,priority,attempts,max_attempts,channel,owner,result,last_error,created_at,updated_at,next_run_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,

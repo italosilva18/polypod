@@ -19,6 +19,24 @@ type OutcomeInput struct {
 	ToolNames   []string `json:"tool_names"`
 }
 
+// VerificationPlanInput describes an independent file-state check for a queued
+// task or routine. SubjectID is the stable task ID; each completed run uses its
+// own RunID when the verified outcome is recorded.
+type VerificationPlanInput struct {
+	SourceKind     string `json:"source_kind"`
+	SubjectID      string `json:"subject_id"`
+	PatternKey     string `json:"pattern_key"`
+	Kind           string `json:"kind"` // currently file_sha256
+	Path           string `json:"path"`
+	ExpectedSHA256 string `json:"expected_sha256"`
+}
+
+type VerificationPlan struct {
+	VerificationPlanInput
+	BaselineSHA256 string `json:"baseline_sha256"`
+	CreatedAt      int64  `json:"created_at"`
+}
+
 type Outcome struct {
 	ID          string   `json:"id"`
 	SourceKind  string   `json:"source_kind"`
