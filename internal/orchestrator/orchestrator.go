@@ -115,21 +115,37 @@ func New(cfg Config) *Orchestrator {
 // 7. Auto-extract memories
 func (o *Orchestrator) ExecuteTool(ctx context.Context, toolName string, args map[string]any) (types.ToolResult, error) {
 	o.mu.RLock()
-	defer o.mu.RUnlock()
-
 	tCtx := o.toolContext(ctx)
+	mode := o.modes.Current
+	planSimulator := o.planSimulator
+	tools := o.tools
+	enforcer := o.enforcer
+	perms := o.perms
+	hookManager := o.hooks
+	auditStore := o.audit
+	logger := o.logger
+	memoryStore := o.memory
+	sessionID := o.sessionID.String()
+	agentName := o.agentName
+	o.mu.RUnlock()
+	if delegated := subagent.AgentNameFromContext(ctx); delegated != "" {
+		agentName = delegated
+		tCtx.AgentID = o.agents.AgentID(delegated)
+	}
+	// Tool execution may invoke agent_run, whose sub-agent calls ExecuteTool
+	// again. Do not hold the orchestrator lock across that nested operation.
 
 	// 1. Plan mode: simulate destructive tools
-	if o.modes.Current == modes.ModePlan {
-		if o.planSimulator != nil {
-			if result, intercepted := o.planSimulator.SimulateToolCall(toolName, args); intercepted {
+	if mode == modes.ModePlan {
+		if planSimulator != nil {
+			if result, intercepted := planSimulator.SimulateToolCall(toolName, args); intercepted {
 				return result, nil
 			}
 		}
 	}
 
 	// 2. Get tool
-	t, ok := o.tools.Get(toolName)
+	t, ok := tools.Get(toolName)
 	if !ok {
 		return types.ToolResult{
 			Content: fmt.Sprintf("ferramenta desconhecida: %s", toolName),
@@ -147,10 +163,10 @@ func (o *Orchestrator) ExecuteTool(ctx context.Context, toolName string, args ma
 	}
 
 	// 4. Check permissions (enforcer takes priority over legacy manager)
-	if o.enforcer != nil {
-		decision, err := o.enforcer.CheckToolCall(ctx, toolName, args)
+	if enforcer != nil {
+		decision, err := enforcer.CheckToolCall(ctx, toolName, args)
 		if err != nil {
-			o.logger.Error("enforcer error", "tool", toolName, "error", err)
+			logger.Error("enforcer error", "tool", toolName, "error", err)
 			return types.ToolResult{
 				Content: fmt.Sprintf("erro de permissao: %v", err),
 				IsError: true,
@@ -169,9 +185,9 @@ func (o *Orchestrator) ExecuteTool(ctx context.Context, toolName string, args ma
 				IsError: true,
 			}, nil
 		}
-	} else if o.perms != nil {
+	} else if perms != nil {
 		// Legacy fallback: simple name-based check
-		decision := o.perms.Check(toolName)
+		decision := perms.Check(toolName)
 		if decision == "deny" {
 			return types.ToolResult{
 				Content: fmt.Sprintf("permissao negada para: %s", toolName),
@@ -181,8 +197,8 @@ func (o *Orchestrator) ExecuteTool(ctx context.Context, toolName string, args ma
 	}
 
 	// 5. Fire PreToolUse hooks
-	if o.hooks != nil {
-		permDecision := o.hooks.CheckToolPermission(ctx, toolName, args)
+	if hookManager != nil {
+		permDecision := hookManager.CheckToolPermission(ctx, toolName, args)
 		if permDecision.Behavior == types.PermissionDeny {
 			return types.ToolResult{
 				Content: fmt.Sprintf("hook negou: %s", permDecision.Message),
@@ -194,28 +210,28 @@ func (o *Orchestrator) ExecuteTool(ctx context.Context, toolName string, args ma
 	// 6. Write the start marker before a side effect. An unavailable audit
 	// trail prevents the tool from starting; it cannot be reconstructed later.
 	started := time.Now()
-	if o.audit != nil {
-		if err := o.audit.Append(ctx, audit.Event{Kind: "tool", Tool: toolName, Status: "started",
-			SessionID: o.sessionID.String(), AgentID: o.agentName}); err != nil {
-			o.logger.Error("tool audit start failed", "tool", toolName, "error", err)
+	if auditStore != nil {
+		if err := auditStore.Append(ctx, audit.Event{Kind: "tool", Tool: toolName, Status: "started",
+			SessionID: sessionID, AgentID: agentName}); err != nil {
+			logger.Error("tool audit start failed", "tool", toolName, "error", err)
 			return types.ToolResult{Content: "auditoria indisponivel; ferramenta nao iniciada", IsError: true}, nil
 		}
 	}
 
 	// 7. Execute
 	result, err := t.Execute(tCtx, args)
-	if o.audit != nil {
+	if auditStore != nil {
 		status := "completed"
 		if err != nil || result.IsError {
 			status = "failed"
 		}
-		if auditErr := o.audit.Append(context.Background(), audit.Event{Kind: "tool", Tool: toolName, Status: status,
-			SessionID: o.sessionID.String(), AgentID: o.agentName, DurationMS: time.Since(started).Milliseconds()}); auditErr != nil {
-			o.logger.Error("tool audit completion failed", "tool", toolName, "error", auditErr)
+		if auditErr := auditStore.Append(context.Background(), audit.Event{Kind: "tool", Tool: toolName, Status: status,
+			SessionID: sessionID, AgentID: agentName, DurationMS: time.Since(started).Milliseconds()}); auditErr != nil {
+			logger.Error("tool audit completion failed", "tool", toolName, "error", auditErr)
 		}
 	}
 	if err != nil {
-		o.logger.Error("tool execution error", "tool", toolName, "error", err)
+		logger.Error("tool execution error", "tool", toolName, "error", err)
 		return types.ToolResult{
 			Content: fmt.Sprintf("erro na execucao: %v", err),
 			IsError: true,
@@ -226,18 +242,18 @@ func (o *Orchestrator) ExecuteTool(ctx context.Context, toolName string, args ma
 	}
 
 	// 8. Fire PostToolUse hooks
-	if o.hooks != nil {
-		o.hooks.Fire(ctx, hooks.HookPayload{
+	if hookManager != nil {
+		hookManager.Fire(ctx, hooks.HookPayload{
 			Event:      hooks.EventPostToolUse,
 			ToolName:   toolName,
 			ToolArgs:   args,
 			ToolResult: result.Content,
-			SessionID:  o.sessionID.String(),
+			SessionID:  sessionID,
 		})
 	}
 
 	// 9. Auto-extract memories from tool results
-	if o.memory != nil && !result.IsError {
+	if memoryStore != nil && !result.IsError {
 		o.autoExtractMemory(toolName, args, result)
 	}
 	return result, nil
@@ -288,6 +304,8 @@ func (o *Orchestrator) SwitchAgent(name string) error {
 
 // SetMode changes the operating mode.
 func (o *Orchestrator) SetMode(mode modes.Mode) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	o.modes.SetMode(string(mode))
 }
 

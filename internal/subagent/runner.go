@@ -256,9 +256,8 @@ func (r *AgentRunner) Stats() map[string]int {
 //   - agent_name (optional, default "task"): the agent persona to use.
 //   - timeout (optional, default 120): timeout in seconds.
 //
-// The tool is marked as read-only because it delegates file-modifying
-// operations to the sub-agent's own tool calls rather than performing them
-// directly.
+// Read-only specialist roles may run concurrently. Roles with write tools
+// are serialized with other write operations.
 func NewAgentTool(runner *AgentRunner, executor *SubAgentExecutor) types.Tool {
 	return types.BuildTool(types.ToolDef{
 		NameFn: func() string { return constants.ToolAgentRun },
@@ -288,8 +287,8 @@ func NewAgentTool(runner *AgentRunner, executor *SubAgentExecutor) types.Tool {
 				"required": []string{"prompt"},
 			}
 		},
-		IsConcurrencyFn: func(map[string]any) bool { return true },
-		IsReadOnlyFn:    func(map[string]any) bool { return true },
+		IsConcurrencyFn: agentRunReadOnly,
+		IsReadOnlyFn:    agentRunReadOnly,
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
 			prompt, _ := args["prompt"].(string)
 			if prompt == "" {
@@ -337,6 +336,19 @@ func NewAgentTool(runner *AgentRunner, executor *SubAgentExecutor) types.Tool {
 	})
 }
 
+// agentRunReadOnly identifies the specialist roles that expose only read
+// tools. Coder, DevOps and the default role may produce side effects and must
+// run serially with other write operations.
+func agentRunReadOnly(args map[string]any) bool {
+	name, _ := args["agent_name"].(string)
+	switch name {
+	case "", "task", "architect", "reviewer":
+		return true
+	default:
+		return false
+	}
+}
+
 // NewAgentToolWithFunc creates a Tool that spawns sub-agents using a raw
 // executor function. This is the legacy constructor for backward compatibility
 // when a full SubAgentExecutor is not available.
@@ -355,8 +367,8 @@ func NewAgentToolWithFunc(runner *AgentRunner, executor func(ctx context.Context
 				"required": []string{"prompt"},
 			}
 		},
-		IsConcurrencyFn: func(map[string]any) bool { return true },
-		IsReadOnlyFn:    func(map[string]any) bool { return true },
+		IsConcurrencyFn: func(map[string]any) bool { return false },
+		IsReadOnlyFn:    func(map[string]any) bool { return false },
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
 			prompt, _ := args["prompt"].(string)
 			agentName, _ := args["agent_name"].(string)

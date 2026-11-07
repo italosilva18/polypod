@@ -33,3 +33,10 @@ em que o pedido foi feito. Consultas de memória sem esse escopo, inclusive as
 skills genéricas de listar e buscar memórias, não mostram episódios. A busca
 semântica também filtra os episódios de outras sessões antes de enviar textos
 ao embedder; os fatos gerais continuam disponíveis como antes.
+
+Na montagem do contexto, a busca considera até 20 candidatos e injeta no
+máximo cinco memórias, sendo no máximo um episódio da sessão. Cada entrada
+mostra origem e confiança, com o conteúdo citado como dado. O trecho de cada
+memória e o bloco total têm limites de tamanho para que memórias longas não
+ocupem toda a janela de contexto. Esses rótulos ajudam o agente a distinguir
+lembranças automáticas de fatos informados diretamente pelo usuário.

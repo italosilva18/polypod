@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,9 +28,28 @@ type SubAgentConfig struct {
 	AIClient    *ai.Client
 	AgentReg    *agent.Registry
 	ToolReg     *tool.Registry
+	Executor    ToolExecutor
 	Logger      *slog.Logger
 	MaxTurns    int
 	TokenBudget int
+}
+
+// ToolExecutor routes sub-agent actions through the same execution pipeline
+// used by the parent agent, including audit records and post-tool hooks.
+type ToolExecutor interface {
+	ExecuteTool(ctx context.Context, toolName string, args map[string]any) (types.ToolResult, error)
+}
+
+type agentContextKey struct{}
+
+// AgentNameFromContext identifies which specialist made a tool call. The
+// orchestrator uses this for the tool context and durable audit trail.
+func AgentNameFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	name, _ := ctx.Value(agentContextKey{}).(string)
+	return name
 }
 
 // SubAgentExecutor runs an AI query loop for sub-agent tasks.
@@ -40,6 +60,7 @@ type SubAgentExecutor struct {
 	aiClient    *ai.Client
 	agentReg    *agent.Registry
 	toolReg     *tool.Registry
+	executor    ToolExecutor
 	logger      *slog.Logger
 	maxTurns    int
 	tokenBudget int
@@ -63,6 +84,7 @@ func NewSubAgentExecutor(cfg SubAgentConfig) *SubAgentExecutor {
 		aiClient:    cfg.AIClient,
 		agentReg:    cfg.AgentReg,
 		toolReg:     cfg.ToolReg,
+		executor:    cfg.Executor,
 		logger:      logger,
 		maxTurns:    maxTurns,
 		tokenBudget: tokenBudget,
@@ -72,20 +94,22 @@ func NewSubAgentExecutor(cfg SubAgentConfig) *SubAgentExecutor {
 // Execute runs a sub-agent to completion and returns the final text response.
 //
 // The flow:
-//  1. Look up the agent in the registry (fall back to "task" if not found).
+//  1. Look up the requested agent in the registry.
 //  2. Derive the allowed tool set from the agent's Skills list.
 //  3. Build a system prompt from the agent's persona.
 //  4. Run an agentic loop: send messages → get response → execute tool calls → repeat.
 //  5. Stop when the model produces a text-only response (no tool calls),
 //     max turns are reached, token budget is exceeded, or context is cancelled.
 func (e *SubAgentExecutor) Execute(ctx context.Context, agentName string, query string) (string, error) {
-	// 1. Look up agent definition.
-	ag := e.agentReg.Get(agentName)
-	if ag == nil {
-		// Should not happen since Registry.Get falls back to default,
-		// but guard against nil registries.
-		ag = agent.TaskAgent()
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	// 1. Look up agent definition.
+	if e.agentReg == nil || !e.agentReg.Has(agentName) {
+		return "", fmt.Errorf("subagente desconhecido: %s", agentName)
+	}
+	ag := e.agentReg.Get(agentName)
+	ctx = context.WithValue(ctx, agentContextKey{}, ag.Name)
 	e.logger.Info("subagent executing",
 		"agent", ag.Name,
 		"query_len", len(query),
@@ -94,6 +118,10 @@ func (e *SubAgentExecutor) Execute(ctx context.Context, agentName string, query 
 
 	// 2. Resolve the allowed tools for this agent.
 	allowedTools := e.resolveTools(ag)
+	allowedNames := make(map[string]struct{}, len(allowedTools))
+	for _, allowedTool := range allowedTools {
+		allowedNames[allowedTool.Function.Name] = struct{}{}
+	}
 	if len(allowedTools) == 0 {
 		e.logger.Warn("subagent has no tools available", "agent", ag.Name)
 	}
@@ -212,7 +240,7 @@ func (e *SubAgentExecutor) Execute(ctx context.Context, agentName string, query 
 
 		// Execute each tool call.
 		for _, tc := range choice.Message.ToolCalls {
-			toolResult := e.executeTool(ctx, ag, tc)
+			toolResult := e.executeTool(ctx, ag, allowedNames, tc)
 			msgs = append(msgs, openai.ChatCompletionMessage{
 				Role:       openai.ChatMessageRoleTool,
 				Content:    toolResult,
@@ -248,6 +276,7 @@ func (e *SubAgentExecutor) resolveTools(ag *agent.Agent) []openai.Tool {
 	if len(allowed) == 0 {
 		return nil
 	}
+	sort.Slice(allowed, func(i, j int) bool { return allowed[i].Name() < allowed[j].Name() })
 
 	result := make([]openai.Tool, 0, len(allowed))
 	for _, t := range allowed {
@@ -256,34 +285,9 @@ func (e *SubAgentExecutor) resolveTools(ag *agent.Agent) []openai.Tool {
 			continue
 		}
 
-		schema := t.InputSchema()
-		properties := make(map[string]any)
-		var required []string
-
-		if props, ok := schema["properties"]; ok {
-			if pm, ok := props.(map[string]any); ok {
-				properties = pm
-			}
-		}
-		if req, ok := schema["required"]; ok {
-			switch r := req.(type) {
-			case []string:
-				required = r
-			case []any:
-				for _, v := range r {
-					if s, ok := v.(string); ok {
-						required = append(required, s)
-					}
-				}
-			}
-		}
-
-		params := map[string]any{
-			"type":       "object",
-			"properties": properties,
-		}
-		if len(required) > 0 {
-			params["required"] = required
+		params := map[string]any{"type": "object"}
+		for key, value := range t.InputSchema() {
+			params[key] = value
 		}
 
 		result = append(result, openai.Tool{
@@ -301,11 +305,12 @@ func (e *SubAgentExecutor) resolveTools(ag *agent.Agent) []openai.Tool {
 // executeTool runs a single tool call and returns the result as a string.
 // It enforces the agent's tool restrictions by checking that the tool is
 // in the agent's allowed set.
-func (e *SubAgentExecutor) executeTool(ctx context.Context, ag *agent.Agent, tc openai.ToolCall) string {
+func (e *SubAgentExecutor) executeTool(ctx context.Context, ag *agent.Agent, allowedNames map[string]struct{}, tc openai.ToolCall) string {
 	toolName := tc.Function.Name
 
-	// Enforce tool restrictions: verify the tool is in the agent's skill set.
-	if !e.isToolAllowed(ag, toolName) {
+	// Accept only names actually advertised to this agent. Bridged SKILL.md
+	// tools use a skill_ prefix and must remain callable when advertised.
+	if _, allowed := allowedNames[toolName]; !allowed {
 		e.logger.Warn("subagent attempted disallowed tool",
 			"agent", ag.Name,
 			"tool", toolName,
@@ -333,12 +338,10 @@ func (e *SubAgentExecutor) executeTool(ctx context.Context, ag *agent.Agent, tc 
 		"args_keys", mapKeys(args),
 	)
 
-	// Execute through the tool registry's pipeline (validate → permissions → execute).
-	toolCtx := types.ToolContext{
-		Context:    ctx,
-		WorkingDir: ".",
+	if e.executor == nil {
+		return "Erro: executor de ferramentas do subagente nao configurado"
 	}
-	result, err := e.toolReg.Execute(toolName, args, toolCtx)
+	result, err := e.executor.ExecuteTool(ctx, toolName, args)
 	if err != nil {
 		return fmt.Sprintf("Erro executando ferramenta '%s': %v", toolName, err)
 	}
@@ -348,20 +351,6 @@ func (e *SubAgentExecutor) executeTool(ctx context.Context, ag *agent.Agent, tc 
 
 	// Truncate large results.
 	return truncateResult(result.Content, 50*1024)
-}
-
-// isToolAllowed checks if a tool is in the agent's allowed skill set.
-func (e *SubAgentExecutor) isToolAllowed(ag *agent.Agent, toolName string) bool {
-	// Prevent recursive agent spawning.
-	if toolName == "agent_run" {
-		return false
-	}
-	for _, skill := range ag.Skills {
-		if skill == toolName {
-			return true
-		}
-	}
-	return false
 }
 
 // resolveModel returns the model to use for this agent, falling back to the

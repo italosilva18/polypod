@@ -247,6 +247,7 @@ func WireAIClient(sys *Systems, aiClient *ai.Client, logger *slog.Logger) {
 		AIClient:    aiClient,
 		AgentReg:    sys.Agents,
 		ToolReg:     sys.ToolRegistry,
+		Executor:    sys.Orchestrator,
 		Logger:      logger,
 		MaxTurns:    subagent.DefaultMaxTurns,
 		TokenBudget: subagent.DefaultTokenBudge,
