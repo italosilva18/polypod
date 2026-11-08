@@ -24,8 +24,9 @@ const (
 	maxPCMBytes = 5 * 60 * 16000 * 2
 )
 
-// LocalConfig runs an installed Python Whisper worker with an already present
-// model checkpoint. It never downloads a model or sends audio over the network.
+// LocalConfig runs an installed Python transcription worker with an already
+// present Whisper .pt checkpoint or offline CTranslate2 model directory. It
+// never downloads a model or sends audio over the network.
 type LocalConfig struct {
 	PythonBinary string
 	ScriptPath   string
@@ -75,7 +76,7 @@ func NewLocalTranscriber(cfg LocalConfig) (*LocalTranscriber, error) {
 	if err != nil {
 		return nil, fmt.Errorf("script de transcrição local: %w", err)
 	}
-	model, err := regularFilePath(cfg.ModelPath)
+	model, err := ValidateLocalModelPath(cfg.ModelPath)
 	if err != nil {
 		return nil, fmt.Errorf("modelo de transcrição local: %w", err)
 	}
@@ -183,6 +184,51 @@ func regularFilePath(name string) (string, error) {
 	}
 	if !info.Mode().IsRegular() || info.Size() == 0 {
 		return "", errors.New("caminho não aponta para arquivo regular com conteúdo")
+	}
+	return path, nil
+}
+
+// ValidateLocalModelPath accepts a non-empty Whisper .pt checkpoint or an
+// offline CTranslate2 directory containing model.bin and config.json. It
+// rejects symlinks in the model path and required files so the model cannot be
+// redirected to a different location after configuration review.
+func ValidateLocalModelPath(name string) (string, error) {
+	name = expandHome(strings.TrimSpace(name))
+	if name == "" {
+		return "", errors.New("modelo não configurado")
+	}
+	path, err := filepath.Abs(name)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	if resolved != path {
+		return "", errors.New("caminho do modelo contém link simbólico")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode().IsRegular() {
+		if filepath.Ext(path) != ".pt" || info.Size() == 0 {
+			return "", errors.New("checkpoint Whisper deve ser arquivo .pt não vazio")
+		}
+		return path, nil
+	}
+	if !info.IsDir() {
+		return "", errors.New("modelo deve ser arquivo .pt ou diretório CTranslate2")
+	}
+	for _, filename := range []string{"model.bin", "config.json"} {
+		file, err := os.Lstat(filepath.Join(path, filename))
+		if err != nil {
+			return "", err
+		}
+		if !file.Mode().IsRegular() || file.Size() == 0 {
+			return "", fmt.Errorf("diretório CTranslate2 exige %s regular não vazio", filename)
+		}
 	}
 	return path, nil
 }

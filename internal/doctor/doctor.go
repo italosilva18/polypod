@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/costa/polypod/internal/audio"
 	"github.com/costa/polypod/internal/config"
 	"github.com/costa/polypod/internal/memory"
 	"github.com/costa/polypod/internal/whatsappgateway"
@@ -180,7 +181,7 @@ func checkLocalTranscription(cfg config.AudioTranscriptionConfig) Check {
 	if !transcriptionFileExists(cfg.ScriptPath) {
 		missing = append(missing, "script")
 	}
-	if !transcriptionFileExists(cfg.ModelPath) {
+	if _, err := audio.ValidateLocalModelPath(cfg.ModelPath); err != nil {
 		missing = append(missing, "modelo")
 	}
 	if !transcriptionExecutableExists(ffmpeg) {

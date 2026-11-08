@@ -1,10 +1,10 @@
 # Transcrição de áudio do WhatsApp
 
-O Polypod recebe mensagens de voz pela mesma caixa de entrada durável usada para texto. O backend `local` usa a biblioteca Python `openai-whisper` e um modelo no próprio computador. A conta ChatGPT usada pelo agente não é necessária para transcrever e não fornece automaticamente uma chave para a API de áudio.
+O Polypod recebe mensagens de voz pela mesma caixa de entrada durável usada para texto. O backend `local` executa um worker de reconhecimento no próprio computador. Esta instalação usa `faster-whisper` com modelo multilíngue `small` em CPU INT8; o worker `openai-whisper` anterior continua disponível como alternativa configurável. A conta ChatGPT usada pelo agente não é necessária para transcrever e não fornece automaticamente uma chave para a API de áudio. A [API pública do DeepSeek](https://api-docs.deepseek.com/api/list-models/) também não lista entrada de áudio.
 
 ## Backend local
 
-Instale `openai-whisper` em um ambiente Python privado do Polypod, disponibilize `ffmpeg` e baixe um checkpoint Whisper. Na instalação desta máquina, o ambiente está em `/home/costa/.local/share/polypod/asr-venv`, o modelo `base.pt` em `/home/costa/.local/share/polypod/models/base.pt` e o worker em `scripts/transcribe-local.py`. O ambiente e o modelo são dados locais, fora do Git; o Polypod não depende dos arquivos do PolyClaw em tempo de execução.
+Instale `faster-whisper` em um ambiente Python privado do Polypod, disponibilize `ffmpeg` para a conversão inicial e mantenha um modelo CTranslate2 local. Na instalação desta máquina, o ambiente está em `/home/costa/.local/share/polypod/asr-faster-venv` (`faster-whisper` 1.2.1), o modelo oficial `Systran/faster-whisper-small` na revisão `536b0662742c02347bc0e980a01041f333bce120` está em `/home/costa/.local/share/polypod/asr-faster-models/small`, e o worker está em `scripts/transcribe-faster.py`. O worker anterior em `scripts/transcribe-local.py`, o ambiente `asr-venv` e o checkpoint `models/base.pt` permanecem disponíveis para retorno manual à configuração anterior. Esses dados ficam fora do Git; o Polypod não depende dos arquivos do PolyClaw em tempo de execução.
 
 Exemplo para o `config.yaml` privado:
 
@@ -13,17 +13,17 @@ whatsapp:
   audio_transcription:
     enabled: true
     backend: local
-    python_binary: /home/costa/.local/share/polypod/asr-venv/bin/python
-    script_path: /home/costa/Área de trabalho/CLI/polypod/scripts/transcribe-local.py
-    model_path: /home/costa/.local/share/polypod/models/base.pt
+    python_binary: /home/costa/.local/share/polypod/asr-faster-venv/bin/python
+    script_path: /home/costa/Área de trabalho/CLI/polypod/scripts/transcribe-faster.py
+    model_path: /home/costa/.local/share/polypod/asr-faster-models/small
     ffmpeg_binary: /home/costa/.local/bin/ffmpeg
     language: pt
     timeout_seconds: 900
 ```
 
-O adaptador valida MIME e assinatura do arquivo, limita a entrada a 16 MiB e a duração a menos de cinco minutos, converte para WAV mono de 16 kHz, executa um processo Whisper por vez e remove os arquivos temporários. Áudio e transcrição não são enviados a um serviço de ASR remoto. O processamento desta instalação usa CPU; uma gravação real em inglês de 11 segundos da [fixture pública do Whisper](https://github.com/openai/whisper/blob/main/tests/jfk.flac), convertida para OGG/Opus como uma mensagem de voz, foi reconhecida pelo teste de integração em cerca de cinco segundos. Isso não mede latência de mensagens reais do WhatsApp.
+O adaptador valida MIME e assinatura do arquivo, limita a entrada a 16 MiB e a duração a menos de cinco minutos, converte para WAV mono PCM16 de 16 kHz, executa um processo de reconhecimento por vez e remove os arquivos temporários. Ambos os workers leem o WAV com `wave` e `numpy` e entregam as amostras diretamente ao modelo; assim, não iniciam um segundo `ffmpeg` nem dependem do `PATH` para decodificar o áudio. O `ffmpeg_binary` configurado continua necessário para a conversão inicial feita pelo Go. Áudio e transcrição não são enviados a um serviço de ASR remoto. O processamento desta instalação usa CPU. Em dois áudios reais preservados, o modelo `small` gerou texto mais coerente em um caso e desempenho semelhante ao `base` no outro; sem uma transcrição de referência, isso não prova fidelidade à fala.
 
-O `doctor` confere os arquivos e executáveis sem abrir o modelo; a prova de fala reconhecida exige um teste de transcrição. Se o checkpoint ou ambiente for movido, atualize os caminhos privados e reinicie o serviço. Para instalar novamente sem PolyClaw, consulte as [instruções oficiais do Whisper](https://github.com/openai/whisper#setup).
+O `doctor` confere os arquivos e executáveis sem abrir o modelo; a prova de fala reconhecida exige uma transcrição real. `model_path` aceita um checkpoint `.pt` não vazio ou diretório CTranslate2 com `model.bin` e `config.json`. Se o modelo ou ambiente for movido, atualize os caminhos privados e reinicie o serviço. Consulte as instruções oficiais de [faster-whisper](https://github.com/SYSTRAN/faster-whisper#installation) e [Whisper](https://github.com/openai/whisper#setup).
 
 ## Backend HTTP opcional
 
