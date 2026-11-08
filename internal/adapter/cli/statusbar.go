@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // StatusBarState holds all the data the status bar displays. It is a pure
@@ -184,7 +185,8 @@ func (sb *StatusBar) renderNormal(width int) string {
 	parts = append(parts, sbLabelStyle.Render("mode:")+sb.renderModeBadge(false))
 
 	if sb.state.Agent != "" {
-		parts = append(parts, sbLabelStyle.Render("agent:")+sbValueStyle.Render(sb.state.Agent))
+		parts = append(parts, sbLabelStyle.Render("agent:")+sbValueStyle.Render(
+			ansi.Truncate(sb.state.Agent, max(12, width/5), "…")))
 	}
 
 	if tok := sb.renderTokensDetailed(); tok != "" {
@@ -216,10 +218,12 @@ func (sb *StatusBar) renderDetailed(width int) string {
 	parts = append(parts, sbLabelStyle.Render("mode:")+sb.renderModeBadge(true))
 
 	if sb.state.Model != "" {
-		parts = append(parts, sbLabelStyle.Render("model:")+sbValueStyle.Render(sb.state.Model))
+		parts = append(parts, sbLabelStyle.Render("model:")+sbValueStyle.Render(
+			ansi.Truncate(sb.state.Model, max(16, width/4), "…")))
 	}
 	if sb.state.Agent != "" {
-		parts = append(parts, sbLabelStyle.Render("agent:")+sbValueStyle.Render(sb.state.Agent))
+		parts = append(parts, sbLabelStyle.Render("agent:")+sbValueStyle.Render(
+			ansi.Truncate(sb.state.Agent, max(12, width/5), "…")))
 	}
 
 	if tok := sb.renderTokensDetailed(); tok != "" {
@@ -357,14 +361,27 @@ func (sb *StatusBar) renderActiveTool() string {
 // ── Layout helpers ──────────────────────────────────────────────────────────
 
 // layoutWithRight places `left` at the start and `right` at the end of the
-// bar, padded with the status-bar background color. If there is no room for
-// the right side it is dropped.
+// bar, padded with the status-bar background color. When both sides do not
+// fit, shorten them so the active tool remains visible without wrapping.
 func (sb *StatusBar) layoutWithRight(left, right string, width int) string {
+	if width <= 0 {
+		return ""
+	}
 	leftLen := visibleRuneLen(left)
 	rightLen := visibleRuneLen(right)
 
-	if right == "" || leftLen+rightLen+2 > width {
+	if right == "" {
 		return sb.padToWidth(left, width)
+	}
+	if leftLen+rightLen+2 > width {
+		rightBudget := min(rightLen, max(12, width/3))
+		if rightBudget >= width {
+			rightBudget = width / 2
+		}
+		left = ansi.Truncate(left, width-rightBudget-1, "…")
+		right = ansi.Truncate(right, rightBudget, "…")
+		leftLen = visibleRuneLen(left)
+		rightLen = visibleRuneLen(right)
 	}
 
 	gap := width - leftLen - rightLen
@@ -377,8 +394,14 @@ func (sb *StatusBar) layoutWithRight(left, right string, width int) string {
 
 // padToWidth pads `content` to `width` visible chars using the bar style.
 func (sb *StatusBar) padToWidth(content string, width int) string {
+	if width <= 0 {
+		return ""
+	}
 	contentLen := visibleRuneLen(content)
-	if contentLen >= width {
+	if contentLen > width {
+		return ansi.Truncate(content, width, "…")
+	}
+	if contentLen == width {
 		return content
 	}
 	padding := sbBarStyle.Render(strings.Repeat(" ", width-contentLen))
@@ -500,24 +523,8 @@ func shortSessionID(id string) string {
 	return id
 }
 
-// visibleRuneLen returns the number of visible runes in s, skipping ANSI SGR
-// escape sequences produced by lipgloss.
+// visibleRuneLen returns the terminal cell width, including wide characters
+// and excluding ANSI escape sequences produced by lipgloss.
 func visibleRuneLen(s string) int {
-	count := 0
-	inEsc := false
-	for _, r := range s {
-		if r == '\x1b' {
-			inEsc = true
-			continue
-		}
-		if inEsc {
-			// ANSI CSI sequences end on a letter in @ - ~.
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
-				inEsc = false
-			}
-			continue
-		}
-		count++
-	}
-	return count
+	return ansi.StringWidth(s)
 }

@@ -12,13 +12,14 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/costa/polypod/internal/adapter"
-	"github.com/costa/polypod/internal/codemap"
 	"github.com/costa/polypod/internal/inputprocessing"
 	"github.com/costa/polypod/internal/mentions"
 	"github.com/costa/polypod/internal/messages"
 	"github.com/costa/polypod/internal/permissions"
+	"github.com/costa/polypod/internal/sliceansi"
 	"github.com/costa/polypod/internal/tool"
 )
 
@@ -538,37 +539,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-
-		headerHeight := 3 // logo + separator + blank
-		inputHeight := 6  // border(1) + textarea(2) + border(1) + status(1) + pad(1)
-		// Rich status bar occupies one extra line when visible.
-		statusHeight := 0
-		if m.statusBar != nil && m.statusBar.IsVisible() {
-			statusHeight = 1
-		}
-		// Token warning banner occupies one extra line when active.
-		warningHeight := 0
-		if m.tokenWarning != nil && m.tokenWarning.Level >= WarningCaution {
-			warningHeight = 1
+		m.width = max(1, msg.Width)
+		m.height = max(1, msg.Height)
+		m.textarea.SetWidth(max(1, m.width-4))
+		if m.height < 14 {
+			m.textarea.SetHeight(1)
+		} else {
+			m.textarea.SetHeight(2)
 		}
 
-		viewportHeight := m.height - headerHeight - inputHeight - statusHeight - warningHeight
-		if viewportHeight < 3 {
-			viewportHeight = 3
-		}
+		viewportHeight := m.viewportHeight()
 
 		if !m.ready {
 			m.viewport = viewport.New(m.width, viewportHeight)
-			m.viewport.SetContent(m.renderMessages())
 			m.ready = true
+			m.viewport.SetContent(m.renderMessages())
 		} else {
+			atBottom := m.viewport.AtBottom()
 			m.viewport.Width = m.width
 			m.viewport.Height = viewportHeight
+			m.viewport.SetContent(m.renderMessages())
+			if atBottom || m.state == stateStreaming {
+				m.viewport.GotoBottom()
+			}
 		}
 
-		m.textarea.SetWidth(m.width - 4) // account for border padding
 		if m.progressLines != nil {
 			m.progressLines.SetWidth(m.width)
 		}
@@ -1102,11 +1097,30 @@ func (m *model) updateViewport() {
 	}
 	// Auto-scroll only if user is already at/near bottom or streaming
 	atBottom := m.viewport.AtBottom() || m.state == stateStreaming
+	m.viewport.Height = m.viewportHeight()
 	content := m.renderMessages()
 	m.viewport.SetContent(content)
 	if atBottom {
 		m.viewport.GotoBottom()
 	}
+}
+
+// viewportHeight measures the visible chrome, including dynamic warning lines.
+func (m model) viewportHeight() int {
+	inputHeight := lipgloss.Height(inputBorderActiveStyle.Width(max(1, m.width-2)).Render(m.textarea.View()))
+	chromeHeight := 2 + 1 + inputHeight // header and the status line above input
+	if m.statusBar != nil && m.statusBar.IsVisible() {
+		chromeHeight++
+	}
+	if m.tokenWarning != nil && m.tokenWarning.Level >= WarningCaution {
+		if FormatWarningBanner(*m.tokenWarning, m.width) != "" {
+			chromeHeight++
+			if m.tokenWarning.Level >= WarningHigh {
+				chromeHeight++
+			}
+		}
+	}
+	return max(1, m.height-chromeHeight)
 }
 
 // ── Render messages ─────────────────────────────────────────────────────────
@@ -1126,12 +1140,11 @@ func (m model) renderMessages() string {
 	for i, entry := range m.messages {
 		switch entry.role {
 		case "user":
-			b.WriteString(userStyle.Render("  > "))
-			b.WriteString(contentStyle.Render(entry.content))
-			b.WriteString("\n\n")
+			writeWrappedMessage(&b, entry.content, userStyle.Render("  > "), "    ", width, contentStyle)
+			b.WriteString("\n")
 
 		case "assistant":
-			rendered := RenderMarkdown(entry.content, width-4)
+			rendered := RenderMarkdown(entry.content, max(1, width-4))
 			// Indent the markdown block
 			for _, line := range strings.Split(rendered, "\n") {
 				b.WriteString("  ")
@@ -1148,19 +1161,12 @@ func (m model) renderMessages() string {
 			b.WriteString("\n")
 
 		case "system":
-			lines := strings.Split(entry.content, "\n")
-			for _, line := range lines {
-				b.WriteString("  ")
-				b.WriteString(line)
-				b.WriteString("\n")
-			}
+			writeWrappedMessage(&b, entry.content, "  ", "  ", width, lipgloss.NewStyle())
 			b.WriteString("\n")
 
 		case "error":
-			b.WriteString("  ")
-			b.WriteString(errorStyle.Render("erro "))
-			b.WriteString(contentStyle.Render(entry.content))
-			b.WriteString("\n\n")
+			writeWrappedMessage(&b, entry.content, "  "+errorStyle.Render("erro "), "       ", width, contentStyle)
+			b.WriteString("\n")
 		}
 
 		// Subtle separator between message pairs
@@ -1191,12 +1197,7 @@ func (m model) renderMessages() string {
 		}
 
 		if m.streaming.Len() > 0 {
-			rendered := m.streaming.String()
-			for _, line := range strings.Split(rendered, "\n") {
-				b.WriteString("  ")
-				b.WriteString(contentStyle.Render(line))
-				b.WriteString("\n")
-			}
+			writeWrappedMessage(&b, m.streaming.String(), "  ", "  ", width, contentStyle)
 		}
 		b.WriteString("  ")
 		b.WriteString(streamingCursorStyle.Render("▍"))
@@ -1206,127 +1207,66 @@ func (m model) renderMessages() string {
 	return b.String()
 }
 
+func writeWrappedMessage(b *strings.Builder, content, firstPrefix, nextPrefix string, width int, style lipgloss.Style) {
+	contentWidth := max(1, width-max(lipgloss.Width(firstPrefix), lipgloss.Width(nextPrefix)))
+	for i, line := range strings.Split(ansi.Wrap(content, contentWidth, ""), "\n") {
+		if i == 0 {
+			b.WriteString(firstPrefix)
+		} else {
+			b.WriteString(nextPrefix)
+		}
+		b.WriteString(style.Render(line))
+		b.WriteByte('\n')
+	}
+}
+
 // ── Welcome screen ──────────────────────────────────────────────────────────
 
 func (m model) renderWelcome() string {
 	var b strings.Builder
+	if m.viewport.Height < 3 {
+		return welcomeTitleStyle.Render("Polypod")
+	}
+	b.WriteString("\n")
+	title := "  Pronto para trabalhar"
+	if m.width < 24 {
+		title = "  Polypod"
+	}
+	b.WriteString(welcomeTitleStyle.Render(title))
+	b.WriteString("\n")
+	if m.viewport.Height < 5 {
+		return b.String()
+	}
 
+	intro := "  Descreva uma tarefa para comecar."
+	if m.width < 38 {
+		intro = "  Digite uma tarefa."
+	}
+	b.WriteString(welcomeSubStyle.Render(intro))
 	b.WriteString("\n")
 
-	logo := `    ____        __                      __
-   / __ \____  / /_  ______  ____  ____/ /
-  / /_/ / __ \/ / / / / __ \/ __ \/ __  /
- / ____/ /_/ / / /_/ / /_/ / /_/ / /_/ /
-/_/    \____/_/\__, / .___/\____/\__,_/
-              /____/_/`
-
-	b.WriteString(welcomeTitleStyle.Render(logo))
-	b.WriteString("\n\n")
-
-	agent := "default"
-	if m.cmdDeps.activeAgent != nil {
-		if a := m.cmdDeps.activeAgent(); a != "" {
-			agent = a
+	if m.viewport.Height >= 8 && m.width >= 28 {
+		b.WriteString("\n")
+		b.WriteString(welcomeHintStyle.Render("  Exemplos:"))
+		b.WriteString("\n")
+		examples := []string{
+			"Explique este projeto",
+			"Encontre e corrija um bug",
+			"/help para ver comandos",
 		}
-	}
-
-	info := welcomeSubStyle.Render(fmt.Sprintf("  agente: %s  |  v%s", agent, version))
-	b.WriteString(info)
-	b.WriteString("\n\n")
-
-	// Hints
-	hints := []struct{ key, desc string }{
-		{"Enter", "enviar mensagem"},
-		{"Tab", "completar comando"},
-		{"Esc", "limpar input"},
-		{"/help", "ver comandos"},
-		{"Ctrl+C", "sair"},
-	}
-
-	b.WriteString(welcomeHintStyle.Render("  atalhos:"))
-	b.WriteString("\n")
-	for _, h := range hints {
-		b.WriteString("    ")
-		b.WriteString(welcomeKeyStyle.Render(h.key))
-		b.WriteString(welcomeDescStyle.Render("  " + h.desc))
-		b.WriteString("\n")
-	}
-
-	// ── Example commands carousel ──
-	// Build a project-aware mix: a few project-specific suggestions
-	// (when we can detect the dominant language) plus a balanced
-	// random selection from the canonical list. This keeps the
-	// welcome screen feeling fresh between launches.
-	exs := buildWelcomeExamples(m.detectProjectType())
-	if len(exs) > 0 {
-		b.WriteString("\n")
-		// Indent the formatted block to match the rest of the
-		// welcome screen.
-		formatted := FormatExamples(exs)
-		for _, line := range strings.Split(strings.TrimRight(formatted, "\n"), "\n") {
-			b.WriteString("  ")
-			b.WriteString(line)
+		count := 1
+		if m.viewport.Height >= 10 && m.width >= 34 {
+			count = len(examples)
+		}
+		for _, example := range examples[:count] {
+			b.WriteString("    ")
+			b.WriteString(welcomeKeyStyle.Render("> "))
+			b.WriteString(welcomeDescStyle.Render(example))
 			b.WriteString("\n")
 		}
 	}
 
-	b.WriteString("\n")
-	b.WriteString(welcomeHintStyle.Render("  Digite qualquer coisa para comecar..."))
-	b.WriteString("\n")
-
 	return b.String()
-}
-
-// detectProjectType returns the lowercase identifier of the dominant
-// language in the current working directory, or "" when project
-// detection fails. The result is suitable for ExamplesForProject.
-//
-// We deliberately swallow errors here: the welcome screen must never
-// fail to render because of a project-detection issue.
-func (m model) detectProjectType() string {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return ""
-	}
-	idx, err := codemap.IndexProject(cwd)
-	if err != nil || idx == nil {
-		return ""
-	}
-	return strings.ToLower(idx.PrimaryLanguage())
-}
-
-// buildWelcomeExamples assembles the list of example commands shown
-// on the welcome screen. It mixes a small number of project-specific
-// suggestions (when projectType is known) with a balanced random
-// selection across the main categories so users discover the breadth
-// of what they can ask for.
-func buildWelcomeExamples(projectType string) []ExampleCommand {
-	out := make([]ExampleCommand, 0, 12)
-	seen := make(map[string]bool)
-
-	add := func(items []ExampleCommand) {
-		for _, e := range items {
-			if seen[e.Description] {
-				continue
-			}
-			seen[e.Description] = true
-			out = append(out, e)
-		}
-	}
-
-	if projectType != "" {
-		add(ExamplesForProject(projectType))
-	}
-
-	// Pull a couple of fresh ideas from each main category so the
-	// final list always has a balanced mix.
-	for _, cat := range []string{"explain", "search", "refactor"} {
-		add(RandomExamples(2, cat))
-	}
-	// Always include the two most useful git shortcuts.
-	add(RandomExamples(2, "git"))
-
-	return out
 }
 
 // ── View ────────────────────────────────────────────────────────────────────
@@ -1374,6 +1314,9 @@ func (m model) View() string {
 		}
 	}
 	header += "  " + headerVersionStyle.Render("v"+version)
+	if lipgloss.Width(header) > m.width {
+		header = sliceansi.Truncate(header, m.width, "…") + ansiReset
+	}
 	b.WriteString(header)
 	b.WriteString("\n")
 	b.WriteString(separatorStyle.Render(strings.Repeat("─", m.width)))
@@ -1384,34 +1327,35 @@ func (m model) View() string {
 	b.WriteString("\n")
 
 	// ── Status line ──
+	var status strings.Builder
 	if m.waitingForUserAnswer {
-		b.WriteString(notifyInfoStyle.Render(" Aguardando sua resposta...  Enter para enviar"))
+		status.WriteString(notifyInfoStyle.Render(" Aguardando sua resposta...  Enter para enviar"))
 	} else if m.notification != "" {
 		switch m.notifyLevel {
 		case "success":
-			b.WriteString(notifySuccessStyle.Render(" " + m.notification))
+			status.WriteString(notifySuccessStyle.Render(" " + m.notification))
 		case "warn":
-			b.WriteString(notifyWarnStyle.Render(" " + m.notification))
+			status.WriteString(notifyWarnStyle.Render(" " + m.notification))
 		case "error":
-			b.WriteString(notifyErrorStyle.Render(" " + m.notification))
+			status.WriteString(notifyErrorStyle.Render(" " + m.notification))
 		default:
-			b.WriteString(notifyInfoStyle.Render(" " + m.notification))
+			status.WriteString(notifyInfoStyle.Render(" " + m.notification))
 		}
 	} else if m.state == stateStreaming {
 		elapsed := time.Since(m.streamStart)
-		b.WriteString(" ")
-		b.WriteString(m.spinner.View())
+		status.WriteString(" ")
+		status.WriteString(m.spinner.View())
 		// Show active tool name or "thinking" in the status line
 		activeToolName := m.activeToolName()
 		if activeToolName != "" {
-			b.WriteString(streamingDimStyle.Render(fmt.Sprintf(" %s %s", activeToolName, formatDuration(elapsed))))
+			status.WriteString(streamingDimStyle.Render(fmt.Sprintf(" %s %s", activeToolName, formatDuration(elapsed))))
 		} else {
-			b.WriteString(streamingDimStyle.Render(fmt.Sprintf(" pensando... %s", formatDuration(elapsed))))
+			status.WriteString(streamingDimStyle.Render(fmt.Sprintf(" pensando... %s", formatDuration(elapsed))))
 		}
 	} else {
 		// Show tab completion hints or default status
 		if len(m.tabMatches) > 0 && m.tabIndex >= 0 {
-			b.WriteString(statusBarStyle.Render(fmt.Sprintf(" Tab: %s (%d/%d)",
+			status.WriteString(statusBarStyle.Render(fmt.Sprintf(" Tab: %s (%d/%d)",
 				m.tabMatches[m.tabIndex], m.tabIndex+1, len(m.tabMatches))))
 		} else {
 			// Multi-line indicator: when the current input spans more
@@ -1422,12 +1366,18 @@ func (m model) View() string {
 				if IsInUnfinishedCodeBlock(m.textarea.Value()) {
 					hint = fmt.Sprintf(" [%d linhas | bloco ``` aberto | Alt+Enter=quebra]", lines)
 				}
-				b.WriteString(statusBarStyle.Render(hint))
+				status.WriteString(statusBarStyle.Render(hint))
 			} else {
-				b.WriteString(statusBarStyle.Render(" Enter enviar  Tab completar  /help comandos  Ctrl+C sair"))
+				hint := " Enter enviar  Tab completar  /help comandos  Ctrl+C sair"
+				if m.width < 62 {
+					hint = " Enter enviar  /help comandos"
+				}
+				status.WriteString(statusBarStyle.Render(hint))
 			}
 		}
 	}
+	b.WriteString(sliceansi.Truncate(status.String(), m.width, "…"))
+	b.WriteString(ansiReset)
 	b.WriteString("\n")
 
 	// ── Token warning banner (above input, when severity is high) ──
@@ -1452,7 +1402,7 @@ func (m model) View() string {
 	if m.waitingForUserAnswer {
 		borderStyle = inputBorderQuestionStyle
 	}
-	bordered := borderStyle.Width(m.width - 2).Render(inputContent)
+	bordered := borderStyle.Width(max(1, m.width-2)).Render(inputContent)
 	b.WriteString(bordered)
 
 	// ── Rich status bar (last line of the screen) ──
