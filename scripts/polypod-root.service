@@ -22,6 +22,10 @@ Environment=POLYPOD_DESKTOP_USER=costa
 Environment=POLYPOD_DESKTOP_HOME=/home/costa
 Environment=YDOTOOL_SOCKET=/run/polypod-input/socket
 Environment=POLYPOD_OCR_LANG=por+eng
+Environment=POLYPOD_RTK_ENABLED=1
+Environment=POLYPOD_RTK_BIN=/usr/local/libexec/polypod-rtk
+Environment=RTK_RECALL=0
+Environment=RTK_TELEMETRY_DISABLED=1
 Environment=PATH=/home/costa/.local/bin:/home/costa/.npm-global/bin:/home/costa/.cargo/bin:/home/costa/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 UMask=0077
 ExecStart=/usr/local/sbin/polypod-root-supervisor

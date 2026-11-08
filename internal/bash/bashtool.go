@@ -45,6 +45,7 @@ type ExecInput struct {
 	Description string // human-readable description of the command
 	WorkingDir  string // override working directory
 	Background  bool   // run in background
+	UseRTK      bool   // request optional RTK compression after permission checks
 
 	// Environment overrides (merged with current env).
 	Env map[string]string
@@ -61,6 +62,7 @@ type ExecOutput struct {
 
 	// OutputTruncated is true if the output exceeded MaxOutputBytes.
 	OutputTruncated bool
+	RTKApplied      bool
 
 	// BackgroundTaskID is set when the command was backgrounded.
 	BackgroundTaskID string
@@ -265,11 +267,26 @@ func (bt *BashTool) Execute(ctx context.Context, input ExecInput) (*ExecOutput, 
 	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(execCtx, bt.shell, "-c", command)
+	commandToRun := command
+	execEnv := input.Env
+	rtkApplied := false
+	if input.UseRTK {
+		if rewritten, ok := bt.rewriteWithRTK(execCtx, command, workDir, input.Env); ok {
+			commandToRun = rewritten
+			rtkApplied = true
+			execEnv = make(map[string]string, len(input.Env)+1)
+			for key, value := range input.Env {
+				execEnv[key] = value
+			}
+			execEnv["RTK_RECALL"] = "0"
+		}
+	}
+
+	cmd := exec.CommandContext(execCtx, bt.shell, "-c", commandToRun)
 	cmd.Dir = workDir
 
 	// Set up environment
-	cmd.Env = bt.buildEnv(input.Env)
+	cmd.Env = bt.buildEnv(execEnv)
 
 	// Set process group for clean termination
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -309,9 +326,10 @@ func (bt *BashTool) Execute(ctx context.Context, input ExecInput) (*ExecOutput, 
 
 	// Build result
 	output := &ExecOutput{
-		Stdout:   stdoutBuf.String(),
-		Stderr:   stderrBuf.String(),
-		Duration: duration,
+		Stdout:     stdoutBuf.String(),
+		Stderr:     stderrBuf.String(),
+		Duration:   duration,
+		RTKApplied: rtkApplied,
 	}
 
 	// Check if output was truncated

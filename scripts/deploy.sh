@@ -22,6 +22,9 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 expected_root='/home/costa/Área de trabalho/CLI/polypod'
 [[ "$repo_root" == "$expected_root" ]] || fail "a unidade systemd espera o checkout em $expected_root"
 [[ -f "$repo_root/config.yaml" ]] || fail "config.yaml não encontrado em $repo_root"
+rtk_source=${POLYPOD_RTK_SOURCE:-/home/costa/.local/bin/rtk}
+[[ "$rtk_source" == /* ]] || fail 'POLYPOD_RTK_SOURCE deve ser um caminho absoluto'
+[[ -x "$rtk_source" ]] || fail "RTK não encontrado em $rtk_source"
 cd -- "$repo_root"
 [[ -x /usr/bin/tmux ]] || fail '/usr/bin/tmux não está disponível'
 [[ "$(uname -s)" == Linux ]] || fail 'este serviço requer Linux'
@@ -64,15 +67,18 @@ fi
 sudo install -d -m 0755 /usr/local/libexec /usr/local/sbin
 sudo install -d -m 0700 /var/backups/polypod
 backup_dir=$(sudo mktemp -d "/var/backups/polypod/deploy-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
+rtk_hash=$(sha256sum "$rtk_source")
+rtk_hash=${rtk_hash%% *}
 
 targets=(
     /usr/local/libexec/polypod-root
+    /usr/local/libexec/polypod-rtk
     /usr/local/sbin/polypod-root-supervisor
     /usr/local/sbin/polypod-root-session
     /etc/systemd/system/polypod-root.service
 )
-names=(binary supervisor session unit)
-modes=(0755 0755 0755 0644)
+names=(binary rtk supervisor session unit)
+modes=(0755 0755 0755 0755 0644)
 was_active=0
 was_enabled=0
 if sudo systemctl is-active --quiet polypod-root.service; then was_active=1; fi
@@ -87,16 +93,18 @@ for i in "${!targets[@]}"; do
 done
 
 rollback() {
+    local restore_path
     printf 'A verificação falhou; restaurando artefatos de %s...\n' "$backup_dir" >&2
     sudo systemctl stop polypod-root.service || true
-    sudo rm -f -- /usr/local/libexec/polypod-root.new || true
+    sudo rm -f -- /usr/local/libexec/polypod-root.new /usr/local/libexec/polypod-rtk.new || true
     for i in "${!targets[@]}"; do
         if sudo test -e "$backup_dir/${names[$i]}"; then
-            if [[ "${names[$i]}" == binary ]]; then
-                if sudo install -m 0755 "$backup_dir/binary" /usr/local/libexec/polypod-root.restore; then
-                    sudo mv -f /usr/local/libexec/polypod-root.restore "${targets[$i]}" || true
+            if [[ "${names[$i]}" == binary || "${names[$i]}" == rtk ]]; then
+                restore_path="${targets[$i]}.restore"
+                if sudo install -m 0755 "$backup_dir/${names[$i]}" "$restore_path"; then
+                    sudo mv -f "$restore_path" "${targets[$i]}" || true
                 else
-                    printf 'Falha ao preparar a restauração do binário; backup em %s\n' "$backup_dir" >&2
+                    printf 'Falha ao preparar a restauração de %s; backup em %s\n' "${names[$i]}" "$backup_dir" >&2
                 fi
             else
                 sudo install -m "${modes[$i]}" "$backup_dir/${names[$i]}" "${targets[$i]}" || true
@@ -166,8 +174,17 @@ printf 'Instalando unidade, lançadores e binário; backup em %s...\n' "$backup_
 deploy_step sudo install -m 0755 "$repo_root/scripts/polypod-root-supervisor" /usr/local/sbin/polypod-root-supervisor
 deploy_step sudo install -m 0755 "$repo_root/scripts/polypod-root-session" /usr/local/sbin/polypod-root-session
 deploy_step sudo install -m 0644 "$repo_root/scripts/polypod-root.service" /etc/systemd/system/polypod-root.service
+deploy_step sudo install -o root -g root -m 0755 "$rtk_source" /usr/local/libexec/polypod-rtk.new
+deploy_step sudo mv -f /usr/local/libexec/polypod-rtk.new /usr/local/libexec/polypod-rtk
 deploy_step sudo install -m 0755 "$build_dir/polypod-root" /usr/local/libexec/polypod-root.new
 deploy_step sudo mv -f /usr/local/libexec/polypod-root.new /usr/local/libexec/polypod-root
+
+installed_rtk_hash=$(sudo sha256sum /usr/local/libexec/polypod-rtk)
+installed_rtk_hash=${installed_rtk_hash%% *}
+if [[ "$installed_rtk_hash" != "$rtk_hash" ]]; then
+    rollback
+    fail "hash do RTK instalado diverge da origem; backup preservado em $backup_dir"
+fi
 
 expected_hash=$(sha256sum "$build_dir/polypod-root")
 expected_hash=${expected_hash%% *}

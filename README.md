@@ -99,6 +99,8 @@ how to connect a private OpenAI-compatible inference server without changing
 the existing WhatsApp and scheduler configuration.
 The [continuous operations guide](docs/integrations/continuous-operations.md)
 explains scheduled routines, inbox recovery and automatic memory.
+The [RTK guide](docs/integrations/rtk.md) explains optional compression of
+shell command output before it reaches the model.
 The [skill catalog](docs/integrations/skill-catalog.md) and
 [skill evolution cycle](docs/integrations/skill-evolution.md) cover discovery,
 import, evidence, review and application.

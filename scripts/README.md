@@ -42,6 +42,12 @@ artefatos anteriores e tenta reativar o serviço. O backup fica preservado para
 inspeção. O script não copia nem substitui `config.yaml`, `.env`, os dados SQLite
 ou outros arquivos de estado.
 
+O deploy também instala uma cópia do RTK de `~/.local/bin/rtk` em
+`/usr/local/libexec/polypod-rtk`, pertencente a `root`, e compara o hash antes de
+ativar a unidade. `POLYPOD_RTK_SOURCE` permite escolher outro executável de
+origem. A integração compacta apenas saídas elegíveis da ferramenta `bash` e
+desativa o recall integral. Veja [o guia do RTK](../docs/integrations/rtk.md).
+
 Para conferir a execução depois da atualização:
 
 ```bash

@@ -102,6 +102,10 @@ func RegisterBashTool(reg *Registry, workingDir string) {
 						"type":        "string",
 						"description": "Clear, concise description of what this command does",
 					},
+					"raw_output": map[string]any{
+						"type":        "boolean",
+						"description": "Skip optional RTK output compression and return the command's normal output",
+					},
 				},
 				"required": []string{"command"},
 			}
@@ -162,6 +166,7 @@ func RegisterBashTool(reg *Registry, workingDir string) {
 			cmd, _ := args["command"].(string)
 			cmd = strings.TrimSpace(cmd)
 			desc, _ := args["description"].(string)
+			rawOutput, _ := args["raw_output"].(bool)
 
 			timeoutMs := 0
 			if t, ok := args["timeout"].(float64); ok {
@@ -269,6 +274,7 @@ func RegisterBashTool(reg *Registry, workingDir string) {
 				Description: desc,
 				WorkingDir:  wd,
 				Env:         sanitizedEnv,
+				UseRTK:      !rawOutput && bash.RTKEnabled(),
 			}
 
 			result, err := bt.Execute(ctx.Context, input)
@@ -293,6 +299,7 @@ func RegisterBashTool(reg *Registry, workingDir string) {
 				"elapsed", elapsed,
 				"truncated", result.OutputTruncated,
 				"timed_out", result.TimedOut,
+				"rtk_applied", result.RTKApplied,
 			)
 
 			return formatBashResult(result), nil
