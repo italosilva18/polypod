@@ -392,7 +392,7 @@ func parseArgs() (configPath string, runSetup bool, headlessPrompt string, headl
 	}
 
 	if headlessPrompt == "" && !runSetup {
-		if _, err := os.Stat(defaultConfigPath); os.IsNotExist(err) {
+		if _, err := os.Stat(configPath); os.IsNotExist(err) {
 			runSetup = true
 		}
 	}
