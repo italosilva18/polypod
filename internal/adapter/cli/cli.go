@@ -189,7 +189,9 @@ func (a *Adapter) Start(ctx context.Context, handler adapter.MessageHandler) err
 		}
 	}
 
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	// Keep mouse reporting disabled so the terminal can select and copy text.
+	// The conversation remains scrollable with PgUp and PgDown.
+	p := tea.NewProgram(m, tea.WithAltScreen())
 
 	// Cancel program when context is done
 	go func() {
