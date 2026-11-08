@@ -251,9 +251,10 @@ type chatEntry struct {
 func newModel(ctx context.Context, streamHandler adapter.StreamHandler, deps commandDeps, dataDir string, userPrompt *tool.UserPromptHandler, approvalHandler *BubbleteaApprovalHandler, fileIndex *mentions.FileIndex) model {
 	ta := textarea.New()
 	ta.Placeholder = "Mensagem..."
+	ta.Prompt = ""
 	ta.Focus()
 	ta.CharLimit = 4096
-	ta.SetHeight(2)
+	ta.SetHeight(1)
 	ta.ShowLineNumbers = false
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 	ta.FocusedStyle.Base = lipgloss.NewStyle()
@@ -535,6 +536,33 @@ func isMentionBoundary(b byte) bool {
 // ── Update ──────────────────────────────────────────────────────────────────
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	_, isKey := msg.(tea.KeyMsg)
+	_, isWindowSize := msg.(tea.WindowSizeMsg)
+	if !isKey && !isWindowSize {
+		return m.update(msg)
+	}
+	preExpanded := m.ready && isKey &&
+		m.currentApproval == nil && m.configForm == nil && m.historySearch == nil &&
+		m.quickOpen == nil && m.modelPicker == nil &&
+		(m.state == stateIdle || m.waitingForUserAnswer)
+	if preExpanded {
+		// Give the textarea room before it handles the key. Otherwise its
+		// private viewport scrolls first and keeps the draft's top hidden
+		// even after the composer grows.
+		m.textarea.SetHeight(m.maxComposerHeight())
+	}
+	next, cmd := m.update(msg)
+	updated, ok := next.(model)
+	if !ok {
+		return next, cmd
+	}
+	if preExpanded || isWindowSize {
+		updated.resizeComposer()
+	}
+	return updated, cmd
+}
+
+func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
@@ -542,11 +570,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = max(1, msg.Width)
 		m.height = max(1, msg.Height)
 		m.textarea.SetWidth(max(1, m.width-4))
-		if m.height < 14 {
-			m.textarea.SetHeight(1)
-		} else {
-			m.textarea.SetHeight(2)
-		}
 
 		viewportHeight := m.viewportHeight()
 
@@ -1105,9 +1128,57 @@ func (m *model) updateViewport() {
 	}
 }
 
+// resizeComposer keeps the entire draft visible while there is room to grow.
+// The conversation retains a small viewport when the draft fills the terminal.
+func (m *model) resizeComposer() {
+	if m.width <= 0 || m.height <= 0 {
+		return
+	}
+	wanted := min(m.inputVisualRows(), m.maxComposerHeight())
+	if wanted == m.textarea.Height() {
+		return
+	}
+	m.textarea.SetHeight(wanted)
+	m.updateViewport()
+}
+
+// inputVisualRows counts explicit newlines and lines wrapped at the usable
+// textarea width. One spare cell accounts for its trailing cursor space.
+func (m model) inputVisualRows() int {
+	textWidth := max(1, m.textarea.Width())
+	rows := 0
+	for _, line := range strings.Split(m.textarea.Value(), "\n") {
+		wrapped := ansi.Wrap(line, textWidth, "")
+		rows += 1 + strings.Count(wrapped, "\n")
+		lastRow := wrapped[strings.LastIndexByte(wrapped, '\n')+1:]
+		if line != "" && lipgloss.Width(lastRow) >= textWidth-1 {
+			// Bubbles reserves one trailing cursor cell. At the width
+			// boundary it creates a final visual row for that cell.
+			rows++
+		}
+	}
+	return max(1, rows)
+}
+
+func (m model) maxComposerHeight() int {
+	chromeHeight := 2 + 1 + 2 // header, hint line and input border
+	if m.statusBar != nil && m.statusBar.IsVisible() {
+		chromeHeight++
+	}
+	if m.tokenWarning != nil && m.tokenWarning.Level >= WarningCaution {
+		if FormatWarningBanner(*m.tokenWarning, m.width) != "" {
+			chromeHeight++
+			if m.tokenWarning.Level >= WarningHigh {
+				chromeHeight++
+			}
+		}
+	}
+	return max(1, m.height-chromeHeight-3)
+}
+
 // viewportHeight measures the visible chrome, including dynamic warning lines.
 func (m model) viewportHeight() int {
-	inputHeight := lipgloss.Height(inputBorderActiveStyle.Width(max(1, m.width-2)).Render(m.textarea.View()))
+	inputHeight := m.textarea.Height() + 2
 	chromeHeight := 2 + 1 + inputHeight // header and the status line above input
 	if m.statusBar != nil && m.statusBar.IsVisible() {
 		chromeHeight++
@@ -1358,13 +1429,15 @@ func (m model) View() string {
 			status.WriteString(statusBarStyle.Render(fmt.Sprintf(" Tab: %s (%d/%d)",
 				m.tabMatches[m.tabIndex], m.tabIndex+1, len(m.tabMatches))))
 		} else {
-			// Multi-line indicator: when the current input spans more
-			// than one line, show a hint explaining the submit/newline
-			// key bindings. Otherwise show the default status line.
-			if lines := CountLines(m.textarea.Value()); lines > 1 {
-				hint := fmt.Sprintf(" [%d linhas | Alt+Enter=quebra | Enter=enviar]", lines)
+			// Count wrapped rows as well as explicit newlines so the user
+			// can tell when a draft exceeds the space available on screen.
+			if rows := m.inputVisualRows(); rows > m.textarea.Height() {
+				hint := fmt.Sprintf(" Entrada: %d linhas, %d visiveis | setas para navegar", rows, m.textarea.Height())
+				status.WriteString(statusBarStyle.Render(hint))
+			} else if rows > 1 {
+				hint := fmt.Sprintf(" [%d linhas | Alt+Enter=quebra | Enter=enviar]", rows)
 				if IsInUnfinishedCodeBlock(m.textarea.Value()) {
-					hint = fmt.Sprintf(" [%d linhas | bloco ``` aberto | Alt+Enter=quebra]", lines)
+					hint = fmt.Sprintf(" [%d linhas | bloco ``` aberto | Alt+Enter=quebra]", rows)
 				}
 				status.WriteString(statusBarStyle.Render(hint))
 			} else {
