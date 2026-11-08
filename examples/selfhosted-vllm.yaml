@@ -1,0 +1,20 @@
+# Example for a model served by vLLM on infrastructure you control.
+# Set the three POLYPOD_SELFHOSTED_* variables before running this profile.
+# For the existing WhatsApp/systemd service, update its private config.yaml
+# instead of replacing it with this minimal example.
+ai:
+  provider: selfhosted
+  base_url: "${POLYPOD_SELFHOSTED_BASE_URL:}"
+  api_key: "${POLYPOD_SELFHOSTED_API_KEY:}"
+  model: "${POLYPOD_SELFHOSTED_MODEL:}"
+  max_tokens: 4096
+  max_tool_iterations: 100
+  temperature: 0.3
+  tools: true
+  fallback_provider: ""
+  fallback_base_url: ""
+  fallback_api_key: ""
+  fallback_model: ""
+
+cli:
+  enabled: true

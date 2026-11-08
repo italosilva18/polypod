@@ -94,6 +94,9 @@ documents the Piper-based OGG/Opus path for WhatsApp voice notes, and
 [WhatsApp outbound media](docs/integrations/whatsapp-outbound-media.md) covers file delivery.
 The [managed browser](docs/integrations/browser-managed.md) explains the
 isolated profile and desktop handoff.
+The [self-hosted model guide](docs/integrations/self-hosted-model.md) explains
+how to connect a private OpenAI-compatible inference server without changing
+the existing WhatsApp and scheduler configuration.
 The [continuous operations guide](docs/integrations/continuous-operations.md)
 explains scheduled routines, inbox recovery and automatic memory.
 The [skill catalog](docs/integrations/skill-catalog.md) and
