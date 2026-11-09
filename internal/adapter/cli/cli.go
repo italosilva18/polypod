@@ -25,7 +25,9 @@ import (
 	"github.com/costa/polypod/internal/modes"
 	"github.com/costa/polypod/internal/permissions"
 	"github.com/costa/polypod/internal/session"
+	"github.com/costa/polypod/internal/sessionmem"
 	"github.com/costa/polypod/internal/skill"
+	"github.com/costa/polypod/internal/tasks"
 	"github.com/costa/polypod/internal/tool"
 	"github.com/costa/polypod/internal/tracking"
 	"github.com/costa/polypod/internal/turncheckpoint"
@@ -64,6 +66,18 @@ type Adapter struct {
 	commandRegistry   *command.Registry
 	turnCheckpoint    *turncheckpoint.Manager
 	activeSessionID   string
+	taskRegistry      *tasks.TaskRegistry
+	sessionMemory     *sessionmem.FileStore
+}
+
+// SetTaskRegistry connects live background-task notices to the CLI.
+func (a *Adapter) SetTaskRegistry(registry *tasks.TaskRegistry) {
+	a.taskRegistry = registry
+}
+
+// SetSessionMemory retains concise facts across compaction for each session.
+func (a *Adapter) SetSessionMemory(store *sessionmem.FileStore) {
+	a.sessionMemory = store
 }
 
 // SetTurnCheckpointManager enables file-aware conversation rewind.
@@ -96,6 +110,7 @@ func (a *Adapter) saveActiveSession(sess *conversation.Session) error {
 			Metadata:  session.SessionMetadata{Tag: "cli", Mode: "interactive"},
 		}
 	}
+	persisted.Metadata = a.currentSessionMetadata(persisted.Metadata)
 	persisted.Messages = make([]session.Message, len(sess.Messages))
 	for i, msg := range sess.Messages {
 		persisted.Messages[i] = session.Message{ID: msg.ID, Role: string(msg.Role), Content: msg.Content, Timestamp: msg.Timestamp}
@@ -226,6 +241,11 @@ func (a *Adapter) Start(ctx context.Context, handler adapter.MessageHandler) err
 	}
 
 	m := newModel(ctx, sh, deps, a.dataDir, a.userPromptHandler, a.approvalHandler, a.fileIndex)
+	if a.taskRegistry != nil {
+		taskCtx, cancelTasks := context.WithCancel(ctx)
+		defer cancelTasks()
+		m.taskEvents = a.taskRegistry.Subscribe(taskCtx)
+	}
 
 	// Inject restored messages into the display
 	if len(a.restoredMessages) > 0 {
@@ -260,7 +280,19 @@ func (a *Adapter) Send(ctx context.Context, msg adapter.OutMessage) error {
 
 // buildCommandDeps creates the closure-based command deps from real implementations.
 func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
-	deps := commandDeps{commandRegistry: a.commandRegistry}
+	deps := commandDeps{commandRegistry: a.commandRegistry, activeSessionID: a.ActiveSessionID}
+	if a.convMgr != nil && a.sessStorage != nil {
+		controller := newPersistentBranchController(a.dataDir, a.sessStorage, a.convMgr,
+			a.ActiveSessionID, a.SetActiveSessionID, a.saveActiveSession)
+		controller.activate = a.restoreSessionMetadata
+		if a.sessionMemory != nil {
+			controller.forkMemory = a.sessionMemory.Fork
+			controller.deleteMemory = a.sessionMemory.Delete
+		}
+		deps.bindBranches = func(state *cliSessionState) error {
+			return state.BindBranches(controller.callbacks())
+		}
+	}
 
 	if a.aiSvc != nil {
 		deps.activeAgent = a.aiSvc.ActiveAgent
@@ -369,6 +401,11 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 				return nil, 0, 0, err
 			}
 			compacted := compact.BuildResultMessages(result)
+			if a.sessionMemory != nil {
+				if _, err := a.sessionMemory.CaptureCompaction(a.ActiveSessionID(), history, compacted); err != nil {
+					a.logger.Warn("session memory capture failed", "error", err)
+				}
+			}
 			if err := a.convMgr.ReplaceMessages(ctx, sess, compacted); err != nil {
 				return nil, 0, 0, err
 			}
@@ -389,26 +426,21 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 
 	if a.mcpMgr != nil {
 		deps.listMCPServers = func() []mcpServerInfo {
-			raw := a.mcpMgr.ListServers()
+			raw := a.mcpMgr.ListConfiguredServers()
 			out := make([]mcpServerInfo, 0, len(raw))
-			for name, toolNames := range raw {
+			for _, server := range raw {
 				out = append(out, mcpServerInfo{
-					name:      name,
-					transport: "stdio", // manager does not currently expose transport per server
-					connected: true,    // Manager.ListServers only returns connected sessions
-					toolCount: len(toolNames),
-					tools:     toolNames,
+					name:      server.Name,
+					transport: server.Transport,
+					connected: server.Connected,
+					toolCount: len(server.Tools),
+					tools:     server.Tools,
 				})
 			}
 			return out
 		}
 		deps.reconnectMCP = func(name string) error {
-			// Best-effort: disconnect + reconnect. A full reconnect would
-			// need the original ServerConfig which Manager does not store.
-			if err := a.mcpMgr.Disconnect(name); err != nil {
-				return err
-			}
-			return fmt.Errorf("reconexao automatica nao implementada — reinicie o polypod para reconectar %q", name)
+			return a.mcpMgr.Reconnect(ctx, name)
 		}
 	}
 
@@ -494,6 +526,12 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 				if sessErr != nil {
 					return nil, fmt.Errorf("abrindo sessao retomada: %w", sessErr)
 				}
+				if restored.ID == a.activeSessionID {
+					return toBranchEntries(sess.Messages), nil
+				}
+				if err := a.saveActiveSession(sess); err != nil {
+					return nil, fmt.Errorf("salvando sessao anterior: %w", err)
+				}
 				conv := make([]conversation.Message, 0, len(restored.Messages))
 				for _, m := range restored.Messages {
 					role := conversation.RoleUser
@@ -513,6 +551,9 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 				if err := a.convMgr.ReplaceMessages(context.Background(), sess, conv); err != nil {
 					return nil, fmt.Errorf("restaurando mensagens da sessao: %w", err)
 				}
+			}
+			for _, warning := range a.restoreSessionMetadata(restored.Metadata) {
+				entries = append(entries, chatEntry{role: "system", content: warning, timestamp: time.Now()})
 			}
 			a.activeSessionID = restored.ID
 			return entries, nil

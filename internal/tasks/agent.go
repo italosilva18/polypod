@@ -106,7 +106,7 @@ type LocalAgentState struct {
 
 // AgentRunFunc runs an agent loop and reports progress without coupling tasks
 // to a particular model provider or subagent implementation.
-type AgentRunFunc func(context.Context, string, string, func(AgentProgress)) (string, error)
+type AgentRunFunc func(context.Context, string, string, *AgentCheckpoint, func(AgentProgress), func(*AgentCheckpoint) error) (string, error)
 
 // SetAgentRunner connects background agent tasks to the active agent runtime.
 func (r *TaskRegistry) SetAgentRunner(run AgentRunFunc) {
@@ -215,7 +215,7 @@ func RegisterLocalAgent(
 	toolUseID string,
 	logger *slog.Logger,
 ) *TaskState {
-	return registerLocalAgent(registry, agentID, description, prompt, agentType, toolUseID, "", nil, logger)
+	return registerLocalAgent(registry, agentID, description, prompt, agentType, toolUseID, "", nil, nil, logger)
 }
 
 func registerLocalAgent(
@@ -227,6 +227,7 @@ func registerLocalAgent(
 	toolUseID string,
 	outputPath string,
 	cancel context.CancelFunc,
+	checkpoint *AgentCheckpoint,
 	logger *slog.Logger,
 ) *TaskState {
 	state := NewTaskState(TaskTypeAgent, description)
@@ -235,6 +236,7 @@ func registerLocalAgent(
 	state.Status = StatusRunning
 	state.input = prompt
 	state.AgentName = agentType
+	state.Checkpoint = cloneAgentCheckpoint(checkpoint)
 	if outputPath != "" {
 		state.OutputFile = outputPath
 	}
@@ -269,6 +271,18 @@ func SpawnAgentTask(
 	agentType string,
 	logger *slog.Logger,
 ) (*TaskState, error) {
+	return spawnAgentTask(parent, registry, description, prompt, agentType, nil, logger)
+}
+
+func spawnAgentTask(
+	parent context.Context,
+	registry *TaskRegistry,
+	description string,
+	prompt string,
+	agentType string,
+	checkpoint *AgentCheckpoint,
+	logger *slog.Logger,
+) (*TaskState, error) {
 	if registry == nil {
 		return nil, errors.New("task registry is not configured")
 	}
@@ -292,7 +306,7 @@ func SpawnAgentTask(
 		base = context.WithoutCancel(parent)
 	}
 	runCtx, cancel := context.WithCancel(base)
-	state := registerLocalAgent(registry, id, description, prompt, agentType, "", output.Name(), cancel, logger)
+	state := registerLocalAgent(registry, id, description, prompt, agentType, "", output.Name(), cancel, checkpoint, logger)
 
 	go func() {
 		defer cancel()
@@ -319,7 +333,8 @@ func SpawnAgentTask(
 				}
 			}
 		}
-		result, runErr := run(runCtx, agentType, prompt, report)
+		result, runErr := run(runCtx, agentType, prompt, cloneAgentCheckpoint(checkpoint), report,
+			func(next *AgentCheckpoint) error { return registry.SaveAgentCheckpoint(id, next) })
 		if runErr != nil {
 			if _, writeErr := fmt.Fprintf(output, "Erro: %v\n", runErr); writeErr != nil {
 				logger.Warn("writing agent error failed", "task_id", id, "error", writeErr)

@@ -2,7 +2,6 @@ package tool
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/costa/polypod/internal/types"
@@ -17,7 +16,8 @@ func RegisterRemainingTools(reg *Registry) {
 	registerSleepTool(reg)
 	// ask_user_question is now registered by RegisterAskUserTool (askuser.go)
 	registerBriefTool(reg)
-	registerToolSearchTool(reg)
+	RegisterToolSearchTool(reg)
+	RegisterToolOutputTool(reg)
 }
 
 // --- Sleep ---
@@ -60,38 +60,6 @@ func registerBriefTool(reg *Registry) {
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
 			msg, _ := args["message"].(string)
 			return types.ToolResult{Content: msg}, nil
-		},
-	})
-}
-
-// --- ToolSearch ---
-func registerToolSearchTool(reg *Registry) {
-	reg.RegisterDef(types.ToolDef{
-		NameFn:        func() string { return "tool_search" },
-		DescriptionFn: func() string { return "Buscar ferramentas por palavra-chave" },
-		InputSchemaFn: func() map[string]any {
-			return map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"query": map[string]any{"type": "string", "description": "Termo de busca"},
-				},
-				"required": []string{"query"},
-			}
-		},
-		IsReadOnlyFn:    func(map[string]any) bool { return true },
-		IsConcurrencyFn: func(map[string]any) bool { return true },
-		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
-			query := strings.ToLower(args["query"].(string))
-			var matches []string
-			for _, name := range reg.List() {
-				if strings.Contains(strings.ToLower(name), query) {
-					matches = append(matches, name)
-				}
-			}
-			if len(matches) == 0 {
-				return types.ToolResult{Content: "Nenhuma ferramenta encontrada."}, nil
-			}
-			return types.ToolResult{Content: fmt.Sprintf("Ferramentas encontradas: %s", strings.Join(matches, ", "))}, nil
 		},
 	})
 }

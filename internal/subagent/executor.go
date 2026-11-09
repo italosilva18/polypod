@@ -2,6 +2,8 @@ package subagent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -12,6 +14,7 @@ import (
 	"github.com/costa/polypod/internal/agent"
 	"github.com/costa/polypod/internal/ai"
 	"github.com/costa/polypod/internal/project"
+	"github.com/costa/polypod/internal/tasks"
 	"github.com/costa/polypod/internal/tool"
 	"github.com/costa/polypod/internal/types"
 	openai "github.com/sashabaranov/go-openai"
@@ -121,6 +124,19 @@ func (e *SubAgentExecutor) ExecuteWithProgress(
 	query string,
 	report func(ExecutionProgress),
 ) (string, error) {
+	return e.ExecuteWithCheckpoint(ctx, agentName, query, nil, report, nil)
+}
+
+// ExecuteWithCheckpoint resumes a task from a complete model/tool boundary.
+// The save callback must persist each boundary before a tool is executed.
+func (e *SubAgentExecutor) ExecuteWithCheckpoint(
+	ctx context.Context,
+	agentName string,
+	query string,
+	initial *tasks.AgentCheckpoint,
+	report func(ExecutionProgress),
+	save func(*tasks.AgentCheckpoint) error,
+) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -186,36 +202,75 @@ func (e *SubAgentExecutor) ExecuteWithProgress(
 	// Use entry.Content (guaranteed deduplicated/normalised by the cache).
 	systemPrompt = entry.Content
 
-	// 4. Build initial messages.
+	// 4. Build initial messages or restore the last durable boundary.
 	msgs := []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
 		{Role: openai.ChatMessageRoleUser, Content: query},
 	}
+	queryDigest := sha256.Sum256([]byte(query))
+	checkpoint := &tasks.AgentCheckpoint{
+		Version: tasks.AgentCheckpointVersion, AgentName: ag.Name,
+		QuerySHA256: hex.EncodeToString(queryDigest[:]), Phase: "model",
+	}
+	if initial != nil {
+		if err := initial.ValidateResume(); err != nil {
+			return "", fmt.Errorf("checkpoint invalido: %w", err)
+		}
+		if initial.AgentName != ag.Name || initial.QuerySHA256 != checkpoint.QuerySHA256 {
+			return "", fmt.Errorf("checkpoint nao corresponde ao agente ou prompt da tarefa")
+		}
+		if err := json.Unmarshal(initial.Messages, &msgs); err != nil {
+			return "", fmt.Errorf("decodificando mensagens do checkpoint: %w", err)
+		}
+		if len(msgs) < 2 || msgs[0].Role != openai.ChatMessageRoleSystem || msgs[1].Role != openai.ChatMessageRoleUser || msgs[1].Content != query {
+			return "", fmt.Errorf("historico do checkpoint nao corresponde ao prompt")
+		}
+		*checkpoint = *initial
+	}
+	saveBoundary := func() error {
+		encoded, err := json.Marshal(msgs)
+		if err != nil {
+			return fmt.Errorf("codificando checkpoint: %w", err)
+		}
+		checkpoint.Messages = encoded
+		if save != nil {
+			if err := save(checkpoint); err != nil {
+				return fmt.Errorf("salvando checkpoint: %w", err)
+			}
+		}
+		return nil
+	}
+	if initial == nil {
+		if err := saveBoundary(); err != nil {
+			return "", err
+		}
+	}
 
-	// 5. Agentic loop.
-	var (
-		totalPromptTokens     int
-		totalCompletionTokens int
-		lastContent           string
-		toolUseCount          int
-	)
-
-	for turn := 0; e.maxTurns < 0 || turn < e.maxTurns; turn++ {
+	// 5. Agentic loop. A tool phase is completed before checking the model-call
+	// limit, matching the result of a model response that requested tools.
+	for {
+		if checkpoint.Phase == "tools" {
+			if err := e.completeCheckpointTools(ctx, ag, allowedNames, &msgs, checkpoint, saveBoundary, report); err != nil {
+				return "", err
+			}
+			continue
+		}
+		turn := checkpoint.Turn
+		if e.maxTurns >= 0 && turn >= e.maxTurns {
+			break
+		}
 		if report != nil {
-			report(ExecutionProgress{Turn: turn + 1, ToolUseCount: toolUseCount,
-				PromptTokens: totalPromptTokens, CompletionTokens: totalCompletionTokens})
+			report(ExecutionProgress{Turn: turn + 1, ToolUseCount: checkpoint.ToolUseCount,
+				PromptTokens: checkpoint.PromptTokens, CompletionTokens: checkpoint.CompletionTokens})
 		}
 		// Check context cancellation.
 		if err := ctx.Err(); err != nil {
 			e.logger.Warn("subagent context cancelled", "agent", ag.Name, "turn", turn, "error", err)
-			if lastContent != "" {
-				return lastContent + "\n\n[subagente interrompido: contexto cancelado]", nil
-			}
 			return "", fmt.Errorf("subagente cancelado: %w", err)
 		}
 
 		// Check token budget.
-		totalTokens := totalPromptTokens + totalCompletionTokens
+		totalTokens := checkpoint.PromptTokens + checkpoint.CompletionTokens
 		if e.tokenBudget > 0 && totalTokens > e.tokenBudget {
 			e.logger.Warn("subagent token budget exceeded",
 				"agent", ag.Name,
@@ -223,8 +278,8 @@ func (e *SubAgentExecutor) ExecuteWithProgress(
 				"total_tokens", totalTokens,
 				"budget", e.tokenBudget,
 			)
-			if lastContent != "" {
-				return lastContent + "\n\n[subagente parou: orcamento de tokens excedido]", nil
+			if checkpoint.LastContent != "" {
+				return checkpoint.LastContent + "\n\n[subagente parou: orcamento de tokens excedido]", nil
 			}
 			return "[subagente parou: orcamento de tokens excedido]", nil
 		}
@@ -253,50 +308,43 @@ func (e *SubAgentExecutor) ExecuteWithProgress(
 		}
 
 		// Track token usage.
-		totalPromptTokens += resp.Usage.PromptTokens
-		totalCompletionTokens += resp.Usage.CompletionTokens
+		checkpoint.PromptTokens += resp.Usage.PromptTokens
+		checkpoint.CompletionTokens += resp.Usage.CompletionTokens
+		checkpoint.Turn++
 		if report != nil {
-			report(ExecutionProgress{Turn: turn + 1, ToolUseCount: toolUseCount,
-				PromptTokens: totalPromptTokens, CompletionTokens: totalCompletionTokens})
+			report(ExecutionProgress{Turn: checkpoint.Turn, ToolUseCount: checkpoint.ToolUseCount,
+				PromptTokens: checkpoint.PromptTokens, CompletionTokens: checkpoint.CompletionTokens})
 		}
 
 		choice := resp.Choices[0]
 
 		// If the model produced text content, capture it.
 		if choice.Message.Content != "" {
-			lastContent = choice.Message.Content
+			checkpoint.LastContent = choice.Message.Content
 		}
 
 		// Check if the model is done (no tool calls).
 		if choice.FinishReason != openai.FinishReasonToolCalls || len(choice.Message.ToolCalls) == 0 {
+			checkpoint.Phase = "done"
+			if err := saveBoundary(); err != nil {
+				return "", err
+			}
 			e.logger.Info("subagent completed",
 				"agent", ag.Name,
 				"turns", turn+1,
-				"prompt_tokens", totalPromptTokens,
-				"completion_tokens", totalCompletionTokens,
+				"prompt_tokens", checkpoint.PromptTokens,
+				"completion_tokens", checkpoint.CompletionTokens,
 				"finish_reason", choice.FinishReason,
 			)
-			return lastContent, nil
+			return checkpoint.LastContent, nil
 		}
 
 		// Append the assistant message with tool calls.
 		msgs = append(msgs, choice.Message)
-
-		// Execute each tool call.
-		for _, tc := range choice.Message.ToolCalls {
-			toolUseCount++
-			if report != nil {
-				report(ExecutionProgress{Turn: turn + 1, ToolUseCount: toolUseCount,
-					PromptTokens: totalPromptTokens, CompletionTokens: totalCompletionTokens,
-					LastTool: tc.Function.Name})
-			}
-			toolResult := e.executeTool(ctx, ag, allowedNames, tc)
-			msgs = append(msgs, openai.ChatCompletionMessage{
-				Role:       openai.ChatMessageRoleTool,
-				Content:    toolResult,
-				Name:       tc.Function.Name,
-				ToolCallID: tc.ID,
-			})
+		checkpoint.Phase = "tools"
+		checkpoint.NextToolIndex = 0
+		if err := saveBoundary(); err != nil {
+			return "", err
 		}
 	}
 
@@ -304,13 +352,82 @@ func (e *SubAgentExecutor) ExecuteWithProgress(
 	e.logger.Warn("subagent reached max turns",
 		"agent", ag.Name,
 		"max_turns", e.maxTurns,
-		"prompt_tokens", totalPromptTokens,
-		"completion_tokens", totalCompletionTokens,
+		"prompt_tokens", checkpoint.PromptTokens,
+		"completion_tokens", checkpoint.CompletionTokens,
 	)
-	if lastContent != "" {
-		return lastContent + "\n\n[subagente parou: limite de turnos atingido]", nil
+	if checkpoint.LastContent != "" {
+		return checkpoint.LastContent + "\n\n[subagente parou: limite de turnos atingido]", nil
 	}
 	return "[subagente parou: limite de turnos atingido]", nil
+}
+
+func (e *SubAgentExecutor) completeCheckpointTools(
+	ctx context.Context,
+	ag *agent.Agent,
+	allowedNames map[string]struct{},
+	messages *[]openai.ChatCompletionMessage,
+	checkpoint *tasks.AgentCheckpoint,
+	saveBoundary func() error,
+	report func(ExecutionProgress),
+) error {
+	if checkpoint.PendingToolCallID != "" {
+		return fmt.Errorf("ferramenta %s teve resultado ambiguo; verificacao manual necessaria", checkpoint.PendingToolCallID)
+	}
+	var calls []openai.ToolCall
+	assistantIndex := -1
+	for i := len(*messages) - 1; i >= 0; i-- {
+		message := (*messages)[i]
+		if message.Role == openai.ChatMessageRoleAssistant && len(message.ToolCalls) > 0 {
+			calls = message.ToolCalls
+			assistantIndex = i
+			break
+		}
+	}
+	if len(calls) == 0 || checkpoint.NextToolIndex > len(calls) {
+		return fmt.Errorf("checkpoint de ferramentas inconsistente")
+	}
+	if len(*messages)-assistantIndex-1 != checkpoint.NextToolIndex {
+		return fmt.Errorf("checkpoint de ferramentas tem resultados incompletos")
+	}
+	for index := 0; index < checkpoint.NextToolIndex; index++ {
+		result := (*messages)[assistantIndex+1+index]
+		if result.Role != openai.ChatMessageRoleTool || result.ToolCallID != calls[index].ID {
+			return fmt.Errorf("checkpoint de ferramenta %d nao corresponde ao resultado salvo", index)
+		}
+	}
+	for index := checkpoint.NextToolIndex; index < len(calls); index++ {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("subagente cancelado antes da ferramenta: %w", err)
+		}
+		call := calls[index]
+		pendingID := call.ID
+		if pendingID == "" {
+			pendingID = fmt.Sprintf("%d:%s", index, call.Function.Name)
+		}
+		checkpoint.PendingToolCallID = pendingID
+		checkpoint.ToolUseCount++
+		if err := saveBoundary(); err != nil {
+			return err
+		}
+		if report != nil {
+			report(ExecutionProgress{Turn: checkpoint.Turn, ToolUseCount: checkpoint.ToolUseCount,
+				PromptTokens: checkpoint.PromptTokens, CompletionTokens: checkpoint.CompletionTokens,
+				LastTool: call.Function.Name})
+		}
+		result := e.executeTool(ctx, ag, allowedNames, call)
+		*messages = append(*messages, openai.ChatCompletionMessage{
+			Role: openai.ChatMessageRoleTool, Content: result,
+			Name: call.Function.Name, ToolCallID: call.ID,
+		})
+		checkpoint.NextToolIndex = index + 1
+		checkpoint.PendingToolCallID = ""
+		if err := saveBoundary(); err != nil {
+			return err
+		}
+	}
+	checkpoint.Phase = "model"
+	checkpoint.NextToolIndex = 0
+	return saveBoundary()
 }
 
 // resolveTools builds the OpenAI tool definitions for the agent's allowed skills.

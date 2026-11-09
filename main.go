@@ -74,6 +74,7 @@ import (
 	"github.com/costa/polypod/internal/security"
 	"github.com/costa/polypod/internal/selfmod"
 	"github.com/costa/polypod/internal/session"
+	"github.com/costa/polypod/internal/sessionmem"
 	"github.com/costa/polypod/internal/setup"
 	"github.com/costa/polypod/internal/skill"
 	"github.com/costa/polypod/internal/sshexec"
@@ -560,11 +561,16 @@ func buildProviderRegistry(cfg *config.Config, multiAuth *auth.MultiProviderAuth
 }
 
 // prepareSessionHistory keeps the persisted session and the next model context aligned.
-func prepareSessionHistory(ctx context.Context, convMgr *conversation.Manager, aiSvc *ai.Service, sess *conversation.Session) ([]conversation.Message, error) {
+func prepareSessionHistory(ctx context.Context, convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionmem.FileStore, scope string, sess *conversation.Session) ([]conversation.Message, error) {
 	history := append([]conversation.Message(nil), convMgr.GetHistory(sess)...)
 	prepared, changed := aiSvc.PrepareHistory(ctx, history)
 	if !changed {
 		return history, nil
+	}
+	if mem != nil && scope != "" {
+		if _, err := mem.CaptureCompaction(scope, history, prepared); err != nil {
+			slog.Warn("session memory capture failed", "error", err, "scope", scope)
+		}
 	}
 	if err := convMgr.ReplaceMessages(ctx, sess, prepared); err != nil {
 		return nil, fmt.Errorf("persisting compacted conversation: %w", err)
@@ -573,13 +579,23 @@ func prepareSessionHistory(ctx context.Context, convMgr *conversation.Manager, a
 }
 
 // makeHandler builds the inline message handler that replaces router.Handler.
-func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service, turns *turncheckpoint.Manager, logger *slog.Logger) adapter.MessageHandler {
+func sessionMemoryScope(msg adapter.InMessage, sess *conversation.Session) string {
+	if msg.Channel == "cli" && msg.Metadata != nil {
+		if id := msg.Metadata["polypod_session_id"]; id != "" {
+			return id
+		}
+	}
+	return sess.ID
+}
+
+func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionmem.FileStore, turns *turncheckpoint.Manager, logger *slog.Logger) adapter.MessageHandler {
 	return func(ctx context.Context, msg adapter.InMessage) (adapter.OutMessage, error) {
 		sess, err := convMgr.GetSession(ctx, msg.Channel, msg.UserID)
 		if err != nil {
 			return adapter.OutMessage{Text: "Erro de sessao"}, err
 		}
-		history, err := prepareSessionHistory(ctx, convMgr, aiSvc, sess)
+		scope := sessionMemoryScope(msg, sess)
+		history, err := prepareSessionHistory(ctx, convMgr, aiSvc, mem, scope, sess)
 		if err != nil {
 			return adapter.OutMessage{Text: "Erro ao preparar o contexto"}, err
 		}
@@ -591,11 +607,12 @@ func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service, turns *turnch
 			}
 		}()
 		resp, err := aiSvc.Answer(turnCtx, ai.AnswerRequest{
-			Channel:         msg.Channel,
-			UserID:          msg.UserID,
-			Query:           msg.Text,
-			History:         history,
-			HistoryPrepared: true,
+			Channel:            msg.Channel,
+			UserID:             msg.UserID,
+			Query:              msg.Text,
+			SessionMemoryScope: scope,
+			History:            history,
+			HistoryPrepared:    true,
 		})
 		if err != nil {
 			return adapter.OutMessage{Text: "Erro ao processar: " + err.Error()}, err
@@ -613,7 +630,7 @@ func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service, turns *turnch
 }
 
 // makeStreamHandler builds the inline stream handler that replaces router.StreamHandler.
-func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, turns *turncheckpoint.Manager, logger *slog.Logger) adapter.StreamHandler {
+func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionmem.FileStore, turns *turncheckpoint.Manager, logger *slog.Logger) adapter.StreamHandler {
 	return func(ctx context.Context, msg adapter.InMessage, chunks chan<- adapter.StreamChunk) {
 		defer close(chunks)
 
@@ -637,7 +654,8 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, turns *
 			chunks <- adapter.StreamChunk{Error: err, Done: true}
 			return
 		}
-		history, err := prepareSessionHistory(ctx, convMgr, aiSvc, sess)
+		scope := sessionMemoryScope(msg, sess)
+		history, err := prepareSessionHistory(ctx, convMgr, aiSvc, mem, scope, sess)
 		if err != nil {
 			chunks <- adapter.StreamChunk{Error: err, Done: true}
 			return
@@ -651,11 +669,12 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, turns *
 		}()
 
 		resp, err := aiSvc.AnswerStream(turnCtx, ai.AnswerRequest{
-			Channel:         msg.Channel,
-			UserID:          msg.UserID,
-			Query:           msg.Text,
-			History:         history,
-			HistoryPrepared: true,
+			Channel:            msg.Channel,
+			UserID:             msg.UserID,
+			Query:              msg.Text,
+			SessionMemoryScope: scope,
+			History:            history,
+			HistoryPrepared:    true,
 		}, func(delta string) {
 			chunks <- adapter.StreamChunk{Delta: delta}
 		})
@@ -672,7 +691,7 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, turns *
 }
 
 // autoSaveSession persists the current CLI conversation to disk on shutdown.
-func autoSaveSession(convMgr *conversation.Manager, sessStorage session.SessionStorage, sessMgr *session.Manager, currentSessionID string, logger *slog.Logger) {
+func autoSaveSession(convMgr *conversation.Manager, sessStorage session.SessionStorage, sessMgr *session.Manager, currentSessionID, agentName, mode string, logger *slog.Logger) {
 	sess, err := convMgr.GetSession(context.Background(), "cli", "local")
 	if err != nil || len(sess.Messages) == 0 {
 		return
@@ -680,6 +699,28 @@ func autoSaveSession(convMgr *conversation.Manager, sessStorage session.SessionS
 
 	now := time.Now()
 	cwd, _ := os.Getwd()
+	createdAt := sess.CreatedAt
+	metadata := session.SessionMetadata{ProjectRoot: cwd, Tag: "cli"}
+	if previous, loadErr := sessStorage.Load(currentSessionID); loadErr != nil {
+		logger.Warn("failed to load existing session metadata", "error", loadErr)
+	} else if previous != nil {
+		metadata = previous.Metadata
+		if !previous.CreatedAt.IsZero() {
+			createdAt = previous.CreatedAt
+		}
+	}
+	if metadata.ProjectRoot == "" {
+		metadata.ProjectRoot = cwd
+	}
+	if metadata.Tag == "" {
+		metadata.Tag = "cli"
+	}
+	if agentName != "" {
+		metadata.AgentName = agentName
+	}
+	if mode != "" {
+		metadata.Mode = mode
+	}
 
 	persistedMsgs := make([]session.Message, len(sess.Messages))
 	for i, m := range sess.Messages {
@@ -692,17 +733,15 @@ func autoSaveSession(convMgr *conversation.Manager, sessStorage session.SessionS
 		ID:        currentSessionID,
 		Title:     title,
 		Messages:  persistedMsgs,
-		CreatedAt: sess.CreatedAt,
+		CreatedAt: createdAt,
 		UpdatedAt: now,
 		Version:   session.CurrentSessionVersion,
-		Metadata: session.SessionMetadata{
-			ProjectRoot: cwd,
-			Tag:         "cli",
-			Mode:        "interactive",
-		},
+		Metadata:  metadata,
 	}
-	if env := session.DetectEnvironment(cwd); env != nil && env.GitBranch != "" {
-		persisted.Metadata.GitBranch = env.GitBranch
+	if persisted.Metadata.GitBranch == "" && filepath.Clean(persisted.Metadata.ProjectRoot) == filepath.Clean(cwd) {
+		if env := session.DetectEnvironment(cwd); env != nil && env.GitBranch != "" {
+			persisted.Metadata.GitBranch = env.GitBranch
+		}
 	}
 
 	if err := sessStorage.Save(persisted); err != nil {
@@ -716,7 +755,7 @@ func autoSaveSession(convMgr *conversation.Manager, sessStorage session.SessionS
 		Channel:   "cli",
 		UserID:    "local",
 		Title:     title,
-		CreatedAt: sess.CreatedAt,
+		CreatedAt: createdAt,
 		UpdatedAt: now,
 		Messages:  len(persistedMsgs),
 	})
@@ -854,8 +893,21 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	if err := agents.LoadDir(cfg.Data.AgentsDir); err != nil {
 		return fmt.Errorf("loading agent definitions: %w", err)
 	}
-	localCatalog := skill.NewLocalCatalog(filepath.Join("third_party", "polyclaw", "skills"),
-		filepath.Join(".polypod", "skills"), skills)
+	// Resolve the checked-in catalog from the config location so a CLI started
+	// in another project still finds the PolyClaw reference skills. Installs
+	// remain local to the current working directory.
+	catalogSource := os.Getenv("POLYPOD_POLYCLAW_CATALOG")
+	if catalogSource == "" {
+		configAbs, absErr := filepath.Abs(configPath)
+		if absErr != nil {
+			return fmt.Errorf("resolving config path for skill catalog: %w", absErr)
+		}
+		if resolved, resolveErr := filepath.EvalSymlinks(configAbs); resolveErr == nil {
+			configAbs = resolved
+		}
+		catalogSource = filepath.Join(filepath.Dir(configAbs), "third_party", "polyclaw", "skills")
+	}
+	localCatalog := skill.NewLocalCatalog(catalogSource, filepath.Join(".polypod", "skills"), skills)
 	tool.RegisterSkillCatalogTools(sys.ToolRegistry, localCatalog)
 	evolutionStore, err := evolution.Open(filepath.Join(cfg.Data.Dir, "evolution.db"),
 		filepath.Join(".polypod", "skills"))
@@ -1315,6 +1367,11 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	aiClient = ai.NewClient(cfg.AI, sys.ToolAdapter)
 	aiSvc := ai.NewService(aiClient, nil, agents, "default", memStore, logger)
 	aiSvc.SetAutoCompact(autoCompactSvc)
+	sessionMemory, err := sessionmem.NewFileStore(cfg.Data.Dir)
+	if err != nil {
+		return fmt.Errorf("opening session memory: %w", err)
+	}
+	aiSvc.SetSessionMemory(sessionMemory)
 
 	// Cost engine
 	costEngine := tracking.NewCostEngine(logger)
@@ -1335,8 +1392,8 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	}
 
 	// Inline handlers (replace router)
-	handler := makeHandler(convMgr, aiSvc, turnCheckpoint, logger)
-	streamHandler := makeStreamHandler(convMgr, aiSvc, turnCheckpoint, logger)
+	handler := makeHandler(convMgr, aiSvc, sessionMemory, turnCheckpoint, logger)
+	streamHandler := makeStreamHandler(convMgr, aiSvc, sessionMemory, turnCheckpoint, logger)
 	// Background routines and one-off tasks share the same operational state.
 	// Serialize their full agent turns while leaving interactive messages free.
 	backgroundAgentGate := make(chan struct{}, 1)
@@ -1911,6 +1968,8 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	cliCh.SetConfig(cfg, configPath)
 	cliCh.SetCommandRegistry(sys.Commands)
 	cliCh.SetTurnCheckpointManager(turnCheckpoint)
+	cliCh.SetTaskRegistry(sys.TaskRegistry)
+	cliCh.SetSessionMemory(sessionMemory)
 	cliCh.SetActiveSessionID(currentSessionID)
 	if bubbleApproval != nil {
 		cliCh.SetApprovalHandler(bubbleApproval)
@@ -1934,7 +1993,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	}
 
 	// Shutdown
-	autoSaveSession(convMgr, sessStorage, sessMgr, cliCh.ActiveSessionID(), logger)
+	autoSaveSession(convMgr, sessStorage, sessMgr, cliCh.ActiveSessionID(), aiSvc.ActiveAgent(), string(modeState.Current), logger)
 
 	hookMgr.Fire(context.Background(), hooks.HookPayload{
 		Event:     hooks.EventSessionEnd,

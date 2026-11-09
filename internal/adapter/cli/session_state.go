@@ -1,10 +1,10 @@
 package cli
 
 import (
+	"errors"
+	"sort"
 	"sync"
 	"time"
-
-	"github.com/costa/polypod/internal/convtree"
 )
 
 // cliSessionState holds runtime state that is local to a CLI session and
@@ -27,23 +27,110 @@ type cliSessionState struct {
 	// AI call should respect this. Mutated by /effort.
 	effort EffortLevel
 
-	// branches holds the named conversation branches managed by
-	// /branch. The "main" branch is created lazily on first use and
-	// is always present. currentBranch points to the active branch
-	// name; the underlying convtree.Tree carries the branch state.
+	// branches holds the named persisted conversations managed by /branch.
+	// The runtime refreshes this metadata from disk on each branch command.
 	branches      map[string]*branchState
 	currentBranch string
+	branchOps     *branchCallbacks
 }
 
-// branchState wraps a convtree.Tree with metadata used by /branch
-// (creation timestamp, parent branch, fork point).
+// branchState identifies one persisted conversation and its fork point.
 type branchState struct {
-	name       string
-	tree       *convtree.Tree
-	createdAt  time.Time
-	parent     string // empty for "main"
-	forkAtMsg  int    // 1-based index of the message in the parent at fork time
-	forkAtNode string // parent node ID where the fork happened
+	name         string
+	createdAt    time.Time
+	parent       string // empty for "main"
+	forkAtMsg    int    // message count in the parent at fork time
+	sessionID    string // persisted transcript selected when this branch is active
+	messageCount int
+}
+
+// branchCallbacks keep the CLI state independent of the transcript store.
+// The adapter supplies implementations that save and restore the actual AI
+// conversation before reporting a successful branch change.
+type branchCallbacks struct {
+	load     func() (branchSnapshot, error)
+	create   func(name string, visible []chatEntry) (branchSnapshot, error)
+	switchTo func(name string, visible []chatEntry) (branchSnapshot, error)
+	delete   func(name string, visible []chatEntry) (branchSnapshot, error)
+}
+
+type branchSnapshot struct {
+	branches map[string]*branchState
+	current  string
+	messages []chatEntry
+}
+
+var errBranchRuntimeUnavailable = errors.New("historico persistente de branches indisponivel")
+
+// BindBranches attaches persistent branch operations and restores branch
+// metadata for the currently selected CLI session.
+func (s *cliSessionState) BindBranches(ops branchCallbacks) error {
+	if ops.load == nil || ops.create == nil || ops.switchTo == nil || ops.delete == nil {
+		return errBranchRuntimeUnavailable
+	}
+	snapshot, err := ops.load()
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.branchOps = &ops
+	s.applyBranchSnapshotLocked(snapshot)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *cliSessionState) branchesBound() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.branchOps != nil
+}
+
+func (s *cliSessionState) applyBranchSnapshotLocked(snapshot branchSnapshot) {
+	s.branches = snapshot.branches
+	s.currentBranch = snapshot.current
+}
+
+func (s *cliSessionState) refreshPersistentBranches() error {
+	s.mu.Lock()
+	ops := s.branchOps
+	s.mu.Unlock()
+	if ops == nil {
+		return errBranchRuntimeUnavailable
+	}
+	snapshot, err := ops.load()
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.applyBranchSnapshotLocked(snapshot)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *cliSessionState) mutatePersistentBranch(action, name string, visible []chatEntry) ([]chatEntry, error) {
+	s.mu.Lock()
+	ops := s.branchOps
+	s.mu.Unlock()
+	if ops == nil {
+		return nil, errBranchRuntimeUnavailable
+	}
+	var snapshot branchSnapshot
+	var err error
+	switch action {
+	case "create":
+		snapshot, err = ops.create(name, visible)
+	case "switch":
+		snapshot, err = ops.switchTo(name, visible)
+	case "delete":
+		snapshot, err = ops.delete(name, visible)
+	}
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	s.applyBranchSnapshotLocked(snapshot)
+	s.mu.Unlock()
+	return snapshot.messages, nil
 }
 
 // newCLISessionState creates an empty session state.
@@ -53,11 +140,9 @@ func newCLISessionState() *cliSessionState {
 		effort:    EffortMedium,
 		branches:  make(map[string]*branchState),
 	}
-	// Bootstrap the "main" branch so /branch always has somewhere to
-	// go even before the user creates anything.
+	// Bootstrap main until the persisted branch runtime is bound.
 	s.branches["main"] = &branchState{
 		name:      "main",
-		tree:      convtree.NewTree(),
 		createdAt: time.Now(),
 	}
 	s.currentBranch = "main"
@@ -87,88 +172,17 @@ func (s *cliSessionState) snapshotBranches() ([]branchState, string) {
 	if main, ok := s.branches["main"]; ok {
 		out = append(out, *main)
 	}
-	// Add the rest in insertion-stable order.
-	for name, b := range s.branches {
-		if name == "main" {
-			continue
+	names := make([]string, 0, len(s.branches))
+	for name := range s.branches {
+		if name != "main" {
+			names = append(names, name)
 		}
-		out = append(out, *b)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		out = append(out, *s.branches[name])
 	}
 	return out, s.currentBranch
-}
-
-// getBranch returns the named branch, or nil if not found.
-func (s *cliSessionState) getBranch(name string) *branchState {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.branches[name]
-}
-
-// createBranch forks a new branch from the current one.
-func (s *cliSessionState) createBranch(name string, currentMsgCount int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if name == "" {
-		return errBranchEmptyName
-	}
-	if _, exists := s.branches[name]; exists {
-		return errBranchExists
-	}
-	parent := s.branches[s.currentBranch]
-	parentNode := ""
-	if parent != nil && parent.tree != nil && parent.tree.Current != nil {
-		parentNode = parent.tree.Current.ID
-	}
-	s.branches[name] = &branchState{
-		name:       name,
-		tree:       convtree.NewTree(),
-		createdAt:  time.Now(),
-		parent:     s.currentBranch,
-		forkAtMsg:  currentMsgCount,
-		forkAtNode: parentNode,
-	}
-	s.currentBranch = name
-	return nil
-}
-
-// switchBranch makes the named branch active.
-func (s *cliSessionState) switchBranch(name string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.branches[name]; !ok {
-		return errBranchNotFound
-	}
-	s.currentBranch = name
-	return nil
-}
-
-// deleteBranch removes a branch (cannot delete main or current).
-func (s *cliSessionState) deleteBranch(name string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if name == "main" {
-		return errBranchProtected
-	}
-	if name == s.currentBranch {
-		return errBranchInUse
-	}
-	if _, ok := s.branches[name]; !ok {
-		return errBranchNotFound
-	}
-	delete(s.branches, name)
-	return nil
-}
-
-// recordBranchMessage adds a message to the current branch's tree so
-// the visual /branch tree reflects the running conversation.
-func (s *cliSessionState) recordBranchMessage(role, content string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	b, ok := s.branches[s.currentBranch]
-	if !ok || b.tree == nil {
-		return
-	}
-	b.tree.AddMessage(role, content)
 }
 
 // recordFileRead marks a file as read in the current context.

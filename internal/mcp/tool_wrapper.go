@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"strings"
 
-	"fmt"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/costa/polypod/internal/types"
@@ -194,6 +194,29 @@ func mcpToolResult(result any) types.ToolResult {
 				texts = append(texts, c.Text)
 			case *mcpsdk.ImageContent:
 				out.Images = append(out.Images, types.ToolImage{MIMEType: c.MIMEType, Base64: base64.StdEncoding.EncodeToString(c.Data)})
+				texts = append(texts, describeMCPBinary("imagem", c.MIMEType, c.Data))
+			case *mcpsdk.AudioContent:
+				texts = append(texts, describeMCPBinary("audio", c.MIMEType, c.Data))
+			case *mcpsdk.ResourceLink:
+				texts = append(texts, describeMCPResourceLink(c))
+			case *mcpsdk.EmbeddedResource:
+				if c.Resource == nil {
+					continue
+				}
+				resource := c.Resource
+				if resource.Text != "" {
+					texts = append(texts, fmt.Sprintf("Recurso MCP %q (%s):\n%s", resource.URI, resource.MIMEType, resource.Text))
+				}
+				if len(resource.Blob) > 0 {
+					if strings.HasPrefix(strings.ToLower(resource.MIMEType), "image/") {
+						out.Images = append(out.Images, types.ToolImage{MIMEType: resource.MIMEType, Base64: base64.StdEncoding.EncodeToString(resource.Blob)})
+						texts = append(texts, fmt.Sprintf("Recurso MCP %q: %s", resource.URI, describeMCPBinary("imagem", resource.MIMEType, resource.Blob)))
+					} else {
+						texts = append(texts, fmt.Sprintf("Recurso MCP %q: %s", resource.URI, describeMCPBinary("recurso", resource.MIMEType, resource.Blob)))
+					}
+				} else if resource.Text == "" {
+					texts = append(texts, fmt.Sprintf("Recurso MCP %q (%s) vazio", resource.URI, resource.MIMEType))
+				}
 			}
 		}
 		if value.StructuredContent != nil {
@@ -207,11 +230,33 @@ func mcpToolResult(result any) types.ToolResult {
 		}
 		out.IsError = value.IsError
 		for _, c := range value.Content {
-			if c.Type == "text" {
+			switch c.Type {
+			case "text":
 				texts = append(texts, c.Text)
-			}
-			if c.Type == "image" {
+			case "image":
 				out.Images = append(out.Images, types.ToolImage{MIMEType: c.MimeType, Base64: c.Data})
+				if data, err := base64.StdEncoding.DecodeString(c.Data); err == nil {
+					texts = append(texts, describeMCPBinary("imagem", c.MimeType, data))
+				}
+			case "audio", "resource":
+				if c.Text != "" {
+					texts = append(texts, fmt.Sprintf("Recurso MCP %q (%s):\n%s", c.URI, c.MimeType, c.Text))
+				}
+				if c.URI != "" && c.Data == "" {
+					if c.Text == "" {
+						texts = append(texts, fmt.Sprintf("Recurso MCP: URI %q (%s)", c.URI, c.MimeType))
+					}
+					continue
+				}
+				if c.Data == "" {
+					continue
+				}
+				data, err := base64.StdEncoding.DecodeString(c.Data)
+				if err != nil {
+					texts = append(texts, fmt.Sprintf("Conteúdo MCP %q inválido: base64 malformado", c.Type))
+					continue
+				}
+				texts = append(texts, describeMCPBinary(c.Type, c.MimeType, data))
 			}
 		}
 	case ToolCallResult:

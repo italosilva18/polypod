@@ -263,9 +263,11 @@ func WireAIClient(sys *Systems, aiClient *ai.Client, logger *slog.Logger) {
 		MaxTurns:    maxTurns,
 		TokenBudget: tokenBudget,
 	})
-	sys.TaskRegistry.SetAgentRunner(func(ctx context.Context, agentName string, query string, report func(tasks.AgentProgress)) (string, error) {
+	sys.TaskRegistry.SetAgentRunner(func(ctx context.Context, agentName string, query string,
+		checkpoint *tasks.AgentCheckpoint, report func(tasks.AgentProgress),
+		save func(*tasks.AgentCheckpoint) error) (string, error) {
 		var recent []tasks.ToolActivity
-		return executor.ExecuteWithProgress(ctx, agentName, query, func(update subagent.ExecutionProgress) {
+		return executor.ExecuteWithCheckpoint(ctx, agentName, query, checkpoint, func(update subagent.ExecutionProgress) {
 			progress := tasks.AgentProgress{
 				ToolUseCount: update.ToolUseCount,
 				TokenCount:   update.PromptTokens + update.CompletionTokens,
@@ -283,7 +285,7 @@ func WireAIClient(sys *Systems, aiClient *ai.Client, logger *slog.Logger) {
 			if report != nil {
 				report(progress)
 			}
-		})
+		}, save)
 	})
 
 	// Replace the placeholder AgentTool with the real one.

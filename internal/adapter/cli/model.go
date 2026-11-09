@@ -20,6 +20,7 @@ import (
 	"github.com/costa/polypod/internal/messages"
 	"github.com/costa/polypod/internal/permissions"
 	"github.com/costa/polypod/internal/sliceansi"
+	"github.com/costa/polypod/internal/tasks"
 	"github.com/costa/polypod/internal/tool"
 )
 
@@ -47,8 +48,18 @@ type notifyMsg struct {
 	level string // "info", "success", "warn", "error"
 }
 
-// clearNotifyMsg clears the notification after timeout.
-type clearNotifyMsg struct{}
+// clearNotifyMsg clears a notification only if it is still the active one.
+type clearNotifyMsg struct{ text string }
+
+// queuedInputMsg starts the next user submission after a stream completes.
+type queuedInputMsg struct{}
+
+type taskEventMsg struct{ event tasks.TaskEvent }
+
+type queuedInput struct {
+	raw    string
+	images []string
+}
 
 // toolEventMsg carries a tool lifecycle event to the Bubbletea update loop.
 type toolEventMsg struct {
@@ -91,14 +102,23 @@ type model struct {
 	spinner  spinner.Model
 	history  *inputHistory
 
-	messages  []chatEntry
-	streaming *strings.Builder
-	streamCh  <-chan streamMsg
-	state     state
+	messages   []chatEntry
+	streaming  *strings.Builder
+	streamCh   <-chan streamMsg
+	state      state
+	queued     []queuedInput
+	activeTurn *retryTurn
+	failedTurn *retryTurn
+	// An ask_user prompt temporarily owns the composer. Preserve any draft that
+	// the user was writing while the current turn streamed.
+	heldDraft      string
+	heldImages     []string
+	heldDraftValid bool
 
 	streamHandler adapter.StreamHandler
 	cmdDeps       commandDeps
 	ctx           context.Context
+	taskEvents    <-chan tasks.TaskEvent
 
 	width  int
 	height int
@@ -253,7 +273,7 @@ func newModel(ctx context.Context, streamHandler adapter.StreamHandler, deps com
 	ta.Placeholder = "Mensagem..."
 	ta.Prompt = ""
 	ta.Focus()
-	ta.CharLimit = 4096
+	ta.CharLimit = 0 // Bubbles uses zero for no character limit.
 	ta.SetHeight(1)
 	ta.ShowLineNumbers = false
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
@@ -341,7 +361,24 @@ func (m model) Init() tea.Cmd {
 	if m.approvalHandler != nil {
 		cmds = append(cmds, waitForApprovalRequest(m.approvalHandler))
 	}
+	if m.taskEvents != nil {
+		cmds = append(cmds, waitForTaskEvent(m.ctx, m.taskEvents))
+	}
 	return tea.Batch(cmds...)
+}
+
+func waitForTaskEvent(ctx context.Context, events <-chan tasks.TaskEvent) tea.Cmd {
+	return func() tea.Msg {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return nil
+			}
+			return taskEventMsg{event: event}
+		case <-ctx.Done():
+			return nil
+		}
+	}
 }
 
 // waitForUserQuestion returns a tea.Cmd that blocks on the handler's
@@ -383,7 +420,7 @@ var slashCommands = []string{
 	"/init", "/init --force",
 	"/commit", "/commit ",
 	"/diff", "/diff --staged", "/diff ",
-	"/compact",
+	"/compact", "/retry",
 	"/doctor",
 	"/mcp", "/mcp list", "/mcp status ", "/mcp tools", "/mcp tools ", "/mcp reconnect ",
 	"/hooks", "/hooks list", "/hooks enable ", "/hooks disable ", "/hooks show ",
@@ -541,10 +578,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if !isKey && !isWindowSize {
 		return m.update(msg)
 	}
+	modalWasOpen := m.currentApproval != nil || m.configForm != nil || m.historySearch != nil ||
+		m.quickOpen != nil || m.modelPicker != nil
 	preExpanded := m.ready && isKey &&
 		m.currentApproval == nil && m.configForm == nil && m.historySearch == nil &&
 		m.quickOpen == nil && m.modelPicker == nil &&
-		(m.state == stateIdle || m.waitingForUserAnswer)
+		(m.state == stateIdle || m.state == stateStreaming || m.waitingForUserAnswer)
 	if preExpanded {
 		// Give the textarea room before it handles the key. Otherwise its
 		// private viewport scrolls first and keeps the draft's top hidden
@@ -558,6 +597,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	if preExpanded || isWindowSize {
 		updated.resizeComposer()
+	}
+	if modalWasOpen {
+		return updated, tea.Batch(cmd, updated.startQueuedCmd())
 	}
 	return updated, cmd
 }
@@ -648,7 +690,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Bracketed-paste bursts arrive as KeyRunes with Paste=true.
 		// Non-bracketed terminals can still deliver large bursts as a
 		// single KeyRunes event with many runes — treat that as a paste.
-		if m.state == stateIdle && msg.Type == tea.KeyRunes &&
+		if (m.state == stateIdle || m.state == stateStreaming) && msg.Type == tea.KeyRunes &&
 			(msg.Paste || len(msg.Runes) >= pasteThreshold) {
 			handled, pcmd := m.handlePasteBurst(string(msg.Runes))
 			if handled {
@@ -661,7 +703,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// textarea without submitting. This gives users a reliable way
 		// to compose multi-line input even when Enter alone would
 		// submit because the surrounding context is "complete".
-		if m.state == stateIdle && !m.waitingForUserAnswer {
+		if (m.state == stateIdle || m.state == stateStreaming) && !m.waitingForUserAnswer {
 			if (msg.Type == tea.KeyEnter && msg.Alt) || msg.Type == tea.KeyCtrlJ {
 				m.resetTab()
 				m.textarea.InsertString("\n")
@@ -705,7 +747,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.openModelPicker()
 			return m, nil
 
-		case msg.Type == tea.KeyTab && m.state == stateIdle:
+		case msg.Type == tea.KeyTab && (m.state == stateIdle || m.state == stateStreaming):
 			if m.tryTabComplete() {
 				return m, nil
 			}
@@ -760,13 +802,38 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.userPromptHandler.AnswerCh <- input
 			}
 			m.textarea.Placeholder = "Mensagem..."
+			if m.heldDraftValid {
+				m.textarea.SetValue(m.heldDraft)
+				m.textarea.CursorEnd()
+				m.pastedImages = m.heldImages
+				m.heldDraft, m.heldImages, m.heldDraftValid = "", nil, false
+			}
 			m.updateViewport()
 			// Re-listen for the next question
 			var nextCmd tea.Cmd
 			if m.userPromptHandler != nil {
 				nextCmd = waitForUserQuestion(m.userPromptHandler)
 			}
-			return m, nextCmd
+			return m, tea.Batch(nextCmd, m.startQueuedCmd())
+
+		case msg.Type == tea.KeyEnter && !msg.Alt && m.state == stateStreaming:
+			m.resetTab()
+			raw := m.textarea.Value()
+			if strings.TrimSpace(raw) == "" {
+				return m, nil
+			}
+			if !ShouldSubmitOnEnter(raw) {
+				m.textarea.InsertString("\n")
+				return m, nil
+			}
+			m.queued = append(m.queued, queuedInput{
+				raw: raw, images: append([]string(nil), m.pastedImages...),
+			})
+			m.pastedImages = nil
+			m.textarea.SetValue("")
+			m.textarea.Reset()
+			m.updateViewport()
+			return m, nil
 
 		case msg.Type == tea.KeyEnter && !msg.Alt && m.state == stateIdle:
 			m.resetTab()
@@ -785,8 +852,12 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.textarea.InsertString("\n")
 				return m, nil
 			}
+			if isRetryCommand(raw) {
+				return m.retryFailedTurn()
+			}
 
 			input := strings.TrimSpace(raw)
+			turnImages := append([]string(nil), m.pastedImages...)
 
 			// Augment the submitted input with any pasted-image
 			// references collected while composing. The reference is
@@ -854,6 +925,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				timestamp: time.Now(),
 			})
 			m.state = stateStreaming
+			m.activeTurn = &retryTurn{raw: raw, images: turnImages}
 			m.streamStart = time.Now()
 			m.streaming.Reset()
 			m.toolEvents = nil // clear tool events for new query
@@ -877,9 +949,11 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamMsg:
 		if msg.err != nil {
 			m.state = stateIdle
+			m.failedTurn = m.activeTurn
+			m.activeTurn = nil
 			m.messages = append(m.messages, chatEntry{
 				role:      "error",
-				content:   msg.err.Error(),
+				content:   msg.err.Error() + retryFailureHint(msg.err),
 				timestamp: time.Now(),
 			})
 			m.streaming.Reset()
@@ -890,7 +964,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshStatusBar()
 			m.refreshTokenWarning()
 			m.updateViewport()
-			return m, nil
+			return m, m.startQueuedCmd()
 		}
 		// Handle tool event carried by streamMsg
 		if msg.toolEvent != nil {
@@ -914,6 +988,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.done {
 			elapsed := time.Since(m.streamStart)
 			m.state = stateIdle
+			m.activeTurn = nil
 			content := m.streaming.String()
 			if content != "" {
 				m.messages = append(m.messages, chatEntry{
@@ -934,7 +1009,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshStatusBar()
 			m.refreshTokenWarning()
 			m.updateViewport()
-			return m, nil
+			return m, m.startQueuedCmd()
 		}
 		// Delta token
 		m.streaming.WriteString(msg.delta)
@@ -995,6 +1070,14 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case userQuestionMsg:
 		// The AI's ask_user tool sent a question — display it and switch to answer mode
 		q := msg.question
+		if !m.waitingForUserAnswer && (m.textarea.Value() != "" || len(m.pastedImages) > 0) {
+			m.heldDraft = m.textarea.Value()
+			m.heldImages = append([]string(nil), m.pastedImages...)
+			m.heldDraftValid = true
+			m.textarea.SetValue("")
+			m.textarea.Reset()
+			m.pastedImages = nil
+		}
 		m.waitingForUserAnswer = true
 		m.pendingQuestion = &q
 
@@ -1040,9 +1123,43 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nextCmd
 
 	case clearNotifyMsg:
-		m.notification = ""
-		m.notifyLevel = ""
+		if msg.text == m.notification {
+			m.notification = ""
+			m.notifyLevel = ""
+		}
 		return m, nil
+
+	case notifyMsg:
+		m.notification = msg.text
+		m.notifyLevel = msg.level
+		return m, clearNotifyAfter(6*time.Second, m.notification)
+
+	case taskEventMsg:
+		state := msg.event.State
+		level := "warn"
+		verb := "interrompida"
+		switch state.Status {
+		case tasks.StatusCompleted:
+			level, verb = "success", "concluída"
+		case tasks.StatusFailed:
+			level, verb = "error", "falhou"
+		}
+		message := fmt.Sprintf("Tarefa %s %s: %s", state.ID, verb, state.Description)
+		if state.Status == tasks.StatusFailed && state.Error != "" {
+			message += fmt.Sprintf(" (%s)", state.Error)
+		}
+		m.messages = append(m.messages, chatEntry{
+			role:      "system",
+			content:   message + "\nDetalhes: /task-status " + state.ID,
+			timestamp: time.Now(),
+		})
+		m.notification = message
+		m.notifyLevel = level
+		m.updateViewport()
+		return m, tea.Batch(waitForTaskEvent(m.ctx, m.taskEvents), clearNotifyAfter(6*time.Second, m.notification))
+
+	case queuedInputMsg:
+		return m.startQueuedInput()
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -1050,9 +1167,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	// Update textarea when idle or waiting for user answer, but never
+	// Update textarea while composing, including during streaming, but never
 	// while a modal approval is taking keyboard focus.
-	if m.currentApproval == nil && (m.state == stateIdle || m.waitingForUserAnswer) {
+	if m.currentApproval == nil && (m.state == stateIdle || m.state == stateStreaming || m.waitingForUserAnswer) {
 		var cmd tea.Cmd
 		m.textarea, cmd = m.textarea.Update(msg)
 		cmds = append(cmds, cmd)
@@ -1061,10 +1178,51 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
+// startQueuedCmd schedules a queued submission when the current turn is idle.
+// It leaves the actual submission to Update so the usual command and stream
+// handling stays in one place.
+func (m model) startQueuedCmd() tea.Cmd {
+	if m.state != stateIdle || m.waitingForUserAnswer || len(m.queued) == 0 ||
+		m.currentApproval != nil || m.configForm != nil || m.historySearch != nil ||
+		m.quickOpen != nil || m.modelPicker != nil {
+		return nil
+	}
+	return func() tea.Msg { return queuedInputMsg{} }
+}
+
+func (m model) startQueuedInput() (tea.Model, tea.Cmd) {
+	if m.startQueuedCmd() == nil {
+		return m, nil
+	}
+
+	item := m.queued[0]
+	m.queued = m.queued[1:]
+	draft := m.textarea.Value()
+	draftImages := append([]string(nil), m.pastedImages...)
+	m.textarea.SetValue(item.raw)
+	m.pastedImages = item.images
+
+	// Reuse the normal Enter path for local commands, history and AI turns.
+	next, cmd := m.update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, ok := next.(model)
+	if !ok {
+		return next, cmd
+	}
+	updated.textarea.SetValue(draft)
+	updated.textarea.CursorEnd()
+	updated.pastedImages = draftImages
+	updated.resizeComposer()
+	return updated, tea.Batch(cmd, updated.startQueuedCmd())
+}
+
 // ── Stream launch ───────────────────────────────────────────────────────────
 
 func (m *model) launchStream(input string) <-chan streamMsg {
 	ch := make(chan streamMsg, 64)
+	metadata := map[string]string{}
+	if m.cmdDeps.activeSessionID != nil {
+		metadata["polypod_session_id"] = m.cmdDeps.activeSessionID()
+	}
 
 	go func() {
 		defer close(ch)
@@ -1076,6 +1234,7 @@ func (m *model) launchStream(input string) <-chan streamMsg {
 			UserName:  "local",
 			Text:      input,
 			Timestamp: time.Now(),
+			Metadata:  metadata,
 		}
 
 		chunks := make(chan adapter.StreamChunk, 64)
@@ -1448,6 +1607,9 @@ func (m model) View() string {
 				status.WriteString(statusBarStyle.Render(hint))
 			}
 		}
+	}
+	if len(m.queued) > 0 {
+		status.WriteString(statusBarStyle.Render(fmt.Sprintf("  fila: %d", len(m.queued))))
 	}
 	b.WriteString(sliceansi.Truncate(status.String(), m.width, "…"))
 	b.WriteString(ansiReset)
@@ -1902,7 +2064,7 @@ func (m *model) handlePasteBurst(content string) (bool, tea.Cmd) {
 			m.notification = fmt.Sprintf("falha ao salvar imagem: %v", err)
 			m.notifyLevel = "error"
 			m.textarea.InsertString(content)
-			return true, clearNotifyAfter(3 * time.Second)
+			return true, clearNotifyAfter(3*time.Second, m.notification)
 		}
 		base := path
 		if i := strings.LastIndex(path, "/"); i >= 0 {
@@ -1912,7 +2074,7 @@ func (m *model) handlePasteBurst(content string) (bool, tea.Cmd) {
 		m.textarea.InsertString(fmt.Sprintf("[image: %s inserida]", base))
 		m.notification = fmt.Sprintf("imagem salva: %s", path)
 		m.notifyLevel = "success"
-		return true, clearNotifyAfter(4 * time.Second)
+		return true, clearNotifyAfter(4*time.Second, m.notification)
 
 	case PasteCode, PasteJSON, PasteFilePath, PasteURL:
 		formatted := FormatPaste(content, pasteType)
@@ -1920,7 +2082,7 @@ func (m *model) handlePasteBurst(content string) (bool, tea.Cmd) {
 		m.notification = fmt.Sprintf("colado: %s (%d caracteres)",
 			pasteType.String(), len(content))
 		m.notifyLevel = "info"
-		return true, clearNotifyAfter(2500 * time.Millisecond)
+		return true, clearNotifyAfter(2500*time.Millisecond, m.notification)
 
 	default:
 		// Plain text: just insert as-is. Note the notification so the
@@ -1930,7 +2092,7 @@ func (m *model) handlePasteBurst(content string) (bool, tea.Cmd) {
 		if len(content) >= pasteThreshold {
 			m.notification = fmt.Sprintf("colado: texto (%d caracteres)", len(content))
 			m.notifyLevel = "info"
-			return true, clearNotifyAfter(2 * time.Second)
+			return true, clearNotifyAfter(2*time.Second, m.notification)
 		}
 		return true, nil
 	}
@@ -1938,8 +2100,8 @@ func (m *model) handlePasteBurst(content string) (bool, tea.Cmd) {
 
 // clearNotifyAfter returns a tea.Cmd that emits a clearNotifyMsg after the
 // given delay, used to auto-dismiss paste notifications.
-func clearNotifyAfter(d time.Duration) tea.Cmd {
+func clearNotifyAfter(d time.Duration, notification string) tea.Cmd {
 	return tea.Tick(d, func(time.Time) tea.Msg {
-		return clearNotifyMsg{}
+		return clearNotifyMsg{text: notification}
 	})
 }

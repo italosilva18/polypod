@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 )
 
 // Restart starts a new task with the same input after a prior run has ended.
@@ -21,6 +22,12 @@ func (r *TaskRegistry) Restart(ctx context.Context, id string, logger *slog.Logg
 	input := state.input
 	agentType := state.AgentName
 	attempt := state.Attempt
+	checkpoint := cloneAgentCheckpoint(state.Checkpoint)
+	toolUseCount := -1
+	if state.Progress != nil {
+		toolUseCount = state.Progress.ToolUseCount
+	}
+	failure := state.Error
 	r.mu.RUnlock()
 	if !status.IsTerminal() {
 		return nil, fmt.Errorf("tarefa %s ainda esta em execucao; encerre-a antes de reiniciar", id)
@@ -47,7 +54,18 @@ func (r *TaskRegistry) Restart(ctx context.Context, id string, logger *slog.Logg
 		}
 		return started, nil
 	case TaskTypeAgent:
-		started, err := SpawnAgentTask(ctx, r, description, input, agentType, logger)
+		if status == StatusCompleted {
+			return nil, fmt.Errorf("tarefa %s ja foi concluida; crie uma nova tarefa para repetir o trabalho", id)
+		}
+		if checkpoint == nil && !legacyAgentReplaySafe(status, toolUseCount, failure) {
+			return nil, fmt.Errorf("tarefa %s nao tem checkpoint retomavel; repetir o prompt pode refazer acoes externas. Revise o resultado e crie uma nova tarefa se desejar recomecar", id)
+		}
+		if checkpoint != nil {
+			if err := checkpoint.ValidateResume(); err != nil {
+				return nil, fmt.Errorf("tarefa %s nao pode ser retomada: %w", id, err)
+			}
+		}
+		started, err := spawnAgentTask(ctx, r, description, input, agentType, checkpoint, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -63,4 +81,12 @@ func (r *TaskRegistry) Restart(ctx context.Context, id string, logger *slog.Logg
 	default:
 		return nil, fmt.Errorf("reinicio indisponivel para o tipo %s", taskType)
 	}
+}
+
+func legacyAgentReplaySafe(status TaskStatus, toolUseCount int, failure string) bool {
+	if status != StatusFailed || toolUseCount != 0 {
+		return false
+	}
+	return strings.HasPrefix(failure, "subagent AI call failed (turn 0)") ||
+		strings.HasPrefix(failure, "subagent received empty response (turn 0)")
 }

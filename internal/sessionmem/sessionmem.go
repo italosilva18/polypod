@@ -1,7 +1,5 @@
-// Package sessionmem provides session-scoped memory that persists across
-// compactions but not across sessions.
-//
-// Ported from TypeScript: services/SessionMemory/
+// Package sessionmem keeps small, scoped facts from a conversation across
+// context compaction and process restarts.
 package sessionmem
 
 import (
@@ -22,10 +20,11 @@ type Entry struct {
 	Category   string    `json:"category"` // "context", "decision", or "learning"
 	CreatedAt  time.Time `json:"created_at"`
 	TurnNumber int       `json:"turn_number"`
+	SourceID   string    `json:"source_id,omitempty"`
 }
 
 // SessionMemory is an ordered, thread-safe collection of session memory entries.
-// It survives context-window compactions but is discarded when the session ends.
+// A FileStore can persist its entries across restarts of the same session.
 type SessionMemory struct {
 	mu      sync.RWMutex
 	entries []Entry

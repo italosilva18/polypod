@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const taskStateVersion = 1
+const taskStateVersion = 2
 
 type persistentTask struct {
 	TaskState
@@ -201,7 +201,9 @@ func readTaskSnapshot(path string) (persistentTaskFile, time.Time, error) {
 	if err := json.Unmarshal(raw, &stored); err != nil {
 		return stored, time.Time{}, fmt.Errorf("parsing task state %s: %w", path, err)
 	}
-	if stored.Version != taskStateVersion {
+	// Version 1 had no subagent checkpoint. Its tasks remain readable; restart
+	// applies the conservative legacy fallback in restart.go.
+	if stored.Version != 1 && stored.Version != taskStateVersion {
 		return stored, time.Time{}, fmt.Errorf("unsupported task state version in %s: %d", path, stored.Version)
 	}
 	stamp := stored.SavedAt

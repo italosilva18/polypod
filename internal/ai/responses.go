@@ -15,14 +15,10 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 	for _, msg := range messages {
 		req.Messages = append(req.Messages, providerapi.Message{Role: msg.Role, Content: msg.Content, Parts: msg.Parts})
 	}
+	var catalog *toolCatalog
 	if c.toolsOn && c.skills != nil {
-		for _, tool := range c.skills.ToolDefinitions(c.skillNamesFor(ctx)) {
-			if tool.Function != nil {
-				req.Tools = append(req.Tools, providerapi.Tool{
-					Name: tool.Function.Name, Description: tool.Function.Description, Parameters: responseToolParameters(tool.Function.Parameters),
-				})
-			}
-		}
+		catalog = c.catalogFor(ctx)
+		req.Tools = catalog.providerDefinitions()
 	}
 
 	var totalPrompt, totalCompletion int
@@ -81,7 +77,7 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 				started := time.Now()
 				richResult, execErr := executeSkillResult(ctx, c.skills, tc.Name, tc.Arguments)
 				result := richResult.Content
-				observations = append(observations, ToolCallResult{ID: tc.ID, Name: tc.Name, Images: richResult.Images, IsError: richResult.IsError || execErr != nil})
+				observations = append(observations, ToolCallResult{ID: tc.ID, Name: tc.Name, Content: result, Images: richResult.Images, IsError: richResult.IsError || execErr != nil})
 				if execErr != nil {
 					result = fmt.Sprintf("Erro executando tool: %v", execErr)
 				}
@@ -91,6 +87,10 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 		}
 		if c.responseProvider.SupportsVision() {
 			req.Messages = append(req.Messages, imageObservations(observations)...)
+		}
+		if catalog != nil {
+			catalog.observe(observations)
+			req.Tools = catalog.providerDefinitions()
 		}
 		if callback != nil {
 			callback("\n")

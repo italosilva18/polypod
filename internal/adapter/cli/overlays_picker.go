@@ -81,7 +81,7 @@ func (m model) handleQuickOpenKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.notification = fmt.Sprintf("inserido: @%s", picked)
 		m.notifyLevel = "success"
 		m.updateViewport()
-		return m, clearNotifyAfter(2 * time.Second)
+		return m, clearNotifyAfter(2*time.Second, m.notification)
 	}
 }
 
@@ -114,6 +114,6 @@ func (m model) handleModelPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.notification = fmt.Sprintf("modelo trocado: %s", picked)
 		m.notifyLevel = "success"
 		m.updateViewport()
-		return m, clearNotifyAfter(3 * time.Second)
+		return m, clearNotifyAfter(3*time.Second, m.notification)
 	}
 }

@@ -2,6 +2,8 @@
 
 O catálogo original de oito skills está em `third_party/polyclaw/skills/`, com licença MIT em `third_party/polyclaw/LICENSE`. É uma cópia de referência da árvore local do PolyClaw; não é executada diretamente. Sete adaptações ativas ficam em `.polypod/skills/` e passam pelo registro de ferramentas e permissões do Polypod.
 
+O catálogo é localizado a partir da pasta do `config.yaml`, mesmo quando o CLI é iniciado em outro projeto. Para usar uma cópia em outro local, defina `POLYPOD_POLYCLAW_CATALOG` com o caminho da pasta `skills`. As skills instaladas continuam sendo gravadas em `.polypod/skills/` do diretório de trabalho atual.
+
 | Skill original | Estado no Polypod |
 | --- | --- |
 | `agent-browser` | Adaptada como `polyclaw_browser`, usando `browser_manage`, `browser_observe`, `browser_act` e desktop. O perfil gerenciado é separado do Chrome pessoal. |

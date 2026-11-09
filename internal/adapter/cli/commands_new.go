@@ -201,6 +201,17 @@ func handleBranch(parts []string, deps commandDeps, messages []chatEntry) comman
 			handled: true,
 		}
 	}
+	if !deps.sessionState.branchesBound() {
+		if deps.bindBranches == nil {
+			return commandResult{output: errorStyle.Render("erro: ") + cmdLabelStyle.Render(errBranchRuntimeUnavailable.Error()), handled: true}
+		}
+		if err := deps.bindBranches(deps.sessionState); err != nil {
+			return commandResult{output: errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()), handled: true}
+		}
+	}
+	if err := deps.sessionState.refreshPersistentBranches(); err != nil {
+		return commandResult{output: errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()), handled: true}
+	}
 
 	sub := ""
 	if len(parts) >= 2 {
@@ -229,7 +240,7 @@ func handleBranch(parts []string, deps commandDeps, messages []chatEntry) comman
 				handled: true,
 			}
 		}
-		return handleBranchSwitch(deps, parts[2])
+		return handleBranchSwitch(deps, parts[2], messages)
 	case "delete", "rm":
 		if len(parts) < 3 {
 			return commandResult{
@@ -238,7 +249,7 @@ func handleBranch(parts []string, deps commandDeps, messages []chatEntry) comman
 				handled: true,
 			}
 		}
-		return handleBranchDelete(deps, parts[2])
+		return handleBranchDelete(deps, parts[2], messages)
 	default:
 		return commandResult{
 			output: cmdLabelStyle.Render("uso: ") +
@@ -278,13 +289,7 @@ func handleBranchList(deps commandDeps) commandResult {
 		b.WriteString(cmdValueStyle.Render(br.name))
 
 		// Stats
-		msgCount := 0
-		if br.tree != nil {
-			msgCount = len(br.tree.Nodes) - 1 // exclude root
-			if msgCount < 0 {
-				msgCount = 0
-			}
-		}
+		msgCount := br.messageCount
 		stats := fmt.Sprintf(" (%d messages", msgCount)
 		if isCurrent {
 			stats += ", current"
@@ -315,13 +320,7 @@ func handleBranchTree(deps commandDeps) commandResult {
 	for i, br := range branches {
 		if i == 0 {
 			// main
-			msgCount := 0
-			if br.tree != nil {
-				msgCount = len(br.tree.Nodes) - 1
-				if msgCount < 0 {
-					msgCount = 0
-				}
-			}
+			msgCount := br.messageCount
 			b.WriteString("  ")
 			if br.name == current {
 				b.WriteString(cmdActiveStyle.Render("● "))
@@ -353,13 +352,7 @@ func handleBranchTree(deps commandDeps) commandResult {
 		}
 		b.WriteString(cmdValueStyle.Render(br.name))
 
-		msgCount := 0
-		if br.tree != nil {
-			msgCount = len(br.tree.Nodes) - 1
-			if msgCount < 0 {
-				msgCount = 0
-			}
-		}
+		msgCount := br.messageCount
 		label := fmt.Sprintf(" (%d messages from msg %d", msgCount, br.forkAtMsg)
 		if br.name == current {
 			label += ", current branch"
@@ -374,23 +367,34 @@ func handleBranchTree(deps commandDeps) commandResult {
 
 func handleBranchNew(deps commandDeps, name string, messages []chatEntry) commandResult {
 	name = strings.TrimSpace(name)
-	if err := deps.sessionState.createBranch(name, len(messages)); err != nil {
+	active, err := deps.sessionState.mutatePersistentBranch("create", name, messages)
+	if err != nil {
 		return commandResult{
 			output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()),
 			handled: true,
 		}
 	}
+	forkAt := 0
+	branches, current := deps.sessionState.snapshotBranches()
+	for _, branch := range branches {
+		if branch.name == current {
+			forkAt = branch.forkAtMsg
+			break
+		}
+	}
 	return commandResult{
 		output: notifySuccessStyle.Render("branch criada: ") +
 			cmdValueStyle.Render(name) +
-			cmdLabelStyle.Render(fmt.Sprintf(" (fork de msg %d)", len(messages))),
-		handled: true,
+			cmdLabelStyle.Render(fmt.Sprintf(" (fork de msg %d)", forkAt)),
+		replaceMessages: active,
+		handled:         true,
 	}
 }
 
-func handleBranchSwitch(deps commandDeps, name string) commandResult {
+func handleBranchSwitch(deps commandDeps, name string, messages []chatEntry) commandResult {
 	name = strings.TrimSpace(name)
-	if err := deps.sessionState.switchBranch(name); err != nil {
+	active, err := deps.sessionState.mutatePersistentBranch("switch", name, messages)
+	if err != nil {
 		return commandResult{
 			output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()),
 			handled: true,
@@ -399,13 +403,14 @@ func handleBranchSwitch(deps commandDeps, name string) commandResult {
 	return commandResult{
 		output: notifySuccessStyle.Render("branch ativa: ") +
 			cmdValueStyle.Render(name),
-		handled: true,
+		replaceMessages: active,
+		handled:         true,
 	}
 }
 
-func handleBranchDelete(deps commandDeps, name string) commandResult {
+func handleBranchDelete(deps commandDeps, name string, messages []chatEntry) commandResult {
 	name = strings.TrimSpace(name)
-	if err := deps.sessionState.deleteBranch(name); err != nil {
+	if _, err := deps.sessionState.mutatePersistentBranch("delete", name, messages); err != nil {
 		return commandResult{
 			output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()),
 			handled: true,

@@ -122,24 +122,25 @@ type TaskHandle struct {
 
 // TaskState holds the common fields for all task states.
 type TaskState struct {
-	ID           string         `json:"id"`
-	Type         TaskType       `json:"type"`
-	Status       TaskStatus     `json:"status"`
-	Description  string         `json:"description"`
-	ToolUseID    string         `json:"tool_use_id,omitempty"`
-	StartTime    time.Time      `json:"start_time"`
-	EndTime      *time.Time     `json:"end_time,omitempty"`
-	OutputFile   string         `json:"output_file"`
-	OutputOffset int            `json:"output_offset"`
-	Notified     bool           `json:"notified"`
-	AgentName    string         `json:"agent_name,omitempty"`
-	Progress     *AgentProgress `json:"progress,omitempty"`
-	Result       string         `json:"result,omitempty"`
-	Error        string         `json:"error,omitempty"`
-	ExitCode     *int           `json:"exit_code,omitempty"`
-	ProcessID    int            `json:"process_id,omitempty"`
-	Attempt      int            `json:"attempt,omitempty"`
-	RestartOf    string         `json:"restart_of,omitempty"`
+	ID           string           `json:"id"`
+	Type         TaskType         `json:"type"`
+	Status       TaskStatus       `json:"status"`
+	Description  string           `json:"description"`
+	ToolUseID    string           `json:"tool_use_id,omitempty"`
+	StartTime    time.Time        `json:"start_time"`
+	EndTime      *time.Time       `json:"end_time,omitempty"`
+	OutputFile   string           `json:"output_file"`
+	OutputOffset int              `json:"output_offset"`
+	Notified     bool             `json:"notified"`
+	AgentName    string           `json:"agent_name,omitempty"`
+	Progress     *AgentProgress   `json:"progress,omitempty"`
+	Checkpoint   *AgentCheckpoint `json:"checkpoint,omitempty"`
+	Result       string           `json:"result,omitempty"`
+	Error        string           `json:"error,omitempty"`
+	ExitCode     *int             `json:"exit_code,omitempty"`
+	ProcessID    int              `json:"process_id,omitempty"`
+	Attempt      int              `json:"attempt,omitempty"`
+	RestartOf    string           `json:"restart_of,omitempty"`
 	// Input is written only to the private task state file for explicit restarts.
 	input string
 }
@@ -183,13 +184,16 @@ type TaskRegistry struct {
 	persistErr  error
 	recoveryErr error
 	lockFile    *os.File
+	// subscribers is guarded by mu; each subscriber owns an independent queue.
+	subscribers map[*taskSubscriber]struct{}
 }
 
 // NewTaskRegistry creates a new task registry.
 func NewTaskRegistry() *TaskRegistry {
 	return &TaskRegistry{
-		tasks:   make(map[string]*TaskState),
-		killers: make(map[TaskType]TaskKiller),
+		tasks:       make(map[string]*TaskState),
+		killers:     make(map[TaskType]TaskKiller),
+		subscribers: make(map[*taskSubscriber]struct{}),
 	}
 }
 
@@ -206,6 +210,9 @@ func (r *TaskRegistry) Register(state *TaskState) {
 	defer r.mu.Unlock()
 	r.tasks[state.ID] = state
 	r.persistLocked()
+	if state.Status.IsTerminal() {
+		r.publishTerminalLocked(state)
+	}
 }
 
 func snapshotTaskState(state *TaskState) *TaskState {
@@ -223,6 +230,7 @@ func snapshotTaskState(state *TaskState) *TaskState {
 		progress.RecentActivities = append([]ToolActivity(nil), progress.RecentActivities...)
 		snapshot.Progress = &progress
 	}
+	snapshot.Checkpoint = cloneAgentCheckpoint(state.Checkpoint)
 	return &snapshot
 }
 
@@ -245,8 +253,12 @@ func (r *TaskRegistry) Update(id string, fn func(*TaskState)) bool {
 	if !ok {
 		return false
 	}
+	previousStatus := t.Status
 	fn(t)
 	r.persistLocked()
+	if t.Status.IsTerminal() && t.Status != previousStatus {
+		r.publishTerminalLocked(t)
+	}
 	return true
 }
 

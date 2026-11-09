@@ -103,6 +103,8 @@ The [continuous operations guide](docs/integrations/continuous-operations.md)
 explains scheduled routines, inbox recovery and automatic memory.
 The [agent runtime guide](docs/integrations/agent-runtime.md) covers background
 tasks, interactive terminals, file-triggered work, rewinding and local options.
+The [Claude Code behavior audit](docs/integrations/claude-code-behavior-audit.md)
+tracks Go rewrites and the remaining gaps without copying reference source.
 The [RTK guide](docs/integrations/rtk.md) explains optional compression of
 shell command output before it reaches the model.
 The [skill catalog](docs/integrations/skill-catalog.md) and

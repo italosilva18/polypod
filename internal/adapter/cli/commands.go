@@ -287,6 +287,7 @@ func helpText() string {
 		{"/review [target]", "code review AI (--staged, ranges, arquivo, --pr)"},
 		{"/security-review [target]", "review focado em seguranca (--staged, --full, arquivo)"},
 		{"/compact", "compacta historico da conversa via AI"},
+		{"/retry", "reenvia a ultima mensagem que falhou"},
 		{"/doctor", "relatorio de diagnostico do sistema"},
 		{"/mcp [sub]", "gerencia servidores MCP (list|status|tools|reconnect)"},
 		{"/hooks [sub]", "gerencia hooks (list|enable|disable|show)"},
@@ -1014,6 +1015,9 @@ type rewindOutcome struct {
 
 // commandDeps holds function callbacks for slash commands.
 type commandDeps struct {
+	// bindBranches connects /branch to persisted transcripts and the active
+	// conversation. The CLI state binds lazily on the first /branch command.
+	bindBranches    func(*cliSessionState) error
 	commandRegistry *command.Registry
 	activeAgent     func() string
 	setAgent        func(name string)
@@ -1023,6 +1027,7 @@ type commandDeps struct {
 	searchMemories  func(query string) ([]memoryEntry, error)
 	clearSession    func() error
 	sessionInfo     func() (string, int, error) // id, count, err
+	activeSessionID func() string
 	listSessions    func(count int) ([]sessionEntry, error)
 	searchSessions  func(query string) ([]sessionEntry, error)
 	costReport      func() string // returns formatted cost report from CostEngine
@@ -1739,11 +1744,30 @@ func handleResume(deps commandDeps, arg string) commandResult {
 			handled: true,
 		}
 	}
+	var branchErr error
+	if deps.sessionState != nil {
+		if deps.sessionState.branchesBound() {
+			branchErr = deps.sessionState.refreshPersistentBranches()
+		} else if deps.bindBranches != nil {
+			branchErr = deps.bindBranches(deps.sessionState)
+		}
+	}
 
 	var b strings.Builder
+	messageCount := len(entries)
+	if deps.sessionInfo != nil {
+		if _, count, err := deps.sessionInfo(); err == nil {
+			messageCount = count
+		}
+	}
 	b.WriteString(notifySuccessStyle.Render("sessao restaurada: "))
 	b.WriteString(cmdValueStyle.Render(shortID(target)))
-	b.WriteString(cmdLabelStyle.Render(fmt.Sprintf(" (%d mensagens)", len(entries))))
+	b.WriteString(cmdLabelStyle.Render(fmt.Sprintf(" (%d mensagens)", messageCount)))
+	if branchErr != nil {
+		b.WriteString("\n")
+		b.WriteString(errorStyle.Render("branches nao sincronizadas: "))
+		b.WriteString(cmdLabelStyle.Render(branchErr.Error()))
+	}
 
 	return commandResult{
 		output:          b.String(),

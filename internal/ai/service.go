@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 
 	"github.com/costa/polypod/internal/agent"
 	"github.com/costa/polypod/internal/compact"
 	"github.com/costa/polypod/internal/conversation"
 	"github.com/costa/polypod/internal/memory"
 	"github.com/costa/polypod/internal/project"
+	"github.com/costa/polypod/internal/sessionmem"
 )
 
 // KnowledgeSearcher is implemented by the knowledge service.
@@ -19,11 +21,12 @@ type KnowledgeSearcher interface {
 
 // AnswerRequest contains the data needed to generate an answer.
 type AnswerRequest struct {
-	Channel         string
-	UserID          string
-	Query           string
-	History         []conversation.Message
-	HistoryPrepared bool // The caller already checked and persisted auto-compaction.
+	Channel            string
+	UserID             string
+	Query              string
+	History            []conversation.Message
+	HistoryPrepared    bool   // The caller already checked and persisted auto-compaction.
+	SessionMemoryScope string // Internal persisted session or branch ID; never trust remote message metadata.
 }
 
 // AnswerResponse contains the AI response and usage stats.
@@ -41,6 +44,7 @@ type Service struct {
 	agentReg    *agent.Registry
 	agentName   string
 	memStore    memory.Store
+	sessionMem  *sessionmem.FileStore
 	logger      *slog.Logger
 	autoCompact *compact.AutoCompactService
 	onActivity  func()
@@ -111,6 +115,12 @@ func (s *Service) SetAutoCompact(svc *compact.AutoCompactService) {
 	s.autoCompact = svc
 }
 
+// SetSessionMemory enables a short, session-specific context section. The
+// caller provides a trusted scope in AnswerRequest for each turn.
+func (s *Service) SetSessionMemory(store *sessionmem.FileStore) {
+	s.sessionMem = store
+}
+
 // PrepareHistory compacts a session before a new user message is appended. The
 // caller can persist the returned history before sending the next model turn.
 // It also runs at the session snapshot limit so short conversations are not
@@ -176,6 +186,26 @@ func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) ([]ChatM
 		memoryCtxScope = memory.WithSessionScope(ctx, req.Channel+":"+req.UserID)
 	}
 	memoryCtx := memory.AutoInject(memoryCtxScope, s.memStore, req.Query)
+	if s.sessionMem != nil && req.SessionMemoryScope != "" {
+		var visible strings.Builder
+		visible.WriteString(req.Query)
+		for _, message := range req.History {
+			if visible.Len()+len(message.Content) > 64*1024 {
+				break
+			}
+			visible.WriteByte('\n')
+			visible.WriteString(message.Content)
+		}
+		section, err := s.sessionMem.Relevant(req.SessionMemoryScope, req.Query, visible.String(), 1000)
+		if err != nil {
+			s.logger.Warn("session memory unavailable", "error", err)
+		} else if section != "" {
+			if memoryCtx != "" {
+				memoryCtx += "\n\n"
+			}
+			memoryCtx += section
+		}
+	}
 
 	// Build messages using agent persona
 	systemPrompt := BuildSystemPrompt(ag.Persona, knowledgeCtx, memoryCtx)
@@ -219,6 +249,7 @@ func (s *Service) Answer(ctx context.Context, req AnswerRequest) (*AnswerRespons
 	ctx = s.withProjectInstructions(ctx)
 	messages, names := s.buildMessages(ctx, req)
 
+	ctx = withRequestToolSession(ctx, req.Channel, req.UserID, s.agentName)
 	resp, err := s.client.CompleteWithTools(withRequestSkillNames(ctx, names), messages, s.logger)
 	if err != nil {
 		return nil, err
@@ -248,6 +279,7 @@ func (s *Service) AnswerStream(ctx context.Context, req AnswerRequest, callback 
 	ctx = s.withProjectInstructions(ctx)
 	messages, names := s.buildMessages(ctx, req)
 
+	ctx = withRequestToolSession(ctx, req.Channel, req.UserID, s.agentName)
 	resp, err := s.client.CompleteWithToolsStream(withRequestSkillNames(ctx, names), messages, callback, s.logger)
 	if err != nil {
 		return nil, err

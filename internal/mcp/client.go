@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
-	"os/exec"
 	"sync"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -32,6 +30,7 @@ type ServerConfig struct {
 type Manager struct {
 	mu        sync.RWMutex
 	sessions  map[string]*mcpsdk.ClientSession
+	configs   map[string]ServerConfig
 	tools     map[string][]*mcpsdk.Tool
 	resources map[string][]*mcpsdk.Resource
 	prompts   map[string][]*mcpsdk.Prompt
@@ -44,8 +43,12 @@ type Manager struct {
 
 // NewManager creates an MCP manager.
 func NewManager(logger *slog.Logger) *Manager {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	m := &Manager{
 		sessions:  make(map[string]*mcpsdk.ClientSession),
+		configs:   make(map[string]ServerConfig),
 		tools:     make(map[string][]*mcpsdk.Tool),
 		resources: make(map[string][]*mcpsdk.Resource),
 		prompts:   make(map[string][]*mcpsdk.Prompt),
@@ -71,45 +74,29 @@ func NewManager(logger *slog.Logger) *Manager {
 
 // Connect connects to an MCP server using the given config.
 func (m *Manager) Connect(ctx context.Context, cfg ServerConfig) error {
+	if cfg.Name == "" {
+		return fmt.Errorf("mcp: nome do servidor obrigatorio")
+	}
 	m.mu.RLock()
-	_, alreadyConnected := m.sessions[cfg.Name]
+	closed := m.closed
 	m.mu.RUnlock()
-	if alreadyConnected {
-		if err := m.Disconnect(cfg.Name); err != nil {
-			m.logger.Warn("mcp previous session close failed", "server", cfg.Name, "error", err)
-		}
+	if closed {
+		return fmt.Errorf("mcp: manager fechado")
 	}
-	newTransport := func() (mcpsdk.Transport, error) {
-		var transport mcpsdk.Transport
-
-		switch cfg.Transport {
-		case "", "stdio":
-			args := cfg.Args
-			cmd := exec.Command(cfg.Command, args...)
-			if len(cfg.Env) > 0 {
-				cmd.Env = os.Environ()
-				for k, v := range cfg.Env {
-					cmd.Env = append(cmd.Env, k+"="+v)
-				}
-			}
-			transport = &mcpsdk.CommandTransport{Command: cmd}
-		case "sse":
-			transport = &mcpsdk.SSEClientTransport{Endpoint: cfg.URL, HTTPClient: mcpHTTPClient(cfg.Headers)}
-		case "http", "streamable-http":
-			transport = &mcpsdk.StreamableClientTransport{Endpoint: cfg.URL, HTTPClient: mcpHTTPClient(cfg.Headers)}
-		default:
-			return nil, fmt.Errorf("mcp: transport desconhecido %q (use 'stdio', 'sse' ou 'http')", cfg.Transport)
-		}
-
-		return transport, nil
-	}
-	if _, err := newTransport(); err != nil {
+	if _, err := transportForConfig(cfg); err != nil {
 		return err
+	}
+	m.mu.Lock()
+	m.configs[cfg.Name] = cloneServerConfig(cfg)
+	_, alreadyConnected := m.sessions[cfg.Name]
+	m.mu.Unlock()
+	if alreadyConnected {
+		return m.Reconnect(ctx, cfg.Name)
 	}
 
 	var session *mcpsdk.ClientSession
 	err := m.reconnect.Connect(ctx, cfg.Name, func(innerCtx context.Context) error {
-		transport, err := newTransport()
+		transport, err := transportForConfig(cfg)
 		if err != nil {
 			return err
 		}
@@ -332,6 +319,7 @@ func (m *Manager) Close() error {
 		m.removeServerSkillsLocked(name)
 	}
 	m.sessions = make(map[string]*mcpsdk.ClientSession)
+	m.configs = make(map[string]ServerConfig)
 	m.tools = make(map[string][]*mcpsdk.Tool)
 	m.resources = make(map[string][]*mcpsdk.Resource)
 	m.prompts = make(map[string][]*mcpsdk.Prompt)

@@ -30,6 +30,8 @@ type Client struct {
 	skills           SkillRegistry
 	skillNamesMu     sync.RWMutex
 	skillNames       []string
+	toolSelectionMu  sync.Mutex
+	toolSelections   map[toolSessionID]*toolSelection
 	costEngine       *tracking.CostEngine
 	toolEventCB      ToolEventCallback
 	streamingToolMgr *StreamingToolManager
@@ -286,10 +288,8 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 		resp, err := c.completeWithResponseTools(ctx, messages, nil, logger)
 		return resp, err
 	}
-	var tools []openai.Tool
-	if c.toolsOn && c.skills != nil {
-		tools = c.skills.ToolDefinitions(c.skillNamesFor(ctx))
-	}
+	catalog := c.catalogFor(ctx)
+	tools := catalog.definitions()
 	if !c.toolsOn || len(tools) == 0 {
 		return c.Complete(ctx, messages)
 	}
@@ -353,7 +353,7 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 
 			richResult, execErr := executeSkillResult(ctx, c.skills, tc.Function.Name, tc.Function.Arguments)
 			result := richResult.Content
-			observations = append(observations, ToolCallResult{ID: tc.ID, Name: tc.Function.Name, Images: richResult.Images, IsError: richResult.IsError || execErr != nil})
+			observations = append(observations, ToolCallResult{ID: tc.ID, Name: tc.Function.Name, Content: result, Images: richResult.Images, IsError: richResult.IsError || execErr != nil})
 			if execErr != nil {
 				result = fmt.Sprintf("Erro executando tool: %v", execErr)
 			}
@@ -368,6 +368,8 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 		if !c.textOnly {
 			msgs = append(msgs, openAIImageObservations(observations)...)
 		}
+		catalog.observe(observations)
+		tools = catalog.definitions()
 	}
 
 	return nil, fmt.Errorf("tool calling reached ai.max_tool_iterations (%d)", maxIterations)
@@ -380,9 +382,11 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 		resp, err := c.completeWithResponseTools(ctx, messages, callback, logger)
 		return resp, err
 	}
+	var catalog *toolCatalog
 	var tools []openai.Tool
 	if c.toolsOn && c.skills != nil {
-		tools = c.skills.ToolDefinitions(c.skillNamesFor(ctx))
+		catalog = c.catalogFor(ctx)
+		tools = catalog.definitions()
 	}
 
 	msgs := make([]openai.ChatCompletionMessage, len(messages))
@@ -610,7 +614,7 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 
 				richResult, execErr := executeSkillResult(ctx, c.skills, tc.Function.Name, tc.Function.Arguments)
 				result := richResult.Content
-				observations = append(observations, ToolCallResult{ID: tc.ID, Name: tc.Function.Name, Images: richResult.Images, IsError: richResult.IsError || execErr != nil})
+				observations = append(observations, ToolCallResult{ID: tc.ID, Name: tc.Function.Name, Content: result, Images: richResult.Images, IsError: richResult.IsError || execErr != nil})
 
 				toolElapsed := time.Since(toolStart)
 
@@ -656,6 +660,10 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 
 		if !c.textOnly {
 			msgs = append(msgs, openAIImageObservations(observations)...)
+		}
+		if catalog != nil {
+			catalog.observe(observations)
+			tools = catalog.definitions()
 		}
 
 		// Notify callback that tool execution happened (optional separator)

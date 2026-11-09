@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/costa/polypod/internal/tool"
+	"github.com/costa/polypod/internal/tooloutput"
 	"github.com/costa/polypod/internal/types"
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -124,13 +125,10 @@ func (a *ToolRegistryAdapter) ExecuteResultContext(ctx context.Context, name str
 	return result, nil
 }
 
-// truncateToolResult truncates long tool results to 50KB.
+// truncateToolResult keeps a bounded preview while retaining large results
+// for retrieval through the normal tool permission path.
 func truncateToolResult(s string) string {
-	const maxLen = 50 * 1024
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "\n... [saida truncada em 50KB]"
+	return tooloutput.Preview(s)
 }
 
 // Ensure ToolRegistryAdapter implements SkillRegistry

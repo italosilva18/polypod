@@ -291,7 +291,7 @@ func RegisterToolSearchTool(reg *Registry) {
 			}
 
 			result := searchToolRegistry(reg, query, maxResults)
-			payload, err := json.MarshalIndent(result, "", "  ")
+			payload, err := json.Marshal(result)
 			if err != nil {
 				return types.ToolResult{
 					Content: fmt.Sprintf("erro ao serializar resultado: %v", err),
