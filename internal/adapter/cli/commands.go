@@ -28,10 +28,13 @@ type commandResult struct {
 	handled      bool
 	quit         bool
 	clearDisplay bool // limpa m.messages quando true
+	voiceSeconds int  // inicia captura assíncrona de voz no compositor
 	// replaceMessages, when non-nil, replaces m.messages entirely.
 	// Used by /resume to load messages from a persisted session and by
 	// /rewind to drop the last N turns from the display.
 	replaceMessages []chatEntry
+	resumeSessionID string
+	historyBefore   int
 	// openConfigForm asks the host model to display the interactive
 	// /config form overlay. Used by the bare "/config" invocation.
 	openConfigForm bool
@@ -39,6 +42,12 @@ type commandResult struct {
 	// open the interactive model picker overlay. Used by /model so the
 	// command both reports a status and brings up the picker.
 	openModelPicker bool
+}
+
+type sessionLoad struct {
+	entries []chatEntry
+	start   int
+	total   int
 }
 
 // processCommand checks if input is a slash command and executes it locally.
@@ -94,6 +103,23 @@ func processCommand(input string, deps commandDeps, messages []chatEntry) comman
 
 	case "/copy":
 		return handleCopy(messages)
+
+	case "/voice":
+		seconds := 15
+		if len(parts) > 2 {
+			return commandResult{output: "uso: /voice [segundos: 1-120]", handled: true}
+		}
+		if len(parts) == 2 {
+			var err error
+			seconds, err = strconv.Atoi(parts[1])
+			if err != nil || seconds < 1 || seconds > 120 {
+				return commandResult{output: "uso: /voice [segundos: 1-120]", handled: true}
+			}
+		}
+		if deps.captureVoice == nil {
+			return commandResult{output: "Entrada por voz indisponível: configure whatsapp.audio_transcription para usar /voice.", handled: true}
+		}
+		return commandResult{output: fmt.Sprintf("Gravando por %d segundo(s)... O texto aparecerá no campo de mensagem.", seconds), voiceSeconds: seconds, handled: true}
 
 	case "/run":
 		if len(parts) < 2 {
@@ -268,6 +294,7 @@ func helpText() string {
 		{"/model", "mostra agente/modelo atual"},
 		{"/session", "info da sessao"},
 		{"/copy", "copia ultima resposta pro clipboard"},
+		{"/voice [segundos]", "grava e transcreve voz no campo de mensagem"},
 		{"/run <cmd>  ou  !<cmd>", "executa comando shell inline"},
 		{"/file <path>", "mostra conteudo de arquivo"},
 		{"/search <pattern>", "busca texto no projeto (grep)"},
@@ -1015,6 +1042,7 @@ type rewindOutcome struct {
 
 // commandDeps holds function callbacks for slash commands.
 type commandDeps struct {
+	captureVoice func(context.Context, time.Duration) (string, error)
 	// bindBranches connects /branch to persisted transcripts and the active
 	// conversation. The CLI state binds lazily on the first /branch command.
 	bindBranches    func(*cliSessionState) error
@@ -1058,9 +1086,9 @@ type commandDeps struct {
 	// the new display history and estimated token counts.
 	compactHistory func() ([]chatEntry, int, int, error)
 
-	// loadSession loads a persisted session by ID and returns its
-	// messages as chatEntry items in display order. Used by /resume.
-	loadSession func(id string) ([]chatEntry, error)
+	// loadSession restores the conversation and returns its newest display page.
+	loadSession      func(id string) (sessionLoad, error)
+	loadOlderHistory func(id string, before, limit int) ([]chatEntry, int, error)
 	// truncateMessages drops the last n messages from the active
 	// conversation, persists the change, and returns the number actually
 	// removed. Used by /rewind.
@@ -1737,13 +1765,14 @@ func handleResume(deps commandDeps, arg string) commandResult {
 		}
 	}
 
-	entries, err := deps.loadSession(target)
+	loaded, err := deps.loadSession(target)
 	if err != nil {
 		return commandResult{
 			output:  errorStyle.Render(fmt.Sprintf("erro ao carregar: %v", err)),
 			handled: true,
 		}
 	}
+	entries := loaded.entries
 	var branchErr error
 	if deps.sessionState != nil {
 		if deps.sessionState.branchesBound() {
@@ -1773,6 +1802,8 @@ func handleResume(deps commandDeps, arg string) commandResult {
 		output:          b.String(),
 		handled:         true,
 		replaceMessages: entries,
+		resumeSessionID: target,
+		historyBefore:   loaded.start,
 	}
 }
 

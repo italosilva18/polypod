@@ -10,6 +10,7 @@ import (
 	"github.com/costa/polypod/internal/tool"
 	"github.com/costa/polypod/internal/tooloutput"
 	"github.com/costa/polypod/internal/types"
+	"github.com/costa/polypod/internal/workdir"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -112,7 +113,7 @@ func (a *ToolRegistryAdapter) ExecuteResultContext(ctx context.Context, name str
 	} else if a.orchestrate != nil {
 		result, err = a.orchestrate(name, args)
 	} else {
-		result, err = a.registry.Execute(name, args, types.ToolContext{Context: ctx, WorkingDir: "."})
+		result, err = a.registry.Execute(name, args, types.ToolContext{Context: ctx, WorkingDir: workdir.Dir(ctx, ".")})
 	}
 	if err != nil {
 		return types.ToolResult{Content: fmt.Sprintf("Erro: %v", err), IsError: true}, nil

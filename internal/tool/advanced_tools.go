@@ -89,9 +89,9 @@ func newAdvancedGrepSearchTool(wd string) types.ToolDef {
 		},
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
 			pattern, _ := args["pattern"].(string)
-			searchPath := resolvePath(wd, args["path"])
+			searchPath := resolvePath(effectiveWorkingDir(ctx, wd), args["path"])
 			if searchPath == "" {
-				searchPath = wd
+				searchPath = effectiveWorkingDir(ctx, wd)
 			}
 			includeGlob, _ := args["include"].(string)
 
@@ -249,9 +249,9 @@ func newAdvancedGlobSearchTool(wd string) types.ToolDef {
 		},
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
 			pattern, _ := args["pattern"].(string)
-			base := resolvePath(wd, args["path"])
+			base := resolvePath(effectiveWorkingDir(ctx, wd), args["path"])
 			if base == "" {
-				base = wd
+				base = effectiveWorkingDir(ctx, wd)
 			}
 
 			type fileEntry struct {

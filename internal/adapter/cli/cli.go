@@ -238,7 +238,9 @@ func (a *Adapter) SetRestoredMessages(msgs []RestoredMessage) {
 }
 
 func (a *Adapter) Start(ctx context.Context, handler adapter.MessageHandler) error {
-	deps := a.buildCommandDeps(ctx)
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	deps := a.buildCommandDeps(runCtx)
 
 	// Use stream handler if available, otherwise wrap the sync handler
 	sh := a.streamHandler
@@ -246,9 +248,9 @@ func (a *Adapter) Start(ctx context.Context, handler adapter.MessageHandler) err
 		sh = syncToStreamHandler(handler)
 	}
 
-	m := newModel(ctx, sh, deps, a.dataDir, a.userPromptHandler, a.approvalHandler, a.fileIndex)
+	m := newModel(runCtx, sh, deps, a.dataDir, a.userPromptHandler, a.approvalHandler, a.fileIndex)
 	if a.taskRegistry != nil {
-		taskCtx, cancelTasks := context.WithCancel(ctx)
+		taskCtx, cancelTasks := context.WithCancel(runCtx)
 		defer cancelTasks()
 		m.taskEvents = a.taskRegistry.Subscribe(taskCtx)
 	}
@@ -270,7 +272,7 @@ func (a *Adapter) Start(ctx context.Context, handler adapter.MessageHandler) err
 
 	// Cancel program when context is done
 	go func() {
-		<-ctx.Done()
+		<-runCtx.Done()
 		p.Quit()
 	}()
 
@@ -288,6 +290,9 @@ func (a *Adapter) Send(ctx context.Context, msg adapter.OutMessage) error {
 // buildCommandDeps creates the closure-based command deps from real implementations.
 func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 	deps := commandDeps{commandRegistry: a.commandRegistry, activeSessionID: a.ActiveSessionID}
+	if a.cfg != nil && a.cfg.WhatsApp.AudioTranscription.Enabled {
+		deps.captureVoice = newVoiceCapture(a.cfg.WhatsApp.AudioTranscription)
+	}
 	if a.convMgr != nil && a.sessStorage != nil {
 		controller := newPersistentBranchController(a.dataDir, a.sessStorage, a.convMgr,
 			a.ActiveSessionID, a.SetActiveSessionID, a.saveActiveSession)
@@ -513,16 +518,30 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 		}
 
 		// /resume: load a persisted session into the active conversation.
-		deps.loadSession = func(id string) ([]chatEntry, error) {
+		deps.loadSession = func(id string) (sessionLoad, error) {
 			restored, err := a.sessStorage.Load(id)
 			if err != nil {
-				return nil, err
+				return sessionLoad{}, err
 			}
 			if restored == nil {
-				return nil, fmt.Errorf("sessao %s nao encontrada", id)
+				return sessionLoad{}, fmt.Errorf("sessao %s nao encontrada", id)
 			}
-			entries := make([]chatEntry, 0, len(restored.Messages))
-			for _, m := range restored.Messages {
+			displayMessages := restored.Messages
+			start := 0
+			if paged, ok := a.sessStorage.(interface {
+				LoadPage(string, int, int) (*session.SessionPage, error)
+			}); ok {
+				page, err := paged.LoadPage(id, 0, historyPageSize)
+				if err != nil {
+					return sessionLoad{}, err
+				}
+				if page != nil {
+					displayMessages = page.Messages
+					start = page.Start
+				}
+			}
+			entries := make([]chatEntry, 0, len(displayMessages))
+			for _, m := range displayMessages {
 				entries = append(entries, chatEntry{
 					role:      m.Role,
 					content:   m.Content,
@@ -535,13 +554,17 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 			if a.convMgr != nil {
 				sess, sessErr := a.convMgr.GetSession(context.Background(), "cli", "local")
 				if sessErr != nil {
-					return nil, fmt.Errorf("abrindo sessao retomada: %w", sessErr)
+					return sessionLoad{}, fmt.Errorf("abrindo sessao retomada: %w", sessErr)
 				}
 				if restored.ID == a.activeSessionID {
-					return a.appendTranscriptHistory(restored.ID, toBranchEntries(sess.Messages)), nil
+					activeEntries := toBranchEntries(sess.Messages)
+					return sessionLoad{
+						entries: a.appendTranscriptHistory(restored.ID, activeEntries),
+						start:   0, total: len(activeEntries),
+					}, nil
 				}
 				if err := a.saveActiveSession(sess); err != nil {
-					return nil, fmt.Errorf("salvando sessao anterior: %w", err)
+					return sessionLoad{}, fmt.Errorf("salvando sessao anterior: %w", err)
 				}
 				conv := make([]conversation.Message, 0, len(restored.Messages))
 				for _, m := range restored.Messages {
@@ -560,14 +583,37 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 					})
 				}
 				if err := a.convMgr.ReplaceMessages(context.Background(), sess, conv); err != nil {
-					return nil, fmt.Errorf("restaurando mensagens da sessao: %w", err)
+					return sessionLoad{}, fmt.Errorf("restaurando mensagens da sessao: %w", err)
 				}
 			}
 			for _, warning := range a.restoreSessionMetadata(restored.Metadata) {
 				entries = append(entries, chatEntry{role: "system", content: warning, timestamp: time.Now()})
 			}
 			a.activeSessionID = restored.ID
-			return a.appendTranscriptHistory(restored.ID, entries), nil
+			return sessionLoad{
+				entries: a.appendTranscriptHistory(restored.ID, entries),
+				start:   start, total: len(restored.Messages),
+			}, nil
+		}
+		deps.loadOlderHistory = func(id string, before, limit int) ([]chatEntry, int, error) {
+			paged, ok := a.sessStorage.(interface {
+				LoadPage(string, int, int) (*session.SessionPage, error)
+			})
+			if !ok {
+				return nil, 0, fmt.Errorf("paginação de sessão indisponível")
+			}
+			page, err := paged.LoadPage(id, before, limit)
+			if err != nil {
+				return nil, 0, err
+			}
+			if page == nil {
+				return nil, 0, fmt.Errorf("sessao %s nao encontrada", id)
+			}
+			entries := make([]chatEntry, 0, len(page.Messages))
+			for _, m := range page.Messages {
+				entries = append(entries, chatEntry{role: m.Role, content: m.Content, timestamp: m.Timestamp})
+			}
+			return entries, page.Start, nil
 		}
 	}
 

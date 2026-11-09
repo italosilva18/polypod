@@ -514,7 +514,7 @@ func newEnhancedFileEditTool(wd string, backups *fileBackupManager, reg *Registr
 			return types.ValidationResult{Valid: true}
 		},
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
-			path := resolvePath(wd, args["file_path"])
+			path := resolvePath(effectiveWorkingDir(ctx, wd), args["file_path"])
 			oldStr, _ := args["old_string"].(string)
 			newStr, _ := args["new_string"].(string)
 			replaceAll := false
@@ -745,7 +745,7 @@ func newEnhancedFileWriteTool(wd string, backups *fileBackupManager, reg *Regist
 			return types.ValidationResult{Valid: true}
 		},
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
-			path := resolvePath(wd, args["file_path"])
+			path := resolvePath(effectiveWorkingDir(ctx, wd), args["file_path"])
 			content, _ := args["content"].(string)
 
 			// Read existing content for diff (if file exists)
@@ -867,7 +867,7 @@ func newUndoEditTool(wd string, backups *fileBackupManager, reg *Registry) types
 			return types.ValidationResult{Valid: true}
 		},
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
-			path := resolvePath(wd, args["file_path"])
+			path := resolvePath(effectiveWorkingDir(ctx, wd), args["file_path"])
 
 			backup, ok := backups.popBackup(path)
 			if !ok {

@@ -92,6 +92,7 @@ import (
 	"github.com/costa/polypod/internal/webhookgateway"
 	"github.com/costa/polypod/internal/whatsappgateway"
 	"github.com/costa/polypod/internal/wiring"
+	"github.com/costa/polypod/internal/workdir"
 )
 
 const defaultConfigPath = "config.yaml"
@@ -1194,6 +1195,29 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		beforeMCP[name] = true
 	}
 	mcpMgr := mcp.NewManager(logger)
+	if err := mcpMgr.SetSubscriptionStore(filepath.Join(cfg.Data.Dir, "mcp-subscriptions.json")); err != nil {
+		logger.Warn("MCP resource subscription persistence unavailable", "error", err)
+	}
+	mcpMgr.SetResourceUpdateHandler(func(wakeCtx context.Context, update mcp.ResourceUpdate) error {
+		_, err := taskQueue.Create(wakeCtx, taskqueue.CreateInput{
+			ID:          update.WakeID,
+			Title:       "Revisar recurso MCP: " + update.Server,
+			Prompt:      fmt.Sprintf("O recurso MCP assinado mudou. Servidor: %q; URI: %q; recebido: %s. Releia o recurso com read_mcp_resource, avalie a mudança, execute o trabalho pertinente e informe o resultado.", update.Server, update.URI, update.At.Format(time.RFC3339Nano)),
+			Priority:    0,
+			MaxAttempts: 3,
+			Channel:     "mcp_resource",
+			Owner:       "owner",
+		})
+		if err != nil && update.WakeID != "" {
+			lookupCtx, cancelLookup := context.WithTimeout(context.Background(), 2*time.Second)
+			_, getErr := taskQueue.Get(lookupCtx, update.WakeID)
+			cancelLookup()
+			if getErr == nil {
+				return nil
+			}
+		}
+		return err
+	}, mcp.ResourceWakeOptions{MinInterval: 30 * time.Second})
 	mcpMgr.SetElicitationHandler(func(qctx context.Context, req *mcp.ElicitationRequest) (*mcp.ElicitationResult, error) {
 		return mcp.PromptElicitation(qctx, req, func(askCtx context.Context, question string) (string, error) {
 			if sys.UserPromptHandler == nil {
@@ -1415,6 +1439,12 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	// AI client (no knowledge service in CLI-only build)
 	aiClient = ai.NewClient(cfg.AI, sys.ToolAdapter)
 	aiSvc := ai.NewService(aiClient, nil, agents, "default", memStore, logger)
+	workspaceStore, err := workdir.Open(filepath.Join(cfg.Data.Dir, "workdirs.json"))
+	if err != nil {
+		logger.Warn("scoped workdirs unavailable", "error", err)
+	} else {
+		aiSvc.SetWorkdirStore(workspaceStore)
+	}
 	aiSvc.SetAutoCompact(autoCompactSvc)
 	sessionMemory, err := sessionmem.NewFileStore(cfg.Data.Dir)
 	if err != nil {

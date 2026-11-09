@@ -195,13 +195,8 @@ func RegisterSkills(reg *skill.Registry, mgr *Manager) {
 			if path == "" {
 				path = fmt.Sprintf("session_%s.md", args["id"])
 			}
-			// Read the session data file
-			sessionFile := filepath.Join(mgr.dataDir, "sessions", args["id"]+".json")
-			data, err := os.ReadFile(sessionFile)
-			if err != nil {
-				return "", fmt.Errorf("sessao nao encontrada: %w", err)
-			}
-			if err := os.WriteFile(path, data, 0644); err != nil {
+			storage := NewFileSystemStorage(filepath.Join(mgr.dataDir, "sessions"), mgr.logger)
+			if err := storage.Export(args["id"], path, "markdown"); err != nil {
 				return "", err
 			}
 			return fmt.Sprintf("Sessao exportada para %s", path), nil

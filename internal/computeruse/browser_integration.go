@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/costa/polypod/internal/browser"
 	"github.com/costa/polypod/internal/types"
@@ -100,8 +101,12 @@ func registerBrowserTools(reg ToolRegistry, cu *ComputerUseTool) {
 }
 
 type browserRuntime struct {
-	endpoint string
-	managed  *browser.ManagedBrowser
+	mu                 sync.RWMutex
+	configuredEndpoint string
+	attachedEndpoint   string
+	attachedProfileDir string
+	desktopSelected    bool
+	managed            *browser.ManagedBrowser
 }
 
 func newBrowserRuntime() *browserRuntime {
@@ -110,7 +115,7 @@ func newBrowserRuntime() *browserRuntime {
 		headless = raw != "0" && !strings.EqualFold(raw, "false")
 	}
 	return &browserRuntime{
-		endpoint: strings.TrimSpace(os.Getenv("POLYPOD_BROWSER_CDP_URL")),
+		configuredEndpoint: strings.TrimSpace(os.Getenv("POLYPOD_BROWSER_CDP_URL")),
 		managed: browser.NewManagedBrowser(browser.ManagedConfig{
 			Binary: os.Getenv("POLYPOD_BROWSER_BINARY"), ProfileDir: os.Getenv("POLYPOD_BROWSER_PROFILE_DIR"),
 			Headless: headless, FallbackHeadless: !headless,
@@ -120,10 +125,77 @@ func newBrowserRuntime() *browserRuntime {
 }
 
 func (r *browserRuntime) client(ctx context.Context) (browser.CDP, error) {
-	if r.endpoint != "" {
-		return browser.CDP{Endpoint: r.endpoint}, nil
+	client, _, attached, err := r.external(ctx)
+	if attached || err != nil {
+		return client, err
 	}
 	return r.managed.Start(ctx)
+}
+
+// external snapshots the connection choice. It never starts a private browser
+// while a user browser is selected, even if that browser later disconnects.
+func (r *browserRuntime) external(ctx context.Context) (browser.CDP, string, bool, error) {
+	r.mu.RLock()
+	profileDir, endpoint, configured, desktop := r.attachedProfileDir, r.attachedEndpoint, r.configuredEndpoint, r.desktopSelected
+	r.mu.RUnlock()
+	if desktop {
+		return browser.CDP{}, "desktop", true, fmt.Errorf("modo desktop ativo; use captura e entrada de tela para operar o navegador aberto")
+	}
+	if profileDir != "" {
+		client, err := browser.ConnectProfileCDP(ctx, profileDir)
+		if err != nil {
+			return browser.CDP{}, "profile", true, err
+		}
+		return client, "profile", true, ctx.Err()
+	}
+	if endpoint != "" {
+		return browser.CDP{Endpoint: endpoint}, "runtime", true, ctx.Err()
+	}
+	if configured != "" {
+		return browser.CDP{Endpoint: configured}, "environment", true, ctx.Err()
+	}
+	return browser.CDP{}, "", false, nil
+}
+
+func (r *browserRuntime) attach(ctx context.Context, endpoint, profileDir string) (browser.CDP, []browser.Tab, error) {
+	if (endpoint == "") == (profileDir == "") {
+		return browser.CDP{}, nil, fmt.Errorf("informe endpoint ou profile_dir para attach")
+	}
+	if profileDir != "" {
+		client, err := browser.ConnectProfileCDP(ctx, profileDir)
+		if err != nil {
+			return browser.CDP{}, nil, err
+		}
+		endpoint = client.Endpoint
+	}
+	client, tabs, err := browser.ConnectLocalCDP(ctx, endpoint)
+	if err != nil {
+		return browser.CDP{}, nil, err
+	}
+	r.mu.Lock()
+	r.attachedEndpoint, r.attachedProfileDir = "", ""
+	r.desktopSelected = false
+	if profileDir != "" {
+		r.attachedProfileDir = profileDir
+	} else {
+		r.attachedEndpoint = client.Endpoint
+	}
+	r.mu.Unlock()
+	return client, tabs, nil
+}
+
+func (r *browserRuntime) detach() {
+	r.mu.Lock()
+	r.attachedEndpoint, r.attachedProfileDir = "", ""
+	r.desktopSelected = false
+	r.mu.Unlock()
+}
+
+func (r *browserRuntime) useDesktop() {
+	r.mu.Lock()
+	r.attachedEndpoint, r.attachedProfileDir = "", ""
+	r.desktopSelected = true
+	r.mu.Unlock()
 }
 
 func browserActionResult(result *browser.ActionResult) types.ToolResult {

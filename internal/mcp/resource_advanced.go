@@ -18,6 +18,7 @@ type ResourceUpdate struct {
 	Server string    `json:"server"`
 	URI    string    `json:"uri"`
 	At     time.Time `json:"at"`
+	WakeID string    `json:"wake_id,omitempty"`
 }
 
 func (m *Manager) refreshResourceTemplates(ctx context.Context, session *mcpsdk.ClientSession) error {
@@ -81,7 +82,7 @@ func (m *Manager) SubscribeResource(ctx context.Context, server, uri string) err
 		return fmt.Errorf("mcp: servidor %q nao conectado", server)
 	}
 	if already {
-		return nil
+		return m.persistSubscriptionChange(server, uri)
 	}
 	initialization := session.InitializeResult()
 	if initialization == nil || initialization.Capabilities.Resources == nil || !initialization.Capabilities.Resources.Subscribe {
@@ -100,6 +101,9 @@ func (m *Manager) SubscribeResource(ctx context.Context, server, uri string) err
 	}
 	m.subscriptions[server][uri] = struct{}{}
 	m.mu.Unlock()
+	if err := m.persistSubscriptionChange(server, uri); err != nil {
+		return fmt.Errorf("mcp: assinatura ativa, mas nao foi salva: %w", err)
+	}
 	return nil
 }
 
@@ -116,7 +120,7 @@ func (m *Manager) UnsubscribeResource(ctx context.Context, server, uri string) e
 	_, subscribed := m.subscriptions[server][uri]
 	m.mu.RUnlock()
 	if !subscribed {
-		return nil
+		return m.persistSubscriptionChange(server, uri)
 	}
 	if session != nil {
 		if err := session.Unsubscribe(ctx, &mcpsdk.UnsubscribeParams{URI: uri}); err != nil {
@@ -129,6 +133,10 @@ func (m *Manager) UnsubscribeResource(ctx context.Context, server, uri string) e
 		delete(m.subscriptions, server)
 	}
 	m.mu.Unlock()
+	m.resourceWake.drop(server, uri)
+	if err := m.persistSubscriptionChange(server, uri); err != nil {
+		return fmt.Errorf("mcp: assinatura removida, mas nao foi salva: %w", err)
+	}
 	return nil
 }
 
@@ -175,21 +183,28 @@ func (m *Manager) recordResourceUpdate(req *mcpsdk.ResourceUpdatedNotificationRe
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.closed {
+		m.mu.Unlock()
 		return
 	}
 	for name, session := range m.sessions {
 		if session != req.Session {
 			continue
 		}
-		items := append(m.resourceUpdates[name], ResourceUpdate{Server: name, URI: req.Params.URI, At: time.Now()})
+		update := ResourceUpdate{Server: name, URI: req.Params.URI, At: time.Now().UTC()}
+		items := append(m.resourceUpdates[name], update)
 		if len(items) > maxResourceUpdates {
 			items = items[len(items)-maxResourceUpdates:]
 		}
 		m.resourceUpdates[name] = items
+		_, subscribed := m.subscriptions[name][req.Params.URI]
+		m.mu.Unlock()
+		if subscribed {
+			m.resourceWake.notify(update)
+		}
 		return
 	}
+	m.mu.Unlock()
 }
 
 // ListResourceUpdates reports recent notifications; reading a resource always

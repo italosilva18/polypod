@@ -2,12 +2,14 @@ package tool
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/costa/polypod/internal/types"
+	"github.com/costa/polypod/internal/workdir"
 )
 
 // WorktreeInfo describes an active worktree.
@@ -24,7 +26,7 @@ type WorktreeInfo struct {
 func NewEnterWorktreeTool() types.ToolDef {
 	return types.ToolDef{
 		NameFn:        func() string { return "worktree_enter" },
-		DescriptionFn: func() string { return "Create a new git worktree for isolated changes. Requires git repo." },
+		DescriptionFn: func() string { return "Cria uma worktree Git isolada e move esta conversa para ela." },
 		InputSchemaFn: func() map[string]any {
 			return map[string]any{
 				"type": "object",
@@ -58,6 +60,12 @@ func NewEnterWorktreeTool() types.ToolDef {
 			return types.ValidationResult{Valid: true}
 		},
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
+			if !workdir.Bound(ctx.Context) {
+				return types.ToolResult{IsError: true, Content: workdir.ErrScopeUnavailable.Error()}, nil
+			}
+			if _, active := workdir.Current(ctx.Context); active {
+				return types.ToolResult{IsError: true, Content: workdir.ErrAlreadyEntered.Error()}, nil
+			}
 			name, _ := args["name"].(string)
 			if name == "" {
 				return types.ToolResult{IsError: true, Content: "name is required"}, nil
@@ -86,12 +94,30 @@ func NewEnterWorktreeTool() types.ToolDef {
 			if baseRef == "" {
 				baseRef = "HEAD"
 			}
+			baseBranch := ""
+			if baseRef == "HEAD" {
+				branch := exec.Command("git", "symbolic-ref", "--quiet", "--short", "HEAD")
+				branch.Dir = workingDir
+				if output, err := branch.Output(); err == nil {
+					baseBranch = strings.TrimSpace(string(output))
+				}
+			} else {
+				candidate := strings.TrimPrefix(baseRef, "refs/heads/")
+				branch := exec.Command("git", "show-ref", "--verify", "--quiet", "refs/heads/"+candidate)
+				branch.Dir = workingDir
+				if err := branch.Run(); err == nil {
+					baseBranch = candidate
+				}
+			}
 
 			wtPath, _ := args["path"].(string)
 			if wtPath == "" {
 				parent := filepath.Dir(repoTop)
 				wtPath = filepath.Join(parent, filepath.Base(repoTop)+"-"+name)
+			} else if !filepath.IsAbs(wtPath) {
+				wtPath = filepath.Join(repoTop, wtPath)
 			}
+			wtPath = filepath.Clean(wtPath)
 
 			branchName := "wt/" + name
 
@@ -102,6 +128,19 @@ func NewEnterWorktreeTool() types.ToolDef {
 			if err != nil {
 				return types.ToolResult{IsError: true, Content: fmt.Sprintf("worktree add failed: %s", string(output))}, nil
 			}
+			if err := workdir.Enter(ctx.Context, wtPath, workingDir, baseBranch); err != nil {
+				remove := exec.Command("git", "worktree", "remove", "--force", wtPath)
+				remove.Dir = repoTop
+				if cleanupErr := remove.Run(); cleanupErr != nil {
+					return types.ToolResult{IsError: true, Content: fmt.Sprintf("Worktree criada, mas não foi possível ativar nem remover %s: %v; limpeza: %v", wtPath, err, cleanupErr)}, nil
+				}
+				branch := exec.Command("git", "branch", "-D", branchName)
+				branch.Dir = repoTop
+				if cleanupErr := branch.Run(); cleanupErr != nil {
+					return types.ToolResult{IsError: true, Content: fmt.Sprintf("Worktree removida após falha de ativação, mas a branch %s permanece: %v", branchName, cleanupErr)}, nil
+				}
+				return types.ToolResult{IsError: true, Content: fmt.Sprintf("Não foi possível ativar a worktree nesta conversa: %v", err)}, nil
+			}
 
 			info := WorktreeInfo{
 				Name:    name,
@@ -111,8 +150,8 @@ func NewEnterWorktreeTool() types.ToolDef {
 				Created: time.Now(),
 			}
 
-			msg := fmt.Sprintf("Worktree created:\n  Name:   %s\n  Path:   %s\n  Branch: %s\n  Base:   %s\n\nTo enter: cd %s",
-				info.Name, info.Path, info.Branch, info.BaseRef, info.Path)
+			msg := fmt.Sprintf("Worktree ativa nesta conversa:\n  Nome: %s\n  Caminho: %s\n  Branch: %s\n  Base: %s",
+				info.Name, info.Path, info.Branch, info.BaseRef)
 			return types.ToolResult{Content: msg}, nil
 		},
 	}
@@ -122,7 +161,7 @@ func NewEnterWorktreeTool() types.ToolDef {
 func NewExitWorktreeTool() types.ToolDef {
 	return types.ToolDef{
 		NameFn:        func() string { return "worktree_exit" },
-		DescriptionFn: func() string { return "Remove a git worktree. Optionally merge its branch back first." },
+		DescriptionFn: func() string { return "Sai da worktree desta conversa e a remove; pode integrar a branch antes." },
 		InputSchemaFn: func() map[string]any {
 			return map[string]any{
 				"type": "object",
@@ -149,11 +188,6 @@ func NewExitWorktreeTool() types.ToolDef {
 		IsReadOnlyFn:    func(map[string]any) bool { return false },
 		IsDestructiveFn: func(map[string]any) bool { return true },
 		ValidateFn: func(args map[string]any) types.ValidationResult {
-			name, _ := args["name"].(string)
-			wtPath, _ := args["path"].(string)
-			if name == "" && wtPath == "" {
-				return types.ValidationResult{Valid: false, Message: "must provide name or path"}
-			}
 			return types.ValidationResult{Valid: true}
 		},
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
@@ -161,9 +195,16 @@ func NewExitWorktreeTool() types.ToolDef {
 			wtPath, _ := args["path"].(string)
 			mergeBack, _ := args["merge_back"].(bool)
 			force, _ := args["force"].(bool)
+			active, scoped := workdir.Current(ctx.Context)
+			if !workdir.Bound(ctx.Context) {
+				return types.ToolResult{IsError: true, Content: workdir.ErrScopeUnavailable.Error()}, nil
+			}
+			if !scoped {
+				return types.ToolResult{IsError: true, Content: workdir.ErrNotEntered.Error()}, nil
+			}
 
 			if name == "" && wtPath == "" {
-				return types.ToolResult{IsError: true, Content: "must provide name or path"}, nil
+				wtPath = active.Dir
 			}
 
 			workingDir := ctx.WorkingDir
@@ -198,9 +239,45 @@ func NewExitWorktreeTool() types.ToolDef {
 					return types.ToolResult{IsError: true, Content: fmt.Sprintf("worktree '%s' not found", name)}, nil
 				}
 			}
+			if !filepath.IsAbs(wtPath) {
+				wtPath = filepath.Join(workingDir, wtPath)
+			}
+			wtPath = filepath.Clean(wtPath)
+			if scoped && active.Dir != wtPath {
+				return types.ToolResult{IsError: true, Content: "Esta conversa está em outra worktree; saia dela antes de remover outra."}, nil
+			}
+			if _, err := os.Stat(wtPath); os.IsNotExist(err) {
+				previous, exitErr := workdir.Exit(ctx.Context, wtPath)
+				if exitErr != nil {
+					return types.ToolResult{IsError: true, Content: fmt.Sprintf("A worktree foi removida fora do Polypod, mas o estado da conversa não pôde ser restaurado: %v", exitErr)}, nil
+				}
+				return types.ToolResult{Content: fmt.Sprintf("A worktree já não existe. Esta conversa voltou para %s.", previous)}, nil
+			}
+			commandDir := workingDir
+			if scoped && active.Dir == wtPath {
+				commandDir = active.Previous
+			}
 
 			var mergeResult string
 			if mergeBack {
+				if active.BaseBranch == "" {
+					return types.ToolResult{IsError: true, Content: "A referência base não é uma branch local; faça o merge manualmente ou saia sem merge_back."}, nil
+				}
+				current := exec.Command("git", "-C", active.Previous, "symbolic-ref", "--quiet", "--short", "HEAD")
+				currentOut, err := current.Output()
+				if err != nil || strings.TrimSpace(string(currentOut)) != active.BaseBranch {
+					return types.ToolResult{IsError: true, Content: fmt.Sprintf("Merge recusado: a branch de destino deve ser %s em %s.", active.BaseBranch, active.Previous)}, nil
+				}
+				if !force {
+					status := exec.Command("git", "-C", wtPath, "status", "--porcelain", "--untracked-files=all")
+					statusOut, err := status.Output()
+					if err != nil {
+						return types.ToolResult{IsError: true, Content: fmt.Sprintf("Não foi possível verificar a worktree antes do merge: %v", err)}, nil
+					}
+					if len(strings.TrimSpace(string(statusOut))) > 0 {
+						return types.ToolResult{IsError: true, Content: "A worktree possui mudanças não commitadas. Faça commit ou saia sem merge_back."}, nil
+					}
+				}
 				// Get branch name
 				cmd := exec.Command("git", "-C", wtPath, "rev-parse", "--abbrev-ref", "HEAD")
 				branchOut, err := cmd.Output()
@@ -211,7 +288,7 @@ func NewExitWorktreeTool() types.ToolDef {
 
 				// Merge back
 				cmd = exec.Command("git", "merge", "--no-ff", branch)
-				cmd.Dir = workingDir
+				cmd.Dir = commandDir
 				mergeOut, err := cmd.CombinedOutput()
 				if err != nil {
 					return types.ToolResult{IsError: true, Content: fmt.Sprintf("merge failed: %s", string(mergeOut))}, nil
@@ -227,13 +304,20 @@ func NewExitWorktreeTool() types.ToolDef {
 			removeArgs = append(removeArgs, wtPath)
 
 			cmd := exec.Command("git", removeArgs...)
-			cmd.Dir = workingDir
+			cmd.Dir = commandDir
 			out, err := cmd.CombinedOutput()
 			if err != nil {
 				return types.ToolResult{IsError: true, Content: fmt.Sprintf("worktree remove failed: %s", string(out))}, nil
 			}
 
-			return types.ToolResult{Content: mergeResult + fmt.Sprintf("Worktree removed: %s", wtPath)}, nil
+			if scoped && active.Dir == wtPath {
+				previous, err := workdir.Exit(ctx.Context, wtPath)
+				if err != nil {
+					return types.ToolResult{IsError: true, Content: fmt.Sprintf("Worktree removida, mas o diretório da conversa não foi restaurado: %v", err)}, nil
+				}
+				return types.ToolResult{Content: mergeResult + fmt.Sprintf("Worktree removida: %s. Esta conversa voltou para %s.", wtPath, previous)}, nil
+			}
+			return types.ToolResult{Content: mergeResult + fmt.Sprintf("Worktree removida: %s", wtPath)}, nil
 		},
 	}
 }

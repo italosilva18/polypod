@@ -1,4 +1,4 @@
-# Transcrição de áudio do WhatsApp
+# Transcrição de áudio do WhatsApp e do CLI
 
 O Polypod recebe mensagens de voz pela mesma caixa de entrada durável usada para texto. O backend `local` executa um worker de reconhecimento no próprio computador. Esta instalação usa `faster-whisper` com modelo multilíngue `small` em CPU INT8; o worker `openai-whisper` anterior continua disponível como alternativa configurável. A conta ChatGPT usada pelo agente não é necessária para transcrever e não fornece automaticamente uma chave para a API de áudio. A [API pública do DeepSeek](https://api-docs.deepseek.com/api/list-models/) também não lista entrada de áudio.
 
@@ -25,6 +25,10 @@ O adaptador valida MIME e assinatura do arquivo, limita a entrada a 16 MiB e a d
 
 O `doctor` confere os arquivos e executáveis sem abrir o modelo; a prova de fala reconhecida exige uma transcrição real. `model_path` aceita um checkpoint `.pt` não vazio ou diretório CTranslate2 com `model.bin` e `config.json`. Se o modelo ou ambiente for movido, atualize os caminhos privados e reinicie o serviço. Consulte as instruções oficiais de [faster-whisper](https://github.com/SYSTRAN/faster-whisper#installation) e [Whisper](https://github.com/openai/whisper#setup).
 
+## Ditado no CLI
+
+Com `whatsapp.audio_transcription.enabled: true`, o CLI reutiliza o mesmo backend de transcrição para o comando `/voice [segundos]`. A duração padrão é 15 segundos, com máximo de 120. O comando grava pelo `arecord` no dispositivo ALSA `default`; `POLYPOD_VOICE_INPUT_DEVICE` escolhe outro dispositivo, como `pulse` ou `pipewire`. A gravação e a transcrição ocorrem em segundo plano. Ao terminar, o texto é inserido no campo de mensagem para revisão e envio com Enter. O arquivo WAV temporário é removido após a transcrição. Uma configuração `backend: local` mantém o áudio na máquina.
+
 ## Backend HTTP opcional
 
 Um endpoint compatível com `POST /audio/transcriptions` continua disponível:
@@ -39,6 +43,6 @@ whatsapp:
     api_key: ${POLYPOD_ASR_API_KEY}
 ```
 
-Guarde a chave no ambiente privado do serviço. Endpoint HTTP só é aceito em loopback; endpoint remoto exige HTTPS e chave. Quando `backend` é omitido, a configuração HTTP antiga continua válida. Com `enabled: false`, o Polypod informa ao agente que chegou áudio sem inventar uma transcrição.
+Guarde a chave no ambiente privado do serviço. HTTP é aceito apenas em loopback; endpoint remoto exige HTTPS e chave. Quando `backend` é omitido, a configuração HTTP antiga continua válida. Com `enabled: false`, o Polypod informa ao agente que chegou áudio sem inventar uma transcrição.
 
 O texto transcrito é marcado como conteúdo não confiável no turno do agente. Falha temporária segue as tentativas da caixa de entrada; áudio inválido recebe uma nota e não bloqueia o turno. O recebimento e a resposta a uma mensagem de voz real no WhatsApp ainda precisam ser confirmados após a implantação.

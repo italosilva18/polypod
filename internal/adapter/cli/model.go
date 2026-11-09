@@ -54,6 +54,11 @@ type clearNotifyMsg struct{ text string }
 // queuedInputMsg starts the next user submission after a stream completes.
 type queuedInputMsg struct{}
 
+type voiceResultMsg struct {
+	text string
+	err  error
+}
+
 type taskEventMsg struct{ event tasks.TaskEvent }
 
 type queuedInput struct {
@@ -104,18 +109,21 @@ type model struct {
 	spinner  spinner.Model
 	history  *inputHistory
 
-	messages  []chatEntry
-	streaming *strings.Builder
-	streamCh  <-chan streamMsg
-	state     state
-	queued    []queuedInput
+	messages       []chatEntry
+	streaming      *strings.Builder
+	streamCh       <-chan streamMsg
+	state          state
+	queued         []queuedInput
+	voiceRecording bool
 	// A background turn keeps processing in the same conversation. Later
 	// submissions stay queued until it completes.
-	backgroundTurn  bool
-	historyStart    int
-	historyExpanded bool
-	activeTurn      *retryTurn
-	failedTurn      *retryTurn
+	backgroundTurn   bool
+	historyStart     int
+	historyExpanded  bool
+	historySessionID string
+	historyBefore    int
+	activeTurn       *retryTurn
+	failedTurn       *retryTurn
 	// An ask_user prompt temporarily owns the composer. Preserve any draft that
 	// the user was writing while the current turn streamed.
 	heldDraft      string
@@ -421,7 +429,7 @@ var slashCommands = []string{
 	"/skills",
 	"/memory list", "/memory search ",
 	"/model", "/session", "/sessions", "/sessions search ",
-	"/copy", "/run ", "/file ", "/search ",
+	"/copy", "/voice", "/voice ", "/run ", "/file ", "/search ",
 	"/git status", "/git log", "/git diff", "/git branch",
 	"/project", "/export ", "/context", "/cost",
 	"/init", "/init --force",
@@ -800,6 +808,8 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.messages = nil
 			m.historyStart = 0
 			m.historyExpanded = false
+			m.historySessionID = ""
+			m.historyBefore = 0
 			m.updateViewport()
 			return m, nil
 
@@ -922,15 +932,24 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			if result.handled {
+				if result.voiceSeconds > 0 && m.voiceRecording {
+					m.messages = append(m.messages, chatEntry{role: "system", content: "Uma gravação já está em andamento.", timestamp: time.Now()})
+					m.updateViewport()
+					return m, nil
+				}
 				if result.clearDisplay {
 					m.messages = nil
 					m.historyStart = 0
 					m.historyExpanded = false
+					m.historySessionID = ""
+					m.historyBefore = 0
 				}
 				if result.replaceMessages != nil {
 					m.messages = append([]chatEntry{}, result.replaceMessages...)
 					m.historyStart = max(0, len(m.messages)-historyPageSize)
 					m.historyExpanded = false
+					m.historySessionID = result.resumeSessionID
+					m.historyBefore = result.historyBefore
 					m.viewport.GotoBottom()
 				}
 				if result.output != "" {
@@ -945,6 +964,16 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if result.openModelPicker {
 					m.openModelPicker()
+				}
+				if result.voiceSeconds > 0 {
+					m.voiceRecording = true
+					capture := m.cmdDeps.captureVoice
+					duration := time.Duration(result.voiceSeconds) * time.Second
+					m.updateViewport()
+					return m, func() tea.Msg {
+						text, err := capture(m.ctx, duration)
+						return voiceResultMsg{text: text, err: err}
+					}
 				}
 				m.updateViewport()
 				return m, nil
@@ -981,6 +1010,25 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.resetTab()
 			}
 		}
+
+	case voiceResultMsg:
+		m.voiceRecording = false
+		if msg.err != nil {
+			m.messages = append(m.messages, chatEntry{role: "error", content: "Entrada por voz: " + msg.err.Error(), timestamp: time.Now()})
+			m.updateViewport()
+			return m, nil
+		}
+		transcript := strings.TrimSpace(msg.text)
+		if transcript == "" {
+			m.messages = append(m.messages, chatEntry{role: "system", content: "Nenhuma fala foi detectada.", timestamp: time.Now()})
+			m.updateViewport()
+			return m, nil
+		}
+		m.textarea.InsertString(transcript)
+		m.resizeComposer()
+		m.notification = "Transcrição inserida. Revise e pressione Enter para enviar."
+		m.notifyLevel = "success"
+		return m, clearNotifyAfter(6*time.Second, m.notification)
 
 	case streamMsg:
 		if msg.err != nil {
@@ -1426,8 +1474,9 @@ func (m model) renderMessages() string {
 	}
 
 	start := min(max(0, m.historyStart), len(m.messages))
-	if start > 0 {
-		b.WriteString(subtleStyle.Render(fmt.Sprintf("  ↑ %d mensagens anteriores; PgUp para carregar", start)))
+	older := start + m.historyBefore
+	if older > 0 {
+		b.WriteString(subtleStyle.Render(fmt.Sprintf("  ↑ %d mensagens anteriores; PgUp para carregar", older)))
 		b.WriteString("\n\n")
 	}
 	for i := start; i < len(m.messages); i++ {

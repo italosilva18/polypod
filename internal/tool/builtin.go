@@ -48,7 +48,7 @@ func newWriteFileTool(wd string) types.ToolDef {
 			return types.ValidationResult{Valid: true}
 		},
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
-			path := resolvePath(wd, args["path"])
+			path := resolvePath(effectiveWorkingDir(ctx, wd), args["path"])
 			content, _ := args["content"].(string)
 			os.MkdirAll(filepath.Dir(path), 0755)
 			if err := os.WriteFile(path, []byte(content), 0644); err != nil {
@@ -77,7 +77,7 @@ func newEditFileTool(wd string) types.ToolDef {
 		},
 		IsDestructiveFn: func(map[string]any) bool { return true },
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
-			path := resolvePath(wd, args["path"])
+			path := resolvePath(effectiveWorkingDir(ctx, wd), args["path"])
 			data, err := os.ReadFile(path)
 			if err != nil {
 				return types.ToolResult{Content: fmt.Sprintf("Erro: %v", err), IsError: true}, nil
@@ -114,7 +114,7 @@ func newListDirTool(wd string) types.ToolDef {
 		IsReadOnlyFn:    func(map[string]any) bool { return true },
 		IsConcurrencyFn: func(map[string]any) bool { return true },
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
-			path := resolvePath(wd, args["path"])
+			path := resolvePath(effectiveWorkingDir(ctx, wd), args["path"])
 			entries, err := os.ReadDir(path)
 			if err != nil {
 				return types.ToolResult{Content: fmt.Sprintf("Erro: %v", err), IsError: true}, nil
@@ -156,7 +156,7 @@ func newGlobTool(wd string) types.ToolDef {
 		IsConcurrencyFn: func(map[string]any) bool { return true },
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
 			pattern, _ := args["pattern"].(string)
-			base := resolvePath(wd, args["path"])
+			base := resolvePath(effectiveWorkingDir(ctx, wd), args["path"])
 			if base == "" {
 				base = "."
 			}
@@ -207,7 +207,7 @@ func newGrepTool(wd string) types.ToolDef {
 		IsConcurrencyFn: func(map[string]any) bool { return true },
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
 			pattern, _ := args["pattern"].(string)
-			searchPath := resolvePath(wd, args["path"])
+			searchPath := resolvePath(effectiveWorkingDir(ctx, wd), args["path"])
 			if searchPath == "" {
 				searchPath = "."
 			}

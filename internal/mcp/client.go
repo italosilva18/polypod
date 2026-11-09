@@ -35,7 +35,10 @@ type Manager struct {
 	resources          map[string][]*mcpsdk.Resource
 	resourceTemplates  map[string][]*mcpsdk.ResourceTemplate
 	subscriptions      map[string]map[string]struct{}
+	subscriptionStore  string
+	subscriptionSaveMu sync.Mutex
 	resourceUpdates    map[string][]ResourceUpdate
+	resourceWake       *resourceWakeDispatcher
 	prompts            map[string][]*mcpsdk.Prompt
 	elicitationHandler ElicitationHandler
 	elicitationWaiters map[*mcpsdk.ClientSession]map[string]chan struct{}
@@ -59,6 +62,7 @@ func NewManager(logger *slog.Logger) *Manager {
 		resourceTemplates:  make(map[string][]*mcpsdk.ResourceTemplate),
 		subscriptions:      make(map[string]map[string]struct{}),
 		resourceUpdates:    make(map[string][]ResourceUpdate),
+		resourceWake:       newResourceWakeDispatcher(logger),
 		elicitationWaiters: make(map[*mcpsdk.ClientSession]map[string]chan struct{}),
 		prompts:            make(map[string][]*mcpsdk.Prompt),
 		logger:             logger,
@@ -185,6 +189,7 @@ func (m *Manager) Disconnect(name string) error {
 	delete(m.resourceUpdates, name)
 	delete(m.prompts, name)
 	m.mu.Unlock()
+	m.resourceWake.dropServer(name)
 	return session.Close()
 }
 
@@ -327,6 +332,7 @@ func (m *Manager) ListServers() map[string][]string {
 
 // Close disconnects all servers.
 func (m *Manager) Close() error {
+	m.resourceWake.Close()
 	m.reconnect.StopAll()
 
 	m.mu.Lock()

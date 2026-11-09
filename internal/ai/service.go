@@ -12,6 +12,7 @@ import (
 	"github.com/costa/polypod/internal/memory"
 	"github.com/costa/polypod/internal/project"
 	"github.com/costa/polypod/internal/sessionmem"
+	"github.com/costa/polypod/internal/workdir"
 )
 
 // KnowledgeSearcher is implemented by the knowledge service.
@@ -49,7 +50,11 @@ type Service struct {
 	logger      *slog.Logger
 	autoCompact *compact.AutoCompactService
 	onActivity  func()
+	workdirs    *workdir.Store
 }
+
+// SetWorkdirStore enables conversation-scoped working directories for tools.
+func (s *Service) SetWorkdirStore(store *workdir.Store) { s.workdirs = store }
 
 // SetActivityCallback registers a lightweight hook invoked whenever a user or
 // routine starts an AI turn. The dreaming service uses it to avoid learning
@@ -250,6 +255,7 @@ func (s *Service) Answer(ctx context.Context, req AnswerRequest) (*AnswerRespons
 	if s.onActivity != nil {
 		s.onActivity()
 	}
+	ctx = workdir.WithScope(ctx, s.workdirs, req.Channel, req.UserID, req.SessionMemoryScope)
 	ctx = s.withProjectInstructions(ctx)
 	messages, names := s.buildMessages(ctx, req)
 
@@ -280,6 +286,7 @@ func (s *Service) AnswerStream(ctx context.Context, req AnswerRequest, callback 
 	if s.onActivity != nil {
 		s.onActivity()
 	}
+	ctx = workdir.WithScope(ctx, s.workdirs, req.Channel, req.UserID, req.SessionMemoryScope)
 	ctx = s.withProjectInstructions(ctx)
 	messages, names := s.buildMessages(ctx, req)
 
@@ -305,7 +312,7 @@ func (s *Service) AnswerStream(ctx context.Context, req AnswerRequest, callback 
 }
 
 func (s *Service) withProjectInstructions(ctx context.Context) context.Context {
-	collector, err := project.NewInstructionCollector(".")
+	collector, err := project.NewInstructionCollector(workdir.Dir(ctx, "."))
 	if err != nil {
 		s.logger.Warn("project instruction collector unavailable", "error", err)
 		return ctx

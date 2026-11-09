@@ -11,6 +11,7 @@ import (
 	"github.com/costa/polypod/internal/evolution"
 	"github.com/costa/polypod/internal/tool"
 	"github.com/costa/polypod/internal/types"
+	"github.com/costa/polypod/internal/workdir"
 )
 
 // maxConcurrentReadOnly is the maximum number of read-only tools that can
@@ -266,7 +267,7 @@ func (m *StreamingToolManager) executeSingle(ctx context.Context, call ToolCallI
 		// enforcement, hooks, plan-mode simulation, and memory extraction.
 		toolCtx := types.ToolContext{
 			Context:    ctx,
-			WorkingDir: ".",
+			WorkingDir: workdir.Dir(ctx, "."),
 		}
 		result, err = m.registry.Execute(call.Name, args, toolCtx)
 	}

@@ -18,6 +18,7 @@ import (
 	"github.com/costa/polypod/internal/subagent"
 	"github.com/costa/polypod/internal/tool"
 	"github.com/costa/polypod/internal/types"
+	"github.com/costa/polypod/internal/workdir"
 )
 
 // Orchestrator is the central coordinator for all subsystems.
@@ -321,7 +322,7 @@ func (o *Orchestrator) toolContext(ctx context.Context) types.ToolContext {
 		Context:    ctx,
 		SessionID:  o.sessionID,
 		AgentID:    o.agents.AgentID(o.agentName),
-		WorkingDir: ".",
+		WorkingDir: workdir.Dir(ctx, "."),
 	}
 }
 

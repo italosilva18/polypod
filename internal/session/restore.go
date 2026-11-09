@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -56,32 +57,24 @@ func NewSessionRestorer(sessionsDir string, logger *slog.Logger) *SessionRestore
 	}
 }
 
-// RestoreSession loads a session from its persisted JSON file. Returns nil
-// if the session file does not exist.
+// RestoreSession loads a session from either the paged or legacy JSON layout.
+// Returns nil if the session does not exist.
 func (r *SessionRestorer) RestoreSession(sessionID string) (*RestoredSession, error) {
-	path := filepath.Join(r.sessionsDir, sessionID+".json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("reading session %s: %w", sessionID, err)
-	}
-
-	var sess RestoredSession
-	if err := json.Unmarshal(data, &sess); err != nil {
-		return nil, fmt.Errorf("parsing session %s: %w", sessionID, err)
+	storage := NewFileSystemStorage(r.sessionsDir, r.logger)
+	sess, err := storage.Load(sessionID)
+	if err != nil || sess == nil {
+		return sess, err
 	}
 
 	// Migrate if needed.
 	if sess.Version < CurrentSessionVersion {
-		if err := r.MigrateSessionFormat(&sess); err != nil {
+		if err := r.MigrateSessionFormat(sess); err != nil {
 			r.logger.Warn("migration failed, returning raw session",
 				"session", sessionID, "version", sess.Version, "error", err)
 		}
 	}
 
-	return &sess, nil
+	return sess, nil
 }
 
 // ValidateRestoredSession checks a restored session for stale data.
@@ -184,8 +177,9 @@ func (r *SessionRestorer) CleanupStaleSessions(maxAge time.Duration) (int, error
 	}
 
 	removed := 0
+	storage := NewFileSystemStorage(r.sessionsDir, r.logger)
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" || entry.Name() == "index.json" {
 			continue
 		}
 
@@ -214,7 +208,7 @@ func (r *SessionRestorer) CleanupStaleSessions(maxAge time.Duration) (int, error
 			}
 		}
 
-		if err := os.Remove(path); err != nil {
+		if err := storage.Delete(strings.TrimSuffix(entry.Name(), ".json")); err != nil {
 			r.logger.Warn("failed to remove stale session", "path", path, "error", err)
 			continue
 		}
@@ -226,23 +220,9 @@ func (r *SessionRestorer) CleanupStaleSessions(maxAge time.Duration) (int, error
 	return removed, nil
 }
 
-// SaveSession persists a session to its JSON file.
+// SaveSession persists a session in the paged storage layout.
 func (r *SessionRestorer) SaveSession(sess *RestoredSession) error {
-	if err := os.MkdirAll(r.sessionsDir, 0700); err != nil {
-		return fmt.Errorf("creating sessions dir: %w", err)
-	}
-
-	sess.Version = CurrentSessionVersion
-	data, err := json.MarshalIndent(sess, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshaling session %s: %w", sess.ID, err)
-	}
-
-	path := filepath.Join(r.sessionsDir, sess.ID+".json")
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		return fmt.Errorf("writing session %s: %w", sess.ID, err)
-	}
-	return nil
+	return NewFileSystemStorage(r.sessionsDir, r.logger).Save(sess)
 }
 
 // ListRestorable returns the IDs of all sessions in the sessions directory.
@@ -257,7 +237,7 @@ func (r *SessionRestorer) ListRestorable() ([]string, error) {
 
 	var ids []string
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" || entry.Name() == "index.json" {
 			continue
 		}
 		id := entry.Name()[:len(entry.Name())-5] // strip .json

@@ -369,10 +369,7 @@ func NewNotebookEditTool(workingDir string) types.Tool {
 			return types.PermissionResult{Behavior: types.PermissionAllow}
 		},
 		ExecuteFn: func(tc types.ToolContext, args map[string]any) (types.ToolResult, error) {
-			base := workingDir
-			if base == "" {
-				base = tc.WorkingDir
-			}
+			base := effectiveWorkingDir(tc, workingDir)
 			nbPath, _ := args["notebook_path"].(string)
 			path := resolvePath(base, nbPath)
 

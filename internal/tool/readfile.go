@@ -88,7 +88,7 @@ func newReadFileTool(wd string, reg *Registry) types.ToolDef {
 			return types.ValidationResult{Valid: true}
 		},
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
-			return executeReadFile(wd, args, func(path string, data []byte) {
+			return executeReadFile(effectiveWorkingDir(ctx, wd), args, func(path string, data []byte) {
 				reg.recordFileVersion(ctx.SessionID, path, data)
 			})
 		},

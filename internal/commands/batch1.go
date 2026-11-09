@@ -881,7 +881,7 @@ func cmdInsights() *command.Command {
 			var earliest, latest time.Time
 
 			for _, e := range entries {
-				if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+				if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") || e.Name() == "index.json" {
 					continue
 				}
 				totalSessions++
@@ -890,6 +890,17 @@ func cmdInsights() *command.Command {
 					continue
 				}
 				totalSize += info.Size()
+				pageDir := filepath.Join(sessionsDir, strings.TrimSuffix(e.Name(), ".json")+".pages")
+				if pages, err := os.ReadDir(pageDir); err == nil {
+					for _, page := range pages {
+						if page.IsDir() || !strings.HasSuffix(page.Name(), ".page") {
+							continue
+						}
+						if pageInfo, err := page.Info(); err == nil {
+							totalSize += pageInfo.Size()
+						}
+					}
+				}
 				modTime := info.ModTime()
 				if earliest.IsZero() || modTime.Before(earliest) {
 					earliest = modTime

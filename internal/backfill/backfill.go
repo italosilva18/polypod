@@ -47,13 +47,15 @@ type indexEntry struct {
 
 // sessionFile is the subset of a persisted session we need for import.
 type sessionFile struct {
-	ID        string         `json:"id"`
-	Title     string         `json:"title"`
-	Messages  []rawMessage   `json:"messages"`
-	Metadata  map[string]any `json:"metadata"`
-	CreatedAt time.Time      `json:"created_at"`
-	UpdatedAt time.Time      `json:"updated_at"`
-	Version   int            `json:"version"`
+	ID           string         `json:"id"`
+	Title        string         `json:"title"`
+	Messages     []rawMessage   `json:"messages"`
+	Format       string         `json:"format"`
+	MessageCount int            `json:"message_count"`
+	Metadata     map[string]any `json:"metadata"`
+	CreatedAt    time.Time      `json:"created_at"`
+	UpdatedAt    time.Time      `json:"updated_at"`
+	Version      int            `json:"version"`
 }
 
 type rawMessage struct {
@@ -93,6 +95,9 @@ func (s *Scanner) FindOrphaned() ([]OrphanedSession, error) {
 			return nil
 		}
 		if d.IsDir() {
+			if strings.HasSuffix(d.Name(), ".pages") {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if strings.ToLower(filepath.Ext(d.Name())) != ".json" {
@@ -118,7 +123,7 @@ func (s *Scanner) FindOrphaned() ([]OrphanedSession, error) {
 			Path:         path,
 			ID:           id,
 			ModTime:      info.ModTime(),
-			Size:         info.Size(),
+			Size:         info.Size() + pageBytes(strings.TrimSuffix(path, ".json")+".pages"),
 			MessageCount: CountMessages(path),
 		})
 		return nil
@@ -154,10 +159,14 @@ func (s *Scanner) Import(session OrphanedSession) error {
 		title = id
 	}
 
+	messageCount := len(sf.Messages)
+	if sf.Format == "paged-v1" {
+		messageCount = max(0, sf.MessageCount)
+	}
 	entry := indexEntry{
 		ID:        id,
 		Title:     title,
-		Messages:  len(sf.Messages),
+		Messages:  messageCount,
 		CreatedAt: sf.CreatedAt,
 		UpdatedAt: sf.UpdatedAt,
 	}
@@ -233,8 +242,8 @@ func (s *Scanner) Preview() string {
 	return sb.String()
 }
 
-// CountMessages performs a quick count of message objects (entries with a
-// "role" field) inside a session JSON file.
+// CountMessages reads the manifest count for paged sessions and counts role
+// objects in legacy JSON sessions.
 func CountMessages(path string) int {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -243,9 +252,15 @@ func CountMessages(path string) int {
 
 	// Try parsing as an object with a "messages" array (standard session format).
 	var obj struct {
+		Format   string            `json:"format"`
+		Count    int               `json:"message_count"`
 		Messages []json.RawMessage `json:"messages"`
 	}
-	if json.Unmarshal(data, &obj) == nil && len(obj.Messages) > 0 {
+	objErr := json.Unmarshal(data, &obj)
+	if objErr == nil && obj.Format == "paged-v1" {
+		return max(0, obj.Count)
+	}
+	if objErr == nil && len(obj.Messages) > 0 {
 		count := 0
 		for _, raw := range obj.Messages {
 			var m map[string]any
@@ -274,6 +289,23 @@ func CountMessages(path string) int {
 	}
 
 	return 0
+}
+
+func pageBytes(dir string) int64 {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	var total int64
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".page") {
+			continue
+		}
+		if info, err := entry.Info(); err == nil {
+			total += info.Size()
+		}
+	}
+	return total
 }
 
 // ---------------------------------------------------------------------------

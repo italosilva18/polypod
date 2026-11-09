@@ -1,6 +1,8 @@
 package session
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -62,7 +64,11 @@ func NewFileSystemStorage(dir string, logger *slog.Logger) *FileSystemStorage {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	os.MkdirAll(dir, 0700)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		logger.Warn("cannot create sessions directory", "dir", dir, "error", err)
+	} else if err := inheritSessionDirOwner(dir); err != nil {
+		logger.Warn("cannot set sessions directory owner", "dir", dir, "error", err)
+	}
 	return &FileSystemStorage{dir: dir, logger: logger}
 }
 
@@ -74,21 +80,67 @@ func (fs *FileSystemStorage) sessionPath(id string) string {
 func (fs *FileSystemStorage) Save(sess *RestoredSession) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	if sess == nil || !validSessionID(sess.ID) {
+		return fmt.Errorf("invalid session")
+	}
 
 	if err := os.MkdirAll(fs.dir, 0700); err != nil {
 		return fmt.Errorf("creating sessions dir: %w", err)
 	}
+	if err := inheritSessionDirOwner(fs.dir); err != nil {
+		return fmt.Errorf("setting sessions dir owner: %w", err)
+	}
+	previous, _, err := fs.readDocument(sess.ID)
+	if err != nil {
+		fs.logger.Warn("cannot read previous session manifest", "session", sess.ID, "error", err)
+	}
 
 	sess.Version = CurrentSessionVersion
-	data, err := json.MarshalIndent(sess, "", "  ")
+	pageDir := fs.pageDir(sess.ID)
+	if err := os.MkdirAll(pageDir, 0700); err != nil {
+		return fmt.Errorf("creating session pages dir: %w", err)
+	}
+	if err := inheritSessionDirOwner(pageDir); err != nil {
+		return fmt.Errorf("setting session pages dir owner: %w", err)
+	}
+	manifest := sessionManifest{
+		Format: pagedFormat, ID: sess.ID, Title: sess.Title,
+		Metadata: sess.Metadata, CreatedAt: sess.CreatedAt,
+		UpdatedAt: sess.UpdatedAt, Version: sess.Version,
+		MessageCount: len(sess.Messages),
+	}
+	if len(sess.Messages) > 0 {
+		manifest.Preview = previewContent(sess.Messages[0].Content)
+	}
+	for start := 0; start < len(sess.Messages); start += messagePageSize {
+		end := min(start+messagePageSize, len(sess.Messages))
+		data, err := json.Marshal(sess.Messages[start:end])
+		if err != nil {
+			return fmt.Errorf("marshaling session page: %w", err)
+		}
+		digest := sha256.Sum256(data)
+		name := hex.EncodeToString(digest[:]) + ".page"
+		path := filepath.Join(pageDir, name)
+		info, err := os.Stat(path)
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("checking existing session page: %w", err)
+		}
+		if os.IsNotExist(err) || info.Size() != int64(len(data)) {
+			if err := atomicWriteFile(path, data); err != nil {
+				return fmt.Errorf("writing session page: %w", err)
+			}
+		}
+		manifest.Pages = append(manifest.Pages, messagePageRef{File: name, Count: end - start})
+	}
+	data, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
-		return fmt.Errorf("marshaling session: %w", err)
+		return fmt.Errorf("marshaling session manifest: %w", err)
 	}
-
-	path := fs.sessionPath(sess.ID)
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		return fmt.Errorf("writing session file: %w", err)
+	if err := atomicWriteFile(fs.sessionPath(sess.ID), data); err != nil {
+		return fmt.Errorf("writing session manifest: %w", err)
 	}
+	fs.retireOldPages(sess.ID, previous, manifest.Pages)
+	fs.pruneUnreferencedPages(sess.ID, manifest.Pages)
 	return nil
 }
 
@@ -96,34 +148,41 @@ func (fs *FileSystemStorage) Save(sess *RestoredSession) error {
 func (fs *FileSystemStorage) Load(sessionID string) (*RestoredSession, error) {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
-
-	path := fs.sessionPath(sessionID)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
+	manifest, legacy, err := fs.readDocument(sessionID)
+	if err != nil || (manifest == nil && legacy == nil) {
+		return nil, err
+	}
+	if legacy != nil {
+		return legacy, nil
+	}
+	sess := manifest.session()
+	sess.Messages = make([]Message, 0, manifest.MessageCount)
+	for _, ref := range manifest.Pages {
+		messages, err := fs.readPage(sessionID, ref)
+		if err != nil {
+			return nil, err
 		}
-		return nil, fmt.Errorf("reading session: %w", err)
+		sess.Messages = append(sess.Messages, messages...)
 	}
-
-	var sess RestoredSession
-	if err := json.Unmarshal(data, &sess); err != nil {
-		return nil, fmt.Errorf("parsing session: %w", err)
-	}
-	return &sess, nil
+	return sess, nil
 }
 
 // Delete removes a session file.
 func (fs *FileSystemStorage) Delete(sessionID string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	if !validSessionID(sessionID) {
+		return fmt.Errorf("invalid session ID %q", sessionID)
+	}
 
 	path := fs.sessionPath(sessionID)
 	if err := os.Remove(path); err != nil {
-		if os.IsNotExist(err) {
-			return nil
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("deleting session: %w", err)
 		}
-		return fmt.Errorf("deleting session: %w", err)
+	}
+	if err := os.RemoveAll(fs.pageDir(sessionID)); err != nil {
+		return fmt.Errorf("deleting session pages: %w", err)
 	}
 	fs.logger.Info("deleted session", "id", sessionID)
 	return nil
@@ -144,50 +203,42 @@ func (fs *FileSystemStorage) List(filter SessionFilter) ([]SessionSummary, error
 
 	var summaries []SessionSummary
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" || entry.Name() == "index.json" {
 			continue
 		}
 
-		path := filepath.Join(fs.dir, entry.Name())
-		data, err := os.ReadFile(path)
-		if err != nil {
+		id := strings.TrimSuffix(entry.Name(), ".json")
+		manifest, legacy, err := fs.readDocument(id)
+		if err != nil || (manifest == nil && legacy == nil) {
 			continue
 		}
-
-		var sess RestoredSession
-		if err := json.Unmarshal(data, &sess); err != nil {
-			continue
+		var header *SessionHeader
+		if legacy != nil {
+			header = headerFromLegacy(legacy)
+		} else {
+			header = manifest.header()
 		}
 
 		// Apply filters.
-		if filter.Channel != "" && sess.Metadata.Tag != filter.Channel {
-			// Check if we have channel info — for file-based storage we match on tag.
-		}
-		if filter.Tag != "" && sess.Metadata.Tag != filter.Tag {
+		if filter.Channel != "" && header.Metadata.Tag != "" && header.Metadata.Tag != filter.Channel {
 			continue
 		}
-		if !filter.Since.IsZero() && sess.UpdatedAt.Before(filter.Since) {
+		if filter.Tag != "" && header.Metadata.Tag != filter.Tag {
 			continue
 		}
-
-		preview := ""
-		if len(sess.Messages) > 0 {
-			first := sess.Messages[0].Content
-			if len(first) > 100 {
-				first = first[:100] + "..."
-			}
-			preview = first
+		if !filter.Since.IsZero() && header.UpdatedAt.Before(filter.Since) {
+			continue
 		}
 
 		summaries = append(summaries, SessionSummary{
-			ID:        sess.ID,
-			Title:     sess.Title,
-			Tag:       sess.Metadata.Tag,
-			Messages:  len(sess.Messages),
-			CreatedAt: sess.CreatedAt,
-			UpdatedAt: sess.UpdatedAt,
-			GitBranch: sess.Metadata.GitBranch,
-			Preview:   preview,
+			ID:        header.ID,
+			Title:     header.Title,
+			Tag:       header.Metadata.Tag,
+			Messages:  header.MessageCount,
+			CreatedAt: header.CreatedAt,
+			UpdatedAt: header.UpdatedAt,
+			GitBranch: header.Metadata.GitBranch,
+			Preview:   header.Preview,
 		})
 	}
 
@@ -221,31 +272,54 @@ func (fs *FileSystemStorage) Search(query string) ([]SessionSummary, error) {
 
 	var results []SessionSummary
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" || entry.Name() == "index.json" {
 			continue
 		}
 
-		path := filepath.Join(fs.dir, entry.Name())
-		data, err := os.ReadFile(path)
-		if err != nil {
+		id := strings.TrimSuffix(entry.Name(), ".json")
+		manifest, legacy, err := fs.readDocument(id)
+		if err != nil || (manifest == nil && legacy == nil) {
 			continue
 		}
-
-		var sess RestoredSession
-		if err := json.Unmarshal(data, &sess); err != nil {
-			continue
+		var header *SessionHeader
+		preview := ""
+		matched := false
+		if legacy != nil {
+			header = headerFromLegacy(legacy)
+			matched = matchesQuery(queryLower, legacy)
+			if matched {
+				preview = extractSearchPreview(queryLower, legacy)
+			}
+		} else {
+			header = manifest.header()
+			metadata := manifest.session()
+			matched = matchesQuery(queryLower, metadata)
+			if matched {
+				preview = manifest.Preview
+			} else {
+				for _, ref := range manifest.Pages {
+					messages, err := fs.readPage(id, ref)
+					if err != nil {
+						break
+					}
+					page := &RestoredSession{Messages: messages}
+					if matchesQuery(queryLower, page) {
+						matched = true
+						preview = extractSearchPreview(queryLower, page)
+						break
+					}
+				}
+			}
 		}
-
-		if matchesQuery(queryLower, &sess) {
-			preview := extractSearchPreview(queryLower, &sess)
+		if matched {
 			results = append(results, SessionSummary{
-				ID:        sess.ID,
-				Title:     sess.Title,
-				Tag:       sess.Metadata.Tag,
-				Messages:  len(sess.Messages),
-				CreatedAt: sess.CreatedAt,
-				UpdatedAt: sess.UpdatedAt,
-				GitBranch: sess.Metadata.GitBranch,
+				ID:        header.ID,
+				Title:     header.Title,
+				Tag:       header.Metadata.Tag,
+				Messages:  header.MessageCount,
+				CreatedAt: header.CreatedAt,
+				UpdatedAt: header.UpdatedAt,
+				GitBranch: header.Metadata.GitBranch,
 				Preview:   preview,
 			})
 		}

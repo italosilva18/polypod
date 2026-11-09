@@ -3,6 +3,7 @@ package computeruse
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/costa/polypod/internal/browser"
@@ -13,14 +14,16 @@ func registerBrowserManageTool(reg ToolRegistry, runtime *browserRuntime) {
 	reg.RegisterDef(types.ToolDef{
 		NameFn: func() string { return "browser_manage" },
 		DescriptionFn: func() string {
-			return "Gerencia navegador com perfil privado persistente: status, start, stop, tabs, new_tab, switch_tab, close_tab, navigate, snapshot, text e evaluate. Sem POLYPOD_BROWSER_CDP_URL, abre Chrome isolado sob demanda; com endpoint explícito, usa esse navegador. Avalie JavaScript apenas quando necessário e observe o efeito após ações."
+			return "Gerencia Chrome/Chromium: status, attach, use_desktop, detach, start, stop, tabs, new_tab, switch_tab, close_tab, navigate, snapshot, text e evaluate. attach conecta a sessão já aberta com CDP local, por endpoint ou profile_dir; use_desktop observa a tela do usuário quando CDP não está disponível. detach retorna à configuração anterior. Sem conexão externa, abre perfil privado sob demanda. Avalie JavaScript apenas quando necessário e observe o efeito após ações."
 		},
 		InputSchemaFn: func() map[string]any {
 			return map[string]any{"type": "object", "properties": map[string]any{
-				"action":     map[string]any{"type": "string", "enum": []string{"status", "start", "stop", "tabs", "new_tab", "switch_tab", "activate_tab", "close_tab", "navigate", "snapshot", "text", "evaluate"}},
-				"tab_id":     map[string]any{"type": "string"},
-				"url":        map[string]any{"type": "string"},
-				"javascript": map[string]any{"type": "string"},
+				"action":      map[string]any{"type": "string", "enum": []string{"status", "attach", "use_desktop", "detach", "start", "stop", "tabs", "new_tab", "switch_tab", "activate_tab", "close_tab", "navigate", "snapshot", "text", "evaluate"}},
+				"endpoint":    map[string]any{"type": "string", "description": "Endpoint HTTP CDP local, por exemplo http://127.0.0.1:9222"},
+				"profile_dir": map[string]any{"type": "string", "description": "Diretório absoluto do perfil de um navegador já aberto com CDP"},
+				"tab_id":      map[string]any{"type": "string"},
+				"url":         map[string]any{"type": "string"},
+				"javascript":  map[string]any{"type": "string"},
 			}, "required": []string{"action"}}
 		},
 		IsReadOnlyFn: func(args map[string]any) bool {
@@ -50,7 +53,20 @@ func registerBrowserManageTool(reg ToolRegistry, runtime *browserRuntime) {
 func validateBrowserManage(args map[string]any) types.ValidationResult {
 	action := stringArg(args, "action", "")
 	switch action {
-	case "status", "start", "stop", "tabs", "snapshot", "text":
+	case "status", "use_desktop", "detach", "start", "stop", "tabs", "snapshot", "text":
+	case "attach":
+		endpoint := strings.TrimSpace(stringArg(args, "endpoint", ""))
+		profileDir := strings.TrimSpace(stringArg(args, "profile_dir", ""))
+		if (endpoint == "") == (profileDir == "") {
+			return types.ValidationResult{Message: "informe endpoint ou profile_dir para attach"}
+		}
+		if endpoint != "" {
+			if _, err := browser.ValidateCDPEndpoint(endpoint); err != nil {
+				return types.ValidationResult{Message: err.Error()}
+			}
+		} else if !filepath.IsAbs(profileDir) {
+			return types.ValidationResult{Message: "profile_dir deve ser caminho absoluto"}
+		}
 	case "new_tab":
 		if raw := stringArg(args, "url", ""); raw != "" {
 			if err := browser.ValidateNavigationURL(raw); err != nil {
@@ -78,14 +94,51 @@ func validateBrowserManage(args map[string]any) types.ValidationResult {
 func executeBrowserManage(ctx types.ToolContext, runtime *browserRuntime, args map[string]any) types.ToolResult {
 	action := stringArg(args, "action", "")
 	if action == "status" {
-		if runtime.endpoint != "" {
-			tabs, err := (browser.CDP{Endpoint: runtime.endpoint}).Tabs(ctx.Context)
-			return browserJSON(map[string]any{"mode": "attached", "connected": err == nil, "tabs": len(tabs)})
+		client, source, attached, err := runtime.external(ctx.Context)
+		if attached {
+			if source == "desktop" {
+				return browserJSON(map[string]any{"mode": "desktop", "display_configured": IsDisplayAvailable()})
+			}
+			state := map[string]any{"mode": "attached", "source": source, "connected": false, "tabs": 0}
+			if err == nil {
+				var tabs []browser.Tab
+				tabs, err = client.Tabs(ctx.Context)
+				state["tabs"] = len(tabs)
+				state["endpoint"] = client.Endpoint
+			}
+			if err != nil {
+				state["error"] = err.Error()
+			} else {
+				state["connected"] = true
+			}
+			return browserJSON(state)
 		}
 		return browserJSON(runtime.managed.Status())
 	}
+	if action == "use_desktop" {
+		if !IsDisplayAvailable() {
+			return browserError(fmt.Errorf("nenhum desktop gráfico configurado para observar o navegador aberto"))
+		}
+		runtime.useDesktop()
+		return browserJSON(map[string]any{"mode": "desktop", "display_configured": true})
+	}
+	if action == "attach" {
+		client, tabs, err := runtime.attach(ctx.Context, strings.TrimSpace(stringArg(args, "endpoint", "")), strings.TrimSpace(stringArg(args, "profile_dir", "")))
+		if err != nil {
+			return browserError(fmt.Errorf("não foi possível conectar ao navegador aberto: %w; confira se ele iniciou com depuração CDP local", err))
+		}
+		return browserJSON(map[string]any{"mode": "attached", "connected": true, "endpoint": client.Endpoint, "tabs": len(tabs)})
+	}
+	if action == "detach" {
+		runtime.detach()
+		return executeBrowserManage(ctx, runtime, map[string]any{"action": "status"})
+	}
+	_, source, attached, _ := runtime.external(ctx.Context)
+	if source == "desktop" && (action == "start" || action == "stop") {
+		return browserError(fmt.Errorf("modo desktop ativo; use detach para voltar ao navegador gerenciado"))
+	}
 	if action == "stop" {
-		if runtime.endpoint != "" {
+		if attached {
 			return browserError(fmt.Errorf("não é possível encerrar Chrome conectado por endpoint externo"))
 		}
 		if err := runtime.managed.Stop(ctx.Context); err != nil {
@@ -93,7 +146,7 @@ func executeBrowserManage(ctx types.ToolContext, runtime *browserRuntime, args m
 		}
 		return browserJSON(runtime.managed.Status())
 	}
-	if action == "start" && runtime.endpoint != "" {
+	if action == "start" && attached {
 		return browserError(fmt.Errorf("Chrome externo já foi configurado; start requer perfil gerenciado"))
 	}
 	client, err := runtime.client(ctx.Context)
