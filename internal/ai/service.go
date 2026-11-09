@@ -21,12 +21,13 @@ type KnowledgeSearcher interface {
 
 // AnswerRequest contains the data needed to generate an answer.
 type AnswerRequest struct {
-	Channel            string
-	UserID             string
-	Query              string
-	History            []conversation.Message
-	HistoryPrepared    bool   // The caller already checked and persisted auto-compaction.
-	SessionMemoryScope string // Internal persisted session or branch ID; never trust remote message metadata.
+	Channel               string
+	UserID                string
+	Query                 string
+	History               []conversation.Message
+	HistoryPrepared       bool   // The caller already checked and persisted auto-compaction.
+	SessionMemoryScope    string // Internal persisted session or branch ID; never trust remote message metadata.
+	ToolTranscriptSummary string // Short historical metadata; never executable tool calls or raw results.
 }
 
 // AnswerResponse contains the AI response and usage stats.
@@ -209,6 +210,9 @@ func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) ([]ChatM
 
 	// Build messages using agent persona
 	systemPrompt := BuildSystemPrompt(ag.Persona, knowledgeCtx, memoryCtx)
+	if req.ToolTranscriptSummary != "" {
+		systemPrompt += "\n\n" + req.ToolTranscriptSummary
+	}
 	if projectContext := project.InjectProjectContext(); projectContext != "" {
 		systemPrompt += "\n\n" + projectContext
 	}

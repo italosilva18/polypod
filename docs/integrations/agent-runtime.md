@@ -19,6 +19,8 @@ O estado e os logs são salvos em `task-registry.d` dentro do diretório de dado
 
 O CLI mostra um aviso quando uma tarefa termina, falha ou é interrompida. É possível digitar e enfileirar a próxima mensagem enquanto a resposta atual chega; a fila aparece na barra de status e pertence apenas à janela atual. Depois de corrigir a causa de uma falha de resposta, `/retry` reenvia a última entrada que falhou.
 
+Durante uma resposta, `Ctrl+B` minimiza a saída ao vivo; pressione novamente para voltar a acompanhá-la. O processamento continua na mesma sessão, e mensagens enviadas nesse intervalo ficam na fila até o turno terminar. Para conversas longas, o TUI renderiza as 60 mensagens mais recentes e `PgUp` revela blocos anteriores sem perder a posição de leitura. A sessão JSON ainda é carregada inteira do disco; a paginação reduz o trabalho de renderização, não a leitura do arquivo.
+
 ## Rotinas e gatilhos
 
 `/schedule` gerencia rotinas persistentes:
@@ -44,6 +46,8 @@ O comando `bash` pode encaminhar programas interativos a uma sessão PTY. As fer
 O histórico é compactado automaticamente quando o contexto cresce. `/compact` força a compactação. `/rewind` restaura conversa e arquivos gravados pelas ferramentas de edição do agente; `/rewind --conversation` e `/rewind --files` selecionam apenas uma parte. Alterações feitas diretamente por shell ou PTY não entram no snapshot de arquivos. Conflitos com edições posteriores são registrados e a restauração solicitada continua.
 
 Na compactação automática e em `/compact`, a memória da sessão guarda até oito afirmações explícitas do usuário que saíram do contexto, com filtros para credenciais e limite de 64 entradas por sessão. A próxima resposta recupera até quatro entradas relevantes, limitadas a 1.000 caracteres. Cada branch começa com uma cópia da memória do ponto de criação e depois evolui separadamente. O registro privado fica em `session-memory.d` no diretório de dados; duas instâncias escrevendo no mesmo ID ao mesmo tempo ainda não têm coordenação entre processos.
+
+Chamadas de ferramentas geram um journal privado por sessão em `tool-transcripts.d`, com início, conclusão ou erro, ID e horário. Argumentos entram só como nomes de campos e hash; resultados ficam com preview redigido. `/resume` mostra os registros recentes sem reexecutá-los. Para dar continuidade ao modelo, cada turno recebe no máximo 400 caracteres de metadados das ferramentas concluídas, sem o texto bruto dos resultados. O journal retém até 1.024 eventos por sessão por 30 dias.
 
 `/branch create <nome>` copia o ponto atual da conversa para uma sessão independente. `/branch switch <nome>` salva a branch ativa e carrega o histórico selecionado para a próxima resposta do modelo. `/branch` mostra as branches e `/branch delete <nome>` remove o nome do índice sem apagar o transcript, que continua disponível em `/resume`. Ao retomar uma sessão, o CLI restaura o agente e modo válidos. Se ela veio de outra pasta, a diferença é mostrada na tela; abra o Polypod naquela pasta para usar seus arquivos.
 

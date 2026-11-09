@@ -61,6 +61,8 @@ type queuedInput struct {
 	images []string
 }
 
+const historyPageSize = 60
+
 // toolEventMsg carries a tool lifecycle event to the Bubbletea update loop.
 type toolEventMsg struct {
 	event adapter.ToolEventInfo
@@ -102,13 +104,18 @@ type model struct {
 	spinner  spinner.Model
 	history  *inputHistory
 
-	messages   []chatEntry
-	streaming  *strings.Builder
-	streamCh   <-chan streamMsg
-	state      state
-	queued     []queuedInput
-	activeTurn *retryTurn
-	failedTurn *retryTurn
+	messages  []chatEntry
+	streaming *strings.Builder
+	streamCh  <-chan streamMsg
+	state     state
+	queued    []queuedInput
+	// A background turn keeps processing in the same conversation. Later
+	// submissions stay queued until it completes.
+	backgroundTurn  bool
+	historyStart    int
+	historyExpanded bool
+	activeTurn      *retryTurn
+	failedTurn      *retryTurn
 	// An ask_user prompt temporarily owns the composer. Preserve any draft that
 	// the user was writing while the current turn streamed.
 	heldDraft      string
@@ -619,12 +626,15 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport = viewport.New(m.width, viewportHeight)
 			m.ready = true
 			m.viewport.SetContent(m.renderMessages())
+			if len(m.messages) > 0 {
+				m.viewport.GotoBottom()
+			}
 		} else {
 			atBottom := m.viewport.AtBottom()
 			m.viewport.Width = m.width
 			m.viewport.Height = viewportHeight
 			m.viewport.SetContent(m.renderMessages())
-			if atBottom || m.state == stateStreaming {
+			if atBottom {
 				m.viewport.GotoBottom()
 			}
 		}
@@ -636,8 +646,14 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.MouseMsg:
 		// Pass mouse events (scroll wheel) to viewport
+		wasAtTop := m.viewport.AtTop()
 		var cmd tea.Cmd
 		m.viewport, cmd = m.viewport.Update(msg)
+		if wasAtTop && msg.Button == tea.MouseButtonWheelUp {
+			m.prependHistoryPage()
+		} else if msg.Button == tea.MouseButtonWheelDown && m.viewport.AtBottom() {
+			m.historyExpanded = false
+		}
 		return m, cmd
 
 	case tea.KeyMsg:
@@ -715,14 +731,26 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case msg.Type == tea.KeyCtrlC:
 			return m, tea.Quit
 
+		case msg.Type == tea.KeyCtrlB && m.state == stateStreaming && !m.waitingForUserAnswer:
+			m.backgroundTurn = !m.backgroundTurn
+			m.updateViewport()
+			return m, nil
+
 		case msg.Type == tea.KeyPgUp:
+			wasAtTop := m.viewport.AtTop()
 			var cmd tea.Cmd
 			m.viewport, cmd = m.viewport.Update(msg)
+			if wasAtTop {
+				m.prependHistoryPage()
+			}
 			return m, cmd
 
 		case msg.Type == tea.KeyPgDown:
 			var cmd tea.Cmd
 			m.viewport, cmd = m.viewport.Update(msg)
+			if m.viewport.AtBottom() {
+				m.historyExpanded = false
+			}
 			return m, cmd
 
 		case msg.Type == tea.KeyCtrlR && m.state == stateIdle:
@@ -770,6 +798,8 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case msg.Type == tea.KeyCtrlL && m.state == stateIdle:
 			m.messages = nil
+			m.historyStart = 0
+			m.historyExpanded = false
 			m.updateViewport()
 			return m, nil
 
@@ -894,9 +924,14 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if result.handled {
 				if result.clearDisplay {
 					m.messages = nil
+					m.historyStart = 0
+					m.historyExpanded = false
 				}
 				if result.replaceMessages != nil {
 					m.messages = append([]chatEntry{}, result.replaceMessages...)
+					m.historyStart = max(0, len(m.messages)-historyPageSize)
+					m.historyExpanded = false
+					m.viewport.GotoBottom()
 				}
 				if result.output != "" {
 					m.messages = append(m.messages, chatEntry{
@@ -925,6 +960,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				timestamp: time.Now(),
 			})
 			m.state = stateStreaming
+			m.backgroundTurn = false
 			m.activeTurn = &retryTurn{raw: raw, images: turnImages}
 			m.streamStart = time.Now()
 			m.streaming.Reset()
@@ -949,6 +985,8 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamMsg:
 		if msg.err != nil {
 			m.state = stateIdle
+			wasBackground := m.backgroundTurn
+			m.backgroundTurn = false
 			m.failedTurn = m.activeTurn
 			m.activeTurn = nil
 			m.messages = append(m.messages, chatEntry{
@@ -956,6 +994,10 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				content:   msg.err.Error() + retryFailureHint(msg.err),
 				timestamp: time.Now(),
 			})
+			if wasBackground {
+				m.notification = "resposta em segundo plano falhou; use /retry após corrigir a causa"
+				m.notifyLevel = "error"
+			}
 			m.streaming.Reset()
 			m.streamCh = nil
 			if m.statusBar != nil {
@@ -964,6 +1006,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshStatusBar()
 			m.refreshTokenWarning()
 			m.updateViewport()
+			if wasBackground {
+				return m, tea.Batch(m.startQueuedCmd(), clearNotifyAfter(6*time.Second, m.notification))
+			}
 			return m, m.startQueuedCmd()
 		}
 		// Handle tool event carried by streamMsg
@@ -988,6 +1033,8 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.done {
 			elapsed := time.Since(m.streamStart)
 			m.state = stateIdle
+			wasBackground := m.backgroundTurn
+			m.backgroundTurn = false
 			m.activeTurn = nil
 			content := m.streaming.String()
 			if content != "" {
@@ -999,6 +1046,10 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				})
 			}
 			m.streaming.Reset()
+			if wasBackground {
+				m.notification = "resposta em segundo plano concluída"
+				m.notifyLevel = "success"
+			}
 			m.streamCh = nil
 			// The turn is done: clear any stale active-tool indicator
 			// and refresh the status bar from the latest cost/token
@@ -1009,6 +1060,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshStatusBar()
 			m.refreshTokenWarning()
 			m.updateViewport()
+			if wasBackground {
+				return m, tea.Batch(m.startQueuedCmd(), clearNotifyAfter(6*time.Second, m.notification))
+			}
 			return m, m.startQueuedCmd()
 		}
 		// Delta token
@@ -1277,8 +1331,12 @@ func (m *model) updateViewport() {
 	if !m.ready {
 		return
 	}
-	// Auto-scroll only if user is already at/near bottom or streaming
-	atBottom := m.viewport.AtBottom() || m.state == stateStreaming
+	// Keep the viewport small while the user follows the latest messages.
+	// Scrolling up preserves the current page until PgUp requests older entries.
+	atBottom := m.viewport.AtBottom()
+	if atBottom && !m.historyExpanded && len(m.messages) > historyPageSize {
+		m.historyStart = len(m.messages) - historyPageSize
+	}
 	m.viewport.Height = m.viewportHeight()
 	content := m.renderMessages()
 	m.viewport.SetContent(content)
@@ -1367,7 +1425,13 @@ func (m model) renderMessages() string {
 		return b.String()
 	}
 
-	for i, entry := range m.messages {
+	start := min(max(0, m.historyStart), len(m.messages))
+	if start > 0 {
+		b.WriteString(subtleStyle.Render(fmt.Sprintf("  ↑ %d mensagens anteriores; PgUp para carregar", start)))
+		b.WriteString("\n\n")
+	}
+	for i := start; i < len(m.messages); i++ {
+		entry := m.messages[i]
 		switch entry.role {
 		case "user":
 			writeWrappedMessage(&b, entry.content, userStyle.Render("  > "), "    ", width, contentStyle)
@@ -1406,6 +1470,12 @@ func (m model) renderMessages() string {
 			b.WriteString(sep)
 			b.WriteString("\n\n")
 		}
+	}
+
+	if m.state == stateStreaming && m.backgroundTurn {
+		b.WriteString(notifyInfoStyle.Render("  Resposta em segundo plano · Ctrl+B para visualizar"))
+		b.WriteString("\n")
+		return b.String()
 	}
 
 	// Show streaming content with cursor
@@ -1560,6 +1630,9 @@ func (m model) View() string {
 	var status strings.Builder
 	if m.waitingForUserAnswer {
 		status.WriteString(notifyInfoStyle.Render(" Aguardando sua resposta...  Enter para enviar"))
+	} else if m.backgroundTurn {
+		elapsed := time.Since(m.streamStart)
+		status.WriteString(notifyInfoStyle.Render(fmt.Sprintf(" Em segundo plano %s · Ctrl+B visualizar", formatDuration(elapsed))))
 	} else if m.notification != "" {
 		switch m.notifyLevel {
 		case "success":
@@ -1581,6 +1654,9 @@ func (m model) View() string {
 			status.WriteString(streamingDimStyle.Render(fmt.Sprintf(" %s %s", activeToolName, formatDuration(elapsed))))
 		} else {
 			status.WriteString(streamingDimStyle.Render(fmt.Sprintf(" pensando... %s", formatDuration(elapsed))))
+		}
+		if m.width >= 80 {
+			status.WriteString(statusBarStyle.Render("  Ctrl+B segundo plano"))
 		}
 	} else {
 		// Show tab completion hints or default status

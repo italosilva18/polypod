@@ -68,6 +68,7 @@ type Adapter struct {
 	activeSessionID   string
 	taskRegistry      *tasks.TaskRegistry
 	sessionMemory     *sessionmem.FileStore
+	toolTranscript    *session.ToolTranscriptStore
 }
 
 // SetTaskRegistry connects live background-task notices to the CLI.
@@ -78,6 +79,11 @@ func (a *Adapter) SetTaskRegistry(registry *tasks.TaskRegistry) {
 // SetSessionMemory retains concise facts across compaction for each session.
 func (a *Adapter) SetSessionMemory(store *sessionmem.FileStore) {
 	a.sessionMemory = store
+}
+
+// SetToolTranscriptStore exposes completed tool history when resuming sessions.
+func (a *Adapter) SetToolTranscriptStore(store *session.ToolTranscriptStore) {
+	a.toolTranscript = store
 }
 
 // SetTurnCheckpointManager enables file-aware conversation rewind.
@@ -255,6 +261,7 @@ func (a *Adapter) Start(ctx context.Context, handler adapter.MessageHandler) err
 				content: rm.Content,
 			})
 		}
+		m.historyStart = max(0, len(m.messages)-historyPageSize)
 	}
 
 	// Keep mouse reporting disabled so the terminal can select and copy text.
@@ -288,6 +295,10 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 		if a.sessionMemory != nil {
 			controller.forkMemory = a.sessionMemory.Fork
 			controller.deleteMemory = a.sessionMemory.Delete
+		}
+		if a.toolTranscript != nil {
+			controller.forkTranscript = a.toolTranscript.Fork
+			controller.deleteTranscript = a.toolTranscript.Delete
 		}
 		deps.bindBranches = func(state *cliSessionState) error {
 			return state.BindBranches(controller.callbacks())
@@ -527,7 +538,7 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 					return nil, fmt.Errorf("abrindo sessao retomada: %w", sessErr)
 				}
 				if restored.ID == a.activeSessionID {
-					return toBranchEntries(sess.Messages), nil
+					return a.appendTranscriptHistory(restored.ID, toBranchEntries(sess.Messages)), nil
 				}
 				if err := a.saveActiveSession(sess); err != nil {
 					return nil, fmt.Errorf("salvando sessao anterior: %w", err)
@@ -556,7 +567,7 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 				entries = append(entries, chatEntry{role: "system", content: warning, timestamp: time.Now()})
 			}
 			a.activeSessionID = restored.ID
-			return entries, nil
+			return a.appendTranscriptHistory(restored.ID, entries), nil
 		}
 	}
 

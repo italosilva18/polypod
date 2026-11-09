@@ -196,4 +196,5 @@ func NewReadMCPResourceTool() types.ToolDef {
 func RegisterMCPResourceTools(reg *Registry) {
 	reg.RegisterDef(NewListMCPResourcesTool())
 	reg.RegisterDef(NewReadMCPResourceTool())
+	registerMCPAdvancedResourceTools(reg)
 }

@@ -24,6 +24,9 @@ func (m *Manager) refreshNotification(session *mcpsdk.ClientSession, kind string
 		err = m.refreshTools(ctx, session)
 	case "resources":
 		err = m.refreshResources(ctx, session)
+		if templateErr := m.refreshResourceTemplates(ctx, session); templateErr != nil {
+			m.logger.Debug("mcp resource templates unavailable", "error", templateErr)
+		}
 	case "prompts":
 		err = m.refreshPrompts(ctx, session)
 	}
@@ -149,6 +152,9 @@ func (m *Manager) refreshOptionalLists(ctx context.Context, session *mcpsdk.Clie
 	if caps.Resources != nil {
 		if err := m.refreshResources(ctx, session); err != nil {
 			m.logger.Warn("mcp initial resource discovery failed", "error", err)
+		}
+		if err := m.refreshResourceTemplates(ctx, session); err != nil {
+			m.logger.Debug("mcp resource templates unavailable", "error", err)
 		}
 	}
 	if caps.Prompts != nil {

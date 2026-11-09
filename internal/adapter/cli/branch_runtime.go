@@ -23,16 +23,18 @@ import (
 // A small manifest records names and fork ancestry. The conversation manager
 // always holds the active branch, so the next AI turn uses the selected history.
 type persistentBranchController struct {
-	mu           sync.Mutex
-	directory    string
-	storage      session.SessionStorage
-	conversation *conversation.Manager
-	activeID     func() string
-	setActiveID  func(string)
-	saveActive   func(*conversation.Session) error
-	activate     func(session.SessionMetadata) []string
-	forkMemory   func(string, string) error
-	deleteMemory func(string) error
+	mu               sync.Mutex
+	directory        string
+	storage          session.SessionStorage
+	conversation     *conversation.Manager
+	activeID         func() string
+	setActiveID      func(string)
+	saveActive       func(*conversation.Session) error
+	activate         func(session.SessionMetadata) []string
+	forkMemory       func(string, string) error
+	deleteMemory     func(string) error
+	forkTranscript   func(string, string) error
+	deleteTranscript func(string) error
 }
 
 type branchManifest struct {
@@ -174,6 +176,24 @@ func (r *persistentBranchController) create(name string, _ []chatEntry) (branchS
 			return branchSnapshot{}, fmt.Errorf("copiando memoria da branch: %w", err)
 		}
 	}
+	if r.forkTranscript != nil {
+		if err := r.forkTranscript(parentID, childID); err != nil {
+			if cleanupErr := r.storage.Delete(childID); cleanupErr != nil {
+				slog.Warn("nao foi possivel remover sessao filha apos falha de transcript", "error", cleanupErr)
+			}
+			if r.deleteMemory != nil {
+				if cleanupErr := r.deleteMemory(childID); cleanupErr != nil {
+					slog.Warn("nao foi possivel remover memoria filha apos falha de transcript", "error", cleanupErr)
+				}
+			}
+			if r.deleteTranscript != nil {
+				if cleanupErr := r.deleteTranscript(childID); cleanupErr != nil {
+					slog.Warn("nao foi possivel remover transcript filho apos falha de copia", "error", cleanupErr)
+				}
+			}
+			return branchSnapshot{}, fmt.Errorf("copiando transcript da branch: %w", err)
+		}
+	}
 	previous := manifest.Active
 	manifest.Branches[name] = branchRecord{
 		SessionID: childID, Parent: previous,
@@ -189,6 +209,11 @@ func (r *persistentBranchController) create(name string, _ []chatEntry) (branchS
 		if r.deleteMemory != nil {
 			if cleanupErr := r.deleteMemory(childID); cleanupErr != nil {
 				slog.Warn("nao foi possivel remover memoria filha apos falha do indice", "error", cleanupErr)
+			}
+		}
+		if r.deleteTranscript != nil {
+			if cleanupErr := r.deleteTranscript(childID); cleanupErr != nil {
+				slog.Warn("nao foi possivel remover transcript filho apos falha do indice", "error", cleanupErr)
 			}
 		}
 		return branchSnapshot{}, err

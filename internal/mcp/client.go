@@ -28,17 +28,22 @@ type ServerConfig struct {
 
 // Manager manages multiple MCP server connections using the official SDK.
 type Manager struct {
-	mu        sync.RWMutex
-	sessions  map[string]*mcpsdk.ClientSession
-	configs   map[string]ServerConfig
-	tools     map[string][]*mcpsdk.Tool
-	resources map[string][]*mcpsdk.Resource
-	prompts   map[string][]*mcpsdk.Prompt
-	skillReg  *skill.Registry
-	closed    bool
-	client    *mcpsdk.Client
-	logger    *slog.Logger
-	reconnect *ReconnectManager
+	mu                 sync.RWMutex
+	sessions           map[string]*mcpsdk.ClientSession
+	configs            map[string]ServerConfig
+	tools              map[string][]*mcpsdk.Tool
+	resources          map[string][]*mcpsdk.Resource
+	resourceTemplates  map[string][]*mcpsdk.ResourceTemplate
+	subscriptions      map[string]map[string]struct{}
+	resourceUpdates    map[string][]ResourceUpdate
+	prompts            map[string][]*mcpsdk.Prompt
+	elicitationHandler ElicitationHandler
+	elicitationWaiters map[*mcpsdk.ClientSession]map[string]chan struct{}
+	skillReg           *skill.Registry
+	closed             bool
+	client             *mcpsdk.Client
+	logger             *slog.Logger
+	reconnect          *ReconnectManager
 }
 
 // NewManager creates an MCP manager.
@@ -47,13 +52,17 @@ func NewManager(logger *slog.Logger) *Manager {
 		logger = slog.Default()
 	}
 	m := &Manager{
-		sessions:  make(map[string]*mcpsdk.ClientSession),
-		configs:   make(map[string]ServerConfig),
-		tools:     make(map[string][]*mcpsdk.Tool),
-		resources: make(map[string][]*mcpsdk.Resource),
-		prompts:   make(map[string][]*mcpsdk.Prompt),
-		logger:    logger,
-		reconnect: NewReconnectManager(DefaultReconnectConfig()),
+		sessions:           make(map[string]*mcpsdk.ClientSession),
+		configs:            make(map[string]ServerConfig),
+		tools:              make(map[string][]*mcpsdk.Tool),
+		resources:          make(map[string][]*mcpsdk.Resource),
+		resourceTemplates:  make(map[string][]*mcpsdk.ResourceTemplate),
+		subscriptions:      make(map[string]map[string]struct{}),
+		resourceUpdates:    make(map[string][]ResourceUpdate),
+		elicitationWaiters: make(map[*mcpsdk.ClientSession]map[string]chan struct{}),
+		prompts:            make(map[string][]*mcpsdk.Prompt),
+		logger:             logger,
+		reconnect:          NewReconnectManager(DefaultReconnectConfig()),
 	}
 	m.client = mcpsdk.NewClient(&mcpsdk.Implementation{
 		Name:    "polypod",
@@ -65,6 +74,11 @@ func NewManager(logger *slog.Logger) *Manager {
 		ResourceListChangedHandler: func(_ context.Context, req *mcpsdk.ResourceListChangedRequest) {
 			go m.refreshNotification(req.Session, "resources")
 		},
+		ResourceUpdatedHandler: func(_ context.Context, req *mcpsdk.ResourceUpdatedNotificationRequest) {
+			m.recordResourceUpdate(req)
+		},
+		ElicitationHandler:         m.handleSDKElicitation,
+		ElicitationCompleteHandler: m.handleElicitationComplete,
 		PromptListChangedHandler: func(_ context.Context, req *mcpsdk.PromptListChangedRequest) {
 			go m.refreshNotification(req.Session, "prompts")
 		},
@@ -142,6 +156,7 @@ func (m *Manager) Connect(ctx context.Context, cfg ServerConfig) error {
 	// Resource and prompt discovery is optional. A server without either
 	// capability must still connect successfully.
 	m.refreshOptionalLists(ctx, session)
+	m.restoreSubscriptions(ctx, cfg.Name, session)
 
 	m.logger.Info("mcp: servidor conectado",
 		"name", cfg.Name,
@@ -166,6 +181,8 @@ func (m *Manager) Disconnect(name string) error {
 	delete(m.sessions, name)
 	delete(m.tools, name)
 	delete(m.resources, name)
+	delete(m.resourceTemplates, name)
+	delete(m.resourceUpdates, name)
 	delete(m.prompts, name)
 	m.mu.Unlock()
 	return session.Close()
@@ -322,6 +339,10 @@ func (m *Manager) Close() error {
 	m.configs = make(map[string]ServerConfig)
 	m.tools = make(map[string][]*mcpsdk.Tool)
 	m.resources = make(map[string][]*mcpsdk.Resource)
+	m.resourceTemplates = make(map[string][]*mcpsdk.ResourceTemplate)
+	m.subscriptions = make(map[string]map[string]struct{})
+	m.resourceUpdates = make(map[string][]ResourceUpdate)
+	m.elicitationWaiters = make(map[*mcpsdk.ClientSession]map[string]chan struct{})
 	m.prompts = make(map[string][]*mcpsdk.Prompt)
 	m.mu.Unlock()
 

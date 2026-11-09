@@ -588,7 +588,44 @@ func sessionMemoryScope(msg adapter.InMessage, sess *conversation.Session) strin
 	return sess.ID
 }
 
-func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionmem.FileStore, turns *turncheckpoint.Manager, logger *slog.Logger) adapter.MessageHandler {
+func appendToolTrace(store *session.ToolTranscriptStore, scope, turnID string, event ai.ToolEvent, logger *slog.Logger) {
+	if store == nil || scope == "" {
+		return
+	}
+	var phase session.ToolTracePhase
+	switch event.Type {
+	case ai.ToolEventStart:
+		phase = session.ToolTraceStart
+	case ai.ToolEventComplete:
+		phase = session.ToolTraceComplete
+	case ai.ToolEventError:
+		phase = session.ToolTraceError
+	default:
+		return
+	}
+	if err := store.Append(scope, session.ToolTraceEvent{
+		TurnID: turnID, CallID: event.ToolID, ToolName: event.ToolName,
+		Phase: phase, Arguments: event.Args, Result: event.Result, Error: event.Error,
+		ResultBytes: event.ResultBytes, ResultSHA256: event.ResultSHA256,
+		Elapsed: event.Elapsed, IsReadOnly: event.IsReadOnly,
+	}); err != nil {
+		logger.Warn("tool transcript event unavailable", "tool", event.ToolName, "error", err)
+	}
+}
+
+func toolTranscriptSummary(store *session.ToolTranscriptStore, scope string, logger *slog.Logger) string {
+	if store == nil || scope == "" {
+		return ""
+	}
+	summary, err := store.Summary(scope, 400)
+	if err != nil {
+		logger.Warn("tool transcript summary unavailable", "error", err)
+		return ""
+	}
+	return summary
+}
+
+func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionmem.FileStore, trace *session.ToolTranscriptStore, turns *turncheckpoint.Manager, logger *slog.Logger) adapter.MessageHandler {
 	return func(ctx context.Context, msg adapter.InMessage) (adapter.OutMessage, error) {
 		sess, err := convMgr.GetSession(ctx, msg.Channel, msg.UserID)
 		if err != nil {
@@ -601,18 +638,22 @@ func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionm
 		}
 		userMessage := convMgr.AddUserMessage(ctx, sess, msg.Text)
 		turnCtx := turns.BeginTurn(ctx, sess.ID, userMessage.ID)
+		turnCtx = ai.WithToolEventCallback(turnCtx, func(event ai.ToolEvent) {
+			appendToolTrace(trace, scope, userMessage.ID, event, logger)
+		})
 		defer func() {
 			if err := turns.FinishTurn(turnCtx); err != nil {
 				logger.Warn("turn checkpoint finalization failed", "turn_id", userMessage.ID, "error", err)
 			}
 		}()
 		resp, err := aiSvc.Answer(turnCtx, ai.AnswerRequest{
-			Channel:            msg.Channel,
-			UserID:             msg.UserID,
-			Query:              msg.Text,
-			SessionMemoryScope: scope,
-			History:            history,
-			HistoryPrepared:    true,
+			Channel:               msg.Channel,
+			UserID:                msg.UserID,
+			Query:                 msg.Text,
+			SessionMemoryScope:    scope,
+			ToolTranscriptSummary: toolTranscriptSummary(trace, scope, logger),
+			History:               history,
+			HistoryPrepared:       true,
 		})
 		if err != nil {
 			return adapter.OutMessage{Text: "Erro ao processar: " + err.Error()}, err
@@ -630,24 +671,9 @@ func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionm
 }
 
 // makeStreamHandler builds the inline stream handler that replaces router.StreamHandler.
-func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionmem.FileStore, turns *turncheckpoint.Manager, logger *slog.Logger) adapter.StreamHandler {
+func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionmem.FileStore, trace *session.ToolTranscriptStore, turns *turncheckpoint.Manager, logger *slog.Logger) adapter.StreamHandler {
 	return func(ctx context.Context, msg adapter.InMessage, chunks chan<- adapter.StreamChunk) {
 		defer close(chunks)
-
-		aiSvc.SetToolEventCallback(func(ev ai.ToolEvent) {
-			chunks <- adapter.StreamChunk{
-				ToolEvent: &adapter.ToolEventInfo{
-					Type:     adapter.ToolEventType(ev.Type),
-					ToolName: ev.ToolName,
-					ToolID:   ev.ToolID,
-					Args:     ev.Args,
-					Result:   ev.Result,
-					Error:    ev.Error,
-					Elapsed:  ev.Elapsed,
-				},
-			}
-		})
-		defer aiSvc.SetToolEventCallback(nil)
 
 		sess, err := convMgr.GetSession(ctx, msg.Channel, msg.UserID)
 		if err != nil {
@@ -662,6 +688,20 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *se
 		}
 		userMessage := convMgr.AddUserMessage(ctx, sess, msg.Text)
 		turnCtx := turns.BeginTurn(ctx, sess.ID, userMessage.ID)
+		turnCtx = ai.WithToolEventCallback(turnCtx, func(ev ai.ToolEvent) {
+			appendToolTrace(trace, scope, userMessage.ID, ev, logger)
+			chunks <- adapter.StreamChunk{
+				ToolEvent: &adapter.ToolEventInfo{
+					Type:     adapter.ToolEventType(ev.Type),
+					ToolName: ev.ToolName,
+					ToolID:   ev.ToolID,
+					Args:     ev.Args,
+					Result:   ev.Result,
+					Error:    ev.Error,
+					Elapsed:  ev.Elapsed,
+				},
+			}
+		})
 		defer func() {
 			if err := turns.FinishTurn(turnCtx); err != nil {
 				logger.Warn("turn checkpoint finalization failed", "turn_id", userMessage.ID, "error", err)
@@ -669,12 +709,13 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *se
 		}()
 
 		resp, err := aiSvc.AnswerStream(turnCtx, ai.AnswerRequest{
-			Channel:            msg.Channel,
-			UserID:             msg.UserID,
-			Query:              msg.Text,
-			SessionMemoryScope: scope,
-			History:            history,
-			HistoryPrepared:    true,
+			Channel:               msg.Channel,
+			UserID:                msg.UserID,
+			Query:                 msg.Text,
+			SessionMemoryScope:    scope,
+			ToolTranscriptSummary: toolTranscriptSummary(trace, scope, logger),
+			History:               history,
+			HistoryPrepared:       true,
 		}, func(delta string) {
 			chunks <- adapter.StreamChunk{Delta: delta}
 		})
@@ -1153,6 +1194,14 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		beforeMCP[name] = true
 	}
 	mcpMgr := mcp.NewManager(logger)
+	mcpMgr.SetElicitationHandler(func(qctx context.Context, req *mcp.ElicitationRequest) (*mcp.ElicitationResult, error) {
+		return mcp.PromptElicitation(qctx, req, func(askCtx context.Context, question string) (string, error) {
+			if sys.UserPromptHandler == nil {
+				return "", fmt.Errorf("ask_user indisponivel")
+			}
+			return sys.UserPromptHandler.Ask(askCtx, tool.UserQuestion{Question: question})
+		})
+	})
 	tool.GetMCPResourceStore().SetBackend(mcpMgr)
 	for _, mcpCfg := range cfg.MCP {
 		if !mcpCfg.AutoStart {
@@ -1372,6 +1421,10 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		return fmt.Errorf("opening session memory: %w", err)
 	}
 	aiSvc.SetSessionMemory(sessionMemory)
+	toolTranscript, err := session.NewToolTranscriptStore(cfg.Data.Dir)
+	if err != nil {
+		return fmt.Errorf("opening tool transcript: %w", err)
+	}
 
 	// Cost engine
 	costEngine := tracking.NewCostEngine(logger)
@@ -1392,8 +1445,8 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	}
 
 	// Inline handlers (replace router)
-	handler := makeHandler(convMgr, aiSvc, sessionMemory, turnCheckpoint, logger)
-	streamHandler := makeStreamHandler(convMgr, aiSvc, sessionMemory, turnCheckpoint, logger)
+	handler := makeHandler(convMgr, aiSvc, sessionMemory, toolTranscript, turnCheckpoint, logger)
+	streamHandler := makeStreamHandler(convMgr, aiSvc, sessionMemory, toolTranscript, turnCheckpoint, logger)
 	// Background routines and one-off tasks share the same operational state.
 	// Serialize their full agent turns while leaving interactive messages free.
 	backgroundAgentGate := make(chan struct{}, 1)
@@ -1970,6 +2023,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	cliCh.SetTurnCheckpointManager(turnCheckpoint)
 	cliCh.SetTaskRegistry(sys.TaskRegistry)
 	cliCh.SetSessionMemory(sessionMemory)
+	cliCh.SetToolTranscriptStore(toolTranscript)
 	cliCh.SetActiveSessionID(currentSessionID)
 	if bubbleApproval != nil {
 		cliCh.SetApprovalHandler(bubbleApproval)

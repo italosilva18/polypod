@@ -53,7 +53,7 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 			calls := make([]ToolCallInfo, 0, len(resp.ToolCalls))
 			for _, tc := range resp.ToolCalls {
 				calls = append(calls, ToolCallInfo{ID: tc.ID, Name: tc.Name, Arguments: tc.Arguments})
-				c.fireResponseToolStart(tc)
+				c.fireResponseToolStart(ctx, tc)
 				if c.costEngine != nil {
 					c.costEngine.RecordToolUse(tc.Name, resp.PromptTokens, resp.CompletionTokens)
 				}
@@ -67,13 +67,13 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 				if result.IsError {
 					content = "Erro executando tool: " + content
 				}
-				c.fireResponseToolDone(result, elapsed)
+				c.fireResponseToolDone(ctx, result, elapsed)
 				req.Messages = append(req.Messages, providerapi.Message{Role: "tool", Content: content, ToolCallID: result.ID, Name: result.Name})
 			}
 		} else {
 			for _, tc := range resp.ToolCalls {
 				logger.Debug("executing Responses API tool", "tool", tc.Name, "iter", iter)
-				c.fireResponseToolStart(tc)
+				c.fireResponseToolStart(ctx, tc)
 				started := time.Now()
 				richResult, execErr := executeSkillResult(ctx, c.skills, tc.Name, tc.Arguments)
 				result := richResult.Content
@@ -81,7 +81,7 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 				if execErr != nil {
 					result = fmt.Sprintf("Erro executando tool: %v", execErr)
 				}
-				c.fireResponseToolDone(ToolCallResult{ID: tc.ID, Name: tc.Name, Content: result, IsError: execErr != nil}, time.Since(started))
+				c.fireResponseToolDone(ctx, ToolCallResult{ID: tc.ID, Name: tc.Name, Content: result, IsError: richResult.IsError || execErr != nil}, time.Since(started))
 				req.Messages = append(req.Messages, providerapi.Message{Role: "tool", Content: result, ToolCallID: tc.ID, Name: tc.Name})
 			}
 		}
@@ -99,22 +99,18 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 	return nil, fmt.Errorf("chamadas de ferramentas atingiram ai.max_tool_iterations (%d)", maxIterations)
 }
 
-func (c *Client) fireResponseToolStart(tc providerapi.ToolCall) {
-	if c.toolEventCB == nil {
-		return
-	}
+func (c *Client) fireResponseToolStart(ctx context.Context, tc providerapi.ToolCall) {
 	var args map[string]any
 	if json.Unmarshal([]byte(tc.Arguments), &args) != nil {
 		args = map[string]any{"raw": tc.Arguments}
 	}
-	c.toolEventCB(ToolEvent{Type: ToolEventStart, ToolName: tc.Name, ToolID: tc.ID, Args: args})
+	c.emitToolEvent(ctx, ToolEvent{Type: ToolEventStart, ToolName: tc.Name, ToolID: tc.ID, Args: args})
 }
 
-func (c *Client) fireResponseToolDone(result ToolCallResult, elapsed time.Duration) {
-	if c.toolEventCB == nil {
-		return
-	}
-	event := ToolEvent{ToolName: result.Name, ToolID: result.ID, Elapsed: elapsed}
+func (c *Client) fireResponseToolDone(ctx context.Context, result ToolCallResult, elapsed time.Duration) {
+	resultBytes, resultHash := toolResultMetadata(result.Content)
+	event := ToolEvent{ToolName: result.Name, ToolID: result.ID, Elapsed: elapsed,
+		ResultBytes: resultBytes, ResultSHA256: resultHash}
 	if result.IsError {
 		event.Type = ToolEventError
 		event.Error = result.Content
@@ -125,7 +121,7 @@ func (c *Client) fireResponseToolDone(result ToolCallResult, elapsed time.Durati
 			event.Result = event.Result[:197] + "..."
 		}
 	}
-	c.toolEventCB(event)
+	c.emitToolEvent(ctx, event)
 }
 
 func responseToolParameters(value any) map[string]interface{} {

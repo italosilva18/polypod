@@ -77,6 +77,8 @@ func (m *Manager) Reconnect(ctx context.Context, name string) error {
 	m.sessions[name] = replacement
 	m.tools[name] = items
 	delete(m.resources, name)
+	delete(m.resourceTemplates, name)
+	delete(m.resourceUpdates, name)
 	delete(m.prompts, name)
 	if m.skillReg != nil {
 		for _, item := range items {
@@ -94,6 +96,7 @@ func (m *Manager) Reconnect(ctx context.Context, name string) error {
 		}
 	}
 	m.refreshOptionalLists(ctx, replacement)
+	m.restoreSubscriptions(ctx, name, replacement)
 	m.logger.Info("mcp server reconnected", "server", name, "tools", len(items))
 	return nil
 }

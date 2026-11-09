@@ -33,6 +33,7 @@ type Client struct {
 	toolSelectionMu  sync.Mutex
 	toolSelections   map[toolSessionID]*toolSelection
 	costEngine       *tracking.CostEngine
+	toolEventMu      sync.RWMutex
 	toolEventCB      ToolEventCallback
 	streamingToolMgr *StreamingToolManager
 }
@@ -57,7 +58,26 @@ func (c *Client) recordProviderUsage(resp *providerapi.ChatResponse) {
 // SetToolEventCallback sets a callback that is invoked for each tool
 // lifecycle event (start, complete, error) during streaming tool execution.
 func (c *Client) SetToolEventCallback(cb ToolEventCallback) {
+	c.toolEventMu.Lock()
 	c.toolEventCB = cb
+	c.toolEventMu.Unlock()
+}
+
+func (c *Client) emitToolEvent(ctx context.Context, event ToolEvent) {
+	if ctx != nil {
+		if callback, ok := ctx.Value(toolEventCallbackKey{}).(ToolEventCallback); ok {
+			if callback != nil {
+				callback(event)
+			}
+			return
+		}
+	}
+	c.toolEventMu.RLock()
+	callback := c.toolEventCB
+	c.toolEventMu.RUnlock()
+	if callback != nil {
+		callback(event)
+	}
 }
 
 // SetStreamingToolManager attaches a StreamingToolManager that enables
@@ -346,6 +366,15 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 				"args", tc.Function.Arguments,
 				"iter", iter,
 			)
+			var parsedArgs map[string]any
+			if err := json.Unmarshal([]byte(tc.Function.Arguments), &parsedArgs); err != nil {
+				parsedArgs = map[string]any{"raw": tc.Function.Arguments}
+			}
+			c.emitToolEvent(ctx, ToolEvent{
+				Type: ToolEventStart, ToolName: tc.Function.Name,
+				ToolID: tc.ID, Args: parsedArgs,
+			})
+			toolStart := time.Now()
 
 			if c.costEngine != nil {
 				c.costEngine.RecordToolUse(tc.Function.Name, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
@@ -356,6 +385,20 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 			observations = append(observations, ToolCallResult{ID: tc.ID, Name: tc.Function.Name, Content: result, Images: richResult.Images, IsError: richResult.IsError || execErr != nil})
 			if execErr != nil {
 				result = fmt.Sprintf("Erro executando tool: %v", execErr)
+			}
+			resultBytes, resultHash := toolResultMetadata(result)
+			if richResult.IsError || execErr != nil {
+				c.emitToolEvent(ctx, ToolEvent{
+					Type: ToolEventError, ToolName: tc.Function.Name,
+					ToolID: tc.ID, Error: result, ResultBytes: resultBytes,
+					ResultSHA256: resultHash, Elapsed: time.Since(toolStart),
+				})
+			} else {
+				c.emitToolEvent(ctx, ToolEvent{
+					Type: ToolEventComplete, ToolName: tc.Function.Name,
+					ToolID: tc.ID, Result: result, ResultBytes: resultBytes,
+					ResultSHA256: resultHash, Elapsed: time.Since(toolStart),
+				})
 			}
 
 			msgs = append(msgs, openai.ChatCompletionMessage{
@@ -511,19 +554,15 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 					Arguments: tc.Function.Arguments,
 				})
 
-				// Fire ToolEventStart for each tool
-				if c.toolEventCB != nil {
-					var parsedArgs map[string]any
-					if err := json.Unmarshal([]byte(tc.Function.Arguments), &parsedArgs); err != nil {
-						parsedArgs = map[string]any{"raw": tc.Function.Arguments}
-					}
-					c.toolEventCB(ToolEvent{
-						Type:     ToolEventStart,
-						ToolName: tc.Function.Name,
-						ToolID:   tc.ID,
-						Args:     parsedArgs,
-					})
+				// Fire ToolEventStart for each tool.
+				var parsedArgs map[string]any
+				if err := json.Unmarshal([]byte(tc.Function.Arguments), &parsedArgs); err != nil {
+					parsedArgs = map[string]any{"raw": tc.Function.Arguments}
 				}
+				c.emitToolEvent(ctx, ToolEvent{
+					Type: ToolEventStart, ToolName: tc.Function.Name,
+					ToolID: tc.ID, Args: parsedArgs,
+				})
 
 				if c.costEngine != nil {
 					c.costEngine.RecordToolUse(tc.Function.Name, 0, 0)
@@ -548,30 +587,25 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 				if r.IsError {
 					content = fmt.Sprintf("Erro executando tool: %s", r.Content)
 				}
+				resultBytes, resultHash := toolResultMetadata(r.Content)
 
-				// Fire ToolEventComplete/Error
-				if c.toolEventCB != nil {
-					if r.IsError {
-						c.toolEventCB(ToolEvent{
-							Type:     ToolEventError,
-							ToolName: r.Name,
-							ToolID:   r.ID,
-							Error:    r.Content,
-							Elapsed:  batchElapsed,
-						})
-					} else {
-						displayResult := r.Content
-						if len(displayResult) > 200 {
-							displayResult = displayResult[:197] + "..."
-						}
-						c.toolEventCB(ToolEvent{
-							Type:     ToolEventComplete,
-							ToolName: r.Name,
-							ToolID:   r.ID,
-							Result:   displayResult,
-							Elapsed:  batchElapsed,
-						})
+				// Fire ToolEventComplete/Error.
+				if r.IsError {
+					c.emitToolEvent(ctx, ToolEvent{
+						Type: ToolEventError, ToolName: r.Name, ToolID: r.ID,
+						Error: r.Content, ResultBytes: resultBytes,
+						ResultSHA256: resultHash, Elapsed: batchElapsed,
+					})
+				} else {
+					displayResult := r.Content
+					if len(displayResult) > 200 {
+						displayResult = displayResult[:197] + "..."
 					}
+					c.emitToolEvent(ctx, ToolEvent{
+						Type: ToolEventComplete, ToolName: r.Name, ToolID: r.ID,
+						Result: displayResult, ResultBytes: resultBytes,
+						ResultSHA256: resultHash, Elapsed: batchElapsed,
+					})
 				}
 
 				msgs = append(msgs, openai.ChatCompletionMessage{
@@ -596,15 +630,10 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 					parsedArgs = map[string]any{"raw": tc.Function.Arguments}
 				}
 
-				// Fire ToolEventStart
-				if c.toolEventCB != nil {
-					c.toolEventCB(ToolEvent{
-						Type:     ToolEventStart,
-						ToolName: tc.Function.Name,
-						ToolID:   tc.ID,
-						Args:     parsedArgs,
-					})
-				}
+				c.emitToolEvent(ctx, ToolEvent{
+					Type: ToolEventStart, ToolName: tc.Function.Name,
+					ToolID: tc.ID, Args: parsedArgs,
+				})
 
 				toolStart := time.Now()
 
@@ -620,33 +649,26 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 
 				if execErr != nil {
 					result = fmt.Sprintf("Erro executando tool: %v", execErr)
-					// Fire ToolEventError
-					if c.toolEventCB != nil {
-						c.toolEventCB(ToolEvent{
-							Type:     ToolEventError,
-							ToolName: tc.Function.Name,
-							ToolID:   tc.ID,
-							Args:     parsedArgs,
-							Error:    execErr.Error(),
-							Elapsed:  toolElapsed,
-						})
-					}
+				}
+				resultBytes, resultHash := toolResultMetadata(result)
+				if execErr != nil || richResult.IsError {
+					c.emitToolEvent(ctx, ToolEvent{
+						Type: ToolEventError, ToolName: tc.Function.Name,
+						ToolID: tc.ID, Args: parsedArgs,
+						Error: result, ResultBytes: resultBytes,
+						ResultSHA256: resultHash, Elapsed: toolElapsed,
+					})
 				} else {
-					// Fire ToolEventComplete
-					if c.toolEventCB != nil {
-						displayResult := result
-						if len(displayResult) > 200 {
-							displayResult = displayResult[:197] + "..."
-						}
-						c.toolEventCB(ToolEvent{
-							Type:     ToolEventComplete,
-							ToolName: tc.Function.Name,
-							ToolID:   tc.ID,
-							Args:     parsedArgs,
-							Result:   displayResult,
-							Elapsed:  toolElapsed,
-						})
+					displayResult := result
+					if len(displayResult) > 200 {
+						displayResult = displayResult[:197] + "..."
 					}
+					c.emitToolEvent(ctx, ToolEvent{
+						Type: ToolEventComplete, ToolName: tc.Function.Name,
+						ToolID: tc.ID, Args: parsedArgs,
+						Result: displayResult, ResultBytes: resultBytes,
+						ResultSHA256: resultHash, Elapsed: toolElapsed,
+					})
 				}
 
 				msgs = append(msgs, openai.ChatCompletionMessage{

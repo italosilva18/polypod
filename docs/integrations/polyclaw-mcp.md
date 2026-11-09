@@ -36,7 +36,8 @@ explícitas de `env`. Não devolver segredos no resultado de ferramentas.
 As ferramentas devem publicar JSON Schema completo, preservando tipos,
 `required`, objetos, arrays e restrições. Resultados visuais usam blocos MCP
 `image` com `mimeType` e `data` em base64. Textos e `structuredContent` são
-preservados; áudio, vídeos e recursos anexados ainda precisam de conversão própria.
+preservados. Áudio e recursos binários recebidos ficam em arquivos privados
+com uma referência no resultado; o modelo não recebe áudio nativo automaticamente.
 
 ## Contrato de ferramentas proposto
 
@@ -105,6 +106,19 @@ mudança em `main.go`. O teste da ponte cobre uma imagem até o próximo request
 `mcp__polyclaw__<ferramenta>`. Não registrar ambas as variantes para a mesma intenção.
 Consumidores antigos que usam apenas `Execute` (por exemplo callbacks textuais)
 ainda recebem somente texto; o caminho multimodal usa `ExecuteResult`.
+
+O cliente MCP também lista templates de URI de recurso, mantém assinaturas de
+mudanças e registra as 64 notificações mais recentes por servidor. As ferramentas
+`list_mcp_resource_templates`, `mcp_resource_subscribe`,
+`mcp_resource_unsubscribe` e `list_mcp_resource_updates` passam pelo registro
+normal de permissões do agente. Assinaturas são refeitas após reconexão; uma
+notificação indica que o recurso deve ser lido novamente, não inclui conteúdo.
+Servidores que não oferecem templates ou assinaturas continuam utilizáveis.
+O SDK aceita pedidos de elicitação; com `ask_user` ligado, o pedido é encaminhado
+ao humano e a resposta é validada antes de voltar ao servidor. Sem canal humano,
+o pedido recebe cancelamento explícito. O fluxo de URL espera o humano concluir
+a etapa externa; aceita a confirmação dele ou a notificação `elicitation/complete`
+do servidor. A conclusão não é simulada.
 
 Ainda faltam o servidor PolyClaw, a bomba de eventos que chama `poll`/`ack`, o
 adaptador da outbox que chama `send`, a correlação das respostas humanas e o teste
