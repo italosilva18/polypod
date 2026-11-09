@@ -113,8 +113,8 @@ func NewStreamingToolManager(
 //   - concurrent: tools where both IsReadOnly and IsConcurrencySafe are true
 //   - serial: everything else (write tools, destructive tools, unknown tools)
 //
-// The partition respects ordering: serial calls act as barriers. When a serial
-// call is encountered, the preceding concurrent group is flushed.
+// PartitionCalls is a classification helper. ExecuteToolCalls preserves the
+// original call order by treating serial calls as barriers.
 func (m *StreamingToolManager) PartitionCalls(calls []ToolCallInfo) (concurrent []ToolCallInfo, serial []ToolCallInfo) {
 	for _, call := range calls {
 		args := m.parseArgs(call.Arguments)
@@ -138,10 +138,9 @@ func (m *StreamingToolManager) PartitionCalls(calls []ToolCallInfo) (concurrent 
 }
 
 // ExecuteToolCalls executes a batch of tool calls with intelligent parallelism.
-// Read-only + concurrency-safe tools run in parallel (up to maxConcurrentReadOnly).
-// All other tools run serially after the parallel batch completes.
-// Results are returned in a deterministic order: concurrent results first
-// (preserving input order), then serial results (preserving input order).
+// Consecutive read-only, concurrency-safe tools run in parallel (up to
+// maxConcurrentReadOnly). Other tools act as barriers and run in call order.
+// Results are returned in the same order as the model's tool calls.
 func (m *StreamingToolManager) ExecuteToolCalls(ctx context.Context, calls []ToolCallInfo) []ToolCallResult {
 	if len(calls) == 0 {
 		return nil
@@ -162,27 +161,40 @@ func (m *StreamingToolManager) ExecuteToolCalls(ctx context.Context, calls []Too
 	}
 	m.mu.Unlock()
 
-	concurrent, serial := m.PartitionCalls(calls)
+	canRunConcurrent := make([]bool, len(calls))
+	concurrentCount := 0
+	for i, call := range calls {
+		args := m.parseArgs(call.Arguments)
+		if t, ok := m.registry.Get(call.Name); ok && m.checkSafe(t, args, call.Name) && m.checkReadOnly(t, args, call.Name) {
+			canRunConcurrent[i] = true
+			concurrentCount++
+		}
+	}
 
 	m.logger.Info("streaming tool execution planned",
 		"total", len(calls),
-		"concurrent", len(concurrent),
-		"serial", len(serial),
+		"concurrent", concurrentCount,
+		"serial", len(calls)-concurrentCount,
 	)
 
 	results := make([]ToolCallResult, 0, len(calls))
-
-	// Phase 1: Execute concurrent (read-only) tools in parallel.
-	if len(concurrent) > 0 {
-		parallelResults := m.executeConcurrent(ctx, concurrent)
-		results = append(results, parallelResults...)
+	readBatch := make([]ToolCallInfo, 0, len(calls))
+	flushReads := func() {
+		if len(readBatch) == 0 {
+			return
+		}
+		results = append(results, m.executeConcurrent(ctx, readBatch)...)
+		readBatch = readBatch[:0]
 	}
-
-	// Phase 2: Execute serial (write) tools one at a time.
-	if len(serial) > 0 {
-		serialResults := m.executeSerial(ctx, serial)
-		results = append(results, serialResults...)
+	for i, call := range calls {
+		if canRunConcurrent[i] {
+			readBatch = append(readBatch, call)
+			continue
+		}
+		flushReads()
+		results = append(results, m.executeSerial(ctx, []ToolCallInfo{call})...)
 	}
+	flushReads()
 
 	return results
 }
