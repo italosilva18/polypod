@@ -26,17 +26,30 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 	for iter := 0; maxIterations < 0 || iter < maxIterations; iter++ {
 		var resp *providerapi.ChatResponse
 		var err error
+		var early *earlyResponseTools
 		if callback == nil {
 			resp, err = c.responseProvider.Chat(ctx, req)
 		} else {
-			resp, err = c.responseProvider.ChatStream(ctx, req, func(delta providerapi.StreamDelta) {
+			streamCallback := func(delta providerapi.StreamDelta) {
 				if delta.Content != "" {
 					callback(delta.Content)
 				}
-			})
+			}
+			if streamer, ok := c.responseProvider.(completedCallStreamer); ok && c.streamingToolMgr != nil {
+				early = newEarlyResponseTools(ctx, c)
+				resp, err = streamer.ChatStreamWithCompletedCalls(ctx, req, streamCallback, early.itemReady)
+				early.finish(err != nil)
+			} else {
+				resp, err = c.responseProvider.ChatStream(ctx, req, streamCallback)
+			}
 		}
 		if err != nil {
 			return nil, err
+		}
+		if early != nil {
+			if err := early.validateFinal(resp.ToolCalls); err != nil {
+				return nil, err
+			}
 		}
 		totalPrompt += resp.PromptTokens
 		totalCompletion += resp.CompletionTokens
@@ -51,23 +64,47 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 		var observations []ToolCallResult
 		if c.streamingToolMgr != nil {
 			calls := make([]ToolCallInfo, 0, len(resp.ToolCalls))
+			results := make([]ToolCallResult, 0, len(resp.ToolCalls))
+			seenIDs := make(map[string]bool, len(resp.ToolCalls))
+			pendingStarted := false
 			for _, tc := range resp.ToolCalls {
-				calls = append(calls, ToolCallInfo{ID: tc.ID, Name: tc.Name, Arguments: tc.Arguments})
-				c.fireResponseToolStart(ctx, tc)
+				if tc.ID != "" {
+					if seenIDs[tc.ID] {
+						continue
+					}
+					seenIDs[tc.ID] = true
+				}
 				if c.costEngine != nil {
 					c.costEngine.RecordToolUse(tc.Name, resp.PromptTokens, resp.CompletionTokens)
 				}
+				if early != nil {
+					if job, ok := early.jobs[tc.ID]; ok {
+						if pendingStarted {
+							return nil, fmt.Errorf("resposta final do provedor alterou a ordem das ferramentas")
+						}
+						results = append(results, job.result)
+						continue
+					}
+				}
+				pendingStarted = true
+				calls = append(calls, ToolCallInfo{ID: tc.ID, Name: tc.Name, Arguments: tc.Arguments})
+				c.fireResponseToolStart(ctx, tc)
 			}
-			started := time.Now()
-			results := c.streamingToolMgr.ExecuteToolCalls(ctx, calls)
+			if len(calls) > 0 {
+				started := time.Now()
+				pending := c.streamingToolMgr.ExecuteToolCalls(ctx, calls)
+				elapsed := time.Since(started)
+				for _, result := range pending {
+					c.fireResponseToolDone(ctx, result, elapsed)
+				}
+				results = append(results, pending...)
+			}
 			observations = append(observations, results...)
-			elapsed := time.Since(started)
 			for _, result := range results {
 				content := result.Content
 				if result.IsError {
 					content = "Erro executando tool: " + content
 				}
-				c.fireResponseToolDone(ctx, result, elapsed)
 				req.Messages = append(req.Messages, providerapi.Message{Role: "tool", Content: content, ToolCallID: result.ID, Name: result.Name})
 			}
 		} else {

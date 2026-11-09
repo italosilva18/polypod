@@ -1,0 +1,267 @@
+package tool
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/costa/polypod/internal/taskplan"
+	"github.com/costa/polypod/internal/types"
+)
+
+// RegisterPlanTaskTools exposes durable planned work. These tools never start
+// background shell commands or agents; task_create retains that behavior.
+func RegisterPlanTaskTools(reg *Registry, store *taskplan.Store) {
+	reg.RegisterDef(types.ToolDef{
+		NameFn:        func() string { return "plan_create" },
+		DescriptionFn: func() string { return "Criar tarefa planejada persistente. Não inicia execução." },
+		InputSchemaFn: func() map[string]any {
+			return map[string]any{"type": "object", "properties": map[string]any{
+				"subject":     map[string]any{"type": "string", "description": "Título curto da tarefa"},
+				"description": map[string]any{"type": "string", "description": "Objetivo e critérios de conclusão"},
+				"owner":       map[string]any{"type": "string", "description": "Agente inicialmente responsável, opcional"},
+				"blocked_by":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "IDs de tarefas que precisam terminar antes desta"},
+			}, "required": []string{"subject"}}
+		},
+		ExecuteFn: func(tc types.ToolContext, args map[string]any) (types.ToolResult, error) {
+			subject, err := planString(args, "subject", true)
+			if err != nil {
+				return planError(err), nil
+			}
+			description, err := planString(args, "description", false)
+			if err != nil {
+				return planError(err), nil
+			}
+			owner, err := planString(args, "owner", false)
+			if err != nil {
+				return planError(err), nil
+			}
+			blockedBy, err := planIDs(args, "blocked_by")
+			if err != nil {
+				return planError(err), nil
+			}
+			task, err := store.Create(planContext(tc), taskplan.CreateInput{
+				Subject: subject, Description: description, Owner: owner, BlockedBy: blockedBy,
+			})
+			return planResult(task, err), nil
+		},
+	})
+
+	reg.RegisterDef(types.ToolDef{
+		NameFn: func() string { return "plan_update" },
+		DescriptionFn: func() string {
+			return "Atualizar título, descrição, dono, estado ou dependências de uma tarefa planejada existente."
+		},
+		InputSchemaFn: func() map[string]any {
+			return map[string]any{"type": "object", "properties": map[string]any{
+				"id":          map[string]any{"type": "string", "description": "ID da tarefa planejada"},
+				"subject":     map[string]any{"type": "string", "description": "Novo título"},
+				"description": map[string]any{"type": "string", "description": "Nova descrição"},
+				"status":      map[string]any{"type": "string", "enum": []string{"pending", "in_progress", "completed"}},
+				"owner":       map[string]any{"type": "string", "description": "Novo agente responsável; string vazia remove a atribuição"},
+				"blocked_by":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Lista completa de dependências; lista vazia remove todas"},
+			}, "required": []string{"id"}}
+		},
+		ExecuteFn: func(tc types.ToolContext, args map[string]any) (types.ToolResult, error) {
+			id, err := planString(args, "id", true)
+			if err != nil {
+				return planError(err), nil
+			}
+			var in taskplan.UpdateInput
+			if in.Subject, err = optionalPlanString(args, "subject"); err != nil {
+				return planError(err), nil
+			}
+			if in.Description, err = optionalPlanString(args, "description"); err != nil {
+				return planError(err), nil
+			}
+			if in.Owner, err = optionalPlanString(args, "owner"); err != nil {
+				return planError(err), nil
+			}
+			if raw, exists := args["status"]; exists {
+				status, ok := raw.(string)
+				if !ok {
+					return planError(fmt.Errorf("status precisa ser texto")), nil
+				}
+				value := taskplan.Status(status)
+				in.Status = &value
+			}
+			if _, exists := args["blocked_by"]; exists {
+				ids, idsErr := planIDs(args, "blocked_by")
+				if idsErr != nil {
+					return planError(idsErr), nil
+				}
+				in.BlockedBy = &ids
+			}
+			task, err := store.Update(planContext(tc), id, in)
+			return planResult(task, err), nil
+		},
+	})
+
+	reg.RegisterDef(types.ToolDef{
+		NameFn:        func() string { return "plan_get" },
+		DescriptionFn: func() string { return "Consultar uma tarefa planejada e suas dependências." },
+		InputSchemaFn: func() map[string]any {
+			return map[string]any{"type": "object", "properties": map[string]any{
+				"id": map[string]any{"type": "string", "description": "ID da tarefa planejada"},
+			}, "required": []string{"id"}}
+		},
+		IsReadOnlyFn: func(map[string]any) bool { return true },
+		ExecuteFn: func(tc types.ToolContext, args map[string]any) (types.ToolResult, error) {
+			id, err := planString(args, "id", true)
+			if err != nil {
+				return planError(err), nil
+			}
+			task, err := store.Get(planContext(tc), id)
+			return planResult(task, err), nil
+		},
+	})
+
+	reg.RegisterDef(types.ToolDef{
+		NameFn:        func() string { return "plan_list" },
+		DescriptionFn: func() string { return "Listar tarefas planejadas persistentes, com filtro opcional por estado." },
+		InputSchemaFn: func() map[string]any {
+			return map[string]any{"type": "object", "properties": map[string]any{
+				"status": map[string]any{"type": "string", "enum": []string{"pending", "in_progress", "completed"}},
+				"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": 200},
+				"offset": map[string]any{"type": "integer", "minimum": 0, "description": "Número de tarefas anteriores a pular"},
+			}}
+		},
+		IsReadOnlyFn: func(map[string]any) bool { return true },
+		ExecuteFn: func(tc types.ToolContext, args map[string]any) (types.ToolResult, error) {
+			status, err := planString(args, "status", false)
+			if err != nil {
+				return planError(err), nil
+			}
+			limit := 50
+			if raw, exists := args["limit"]; exists {
+				var valid bool
+				limit, valid = planInt(raw)
+				if !valid || limit < 1 || limit > 200 {
+					return planError(fmt.Errorf("limit precisa estar entre 1 e 200")), nil
+				}
+			}
+			offset := 0
+			if raw, exists := args["offset"]; exists {
+				var valid bool
+				offset, valid = planInt(raw)
+				if !valid || offset < 0 {
+					return planError(fmt.Errorf("offset precisa ser um inteiro positivo")), nil
+				}
+			}
+			tasks, err := store.List(planContext(tc), taskplan.Status(status), limit, offset)
+			return planResult(tasks, err), nil
+		},
+	})
+
+	reg.RegisterDef(types.ToolDef{
+		NameFn: func() string { return "plan_claim" },
+		DescriptionFn: func() string {
+			return "Assumir uma tarefa planejada disponível; verifica dependências e atribuição atual. Não inicia execução."
+		},
+		InputSchemaFn: func() map[string]any {
+			return map[string]any{"type": "object", "properties": map[string]any{
+				"id":    map[string]any{"type": "string", "description": "ID da tarefa planejada"},
+				"owner": map[string]any{"type": "string", "description": "Agente que assume a tarefa; padrão: agente atual"},
+			}, "required": []string{"id"}}
+		},
+		ExecuteFn: func(tc types.ToolContext, args map[string]any) (types.ToolResult, error) {
+			id, err := planString(args, "id", true)
+			if err != nil {
+				return planError(err), nil
+			}
+			owner, err := planString(args, "owner", false)
+			if err != nil {
+				return planError(err), nil
+			}
+			if owner == "" {
+				owner = string(tc.AgentID)
+			}
+			task, err := store.Claim(planContext(tc), id, owner)
+			return planResult(task, err), nil
+		},
+	})
+}
+
+func planContext(tc types.ToolContext) context.Context {
+	if tc.Context != nil {
+		return tc.Context
+	}
+	return context.Background()
+}
+
+func planString(args map[string]any, key string, required bool) (string, error) {
+	value, exists := args[key]
+	if !exists {
+		if required {
+			return "", fmt.Errorf("%s é obrigatório", key)
+		}
+		return "", nil
+	}
+	text, ok := value.(string)
+	if !ok || (required && strings.TrimSpace(text) == "") {
+		return "", fmt.Errorf("%s precisa ser texto não vazio", key)
+	}
+	return text, nil
+}
+
+func optionalPlanString(args map[string]any, key string) (*string, error) {
+	if _, exists := args[key]; !exists {
+		return nil, nil
+	}
+	value, err := planString(args, key, false)
+	if err != nil {
+		return nil, err
+	}
+	return &value, nil
+}
+
+func planIDs(args map[string]any, key string) ([]string, error) {
+	raw, exists := args[key]
+	if !exists {
+		return nil, nil
+	}
+	switch values := raw.(type) {
+	case []string:
+		return values, nil
+	case []any:
+		ids := make([]string, 0, len(values))
+		for _, item := range values {
+			id, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("%s precisa conter apenas IDs em texto", key)
+			}
+			ids = append(ids, id)
+		}
+		return ids, nil
+	default:
+		return nil, fmt.Errorf("%s precisa ser uma lista de IDs", key)
+	}
+}
+
+func planInt(raw any) (int, bool) {
+	switch value := raw.(type) {
+	case int:
+		return value, true
+	case float64:
+		integer := int(value)
+		return integer, float64(integer) == value
+	default:
+		return 0, false
+	}
+}
+
+func planError(err error) types.ToolResult {
+	return types.ToolResult{Content: "Plano: " + err.Error(), IsError: true}
+}
+
+func planResult(value any, err error) types.ToolResult {
+	if err != nil {
+		return planError(err)
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return planError(err)
+	}
+	return types.ToolResult{Content: string(raw)}
+}

@@ -263,6 +263,10 @@ func (a *Adapter) Start(ctx context.Context, handler adapter.MessageHandler) err
 				content: rm.Content,
 			})
 		}
+		if notice, draft := a.activeRecovery(runCtx); notice != "" {
+			m.messages = append(m.messages, chatEntry{role: "system", content: notice, timestamp: time.Now()})
+			m.recoveryDraft = draft
+		}
 		m.historyStart = max(0, len(m.messages)-historyPageSize)
 	}
 
@@ -558,9 +562,13 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 				}
 				if restored.ID == a.activeSessionID {
 					activeEntries := toBranchEntries(sess.Messages)
+					activeEntries = a.appendTranscriptHistory(restored.ID, activeEntries)
+					notice, draft := a.inspectRecovery(restored.ID, recoveryMessages(sess.Messages))
+					if notice != "" {
+						activeEntries = append(activeEntries, chatEntry{role: "system", content: notice, timestamp: time.Now()})
+					}
 					return sessionLoad{
-						entries: a.appendTranscriptHistory(restored.ID, activeEntries),
-						start:   0, total: len(activeEntries),
+						entries: activeEntries, start: 0, total: len(sess.Messages), recoveryDraft: draft,
 					}, nil
 				}
 				if err := a.saveActiveSession(sess); err != nil {
@@ -590,9 +598,13 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 				entries = append(entries, chatEntry{role: "system", content: warning, timestamp: time.Now()})
 			}
 			a.activeSessionID = restored.ID
+			entries = a.appendTranscriptHistory(restored.ID, entries)
+			notice, draft := a.inspectRecovery(restored.ID, restored.Messages)
+			if notice != "" {
+				entries = append(entries, chatEntry{role: "system", content: notice, timestamp: time.Now()})
+			}
 			return sessionLoad{
-				entries: a.appendTranscriptHistory(restored.ID, entries),
-				start:   start, total: len(restored.Messages),
+				entries: entries, start: start, total: len(restored.Messages), recoveryDraft: draft,
 			}, nil
 		}
 		deps.loadOlderHistory = func(id string, before, limit int) ([]chatEntry, int, error) {

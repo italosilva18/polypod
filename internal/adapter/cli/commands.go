@@ -35,6 +35,7 @@ type commandResult struct {
 	replaceMessages []chatEntry
 	resumeSessionID string
 	historyBefore   int
+	recoveryDraft   string
 	// openConfigForm asks the host model to display the interactive
 	// /config form overlay. Used by the bare "/config" invocation.
 	openConfigForm bool
@@ -45,9 +46,10 @@ type commandResult struct {
 }
 
 type sessionLoad struct {
-	entries []chatEntry
-	start   int
-	total   int
+	entries       []chatEntry
+	start         int
+	total         int
+	recoveryDraft string
 }
 
 // processCommand checks if input is a slash command and executes it locally.
@@ -305,6 +307,7 @@ func helpText() string {
 		{"/cost", "mostra custo detalhado da sessao"},
 		{"/sessions [search <q>]", "lista ou busca sessoes persistidas"},
 		{"/resume [id]", "lista ou carrega uma sessao persistida"},
+		{"/recover", "prepara rascunho editavel para retomar turno interrompido"},
 		{"/rewind [n] [--conversation|--files]", "restaura turnos, arquivos e conversa"},
 		{"/permissions [sub]", "gerencia regras de permissoes"},
 		{"/plan [on|off|show|execute]", "alterna/gerencia plan mode"},
@@ -1804,6 +1807,7 @@ func handleResume(deps commandDeps, arg string) commandResult {
 		replaceMessages: entries,
 		resumeSessionID: target,
 		historyBefore:   loaded.start,
+		recoveryDraft:   loaded.recoveryDraft,
 	}
 }
 

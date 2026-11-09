@@ -35,6 +35,8 @@ Uma definição presente na árvore extraída pode estar condicionada a uma *fea
 
 O `AdvancedQueryEngine` em `internal/query/advanced_engine.go` e os modos `coordinator` não são instanciados no caminho principal; o CLI usa `internal/ai/service.go`. A integração deve mirar esse runtime efetivo, evitando ampliar módulos paralelos inativos.
 
+**Atualização desta continuação:** plano persistente, recuperação manual de turnos e antecipação de buscas na Responses API foram ligados ao runtime; os detalhes estão na [leitura linha a linha](src-extracted-line-review.md). Revisei a ligação de equipes: `internal/tool/teamtools.go` usa um `globalTeamStore` em memória que não é `sys.Swarm`, e os resultados dos trabalhadores ainda não são entregues ao líder. Registrar essas ferramentas como estão anunciaria equipes sem execução observável. Faltam ponte do executor, mensagens, resultados consultáveis e encerramento antes de expô-las.
+
 ## Capacidades presentes no runtime
 
 - Agendador durável com retomada, tentativas e histórico: `internal/scheduler/scheduler.go:360`.

@@ -78,6 +78,7 @@ import (
 	"github.com/costa/polypod/internal/setup"
 	"github.com/costa/polypod/internal/skill"
 	"github.com/costa/polypod/internal/sshexec"
+	"github.com/costa/polypod/internal/taskplan"
 	"github.com/costa/polypod/internal/taskqueue"
 	"github.com/costa/polypod/internal/tasks"
 	"github.com/costa/polypod/internal/template"
@@ -914,6 +915,12 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		return fmt.Errorf("opening task queue: %w", err)
 	}
 	defer taskQueue.Close()
+	planStore, err := taskplan.Open(cfg.Data.Dir)
+	if err != nil {
+		return fmt.Errorf("opening planned tasks: %w", err)
+	}
+	defer planStore.Close()
+	tool.RegisterPlanTaskTools(sys.ToolRegistry, planStore)
 
 	tool.RegisterAdvancedTools(sys.ToolRegistry, ".")
 	tool.RegisterHardwareTools(sys.ToolRegistry)

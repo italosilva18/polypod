@@ -131,7 +131,7 @@ func WireAll(cfg Config) *Systems {
 	tool.RegisterREPLTool(toolReg)
 	tool.RegisterMCPAuthTool(toolReg)
 	tool.RegisterMCPResourceTools(toolReg)
-	tool.RegisterTaskUpdateTool(toolReg)
+	tool.RegisterTaskUpdateTool(toolReg, taskRegistry)
 	tool.RegisterSyntheticOutputTool(toolReg)
 
 	// ---------------------------------------------------------------

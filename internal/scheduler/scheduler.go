@@ -330,11 +330,14 @@ func (s *Scheduler) Save() error {
 	if err := os.MkdirAll(filepath.Dir(s.dataFile), 0o700); err != nil {
 		return fmt.Errorf("criando diretorio do agendador: %w", err)
 	}
-	tmp := s.dataFile + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	// A fixed .tmp path lets separate Polypod processes truncate each other's
+	// in-progress save. Give every writer its own private staging file.
+	f, err := os.CreateTemp(filepath.Dir(s.dataFile), "."+filepath.Base(s.dataFile)+".tmp-*")
 	if err != nil {
 		return fmt.Errorf("abrindo estado temporario do agendador: %w", err)
 	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
 	if _, err := f.Write(data); err != nil {
 		f.Close()
 		return fmt.Errorf("gravando estado temporario do agendador: %w", err)

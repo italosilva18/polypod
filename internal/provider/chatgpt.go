@@ -37,6 +37,28 @@ func (p *ChatGPT) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, err
 }
 
 func (p *ChatGPT) ChatStream(ctx context.Context, req ChatRequest, callback StreamCallback) (*ChatResponse, error) {
+	return p.chatStream(ctx, req, callback, nil)
+}
+
+// ChatStreamWithCompletedCalls exposes finalized function calls to the AI
+// runtime before the response ends. It is deliberately opt-in: a Failover
+// provider continues to use ChatStream, so an incomplete provider response
+// cannot cause tools to run before its fallback decision.
+func (p *ChatGPT) ChatStreamWithCompletedCalls(
+	ctx context.Context,
+	req ChatRequest,
+	callback StreamCallback,
+	itemReady func(index int64, call *ToolCall),
+) (*ChatResponse, error) {
+	return p.chatStream(ctx, req, callback, itemReady)
+}
+
+func (p *ChatGPT) chatStream(
+	ctx context.Context,
+	req ChatRequest,
+	callback StreamCallback,
+	itemReady func(index int64, call *ToolCall),
+) (*ChatResponse, error) {
 	client, params, err := p.request(ctx, req)
 	if err != nil {
 		return nil, err
@@ -47,18 +69,52 @@ func (p *ChatGPT) ChatStream(ctx context.Context, req ChatRequest, callback Stre
 	var final *responses.Response
 	var text strings.Builder
 	var items []responses.ResponseOutputItemUnion
+	type streamedItem struct {
+		item  responses.ResponseOutputItemUnion
+		index int64
+	}
+	itemByID := make(map[string]streamedItem)
 	for stream.Next() {
 		event := stream.Current()
 		switch event.Type {
+		case "response.output_item.added":
+			added := event.AsResponseOutputItemAdded()
+			if added.Item.Type == "function_call" {
+				itemByID[added.Item.ID] = streamedItem{item: added.Item, index: added.OutputIndex}
+			} else if itemReady != nil {
+				// Non-function items have no local tool barrier.
+				itemReady(added.OutputIndex, nil)
+			}
+		case "response.function_call_arguments.done":
+			if itemReady != nil {
+				done := event.AsResponseFunctionCallArgumentsDone()
+				tracked, ok := itemByID[done.ItemID]
+				item := tracked.item
+				name := done.Name
+				if name == "" {
+					name = item.Name
+				}
+				if ok && tracked.index == done.OutputIndex && item.CallID != "" && name != "" && (item.Name == "" || item.Name == name) {
+					itemReady(done.OutputIndex, &ToolCall{ID: item.CallID, Name: name, Arguments: done.Arguments})
+				}
+			}
 		case "response.output_text.delta":
 			text.WriteString(event.Delta)
 			if callback != nil {
 				callback(StreamDelta{Content: event.Delta})
 			}
 		case "response.output_item.done":
-			item := event.AsResponseOutputItemDone().Item
+			completed := event.AsResponseOutputItemDone()
+			item := completed.Item
 			if item.Type != "" {
 				items = append(items, item)
+			}
+			if itemReady != nil {
+				if item.Type == "function_call" && item.CallID != "" && item.Name != "" {
+					itemReady(completed.OutputIndex, &ToolCall{ID: item.CallID, Name: item.Name, Arguments: item.Arguments})
+				} else if item.Type != "function_call" {
+					itemReady(completed.OutputIndex, nil)
+				}
 			}
 		case "response.completed", "response.failed", "response.incomplete":
 			if event.Response.ID != "" {

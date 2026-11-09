@@ -133,6 +133,9 @@ type model struct {
 	historyBefore    int
 	activeTurn       *retryTurn
 	failedTurn       *retryTurn
+	// /recover fills the composer only after the user asks for it. It never
+	// starts a model turn or reissues a tool call by itself.
+	recoveryDraft string
 	// An ask_user prompt temporarily owns the composer. Preserve any draft that
 	// the user was writing while the current turn streamed.
 	heldDraft      string
@@ -451,7 +454,7 @@ var slashCommands = []string{
 	"/files",
 	"/add-dir ", "/add-dir list", "/add-dir remove ",
 	"/config", "/config get ", "/config set ", "/config save", "/config reload",
-	"/resume", "/resume ",
+	"/resume", "/resume ", "/recover",
 	"/rewind", "/rewind ",
 	"/permissions", "/permissions list",
 	"/permissions allow ", "/permissions deny ", "/permissions ask ",
@@ -875,6 +878,12 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.textarea.InsertString("\n")
 				return m, nil
 			}
+			if strings.TrimSpace(raw) == "/recover" {
+				m.notification = "Aguarde o turno atual terminar para usar /recover; o comando permanece no campo."
+				m.notifyLevel = "info"
+				m.updateViewport()
+				return m, clearNotifyAfter(6*time.Second, m.notification)
+			}
 			m.queued = append(m.queued, queuedInput{
 				raw: raw, images: append([]string(nil), m.pastedImages...),
 			})
@@ -903,6 +912,30 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if isRetryCommand(raw) {
 				return m.retryFailedTurn()
+			}
+			if strings.TrimSpace(raw) == "/recover" {
+				m.history.Add("/recover")
+				m.history.ResetCursor()
+				if m.recoveryDraft == "" {
+					m.textarea.SetValue("")
+					m.messages = append(m.messages, chatEntry{role: "system", content: "Nenhum turno interrompido desta sessão está marcado para recuperação.", timestamp: time.Now()})
+				} else {
+					draft := m.recoveryDraft
+					if m.heldDraftValid {
+						// Preserve an ask_user draft if the modal handed control
+						// back between the command and this recovery request.
+						if strings.TrimSpace(m.heldDraft) != "" {
+							draft = m.heldDraft + "\n\n" + draft
+						}
+						m.pastedImages = append(m.pastedImages, m.heldImages...)
+						m.heldDraft, m.heldImages, m.heldDraftValid = "", nil, false
+					}
+					m.textarea.SetValue(draft)
+					m.textarea.CursorEnd()
+					m.messages = append(m.messages, chatEntry{role: "system", content: "Rascunho de continuidade no campo de mensagem. Revise antes de enviar; nada foi executado automaticamente.", timestamp: time.Now()})
+				}
+				m.updateViewport()
+				return m, nil
 			}
 
 			input := strings.TrimSpace(raw)
@@ -948,6 +981,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if result.clearDisplay {
 					m.messages = nil
+					m.recoveryDraft = ""
 					m.historyStart = 0
 					m.historyExpanded = false
 					m.historySessionID = ""
@@ -955,6 +989,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if result.replaceMessages != nil {
 					m.messages = append([]chatEntry{}, result.replaceMessages...)
+					m.recoveryDraft = result.recoveryDraft
 					m.historyStart = max(0, len(m.messages)-historyPageSize)
 					m.historyExpanded = false
 					m.historySessionID = result.resumeSessionID
@@ -997,6 +1032,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				content:   input,
 				timestamp: time.Now(),
 			})
+			m.recoveryDraft = ""
 			m.state = stateStreaming
 			m.backgroundTurn = false
 			m.activeTurn = &retryTurn{raw: raw, images: turnImages}
@@ -1328,6 +1364,17 @@ func (m model) startQueuedInput() (tea.Model, tea.Cmd) {
 	updated, ok := next.(model)
 	if !ok {
 		return next, cmd
+	}
+	if strings.TrimSpace(item.raw) == "/recover" && updated.recoveryDraft != "" {
+		// Preserve a draft written while this queued command waited. The
+		// command itself only filled the composer and must not lose its text
+		// when the normal queued-input restoration runs below.
+		recovered := updated.textarea.Value()
+		if strings.TrimSpace(draft) == "" {
+			draft = recovered
+		} else if strings.TrimSpace(recovered) != "" {
+			draft += "\n\n" + recovered
+		}
 	}
 	updated.textarea.SetValue(draft)
 	updated.textarea.CursorEnd()

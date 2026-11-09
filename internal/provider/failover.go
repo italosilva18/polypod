@@ -67,6 +67,96 @@ func (f *Failover) ChatStream(ctx context.Context, req ChatRequest, callback Str
 	}
 	return resp, err
 }
+
+type completedCallStreamProvider interface {
+	ChatStreamWithCompletedCalls(
+		ctx context.Context,
+		req ChatRequest,
+		callback StreamCallback,
+		itemReady func(index int64, call *ToolCall),
+	) (*ChatResponse, error)
+}
+
+// ChatStreamWithCompletedCalls preserves the ordinary failover threshold while
+// allowing finalized tool calls to reach the runtime early. Until the primary
+// emits a visible stream delta, its completed calls are buffered: a failure
+// can still switch providers without executing tools from the failed attempt.
+func (f *Failover) ChatStreamWithCompletedCalls(
+	ctx context.Context,
+	req ChatRequest,
+	callback StreamCallback,
+	itemReady func(index int64, call *ToolCall),
+) (*ChatResponse, error) {
+	type completedItem struct {
+		index int64
+		call  *ToolCall
+	}
+	var pending []completedItem
+	emitted := false
+	flushPending := func() {
+		if itemReady != nil {
+			for _, item := range pending {
+				itemReady(item.index, item.call)
+			}
+		}
+		pending = nil
+	}
+	primaryItemReady := func(index int64, call *ToolCall) {
+		if emitted {
+			if itemReady != nil {
+				itemReady(index, call)
+			}
+			return
+		}
+		if itemReady != nil {
+			var copyCall *ToolCall
+			if call != nil {
+				copy := *call
+				copyCall = &copy
+			}
+			pending = append(pending, completedItem{index: index, call: copyCall})
+		}
+	}
+	primaryCallback := func(delta StreamDelta) {
+		if delta.Content != "" || len(delta.ToolCalls) > 0 || delta.Done {
+			emitted = true
+		}
+		if callback != nil {
+			callback(delta)
+		}
+		if emitted {
+			flushPending()
+		}
+	}
+
+	var resp *ChatResponse
+	var err error
+	if streamer, ok := f.primary.(completedCallStreamProvider); ok {
+		resp, err = streamer.ChatStreamWithCompletedCalls(ctx, req, primaryCallback, primaryItemReady)
+	} else {
+		resp, err = f.primary.ChatStream(ctx, req, primaryCallback)
+	}
+	if emitted || !f.shouldSwitch(ctx, req, err) {
+		if err == nil {
+			flushPending()
+		}
+		return resp, err
+	}
+	// The primary never emitted externally visible output. Discard all of its
+	// completed-item notifications before invoking the secondary provider.
+	pending = nil
+	req.Model = f.model
+	if streamer, ok := f.secondary.(completedCallStreamProvider); ok {
+		resp, err = streamer.ChatStreamWithCompletedCalls(ctx, req, callback, itemReady)
+	} else {
+		resp, err = f.secondary.ChatStream(ctx, req, callback)
+	}
+	if resp != nil {
+		resp.Model = f.model
+	}
+	return resp, err
+}
+
 func (f *Failover) shouldSwitch(ctx context.Context, req ChatRequest, err error) bool {
 	if ctx.Err() != nil || f.model == "" || !IsFailoverError(err) {
 		return false

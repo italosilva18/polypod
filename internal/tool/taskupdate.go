@@ -3,161 +3,91 @@ package tool
 import (
 	"encoding/json"
 	"fmt"
-	"sync"
-	"time"
+	"strings"
 
+	"github.com/costa/polypod/internal/tasks"
 	"github.com/costa/polypod/internal/types"
 )
 
-// TaskUpdateStore holds task metadata updates independent of the tasks package.
-type TaskUpdateStore struct {
-	mu    sync.Mutex
-	tasks map[string]*TaskMetadata
-}
-
-type TaskMetadata struct {
-	ID          string    `json:"id"`
-	Title       string    `json:"title,omitempty"`
-	Priority    int       `json:"priority"`
-	Context     []string  `json:"context,omitempty"`
-	MaxBudget   int       `json:"max_budget,omitempty"`
-	Deadline    time.Time `json:"deadline,omitempty"`
-	Status      string    `json:"status"`
-	UpdatedAt   time.Time `json:"updated_at"`
-	UpdateCount int       `json:"update_count"`
-}
-
-var globalTaskUpdateStore = &TaskUpdateStore{tasks: make(map[string]*TaskMetadata)}
-
-func GetTaskUpdateStore() *TaskUpdateStore { return globalTaskUpdateStore }
-
-func (s *TaskUpdateStore) Update(id string, updates map[string]any) (*TaskMetadata, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	task, ok := s.tasks[id]
-	if !ok {
-		task = &TaskMetadata{ID: id, Status: "pending"}
-		s.tasks[id] = task
-	}
-
-	if v, ok := updates["title"].(string); ok {
-		task.Title = v
-	}
-	if v, ok := updates["priority"].(float64); ok {
-		task.Priority = int(v)
-	}
-	if v, ok := updates["priority"].(int); ok {
-		task.Priority = v
-	}
-	if v, ok := updates["add_context"].(string); ok && v != "" {
-		task.Context = append(task.Context, v)
-	}
-	if v, ok := updates["max_budget"].(float64); ok {
-		task.MaxBudget = int(v)
-	}
-	if v, ok := updates["max_budget"].(int); ok {
-		task.MaxBudget = v
-	}
-	if v, ok := updates["deadline"].(string); ok && v != "" {
-		if t, err := time.Parse(time.RFC3339, v); err == nil {
-			task.Deadline = t
-		}
-	}
-	if v, ok := updates["status"].(string); ok {
-		task.Status = v
-	}
-
-	task.UpdatedAt = time.Now()
-	task.UpdateCount++
-
-	copy := *task
-	return &copy, nil
-}
-
-func (s *TaskUpdateStore) Get(id string) (*TaskMetadata, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	t, ok := s.tasks[id]
-	if !ok {
-		return nil, false
-	}
-	copy := *t
-	return &copy, true
-}
-
-// NewTaskUpdateTool creates the task_update tool.
-func NewTaskUpdateTool() types.ToolDef {
+// NewTaskUpdateTool updates a field that really belongs to a background task.
+// Runtime status is owned by its process; planned work uses plan_update.
+func NewTaskUpdateTool(taskRegistry *tasks.TaskRegistry) types.ToolDef {
 	return types.ToolDef{
 		NameFn: func() string { return "task_update" },
 		DescriptionFn: func() string {
-			return "Update metadata of a background task: title, priority, context, budget, deadline, or status."
+			return "Atualizar a descrição de uma tarefa background existente. Para estado, dono e dependências de planejamento, use plan_update; esta ferramenta não altera a execução."
 		},
 		InputSchemaFn: func() map[string]any {
 			return map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"task_id": map[string]any{
-						"type":        "string",
-						"description": "Task ID to update",
-					},
-					"title": map[string]any{
-						"type":        "string",
-						"description": "New title",
-					},
-					"priority": map[string]any{
-						"type":        "integer",
-						"description": "New priority (0 = normal, higher = more important)",
-					},
-					"add_context": map[string]any{
-						"type":        "string",
-						"description": "Additional context message to append",
-					},
-					"max_budget": map[string]any{
-						"type":        "integer",
-						"description": "Max token budget",
-					},
-					"deadline": map[string]any{
-						"type":        "string",
-						"description": "RFC3339 deadline",
-					},
-					"status": map[string]any{
-						"type":        "string",
-						"enum":        []string{"pending", "running", "paused", "completed", "cancelled", "failed"},
-						"description": "New status",
-					},
+					"task_id":     map[string]any{"type": "string", "description": "ID de uma tarefa background existente"},
+					"description": map[string]any{"type": "string", "description": "Nova descrição mostrada em task_get e task_list"},
+					"title":       map[string]any{"type": "string", "description": "Sinônimo legado de description"},
 				},
 				"required": []string{"task_id"},
 			}
 		},
-		IsReadOnlyFn:    func(map[string]any) bool { return false },
-		IsDestructiveFn: func(map[string]any) bool { return false },
-		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
-			taskID, _ := args["task_id"].(string)
-			if taskID == "" {
-				return types.ToolResult{IsError: true, Content: "task_id is required"}, nil
+		ValidateFn: func(args map[string]any) types.ValidationResult {
+			if err := validateTaskUpdate(args); err != nil {
+				return types.ValidationResult{Message: err.Error()}
 			}
-
-			updates := make(map[string]any)
-			for k, v := range args {
-				if k == "task_id" {
-					continue
-				}
-				updates[k] = v
+			return types.ValidationResult{Valid: true}
+		},
+		ExecuteFn: func(_ types.ToolContext, args map[string]any) (types.ToolResult, error) {
+			if err := validateTaskUpdate(args); err != nil {
+				return types.ToolResult{Content: err.Error(), IsError: true}, nil
 			}
-
-			task, err := GetTaskUpdateStore().Update(taskID, updates)
+			if taskRegistry == nil {
+				return types.ToolResult{Content: "Registro de tarefas background indisponível", IsError: true}, nil
+			}
+			id := args["task_id"].(string)
+			description, ok := args["description"].(string)
+			if !ok {
+				description = args["title"].(string)
+			}
+			if !taskRegistry.Update(id, func(task *tasks.TaskState) { task.Description = description }) {
+				return types.ToolResult{Content: fmt.Sprintf("Tarefa background %s não encontrada", id), IsError: true}, nil
+			}
+			state, ok := taskRegistry.Get(id)
+			if !ok {
+				return types.ToolResult{Content: fmt.Sprintf("Tarefa background %s não encontrada", id), IsError: true}, nil
+			}
+			raw, err := json.Marshal(state)
 			if err != nil {
-				return types.ToolResult{IsError: true, Content: err.Error()}, nil
+				return types.ToolResult{Content: err.Error(), IsError: true}, nil
 			}
-
-			data, _ := json.Marshal(task)
-			return types.ToolResult{Content: fmt.Sprintf("Task updated (%d updates total):\n%s", task.UpdateCount, string(data))}, nil
+			return types.ToolResult{Content: string(raw)}, nil
 		},
 	}
 }
 
-// RegisterTaskUpdateTool registers the tool.
-func RegisterTaskUpdateTool(reg *Registry) {
-	reg.RegisterDef(NewTaskUpdateTool())
+func validateTaskUpdate(args map[string]any) error {
+	id, ok := args["task_id"].(string)
+	if !ok || strings.TrimSpace(id) == "" {
+		return fmt.Errorf("task_id é obrigatório")
+	}
+	for key := range args {
+		if key != "task_id" && key != "description" && key != "title" {
+			return fmt.Errorf("%s não altera tarefas background; use plan_update para planejamento", key)
+		}
+	}
+	if _, both := args["description"]; both {
+		if _, alias := args["title"]; alias {
+			return fmt.Errorf("informe apenas description ou title")
+		}
+	}
+	value, exists := args["description"]
+	if !exists {
+		value, exists = args["title"]
+	}
+	text, ok := value.(string)
+	if !exists || !ok || strings.TrimSpace(text) == "" {
+		return fmt.Errorf("description é obrigatório e precisa ser texto não vazio")
+	}
+	return nil
+}
+
+func RegisterTaskUpdateTool(reg *Registry, taskRegistry *tasks.TaskRegistry) {
+	reg.RegisterDef(NewTaskUpdateTool(taskRegistry))
 }
