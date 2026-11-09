@@ -54,6 +54,12 @@ type clearNotifyMsg struct{ text string }
 // queuedInputMsg starts the next user submission after a stream completes.
 type queuedInputMsg struct{}
 
+// streamRedrawMsg groups frequent token deltas into one viewport render.
+// Tool events, questions, errors and turn completion still render immediately.
+type streamRedrawMsg struct{ generation uint64 }
+
+const streamRedrawInterval = 33 * time.Millisecond
+
 type voiceResultMsg struct {
 	text string
 	err  error
@@ -109,12 +115,15 @@ type model struct {
 	spinner  spinner.Model
 	history  *inputHistory
 
-	messages       []chatEntry
-	streaming      *strings.Builder
-	streamCh       <-chan streamMsg
-	state          state
-	queued         []queuedInput
-	voiceRecording bool
+	messages               []chatEntry
+	streaming              *strings.Builder
+	streamCh               <-chan streamMsg
+	state                  state
+	queued                 []queuedInput
+	voiceRecording         bool
+	streamRedrawPending    bool
+	streamRedrawGeneration uint64
+	lastViewportRedraw     time.Time
 	// A background turn keeps processing in the same conversation. Later
 	// submissions stay queued until it completes.
 	backgroundTurn   bool
@@ -1115,8 +1124,18 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Delta token
 		m.streaming.WriteString(msg.delta)
+		redraw := m.queueStreamRedraw()
+		if redraw == nil {
+			return m, waitForStream(m.streamCh)
+		}
+		return m, tea.Batch(waitForStream(m.streamCh), redraw)
+
+	case streamRedrawMsg:
+		if !m.streamRedrawPending || msg.generation != m.streamRedrawGeneration {
+			return m, nil
+		}
 		m.updateViewport()
-		return m, waitForStream(m.streamCh)
+		return m, nil
 
 	case toolEventMsg:
 		m.toolEvents = append(m.toolEvents, msg.event)
@@ -1376,6 +1395,10 @@ func waitForStream(ch <-chan streamMsg) tea.Cmd {
 // ── Viewport update ─────────────────────────────────────────────────────────
 
 func (m *model) updateViewport() {
+	// A forced render supersedes any pending token timer. Its later message is
+	// ignored, including when a new turn has already started.
+	m.streamRedrawPending = false
+	m.streamRedrawGeneration++
 	if !m.ready {
 		return
 	}
@@ -1391,6 +1414,24 @@ func (m *model) updateViewport() {
 	if atBottom {
 		m.viewport.GotoBottom()
 	}
+	m.lastViewportRedraw = time.Now()
+}
+
+func (m *model) queueStreamRedraw() tea.Cmd {
+	if !m.ready || m.streamRedrawPending {
+		return nil
+	}
+	elapsed := time.Since(m.lastViewportRedraw)
+	if m.lastViewportRedraw.IsZero() || elapsed >= streamRedrawInterval {
+		m.updateViewport()
+		return nil
+	}
+	m.streamRedrawPending = true
+	m.streamRedrawGeneration++
+	generation := m.streamRedrawGeneration
+	return tea.Tick(streamRedrawInterval-elapsed, func(time.Time) tea.Msg {
+		return streamRedrawMsg{generation: generation}
+	})
 }
 
 // resizeComposer keeps the entire draft visible while there is room to grow.
