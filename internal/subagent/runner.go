@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -259,14 +261,31 @@ func (r *AgentRunner) Stats() map[string]int {
 // Read-only specialist roles may run concurrently. Roles with write tools
 // are serialized with other write operations.
 func NewAgentTool(runner *AgentRunner, executor *SubAgentExecutor) types.Tool {
+	availableAgents := func() []string {
+		if executor == nil || executor.agentReg == nil {
+			return nil
+		}
+		names := executor.agentReg.List()
+		sort.Strings(names)
+		return names
+	}
 	return types.BuildTool(types.ToolDef{
 		NameFn: func() string { return constants.ToolAgentRun },
 		DescriptionFn: func() string {
-			return "Executar uma tarefa em um subagente independente. " +
-				"Use para delegar subtarefas de pesquisa, analise ou implementacao a um agente especializado. " +
-				"O agente 'task' e somente-leitura (pesquisa); 'coder' tem acesso total."
+			description := "Executar uma tarefa em um subagente independente para pesquisa, analise ou implementacao."
+			if names := availableAgents(); len(names) > 0 {
+				description += " Agentes disponiveis: " + strings.Join(names, ", ") + "."
+			}
+			return description
 		},
 		InputSchemaFn: func() map[string]any {
+			agentName := map[string]any{
+				"type":        "string",
+				"description": "Nome de um agente registrado (padrao: task)",
+			}
+			if names := availableAgents(); len(names) > 0 {
+				agentName["enum"] = names
+			}
 			return map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -274,11 +293,7 @@ func NewAgentTool(runner *AgentRunner, executor *SubAgentExecutor) types.Tool {
 						"type":        "string",
 						"description": "A tarefa para o subagente executar. Seja especifico e inclua todo o contexto necessario.",
 					},
-					"agent_name": map[string]any{
-						"type":        "string",
-						"description": "Nome do agente a usar. Opcoes: 'task' (pesquisa somente-leitura), 'coder' (acesso total), 'reviewer' (revisao de codigo), 'architect' (design). Default: task",
-						"enum":        []string{"task", "coder", "reviewer", "architect", "devops", "default"},
-					},
+					"agent_name": agentName,
 					"timeout": map[string]any{
 						"type":        "integer",
 						"description": "Timeout em segundos (default: 120)",
@@ -298,6 +313,9 @@ func NewAgentTool(runner *AgentRunner, executor *SubAgentExecutor) types.Tool {
 			agentName, _ := args["agent_name"].(string)
 			if agentName == "" {
 				agentName = "task"
+			}
+			if executor == nil || executor.agentReg == nil || !executor.agentReg.Has(agentName) {
+				return types.ToolResult{Content: fmt.Sprintf("Subagente desconhecido: %s. Agentes disponiveis: %s", agentName, strings.Join(availableAgents(), ", ")), IsError: true}, nil
 			}
 
 			timeout := DefaultTimeout

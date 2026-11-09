@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/sashabaranov/go-openai/jsonschema"
+	"gopkg.in/yaml.v3"
 )
 
 // PluginManifest is the parsed contents of a plugin.json file found inside a
@@ -243,7 +244,7 @@ func (pl *PluginLoader) loadAndCount(manifest PluginManifest, reg interface{ Reg
 // Supported formats:
 //   - .md / .skill.md  — Markdown with YAML frontmatter, parsed via ParseSkillFile
 //     (the same function used by FSSkillLoader)
-//   - .yaml / .yml     — JSON-encoded skill definition (pluginSkillDef)
+//   - .yaml / .yml     — YAML skill definition (pluginSkillDef)
 func (pl *PluginLoader) loadSkillFile(path string) (*Skill, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -257,7 +258,7 @@ func (pl *PluginLoader) loadSkillFile(path string) (*Skill, error) {
 
 	ext := strings.ToLower(filepath.Ext(path))
 	if ext == ".yaml" || ext == ".yml" {
-		return skillFromJSON(path, data)
+		return skillFromYAML(path, data)
 	}
 
 	return nil, fmt.Errorf("unsupported skill file extension %q (want .yaml, .yml, or .md)", filepath.Ext(path))
@@ -285,25 +286,29 @@ func skillFromParsed(path string, data []byte) (*Skill, error) {
 	}, nil
 }
 
-// pluginSkillDef is the JSON schema for a plugin skill file.
-// It intentionally mirrors CustomSkillDef's fields so existing custom skill
-// YAML files (when valid JSON-compatible YAML) can be used as plugin skills.
+// pluginSkillDef is the schema for a YAML plugin skill file.
+// It mirrors CustomSkillDef's fields so existing custom skills can be used as
+// plugin skills. JSON documents remain valid YAML input.
 type pluginSkillDef struct {
-	Name        string            `json:"name"`
-	Description string            `json:"description"`
-	Parameters  map[string]string `json:"parameters"` // param name → description
-	Script      string            `json:"script"`
+	Name        string            `json:"name" yaml:"name"`
+	Description string            `json:"description" yaml:"description"`
+	Parameters  map[string]string `json:"parameters" yaml:"parameters"` // param name → description
+	Script      string            `json:"script" yaml:"script"`
 }
 
-// skillFromJSON decodes a pluginSkillDef from a JSON-encoded .yaml file and
-// builds a *Skill from it.
-//
-// Plugin skill YAML files must use JSON-compatible syntax (valid JSON) because
-// this file uses only the standard library (encoding/json) for decoding.
-func skillFromJSON(path string, data []byte) (*Skill, error) {
+// skillFromYAML decodes a pluginSkillDef from YAML or JSON and builds a *Skill.
+func skillFromYAML(path string, data []byte) (*Skill, error) {
 	var def pluginSkillDef
-	if err := json.Unmarshal(data, &def); err != nil {
-		return nil, fmt.Errorf("parse: %w", err)
+	var err error
+	if json.Valid(data) {
+		// Preserve the existing JSON decoding behavior for JSON-formatted files.
+		err = json.Unmarshal(data, &def)
+	} else {
+		err = yaml.Unmarshal(data, &def)
+	}
+	if err != nil {
+		// YAML type errors can quote source values, which may contain secrets.
+		return nil, fmt.Errorf("invalid plugin skill YAML or JSON syntax or field types")
 	}
 	if strings.TrimSpace(def.Name) == "" {
 		return nil, fmt.Errorf("skill file %s: name is required", path)

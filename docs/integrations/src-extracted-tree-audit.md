@@ -2,6 +2,8 @@
 
 **Data:** 9 de novembro de 2026. A referência é a cópia local em `../src_extracted/src` (relativa à pasta `polypod`). Esta análise usa os comportamentos observados como referência para implementação independente em Go; não incorpora código, prompts ou recursos da referência.
 
+A [leitura linha a linha dos fluxos prioritários](src-extracted-line-review.md) registra os arquivos efetivamente cobertos, as correções aplicadas e os próximos trabalhos.
+
 ## Cobertura e método
 
 O inventário percorreu todos os arquivos de `src_extracted/src`. Há **3.804 arquivos físicos**, porém `src_extracted/src/src` repete exatamente a árvore externa: **1.902 caminhos correspondentes, sem diferenças de SHA-256**. Portanto, há **1.902 arquivos únicos**. Cada arquivo único foi classificado por área. A revisão funcional rastreou símbolos, imports e pontos de inicialização, com leitura dirigida dos fluxos de maior impacto. **Não foi uma leitura linha a linha dos 1.902 arquivos, nem uma prova de equivalência em execução.** O usuário adiou os testes nesta rodada.
