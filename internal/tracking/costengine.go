@@ -143,6 +143,17 @@ func NewCostEngine(logger *slog.Logger) *CostEngine {
 // RecordCompletion records token usage and cost for one API completion call.
 func (ce *CostEngine) RecordCompletion(model string, promptTokens, completionTokens, cacheReadTokens, cacheCreationTokens int) {
 	inputCost, outputCost := calculateModelCost(model, promptTokens, completionTokens)
+	if strings.HasPrefix(model, "claude") && (cacheReadTokens > 0 || cacheCreationTokens > 0) {
+		if pricing, ok := lookupPricing(model); ok {
+			uncached := promptTokens - cacheReadTokens - cacheCreationTokens
+			if uncached < 0 {
+				uncached = 0
+			}
+			// Anthropic's five-minute cache charges reads at 0.1x and writes
+			// at 1.25x of the base input rate. PromptTokens includes all input.
+			inputCost = (float64(uncached) + 0.1*float64(cacheReadTokens) + 1.25*float64(cacheCreationTokens)) / 1_000_000 * pricing.InputPerMillion
+		}
+	}
 
 	ce.mu.Lock()
 	defer ce.mu.Unlock()
@@ -277,8 +288,13 @@ func (ce *CostEngine) FormatDetailedReport() string {
 	fmt.Fprintf(&sb, "- **Tokens**: %d prompt + %d completion = **%d total**\n",
 		ce.totalPromptTokens, ce.totalCompletionTokens, totalTokens)
 	if ce.totalCacheReadTokens > 0 || ce.totalCacheCreationTokens > 0 {
-		fmt.Fprintf(&sb, "- **Cache**: %d read, %d creation\n",
-			ce.totalCacheReadTokens, ce.totalCacheCreationTokens)
+		cacheTotal := ce.totalCacheReadTokens + ce.totalCacheCreationTokens
+		cacheHitRate := 0.0
+		if cacheTotal > 0 {
+			cacheHitRate = 100 * float64(ce.totalCacheReadTokens) / float64(cacheTotal)
+		}
+		fmt.Fprintf(&sb, "- **Cache**: %d lidos, %d gravados (%.1f%% de acertos entre tokens cacheados)\n",
+			ce.totalCacheReadTokens, ce.totalCacheCreationTokens, cacheHitRate)
 	}
 	fmt.Fprintf(&sb, "- **Custo**: $%.4f input + $%.4f output = **$%.4f USD**\n",
 		ce.totalInputCostUSD, ce.totalOutputCostUSD, totalCost)

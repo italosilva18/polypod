@@ -3,6 +3,7 @@ package conversation
 import (
 	"context"
 	"log/slog"
+	"time"
 )
 
 // Manager handles the lifecycle of conversation sessions.
@@ -21,15 +22,21 @@ func NewManager(store *Store, logger *slog.Logger) *Manager {
 
 // GetSession retrieves or creates a session for a user on a channel.
 func (m *Manager) GetSession(ctx context.Context, channel, userID string) (*Session, error) {
-	return m.store.Get(ctx, channel, userID)
+	sess, err := m.store.Get(ctx, channel, userID)
+	if err != nil {
+		return nil, err
+	}
+	sess.unbounded = true
+	return sess, nil
 }
 
 // AddUserMessage adds a user message to the session.
-func (m *Manager) AddUserMessage(ctx context.Context, sess *Session, content string) {
-	sess.AddMessage(RoleUser, content)
+func (m *Manager) AddUserMessage(ctx context.Context, sess *Session, content string) Message {
+	msg := sess.AddMessage(RoleUser, content)
 	if err := m.store.Save(ctx, sess); err != nil {
 		m.logger.Warn("failed to persist user message", "session", sess.ID, "error", err)
 	}
+	return msg
 }
 
 // AddAssistantMessage adds an assistant message and persists the session.
@@ -86,8 +93,13 @@ func (m *Manager) TruncateMessages(ctx context.Context, sess *Session, n int) ([
 // ReplaceMessages replaces the session messages wholesale and persists.
 // Used by /resume to load a persisted session into the active conversation.
 func (m *Manager) ReplaceMessages(ctx context.Context, sess *Session, msgs []Message) error {
+	previous := append([]Message(nil), sess.Messages...)
+	previousUpdatedAt := sess.UpdatedAt
 	sess.Messages = append(sess.Messages[:0], msgs...)
+	sess.UpdatedAt = time.Now()
 	if err := m.store.Save(ctx, sess); err != nil {
+		sess.Messages = previous
+		sess.UpdatedAt = previousUpdatedAt
 		m.logger.Warn("failed to persist replaced session", "session", sess.ID, "error", err)
 		return err
 	}

@@ -3,6 +3,7 @@ package tasks
 import (
 	"crypto/rand"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 )
@@ -35,16 +36,17 @@ const (
 type TaskStatus string
 
 const (
-	StatusPending   TaskStatus = "pending"
-	StatusRunning   TaskStatus = "running"
-	StatusCompleted TaskStatus = "completed"
-	StatusFailed    TaskStatus = "failed"
-	StatusKilled    TaskStatus = "killed"
+	StatusPending     TaskStatus = "pending"
+	StatusRunning     TaskStatus = "running"
+	StatusCompleted   TaskStatus = "completed"
+	StatusFailed      TaskStatus = "failed"
+	StatusKilled      TaskStatus = "killed"
+	StatusInterrupted TaskStatus = "interrupted"
 )
 
 // IsTerminal returns true if the task will not transition further.
 func (s TaskStatus) IsTerminal() bool {
-	return s == StatusCompleted || s == StatusFailed || s == StatusKilled
+	return s == StatusCompleted || s == StatusFailed || s == StatusKilled || s == StatusInterrupted
 }
 
 // ---------------------------------------------------------------------------
@@ -120,16 +122,26 @@ type TaskHandle struct {
 
 // TaskState holds the common fields for all task states.
 type TaskState struct {
-	ID           string     `json:"id"`
-	Type         TaskType   `json:"type"`
-	Status       TaskStatus `json:"status"`
-	Description  string     `json:"description"`
-	ToolUseID    string     `json:"tool_use_id,omitempty"`
-	StartTime    time.Time  `json:"start_time"`
-	EndTime      *time.Time `json:"end_time,omitempty"`
-	OutputFile   string     `json:"output_file"`
-	OutputOffset int        `json:"output_offset"`
-	Notified     bool       `json:"notified"`
+	ID           string         `json:"id"`
+	Type         TaskType       `json:"type"`
+	Status       TaskStatus     `json:"status"`
+	Description  string         `json:"description"`
+	ToolUseID    string         `json:"tool_use_id,omitempty"`
+	StartTime    time.Time      `json:"start_time"`
+	EndTime      *time.Time     `json:"end_time,omitempty"`
+	OutputFile   string         `json:"output_file"`
+	OutputOffset int            `json:"output_offset"`
+	Notified     bool           `json:"notified"`
+	AgentName    string         `json:"agent_name,omitempty"`
+	Progress     *AgentProgress `json:"progress,omitempty"`
+	Result       string         `json:"result,omitempty"`
+	Error        string         `json:"error,omitempty"`
+	ExitCode     *int           `json:"exit_code,omitempty"`
+	ProcessID    int            `json:"process_id,omitempty"`
+	Attempt      int            `json:"attempt,omitempty"`
+	RestartOf    string         `json:"restart_of,omitempty"`
+	// Input is written only to the private task state file for explicit restarts.
+	input string
 }
 
 // NewTaskState creates a new task state in pending status.
@@ -141,6 +153,7 @@ func NewTaskState(taskType TaskType, description string) *TaskState {
 		Description: description,
 		StartTime:   time.Now(),
 		OutputFile:  fmt.Sprintf("/tmp/polypod_task_%s.log", GenerateTaskID(taskType)),
+		Attempt:     1,
 	}
 }
 
@@ -161,9 +174,15 @@ type TaskKiller interface {
 
 // TaskRegistry manages all task states.
 type TaskRegistry struct {
-	mu      sync.RWMutex
-	tasks   map[string]*TaskState
-	killers map[TaskType]TaskKiller
+	mu          sync.RWMutex
+	tasks       map[string]*TaskState
+	killers     map[TaskType]TaskKiller
+	agentRunner AgentRunFunc
+	persistPath string
+	outputDir   string
+	persistErr  error
+	recoveryErr error
+	lockFile    *os.File
 }
 
 // NewTaskRegistry creates a new task registry.
@@ -186,14 +205,36 @@ func (r *TaskRegistry) Register(state *TaskState) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.tasks[state.ID] = state
+	r.persistLocked()
 }
 
-// Get returns a task state by ID.
+func snapshotTaskState(state *TaskState) *TaskState {
+	snapshot := *state
+	if state.EndTime != nil {
+		end := *state.EndTime
+		snapshot.EndTime = &end
+	}
+	if state.ExitCode != nil {
+		exitCode := *state.ExitCode
+		snapshot.ExitCode = &exitCode
+	}
+	if state.Progress != nil {
+		progress := *state.Progress
+		progress.RecentActivities = append([]ToolActivity(nil), progress.RecentActivities...)
+		snapshot.Progress = &progress
+	}
+	return &snapshot
+}
+
+// Get returns a task state snapshot by ID.
 func (r *TaskRegistry) Get(id string) (*TaskState, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	t, ok := r.tasks[id]
-	return t, ok
+	if !ok {
+		return nil, false
+	}
+	return snapshotTaskState(t), true
 }
 
 // Update atomically updates a task state.
@@ -205,6 +246,7 @@ func (r *TaskRegistry) Update(id string, fn func(*TaskState)) bool {
 		return false
 	}
 	fn(t)
+	r.persistLocked()
 	return true
 }
 
@@ -214,7 +256,7 @@ func (r *TaskRegistry) List() []*TaskState {
 	defer r.mu.RUnlock()
 	result := make([]*TaskState, 0, len(r.tasks))
 	for _, t := range r.tasks {
-		result = append(result, t)
+		result = append(result, snapshotTaskState(t))
 	}
 	return result
 }
@@ -226,7 +268,7 @@ func (r *TaskRegistry) ListByStatus(status TaskStatus) []*TaskState {
 	var result []*TaskState
 	for _, t := range r.tasks {
 		if t.Status == status {
-			result = append(result, t)
+			result = append(result, snapshotTaskState(t))
 		}
 	}
 	return result
@@ -239,7 +281,7 @@ func (r *TaskRegistry) ListByType(taskType TaskType) []*TaskState {
 	var result []*TaskState
 	for _, t := range r.tasks {
 		if t.Type == taskType {
-			result = append(result, t)
+			result = append(result, snapshotTaskState(t))
 		}
 	}
 	return result
@@ -271,6 +313,7 @@ func (r *TaskRegistry) Remove(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.tasks, id)
+	r.persistLocked()
 }
 
 // RunningCount returns the number of running tasks.

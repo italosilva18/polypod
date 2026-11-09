@@ -114,6 +114,13 @@ func (m *Manager) SetAutoCompactCallback(fn func()) {
 	m.onAutoCompact = fn
 }
 
+// SetModel refreshes token limits after an interactive model switch.
+func (m *Manager) SetModel(model string) {
+	m.mu.Lock()
+	m.limits = WellKnownLimits(model)
+	m.mu.Unlock()
+}
+
 // SetCriticalCallback sets the function called when critical threshold is hit.
 func (m *Manager) SetCriticalCallback(fn func()) {
 	m.mu.Lock()

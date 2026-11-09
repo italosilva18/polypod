@@ -45,10 +45,10 @@ var pdfExtensions = map[string]bool{
 
 // RegisterReadFileTool registers the production read_file tool.
 func RegisterReadFileTool(reg *Registry, workingDir string) {
-	reg.RegisterDef(newReadFileTool(workingDir))
+	reg.RegisterDef(newReadFileTool(workingDir, reg))
 }
 
-func newReadFileTool(wd string) types.ToolDef {
+func newReadFileTool(wd string, reg *Registry) types.ToolDef {
 	return types.ToolDef{
 		NameFn: func() string { return constants.ToolReadFile },
 		DescriptionFn: func() string {
@@ -88,7 +88,9 @@ func newReadFileTool(wd string) types.ToolDef {
 			return types.ValidationResult{Valid: true}
 		},
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
-			return executeReadFile(wd, args)
+			return executeReadFile(wd, args, func(path string, data []byte) {
+				reg.recordFileVersion(ctx.SessionID, path, data)
+			})
 		},
 	}
 }
@@ -97,7 +99,7 @@ func newReadFileTool(wd string) types.ToolDef {
 // Execute
 // ---------------------------------------------------------------------------
 
-func executeReadFile(wd string, args map[string]any) (types.ToolResult, error) {
+func executeReadFile(wd string, args map[string]any, record func(string, []byte)) (types.ToolResult, error) {
 	filePath := argString(args, "file_path")
 	resolved := resolvePath(wd, filePath)
 
@@ -186,6 +188,9 @@ func executeReadFile(wd string, args map[string]any) (types.ToolResult, error) {
 	data, err := io.ReadAll(f)
 	if err != nil {
 		return errResult("Error reading file: %v", err), nil
+	}
+	if record != nil {
+		record(resolved, data)
 	}
 
 	// Strip UTF-8 BOM if present.

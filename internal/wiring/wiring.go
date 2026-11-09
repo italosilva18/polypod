@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 
 	"github.com/costa/polypod/internal/agent"
 	"github.com/costa/polypod/internal/ai"
@@ -102,6 +103,11 @@ func WireAll(cfg Config) *Systems {
 	// 1d. Task tools (TodoWrite, TodoRead, TaskCreate, TaskGet, TaskList, TaskStop, TaskOutput)
 	taskList := tasktool.NewTaskList()
 	taskRegistry := tasks.NewTaskRegistry()
+	if cfg.DataDir != "" {
+		if err := taskRegistry.EnablePersistence(filepath.Join(cfg.DataDir, "task-registry.json")); err != nil {
+			logger.Warn("background task recovery unavailable", "error", err)
+		}
+	}
 	// Register killers for shell and agent tasks
 	taskRegistry.RegisterKiller(tasks.NewLocalShellTaskKiller(logger))
 	taskRegistry.RegisterKiller(tasks.NewLocalAgentTaskKiller(logger))
@@ -243,14 +249,41 @@ func WireAll(cfg Config) *Systems {
 // SubAgentExecutor backed by the given ai.Client. This should be called
 // after ai.NewClient, before the system starts handling requests.
 func WireAIClient(sys *Systems, aiClient *ai.Client, logger *slog.Logger) {
+	maxTurns := subagent.DefaultMaxTurns
+	tokenBudget := subagent.DefaultTokenBudge
+	if sys.Permissions != nil && sys.Permissions.Mode() == types.ModeBypass {
+		maxTurns, tokenBudget = -1, -1
+	}
 	executor := subagent.NewSubAgentExecutor(subagent.SubAgentConfig{
 		AIClient:    aiClient,
 		AgentReg:    sys.Agents,
 		ToolReg:     sys.ToolRegistry,
 		Executor:    sys.Orchestrator,
 		Logger:      logger,
-		MaxTurns:    subagent.DefaultMaxTurns,
-		TokenBudget: subagent.DefaultTokenBudge,
+		MaxTurns:    maxTurns,
+		TokenBudget: tokenBudget,
+	})
+	sys.TaskRegistry.SetAgentRunner(func(ctx context.Context, agentName string, query string, report func(tasks.AgentProgress)) (string, error) {
+		var recent []tasks.ToolActivity
+		return executor.ExecuteWithProgress(ctx, agentName, query, func(update subagent.ExecutionProgress) {
+			progress := tasks.AgentProgress{
+				ToolUseCount: update.ToolUseCount,
+				TokenCount:   update.PromptTokens + update.CompletionTokens,
+				Summary:      fmt.Sprintf("Turno %d", update.Turn),
+			}
+			if update.LastTool != "" {
+				activity := tasks.ToolActivity{ToolName: update.LastTool}
+				recent = append(recent, activity)
+				if len(recent) > 5 {
+					recent = recent[len(recent)-5:]
+				}
+				progress.LastActivity = &activity
+			}
+			progress.RecentActivities = append([]tasks.ToolActivity(nil), recent...)
+			if report != nil {
+				report(progress)
+			}
+		})
 	})
 
 	// Replace the placeholder AgentTool with the real one.

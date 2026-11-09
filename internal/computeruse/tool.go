@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -75,6 +76,15 @@ func (t *ComputerUseTool) ExecuteAction(ctx context.Context, action ToolAction) 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	releaseDesktop, err := acquireDesktopLock(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("desktop ocupado: %w", err)
+	}
+	defer func() {
+		if releaseErr := releaseDesktop(); releaseErr != nil {
+			err = errors.Join(err, releaseErr)
+		}
+	}()
 	defer func() {
 		if err == nil && result != nil && result.Success && action.Action != "screenshot" {
 			t.observeAfterAction(ctx, result)

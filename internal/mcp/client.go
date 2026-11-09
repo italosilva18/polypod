@@ -33,6 +33,10 @@ type Manager struct {
 	mu        sync.RWMutex
 	sessions  map[string]*mcpsdk.ClientSession
 	tools     map[string][]*mcpsdk.Tool
+	resources map[string][]*mcpsdk.Resource
+	prompts   map[string][]*mcpsdk.Prompt
+	skillReg  *skill.Registry
+	closed    bool
 	client    *mcpsdk.Client
 	logger    *slog.Logger
 	reconnect *ReconnectManager
@@ -40,22 +44,41 @@ type Manager struct {
 
 // NewManager creates an MCP manager.
 func NewManager(logger *slog.Logger) *Manager {
-	client := mcpsdk.NewClient(&mcpsdk.Implementation{
-		Name:    "polypod",
-		Version: "0.6.0",
-	}, nil)
-
-	return &Manager{
+	m := &Manager{
 		sessions:  make(map[string]*mcpsdk.ClientSession),
 		tools:     make(map[string][]*mcpsdk.Tool),
-		client:    client,
+		resources: make(map[string][]*mcpsdk.Resource),
+		prompts:   make(map[string][]*mcpsdk.Prompt),
 		logger:    logger,
 		reconnect: NewReconnectManager(DefaultReconnectConfig()),
 	}
+	m.client = mcpsdk.NewClient(&mcpsdk.Implementation{
+		Name:    "polypod",
+		Version: "0.6.0",
+	}, &mcpsdk.ClientOptions{
+		ToolListChangedHandler: func(_ context.Context, req *mcpsdk.ToolListChangedRequest) {
+			go m.refreshNotification(req.Session, "tools")
+		},
+		ResourceListChangedHandler: func(_ context.Context, req *mcpsdk.ResourceListChangedRequest) {
+			go m.refreshNotification(req.Session, "resources")
+		},
+		PromptListChangedHandler: func(_ context.Context, req *mcpsdk.PromptListChangedRequest) {
+			go m.refreshNotification(req.Session, "prompts")
+		},
+	})
+	return m
 }
 
 // Connect connects to an MCP server using the given config.
 func (m *Manager) Connect(ctx context.Context, cfg ServerConfig) error {
+	m.mu.RLock()
+	_, alreadyConnected := m.sessions[cfg.Name]
+	m.mu.RUnlock()
+	if alreadyConnected {
+		if err := m.Disconnect(cfg.Name); err != nil {
+			m.logger.Warn("mcp previous session close failed", "server", cfg.Name, "error", err)
+		}
+	}
 	newTransport := func() (mcpsdk.Transport, error) {
 		var transport mcpsdk.Transport
 
@@ -98,21 +121,44 @@ func (m *Manager) Connect(ctx context.Context, cfg ServerConfig) error {
 		return fmt.Errorf("mcp connect %s: %w", cfg.Name, err)
 	}
 
-	// List tools
-	result, err := session.ListTools(ctx, nil)
-	if err != nil {
-		session.Close()
-		return fmt.Errorf("mcp list tools %s: %w", cfg.Name, err)
+	// Servers may expose only resources or prompts. Query tools only when the
+	// server advertises that capability.
+	var items []*mcpsdk.Tool
+	if initialization := session.InitializeResult(); initialization != nil && initialization.Capabilities.Tools != nil {
+		items, err = listAllTools(ctx, session)
+		if err != nil {
+			session.Close()
+			return fmt.Errorf("mcp list tools %s: %w", cfg.Name, err)
+		}
 	}
 
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		session.Close()
+		return fmt.Errorf("mcp: manager fechado")
+	}
+	if old := m.sessions[cfg.Name]; old != nil {
+		m.mu.Unlock()
+		session.Close()
+		return fmt.Errorf("mcp: servidor %q já conectado", cfg.Name)
+	}
 	m.sessions[cfg.Name] = session
-	m.tools[cfg.Name] = result.Tools
+	m.tools[cfg.Name] = items
+	if m.skillReg != nil {
+		for _, item := range items {
+			m.registerMCPToolLocked(cfg.Name, item, session)
+		}
+	}
 	m.mu.Unlock()
+
+	// Resource and prompt discovery is optional. A server without either
+	// capability must still connect successfully.
+	m.refreshOptionalLists(ctx, session)
 
 	m.logger.Info("mcp: servidor conectado",
 		"name", cfg.Name,
-		"tools", len(result.Tools),
+		"tools", len(items),
 	)
 
 	return nil
@@ -120,31 +166,35 @@ func (m *Manager) Connect(ctx context.Context, cfg ServerConfig) error {
 
 // Disconnect closes a server connection.
 func (m *Manager) Disconnect(name string) error {
+	m.reconnect.Stop(name)
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	session, ok := m.sessions[name]
 	if !ok {
+		m.mu.Unlock()
 		return fmt.Errorf("mcp: servidor %q nao conectado", name)
 	}
 
-	err := session.Close()
+	m.removeServerSkillsLocked(name)
 	delete(m.sessions, name)
 	delete(m.tools, name)
-	return err
+	delete(m.resources, name)
+	delete(m.prompts, name)
+	m.mu.Unlock()
+	return session.Close()
 }
 
 // RegisterTools registers all MCP tools from connected servers into a skill registry.
 func (m *Manager) RegisterTools(reg *skill.Registry) int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.skillReg = reg
 
 	count := 0
 	for serverName, tools := range m.tools {
 		session := m.sessions[serverName]
 		for _, tool := range tools {
-			s := m.toolToSkill(serverName, tool, session)
-			reg.Register(s)
+			m.registerMCPToolLocked(serverName, tool, session)
 			count++
 		}
 	}
@@ -172,6 +222,7 @@ func (m *Manager) toolToSkill(serverName string, tool *mcpsdk.Tool, session *mcp
 	}
 	return &skill.Skill{
 		Name:          skillName,
+		Origin:        "mcp:" + serverName,
 		Description:   fmt.Sprintf("[MCP:%s] %s", serverName, tool.Description),
 		Parameters:    params,
 		InputSchema:   schema,
@@ -275,17 +326,24 @@ func (m *Manager) Close() error {
 	m.reconnect.StopAll()
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.closed = true
+	sessions := m.sessions
+	for name := range sessions {
+		m.removeServerSkillsLocked(name)
+	}
+	m.sessions = make(map[string]*mcpsdk.ClientSession)
+	m.tools = make(map[string][]*mcpsdk.Tool)
+	m.resources = make(map[string][]*mcpsdk.Resource)
+	m.prompts = make(map[string][]*mcpsdk.Prompt)
+	m.mu.Unlock()
 
 	var lastErr error
-	for name, session := range m.sessions {
+	for name, session := range sessions {
 		if err := session.Close(); err != nil {
 			lastErr = err
 			m.logger.Warn("mcp close error", "server", name, "error", err)
 		}
 	}
-	m.sessions = make(map[string]*mcpsdk.ClientSession)
-	m.tools = make(map[string][]*mcpsdk.Tool)
 	return lastErr
 }
 

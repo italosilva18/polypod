@@ -27,7 +27,7 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 
 	var totalPrompt, totalCompletion int
 	maxIterations := c.toolIterationLimit()
-	for iter := 0; iter < maxIterations; iter++ {
+	for iter := 0; maxIterations < 0 || iter < maxIterations; iter++ {
 		var resp *providerapi.ChatResponse
 		var err error
 		if callback == nil {
@@ -44,13 +44,7 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 		}
 		totalPrompt += resp.PromptTokens
 		totalCompletion += resp.CompletionTokens
-		if c.costEngine != nil {
-			model := resp.Model
-			if model == "" {
-				model = c.model
-			}
-			c.costEngine.RecordCompletion(model, resp.PromptTokens, resp.CompletionTokens, 0, 0)
-		}
+		c.recordProviderUsage(resp)
 		if len(resp.ToolCalls) == 0 {
 			return &ChatResponse{Content: resp.Content, PromptTokens: totalPrompt, CompletionTokens: totalCompletion, TotalTokens: totalPrompt + totalCompletion}, nil
 		}

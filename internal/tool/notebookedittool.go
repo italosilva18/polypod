@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/costa/polypod/internal/types"
@@ -269,8 +268,8 @@ func SaveNotebook(path string, nb *Notebook) error {
 // notebook_edit tool
 // ---------------------------------------------------------------------------
 
-// NewNotebookEditTool creates the notebook_edit tool, scoped to a workspace
-// directory. Paths outside the workspace are rejected via permission check.
+// NewNotebookEditTool creates the notebook_edit tool. The working directory
+// resolves relative paths; absolute paths are accepted as provided.
 func NewNotebookEditTool(workingDir string) types.Tool {
 	return types.BuildTool(types.ToolDef{
 		NameFn: func() string { return "notebook_edit" },
@@ -366,19 +365,7 @@ func NewNotebookEditTool(workingDir string) types.Tool {
 			}
 			return types.ValidationResult{Valid: true}
 		},
-		CheckPermFn: func(args map[string]any, tc types.ToolContext) types.PermissionResult {
-			base := workingDir
-			if base == "" {
-				base = tc.WorkingDir
-			}
-			nbPath, _ := args["notebook_path"].(string)
-			resolved := resolvePath(base, nbPath)
-			if base != "" && !isWithinDir(base, resolved) {
-				return types.PermissionResult{
-					Behavior: types.PermissionDeny,
-					Message:  fmt.Sprintf("notebook_path %q is outside the workspace %q", resolved, base),
-				}
-			}
+		CheckPermFn: func(map[string]any, types.ToolContext) types.PermissionResult {
 			return types.PermissionResult{Behavior: types.PermissionAllow}
 		},
 		ExecuteFn: func(tc types.ToolContext, args map[string]any) (types.ToolResult, error) {
@@ -515,21 +502,4 @@ func coerceInt(v any) (int, bool) {
 		return int(i), true
 	}
 	return 0, false
-}
-
-// isWithinDir reports whether path is contained in base after cleaning.
-func isWithinDir(base, path string) bool {
-	absBase, err := filepath.Abs(base)
-	if err != nil {
-		return false
-	}
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return false
-	}
-	rel, err := filepath.Rel(absBase, absPath)
-	if err != nil {
-		return false
-	}
-	return rel == "." || (!strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel))
 }

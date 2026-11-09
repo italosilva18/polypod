@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/costa/polypod/internal/agent"
 	"github.com/costa/polypod/internal/ai"
 	"github.com/costa/polypod/internal/command"
+	"github.com/costa/polypod/internal/compact"
 	"github.com/costa/polypod/internal/config"
 	"github.com/costa/polypod/internal/conversation"
 	"github.com/costa/polypod/internal/hooks"
@@ -26,6 +28,7 @@ import (
 	"github.com/costa/polypod/internal/skill"
 	"github.com/costa/polypod/internal/tool"
 	"github.com/costa/polypod/internal/tracking"
+	"github.com/costa/polypod/internal/turncheckpoint"
 )
 
 // RestoredMessage represents a message restored from a persisted session
@@ -59,6 +62,51 @@ type Adapter struct {
 	cfg               *config.Config
 	cfgPath           string
 	commandRegistry   *command.Registry
+	turnCheckpoint    *turncheckpoint.Manager
+	activeSessionID   string
+}
+
+// SetTurnCheckpointManager enables file-aware conversation rewind.
+func (a *Adapter) SetTurnCheckpointManager(manager *turncheckpoint.Manager) {
+	a.turnCheckpoint = manager
+}
+
+// SetActiveSessionID identifies the persisted CLI session updated by rewind.
+func (a *Adapter) SetActiveSessionID(id string) {
+	a.activeSessionID = id
+}
+
+// ActiveSessionID returns the session selected by startup or /resume.
+func (a *Adapter) ActiveSessionID() string {
+	return a.activeSessionID
+}
+
+func (a *Adapter) saveActiveSession(sess *conversation.Session) error {
+	if a.sessStorage == nil || a.activeSessionID == "" {
+		return nil
+	}
+	persisted, err := a.sessStorage.Load(a.activeSessionID)
+	if err != nil {
+		return err
+	}
+	if persisted == nil {
+		persisted = &session.RestoredSession{
+			ID:        a.activeSessionID,
+			CreatedAt: sess.CreatedAt,
+			Metadata:  session.SessionMetadata{Tag: "cli", Mode: "interactive"},
+		}
+	}
+	persisted.Messages = make([]session.Message, len(sess.Messages))
+	for i, msg := range sess.Messages {
+		persisted.Messages[i] = session.Message{ID: msg.ID, Role: string(msg.Role), Content: msg.Content, Timestamp: msg.Timestamp}
+	}
+	persisted.Title = session.TitleFromFirstMessage(persisted.Messages)
+	persisted.UpdatedAt = time.Now()
+	return a.sessStorage.Save(persisted)
+}
+
+func isCompactSummaryMessage(content string) bool {
+	return strings.HasPrefix(content, "This session is being continued from a previous conversation")
 }
 
 // SetCostEngine attaches a CostEngine for the /cost command.
@@ -169,7 +217,7 @@ func (a *Adapter) SetRestoredMessages(msgs []RestoredMessage) {
 }
 
 func (a *Adapter) Start(ctx context.Context, handler adapter.MessageHandler) error {
-	deps := a.buildCommandDeps()
+	deps := a.buildCommandDeps(ctx)
 
 	// Use stream handler if available, otherwise wrap the sync handler
 	sh := a.streamHandler
@@ -211,7 +259,7 @@ func (a *Adapter) Send(ctx context.Context, msg adapter.OutMessage) error {
 }
 
 // buildCommandDeps creates the closure-based command deps from real implementations.
-func (a *Adapter) buildCommandDeps() commandDeps {
+func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 	deps := commandDeps{commandRegistry: a.commandRegistry}
 
 	if a.aiSvc != nil {
@@ -308,12 +356,35 @@ func (a *Adapter) buildCommandDeps() commandDeps {
 		}
 	}
 
-	// /compact: report availability. Actual compaction is handled by the
-	// AI service's auto-compact pipeline. A dedicated manual flow would
-	// need a wiring hook to compact.CompactService, which is not exposed
-	// through the adapter yet.
-	deps.compactAvailable = func() bool {
-		return a.aiSvc != nil
+	if a.aiSvc != nil && a.convMgr != nil {
+		deps.compactAvailable = func() bool { return true }
+		deps.compactHistory = func() ([]chatEntry, int, int, error) {
+			sess, err := a.convMgr.GetSession(ctx, "cli", "local")
+			if err != nil {
+				return nil, 0, 0, err
+			}
+			history := append([]conversation.Message(nil), a.convMgr.GetHistory(sess)...)
+			result, err := a.aiSvc.CompactHistory(ctx, history)
+			if err != nil {
+				return nil, 0, 0, err
+			}
+			compacted := compact.BuildResultMessages(result)
+			if err := a.convMgr.ReplaceMessages(ctx, sess, compacted); err != nil {
+				return nil, 0, 0, err
+			}
+			if err := a.saveActiveSession(sess); err != nil {
+				a.logger.Warn("compacted CLI session snapshot unavailable", "error", err)
+			}
+			entries := make([]chatEntry, 0, len(compacted))
+			for _, msg := range compacted {
+				entries = append(entries, chatEntry{
+					role:      string(msg.Role),
+					content:   msg.Content,
+					timestamp: msg.Timestamp,
+				})
+			}
+			return entries, result.PreCompactTokens, result.PostCompactTokens, nil
+		}
 	}
 
 	if a.mcpMgr != nil {
@@ -410,8 +481,9 @@ func (a *Adapter) buildCommandDeps() commandDeps {
 			entries := make([]chatEntry, 0, len(restored.Messages))
 			for _, m := range restored.Messages {
 				entries = append(entries, chatEntry{
-					role:    m.Role,
-					content: m.Content,
+					role:      m.Role,
+					content:   m.Content,
+					timestamp: m.Timestamp,
 				})
 			}
 
@@ -419,24 +491,30 @@ func (a *Adapter) buildCommandDeps() commandDeps {
 			// store if wired, so the next AI turn has full history.
 			if a.convMgr != nil {
 				sess, sessErr := a.convMgr.GetSession(context.Background(), "cli", "local")
-				if sessErr == nil {
-					conv := make([]conversation.Message, 0, len(restored.Messages))
-					for _, m := range restored.Messages {
-						role := conversation.RoleUser
-						switch m.Role {
-						case "assistant":
-							role = conversation.RoleAssistant
-						case "system":
-							role = conversation.RoleSystem
-						}
-						conv = append(conv, conversation.Message{
-							Role:    role,
-							Content: m.Content,
-						})
+				if sessErr != nil {
+					return nil, fmt.Errorf("abrindo sessao retomada: %w", sessErr)
+				}
+				conv := make([]conversation.Message, 0, len(restored.Messages))
+				for _, m := range restored.Messages {
+					role := conversation.RoleUser
+					switch m.Role {
+					case "assistant":
+						role = conversation.RoleAssistant
+					case "system":
+						role = conversation.RoleSystem
 					}
-					_ = a.convMgr.ReplaceMessages(context.Background(), sess, conv)
+					conv = append(conv, conversation.Message{
+						ID:        m.ID,
+						Role:      role,
+						Content:   m.Content,
+						Timestamp: m.Timestamp,
+					})
+				}
+				if err := a.convMgr.ReplaceMessages(context.Background(), sess, conv); err != nil {
+					return nil, fmt.Errorf("restaurando mensagens da sessao: %w", err)
 				}
 			}
+			a.activeSessionID = restored.ID
 			return entries, nil
 		}
 	}
@@ -450,6 +528,75 @@ func (a *Adapter) buildCommandDeps() commandDeps {
 			}
 			removed, err := a.convMgr.TruncateMessages(context.Background(), sess, n)
 			return len(removed), err
+		}
+		deps.listRewindTurns = func() ([]rewindTurn, error) {
+			sess, err := a.convMgr.GetSession(ctx, "cli", "local")
+			if err != nil {
+				return nil, err
+			}
+			turns := make([]rewindTurn, 0)
+			for _, msg := range sess.Messages {
+				if msg.Role == conversation.RoleUser && !isCompactSummaryMessage(msg.Content) {
+					turns = append(turns, rewindTurn{preview: msg.Content})
+				}
+			}
+			return turns, nil
+		}
+		deps.rewindTurns = func(n int, withFiles, withConversation bool) (rewindOutcome, error) {
+			var outcome rewindOutcome
+			sess, err := a.convMgr.GetSession(ctx, "cli", "local")
+			if err != nil {
+				return outcome, err
+			}
+			history := append([]conversation.Message(nil), sess.Messages...)
+			var userIndexes []int
+			for i, msg := range history {
+				if msg.Role == conversation.RoleUser && !isCompactSummaryMessage(msg.Content) {
+					userIndexes = append(userIndexes, i)
+				}
+			}
+			if n <= 0 || n > len(userIndexes) {
+				return outcome, fmt.Errorf("ha %d turno(s) disponiveis", len(userIndexes))
+			}
+			cutFrom := userIndexes[len(userIndexes)-n]
+			turnIDs := make([]string, 0, n)
+			for _, msg := range history[cutFrom:] {
+				if msg.Role == conversation.RoleUser && !isCompactSummaryMessage(msg.Content) && msg.ID != "" {
+					turnIDs = append(turnIDs, msg.ID)
+				}
+			}
+			if withFiles {
+				if a.turnCheckpoint == nil {
+					outcome.warnings = append(outcome.warnings, "checkpoint de arquivos indisponivel")
+				} else {
+					result, restoreErr := a.turnCheckpoint.RestoreTurns(ctx, sess.ID, turnIDs)
+					outcome.restored = result.Restored
+					outcome.conflicts = result.Conflicts
+					outcome.warnings = append(outcome.warnings, result.Warnings...)
+					if restoreErr != nil {
+						return outcome, fmt.Errorf("restaurando arquivos: %w", restoreErr)
+					}
+				}
+			}
+			if withConversation {
+				kept := history[:cutFrom]
+				if err := a.convMgr.ReplaceMessages(ctx, sess, kept); err != nil {
+					return outcome, err
+				}
+				if err := a.saveActiveSession(sess); err != nil {
+					outcome.warnings = append(outcome.warnings, fmt.Sprintf("sessao externa nao atualizada: %v", err))
+				}
+				outcome.messages = make([]chatEntry, 0, len(kept))
+				for _, msg := range kept {
+					outcome.messages = append(outcome.messages, chatEntry{
+						role:      string(msg.Role),
+						content:   msg.Content,
+						timestamp: msg.Timestamp,
+					})
+				}
+			}
+			outcome.removed = n
+			return outcome, nil
 		}
 	}
 

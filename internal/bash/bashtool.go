@@ -62,7 +62,10 @@ type ExecOutput struct {
 
 	// OutputTruncated is true if the output exceeded MaxOutputBytes.
 	OutputTruncated bool
-	RTKApplied      bool
+	// OutputID lets bash_output retrieve stdout and stderr when the preview was truncated.
+	OutputID           string
+	OutputStorageError string
+	RTKApplied         bool
 
 	// BackgroundTaskID is set when the command was backgrounded.
 	BackgroundTaskID string
@@ -293,18 +296,25 @@ func (bt *BashTool) Execute(ctx context.Context, input ExecInput) (*ExecOutput, 
 		Setpgid: true,
 	}
 
-	// Capture output with size limits
-	var stdoutBuf, stderrBuf limitedBuffer
-	stdoutBuf.maxSize = MaxOutputBytes
-	stderrBuf.maxSize = MaxOutputBytes
-
-	cmd.Stdout = &stdoutBuf
-	cmd.Stderr = &stderrBuf
+	// Keep a short preview in memory and spool longer output to private files.
+	outputID, stdoutCapture, stderrCapture, storeErr := openOutputCaptures()
+	if storeErr != nil {
+		stdoutCapture = newOutputCapture(nil)
+		stderrCapture = newOutputCapture(nil)
+	}
+	cmd.Stdout = stdoutCapture
+	cmd.Stderr = stderrCapture
 
 	startTime := time.Now()
 
 	// Start the command
 	if err := cmd.Start(); err != nil {
+		stdoutCapture.close()
+		stderrCapture.close()
+		if stdoutCapture.file != nil {
+			os.Remove(stdoutCapture.file.Name())
+			os.Remove(stderrCapture.file.Name())
+		}
 		return nil, fmt.Errorf("failed to start command: %w", err)
 	}
 
@@ -312,12 +322,14 @@ func (bt *BashTool) Execute(ctx context.Context, input ExecInput) (*ExecOutput, 
 	var progressDone chan struct{}
 	if bt.OnProgress != nil {
 		progressDone = make(chan struct{})
-		go bt.reportProgress(execCtx, &stdoutBuf, startTime, progressDone)
+		go bt.reportProgress(execCtx, &stdoutCapture.preview, startTime, progressDone)
 	}
 
 	// Wait for completion
 	err := cmd.Wait()
 	duration := time.Since(startTime)
+	stdoutCloseErr := stdoutCapture.close()
+	stderrCloseErr := stderrCapture.close()
 
 	// Stop progress reporting
 	if progressDone != nil {
@@ -326,14 +338,37 @@ func (bt *BashTool) Execute(ctx context.Context, input ExecInput) (*ExecOutput, 
 
 	// Build result
 	output := &ExecOutput{
-		Stdout:     stdoutBuf.String(),
-		Stderr:     stderrBuf.String(),
+		Stdout:     stdoutCapture.preview.String(),
+		Stderr:     stderrCapture.preview.String(),
 		Duration:   duration,
 		RTKApplied: rtkApplied,
 	}
 
 	// Check if output was truncated
-	output.OutputTruncated = stdoutBuf.truncated || stderrBuf.truncated
+	output.OutputTruncated = stdoutCapture.preview.truncated || stderrCapture.preview.truncated ||
+		strings.Count(output.Stdout, "\n")+1 > MaxOutputLines
+	if storeErr == nil {
+		if stdoutCapture.writeErr != nil {
+			storeErr = stdoutCapture.writeErr
+		} else if stderrCapture.writeErr != nil {
+			storeErr = stderrCapture.writeErr
+		} else if stdoutCloseErr != nil {
+			storeErr = stdoutCloseErr
+		} else if stderrCloseErr != nil {
+			storeErr = stderrCloseErr
+		}
+	}
+	if output.OutputTruncated && storeErr == nil {
+		output.OutputID = outputID
+	} else if output.OutputTruncated && storeErr != nil {
+		output.OutputStorageError = storeErr.Error()
+	}
+	if !output.OutputTruncated || storeErr != nil {
+		if stdoutCapture.file != nil {
+			os.Remove(stdoutCapture.file.Name())
+			os.Remove(stderrCapture.file.Name())
+		}
+	}
 
 	// Determine exit status
 	if execCtx.Err() == context.DeadlineExceeded {
@@ -365,7 +400,7 @@ func (bt *BashTool) Execute(ctx context.Context, input ExecInput) (*ExecOutput, 
 	output.NoOutputExpected = isSilentCommand(command)
 
 	// Post-process output
-	output.Stdout = postProcessOutput(output.Stdout, output.OutputTruncated)
+	output.Stdout = postProcessOutput(output.Stdout)
 	output.Stderr = strings.TrimSpace(output.Stderr)
 
 	return output, nil
@@ -401,7 +436,11 @@ func (bt *BashTool) formatResult(output *ExecOutput) types.ToolResult {
 	}
 
 	if output.OutputTruncated {
-		parts = append(parts, "[output truncated]")
+		if output.OutputID != "" {
+			parts = append(parts, fmt.Sprintf("[saida completa: bash_output id=%s stream=stdout|stderr]", output.OutputID))
+		} else {
+			parts = append(parts, fmt.Sprintf("[saida truncada; falha no armazenamento: %s]", output.OutputStorageError))
+		}
 	}
 
 	content := strings.Join(parts, "\n")
@@ -502,13 +541,13 @@ func validateWorkingDir(dir string) error {
 }
 
 // postProcessOutput cleans and truncates command output.
-func postProcessOutput(output string, wasTruncated bool) string {
+func postProcessOutput(output string) string {
 	// Strip leading empty lines
 	output = strings.TrimLeft(output, "\n")
 
 	// Truncate by line count if needed
 	lines := strings.Split(output, "\n")
-	if len(lines) > MaxOutputLines && !wasTruncated {
+	if len(lines) > MaxOutputLines {
 		output = strings.Join(lines[:MaxOutputLines], "\n")
 	}
 

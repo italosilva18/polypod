@@ -192,11 +192,16 @@ func (a *Anthropic) buildParams(req ChatRequest) anthropic.MessageNewParams {
 }
 
 func (a *Anthropic) parseResponse(msg *anthropic.Message) *ChatResponse {
+	cacheRead := int(msg.Usage.CacheReadInputTokens)
+	cacheWrite := int(msg.Usage.CacheCreationInputTokens)
+	inputTokens := int(msg.Usage.InputTokens) + cacheRead + cacheWrite
 	cr := &ChatResponse{
 		FinishReason:     string(msg.StopReason),
-		PromptTokens:     int(msg.Usage.InputTokens),
+		PromptTokens:     inputTokens,
 		CompletionTokens: int(msg.Usage.OutputTokens),
-		TotalTokens:      int(msg.Usage.InputTokens + msg.Usage.OutputTokens),
+		TotalTokens:      inputTokens + int(msg.Usage.OutputTokens),
+		CacheReadTokens:  cacheRead,
+		CacheWriteTokens: cacheWrite,
 	}
 
 	var textParts []string

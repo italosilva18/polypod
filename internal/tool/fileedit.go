@@ -43,15 +43,23 @@ func newFileBackupManager(maxPerFile int) *fileBackupManager {
 // saveBackup records the current content of a file before modification.
 // If the file does not exist, it records a nil-content entry (for undo = delete).
 func (m *fileBackupManager) saveBackup(filePath, toolName string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	var content []byte
 	data, err := os.ReadFile(filePath)
 	if err == nil {
 		content = data
 	}
-	// err != nil (e.g. file doesn't exist) → content stays nil
+	m.saveBackupContent(filePath, toolName, content)
+}
+
+// saveBackupContent records the exact version validated by a file tool.
+func (m *fileBackupManager) saveBackupContent(filePath, toolName string, content []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if content != nil {
+		copyOfContent := make([]byte, len(content))
+		copy(copyOfContent, content)
+		content = copyOfContent
+	}
 
 	entry := fileBackupEntry{
 		Content:   content,
@@ -449,16 +457,16 @@ func computeHunksSimple(oldLines, newLines []string, contextLines int) []diffHun
 func RegisterFileEditTools(reg *Registry, workingDir string) {
 	backups := newFileBackupManager(50)
 
-	reg.RegisterDef(newEnhancedFileEditTool(workingDir, backups))
-	reg.RegisterDef(newEnhancedFileWriteTool(workingDir, backups))
-	reg.RegisterDef(newUndoEditTool(workingDir, backups))
+	reg.RegisterDef(newEnhancedFileEditTool(workingDir, backups, reg))
+	reg.RegisterDef(newEnhancedFileWriteTool(workingDir, backups, reg))
+	reg.RegisterDef(newUndoEditTool(workingDir, backups, reg))
 }
 
 // ---------------------------------------------------------------------------
 // file_edit — enhanced with unified diff preview, backup, and validation
 // ---------------------------------------------------------------------------
 
-func newEnhancedFileEditTool(wd string, backups *fileBackupManager) types.ToolDef {
+func newEnhancedFileEditTool(wd string, backups *fileBackupManager, reg *Registry) types.ToolDef {
 	return types.ToolDef{
 		NameFn: func() string { return "file_edit" },
 		DescriptionFn: func() string {
@@ -528,7 +536,7 @@ func newEnhancedFileEditTool(wd string, backups *fileBackupManager) types.ToolDe
 				if os.IsNotExist(err) {
 					// Empty old_string on non-existent file → create new file
 					if oldStr == "" {
-						return fileEditCreateNew(path, newStr, backups)
+						return fileEditCreateNew(path, newStr, backups, reg, ctx)
 					}
 					return types.ToolResult{
 						Content: fmt.Sprintf("File not found: %s", path),
@@ -548,6 +556,9 @@ func newEnhancedFileEditTool(wd string, backups *fileBackupManager) types.ToolDe
 			}
 
 			content := string(data)
+			if reg.hasStaleFileVersion(ctx.SessionID, path, data) {
+				return staleFileResult(path), nil
+			}
 
 			// --- Empty old_string on existing file with content ---
 			if oldStr == "" && strings.TrimSpace(content) != "" {
@@ -560,7 +571,17 @@ func newEnhancedFileEditTool(wd string, backups *fileBackupManager) types.ToolDe
 
 			// --- Empty old_string on empty/whitespace-only file → overwrite ---
 			if oldStr == "" {
-				backups.saveBackup(path, "file_edit")
+				matches, checkErr := fileStillMatches(path, true, data)
+				if checkErr != nil {
+					return types.ToolResult{Content: fmt.Sprintf("Erro ao verificar arquivo: %v", checkErr), IsError: true}, nil
+				}
+				if !matches {
+					return staleFileResult(path), nil
+				}
+				if err := reg.runBeforeFileWrite(ctx, path, data, true); err != nil {
+					return beforeFileWriteError(err), nil
+				}
+				backups.saveBackupContent(path, "file_edit", data)
 				if wErr := os.WriteFile(path, []byte(newStr), 0644); wErr != nil {
 					return types.ToolResult{
 						Content: fmt.Sprintf("Error writing file: %v", wErr),
@@ -568,9 +589,9 @@ func newEnhancedFileEditTool(wd string, backups *fileBackupManager) types.ToolDe
 					}, nil
 				}
 				diff := generateUnifiedDiff(relativePath(wd, path), content, newStr)
-				return types.ToolResult{
+				return reg.afterFileWrite(ctx, path, newStr, types.ToolResult{
 					Content: fmt.Sprintf("File updated: %s\n\n%s", path, diff),
-				}, nil
+				}), nil
 			}
 
 			// --- Count occurrences ---
@@ -603,9 +624,6 @@ func newEnhancedFileEditTool(wd string, backups *fileBackupManager) types.ToolDe
 				}, nil
 			}
 
-			// --- Save backup before modifying ---
-			backups.saveBackup(path, "file_edit")
-
 			// --- Apply replacement ---
 			var updated string
 			if replaceAll {
@@ -619,6 +637,17 @@ func newEnhancedFileEditTool(wd string, backups *fileBackupManager) types.ToolDe
 			if info, statErr := os.Stat(path); statErr == nil {
 				mode = info.Mode()
 			}
+			matches, checkErr := fileStillMatches(path, true, data)
+			if checkErr != nil {
+				return types.ToolResult{Content: fmt.Sprintf("Erro ao verificar arquivo: %v", checkErr), IsError: true}, nil
+			}
+			if !matches {
+				return staleFileResult(path), nil
+			}
+			if err := reg.runBeforeFileWrite(ctx, path, data, true); err != nil {
+				return beforeFileWriteError(err), nil
+			}
+			backups.saveBackupContent(path, "file_edit", data)
 
 			if wErr := os.WriteFile(path, []byte(updated), mode); wErr != nil {
 				return types.ToolResult{
@@ -639,17 +668,17 @@ func newEnhancedFileEditTool(wd string, backups *fileBackupManager) types.ToolDe
 			}
 
 			if diff != "" {
-				return types.ToolResult{
+				return reg.afterFileWrite(ctx, path, updated, types.ToolResult{
 					Content: fmt.Sprintf("%s\n\n%s", msg, diff),
-				}, nil
+				}), nil
 			}
-			return types.ToolResult{Content: msg}, nil
+			return reg.afterFileWrite(ctx, path, updated, types.ToolResult{Content: msg}), nil
 		},
 	}
 }
 
 // fileEditCreateNew handles the case where old_string="" and file doesn't exist → create.
-func fileEditCreateNew(path, newStr string, backups *fileBackupManager) (types.ToolResult, error) {
+func fileEditCreateNew(path, newStr string, backups *fileBackupManager, reg *Registry, ctx types.ToolContext) (types.ToolResult, error) {
 	dir := filepath.Dir(path)
 	if mkErr := os.MkdirAll(dir, 0755); mkErr != nil {
 		return types.ToolResult{
@@ -657,29 +686,30 @@ func fileEditCreateNew(path, newStr string, backups *fileBackupManager) (types.T
 			IsError: true,
 		}, nil
 	}
+	if err := reg.runBeforeFileWrite(ctx, path, nil, false); err != nil {
+		return beforeFileWriteError(err), nil
+	}
 
-	// Save backup (file doesn't exist, so backup records nil content)
-	backups.saveBackup(path, "file_edit")
-
-	if wErr := os.WriteFile(path, []byte(newStr), 0644); wErr != nil {
+	if wErr := writeNewFileExclusive(path, []byte(newStr), 0644); wErr != nil {
 		return types.ToolResult{
-			Content: fmt.Sprintf("Error writing file: %v", wErr),
+			Content: fmt.Sprintf("Error creating file: %v", wErr),
 			IsError: true,
 		}, nil
 	}
+	backups.saveBackupContent(path, "file_edit", nil)
 
 	// Show diff for new file creation
 	diff := generateUnifiedDiff(filepath.Base(path), "", newStr)
-	return types.ToolResult{
+	return reg.afterFileWrite(ctx, path, newStr, types.ToolResult{
 		Content: fmt.Sprintf("Created new file: %s (%d bytes)\n\n%s", path, len(newStr), diff),
-	}, nil
+	}), nil
 }
 
 // ---------------------------------------------------------------------------
 // file_write — enhanced with backup, diff preview, permission preservation
 // ---------------------------------------------------------------------------
 
-func newEnhancedFileWriteTool(wd string, backups *fileBackupManager) types.ToolDef {
+func newEnhancedFileWriteTool(wd string, backups *fileBackupManager, reg *Registry) types.ToolDef {
 	return types.ToolDef{
 		NameFn: func() string { return "file_write" },
 		DescriptionFn: func() string {
@@ -722,17 +752,23 @@ func newEnhancedFileWriteTool(wd string, backups *fileBackupManager) types.ToolD
 			var oldContent string
 			var existed bool
 			var oldMode os.FileMode
+			var original []byte
 
 			if info, statErr := os.Stat(path); statErr == nil {
 				existed = true
 				oldMode = info.Mode()
-				if data, readErr := os.ReadFile(path); readErr == nil {
-					oldContent = string(data)
+				data, readErr := os.ReadFile(path)
+				if readErr != nil {
+					return types.ToolResult{Content: fmt.Sprintf("Error reading file: %v", readErr), IsError: true}, nil
 				}
+				original = data
+				oldContent = string(data)
+			} else if !os.IsNotExist(statErr) {
+				return types.ToolResult{Content: fmt.Sprintf("Error checking file: %v", statErr), IsError: true}, nil
 			}
-
-			// Save backup before writing
-			backups.saveBackup(path, "file_write")
+			if existed && reg.hasStaleFileVersion(ctx.SessionID, path, original) {
+				return staleFileResult(path), nil
+			}
 
 			// Ensure parent directories exist
 			if mkErr := os.MkdirAll(filepath.Dir(path), 0755); mkErr != nil {
@@ -748,31 +784,52 @@ func newEnhancedFileWriteTool(wd string, backups *fileBackupManager) types.ToolD
 				mode = oldMode
 			}
 
-			if wErr := os.WriteFile(path, []byte(content), mode); wErr != nil {
+			matches, checkErr := fileStillMatches(path, existed, original)
+			if checkErr != nil {
+				return types.ToolResult{Content: fmt.Sprintf("Erro ao verificar arquivo: %v", checkErr), IsError: true}, nil
+			}
+			if !matches {
+				return staleFileResult(path), nil
+			}
+			if existed && oldContent == content {
+				reg.recordFileVersion(ctx.SessionID, path, original)
+				return types.ToolResult{Content: fmt.Sprintf("File unchanged: %s (%d bytes)", path, len(content))}, nil
+			}
+			if err := reg.runBeforeFileWrite(ctx, path, original, existed); err != nil {
+				return beforeFileWriteError(err), nil
+			}
+			if existed {
+				backups.saveBackupContent(path, "file_write", original)
+			}
+			var wErr error
+			if existed {
+				wErr = os.WriteFile(path, []byte(content), mode)
+			} else {
+				wErr = writeNewFileExclusive(path, []byte(content), mode)
+			}
+			if wErr != nil {
 				return types.ToolResult{
 					Content: fmt.Sprintf("Error writing file: %v", wErr),
 					IsError: true,
 				}, nil
 			}
+			if !existed {
+				backups.saveBackupContent(path, "file_write", nil)
+			}
 
 			relPath := relativePath(wd, path)
 
 			if existed {
-				if oldContent == content {
-					return types.ToolResult{
-						Content: fmt.Sprintf("File unchanged: %s (%d bytes)", path, len(content)),
-					}, nil
-				}
 				diff := generateUnifiedDiff(relPath, oldContent, content)
-				return types.ToolResult{
+				return reg.afterFileWrite(ctx, path, content, types.ToolResult{
 					Content: fmt.Sprintf("Updated %s (%d bytes)\n\n%s", path, len(content), diff),
-				}, nil
+				}), nil
 			}
 
 			diff := generateUnifiedDiff(relPath, "", content)
-			return types.ToolResult{
+			return reg.afterFileWrite(ctx, path, content, types.ToolResult{
 				Content: fmt.Sprintf("Created %s (%d bytes)\n\n%s", path, len(content), diff),
-			}, nil
+			}), nil
 		},
 	}
 }
@@ -781,7 +838,7 @@ func newEnhancedFileWriteTool(wd string, backups *fileBackupManager) types.ToolD
 // undo_edit — restore a file from its most recent backup
 // ---------------------------------------------------------------------------
 
-func newUndoEditTool(wd string, backups *fileBackupManager) types.ToolDef {
+func newUndoEditTool(wd string, backups *fileBackupManager, reg *Registry) types.ToolDef {
 	return types.ToolDef{
 		NameFn: func() string { return "undo_edit" },
 		DescriptionFn: func() string {
@@ -870,11 +927,11 @@ func newUndoEditTool(wd string, backups *fileBackupManager) types.ToolDef {
 
 			diff := generateUnifiedDiff(relPath, currentContent, restoredContent)
 			remaining := backups.backupCount(path)
-			return types.ToolResult{
+			return reg.afterFileWrite(ctx, path, restoredContent, types.ToolResult{
 				Content: fmt.Sprintf("Undo: restored %s (from %s backup)\n"+
 					"Remaining undo steps: %d\n\n%s",
 					path, backup.Tool, remaining, diff),
-			}, nil
+			}), nil
 		},
 	}
 }

@@ -15,6 +15,53 @@ import (
 // RegisterSkills registers MCP management skills.
 func RegisterSkills(reg *skill.Registry, mgr *Manager) {
 	reg.Register(&skill.Skill{
+		Name:        "mcp_list_prompts",
+		Description: "Listar prompts publicados por servidores MCP conectados",
+		Parameters: jsonschema.Definition{
+			Type: jsonschema.Object,
+			Properties: map[string]jsonschema.Definition{
+				"server": {Type: jsonschema.String, Description: "Servidor MCP opcional"},
+			},
+		},
+		Execute: func(args map[string]string) (string, error) {
+			data, err := json.Marshal(mgr.ListPrompts(args["server"]))
+			if err != nil {
+				return "", fmt.Errorf("codificar prompts MCP: %w", err)
+			}
+			return string(data), nil
+		},
+	})
+	reg.Register(&skill.Skill{
+		Name:        "mcp_get_prompt",
+		Description: "Obter um prompt de um servidor MCP com seus argumentos",
+		Parameters: jsonschema.Definition{
+			Type: jsonschema.Object,
+			Properties: map[string]jsonschema.Definition{
+				"server":    {Type: jsonschema.String, Description: "Servidor MCP"},
+				"name":      {Type: jsonschema.String, Description: "Nome do prompt"},
+				"arguments": {Type: jsonschema.String, Description: "Argumentos como objeto JSON opcional"},
+			},
+			Required: []string{"server", "name"},
+		},
+		Execute: func(args map[string]string) (string, error) {
+			var promptArgs map[string]string
+			if raw := args["arguments"]; raw != "" {
+				if err := json.Unmarshal([]byte(raw), &promptArgs); err != nil {
+					return "", fmt.Errorf("argumentos JSON invalidos: %w", err)
+				}
+			}
+			result, err := mgr.GetPrompt(context.Background(), args["server"], args["name"], promptArgs)
+			if err != nil {
+				return "", err
+			}
+			data, err := json.Marshal(result)
+			if err != nil {
+				return "", fmt.Errorf("codificar prompt MCP: %w", err)
+			}
+			return string(data), nil
+		},
+	})
+	reg.Register(&skill.Skill{
 		Name:        "mcp_list_servers",
 		Description: "Listar servidores MCP conectados e suas ferramentas",
 		Parameters: jsonschema.Definition{

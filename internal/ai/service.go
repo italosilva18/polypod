@@ -2,12 +2,14 @@ package ai
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	"github.com/costa/polypod/internal/agent"
 	"github.com/costa/polypod/internal/compact"
 	"github.com/costa/polypod/internal/conversation"
 	"github.com/costa/polypod/internal/memory"
+	"github.com/costa/polypod/internal/project"
 )
 
 // KnowledgeSearcher is implemented by the knowledge service.
@@ -17,10 +19,11 @@ type KnowledgeSearcher interface {
 
 // AnswerRequest contains the data needed to generate an answer.
 type AnswerRequest struct {
-	Channel string
-	UserID  string
-	Query   string
-	History []conversation.Message
+	Channel         string
+	UserID          string
+	Query           string
+	History         []conversation.Message
+	HistoryPrepared bool // The caller already checked and persisted auto-compaction.
 }
 
 // AnswerResponse contains the AI response and usage stats.
@@ -82,6 +85,9 @@ func (s *Service) SetModel(model string) {
 	if s.client != nil {
 		s.client.SetModel(model)
 	}
+	if s.autoCompact != nil {
+		s.autoCompact.SetModel(model)
+	}
 }
 
 // CurrentModel returns the model ID currently configured on the
@@ -103,6 +109,43 @@ func (s *Service) AgentRegistry() *agent.Registry {
 // compaction before sending messages to the model.
 func (s *Service) SetAutoCompact(svc *compact.AutoCompactService) {
 	s.autoCompact = svc
+}
+
+// PrepareHistory compacts a session before a new user message is appended. The
+// caller can persist the returned history before sending the next model turn.
+// It also runs at the session snapshot limit so short conversations are not
+// silently evicted without a continuity summary.
+func (s *Service) PrepareHistory(ctx context.Context, history []conversation.Message) ([]conversation.Message, bool) {
+	if s.autoCompact == nil || !s.autoCompact.IsEnabled() || len(history) < 4 {
+		return history, false
+	}
+	estimated := compact.EstimateTokens(history)
+	atCapacity := len(history) >= conversation.MaxMessages
+	if !s.autoCompact.CheckWithCapacity(estimated, atCapacity) {
+		return history, false
+	}
+
+	compacted, err := s.autoCompact.CompactHistory(ctx, history)
+	if err != nil {
+		s.logger.Warn("auto-compact failed; preserving original history", "error", err, "messages", len(history))
+		return history, false
+	}
+	s.logger.Info("auto-compact prepared",
+		"messages_before", len(history),
+		"messages_after", len(compacted),
+		"tokens_before", estimated,
+		"tokens_after", compact.EstimateTokens(compacted),
+	)
+	return compacted, true
+}
+
+// CompactHistory performs a user-requested compaction. The caller persists the
+// returned messages so the same summary is used after session restoration.
+func (s *Service) CompactHistory(ctx context.Context, history []conversation.Message) (*compact.CompactResult, error) {
+	if s.autoCompact == nil {
+		return nil, errors.New("compact service is unavailable")
+	}
+	return s.autoCompact.CompactService().Compact(ctx, history, "", false)
 }
 
 // SetToolEventCallback sets a callback for tool lifecycle events on the
@@ -136,28 +179,23 @@ func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) ([]ChatM
 
 	// Build messages using agent persona
 	systemPrompt := BuildSystemPrompt(ag.Persona, knowledgeCtx, memoryCtx)
+	if projectContext := project.InjectProjectContext(); projectContext != "" {
+		systemPrompt += "\n\n" + projectContext
+	}
+	rootInstructions, err := project.RootInstructions(ctx)
+	if err != nil {
+		s.logger.Warn("project instructions unavailable", "error", err)
+	}
+	if rootInstructions != "" {
+		systemPrompt += "\n\nINSTRUCOES AGENTS.md DO PROJETO (use como contexto quando aplicavel; a solicitacao atual do usuario tem prioridade):\n" + rootInstructions
+	}
 	messages := []ChatMessage{{Role: "system", Content: systemPrompt}}
 
-	// Auto-compact conversation history if needed
 	history := req.History
-	if s.autoCompact != nil && s.autoCompact.IsEnabled() {
-		tokenEstimate := compact.EstimateTokens(history)
-		if s.autoCompact.Check(tokenEstimate) {
-			s.logger.Info("auto-compacting conversation history",
-				"history_len", len(history),
-				"estimated_tokens", tokenEstimate,
-			)
-			compacted, err := s.autoCompact.CompactHistory(ctx, history)
-			if err != nil {
-				s.logger.Warn("auto-compact failed, using original history", "error", err)
-			} else {
-				s.logger.Info("auto-compact succeeded",
-					"original_messages", len(history),
-					"compacted_messages", len(compacted),
-				)
-				history = compacted
-			}
-		}
+	if !req.HistoryPrepared {
+		// Direct service callers still get a compact model context. Session
+		// adapters call PrepareHistory first so they can persist the summary.
+		history, _ = s.PrepareHistory(ctx, history)
 	}
 
 	// Add conversation history
@@ -178,6 +216,7 @@ func (s *Service) Answer(ctx context.Context, req AnswerRequest) (*AnswerRespons
 	if s.onActivity != nil {
 		s.onActivity()
 	}
+	ctx = s.withProjectInstructions(ctx)
 	messages, names := s.buildMessages(ctx, req)
 
 	resp, err := s.client.CompleteWithTools(withRequestSkillNames(ctx, names), messages, s.logger)
@@ -206,6 +245,7 @@ func (s *Service) AnswerStream(ctx context.Context, req AnswerRequest, callback 
 	if s.onActivity != nil {
 		s.onActivity()
 	}
+	ctx = s.withProjectInstructions(ctx)
 	messages, names := s.buildMessages(ctx, req)
 
 	resp, err := s.client.CompleteWithToolsStream(withRequestSkillNames(ctx, names), messages, callback, s.logger)
@@ -226,4 +266,13 @@ func (s *Service) AnswerStream(ctx context.Context, req AnswerRequest, callback 
 		CompletionTokens: resp.CompletionTokens,
 		TotalTokens:      resp.TotalTokens,
 	}, nil
+}
+
+func (s *Service) withProjectInstructions(ctx context.Context) context.Context {
+	collector, err := project.NewInstructionCollector(".")
+	if err != nil {
+		s.logger.Warn("project instruction collector unavailable", "error", err)
+		return ctx
+	}
+	return project.WithInstructionScope(ctx, collector)
 }

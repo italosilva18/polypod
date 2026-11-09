@@ -74,6 +74,8 @@ type ChatResponse struct {
 	PromptTokens     int
 	CompletionTokens int
 	TotalTokens      int
+	CacheReadTokens  int
+	CacheWriteTokens int
 	InputCostPer1M   float64
 	OutputCostPer1M  float64
 }

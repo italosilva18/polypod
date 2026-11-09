@@ -22,6 +22,8 @@ The v0.6 line is the stabilization release for the large CLI-only rewrite:
 This workspace intentionally defaults to `bypassPermissions`. In this mode the
 permission manager, orchestrator enforcer and terminal approval handler all
 allow tool calls without prompting. The command sandbox is also disabled.
+The active `config.yaml` also uses `ai.max_tool_iterations: -1` so the local
+runtime does not stop a tool loop after a fixed number of rounds.
 
 ```yaml
 permissions:
@@ -99,6 +101,8 @@ how to connect a private OpenAI-compatible inference server without changing
 the existing WhatsApp and scheduler configuration.
 The [continuous operations guide](docs/integrations/continuous-operations.md)
 explains scheduled routines, inbox recovery and automatic memory.
+The [agent runtime guide](docs/integrations/agent-runtime.md) covers background
+tasks, interactive terminals, file-triggered work, rewinding and local options.
 The [RTK guide](docs/integrations/rtk.md) explains optional compression of
 shell command output before it reaches the model.
 The [skill catalog](docs/integrations/skill-catalog.md) and

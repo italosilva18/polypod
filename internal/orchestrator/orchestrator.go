@@ -207,14 +207,13 @@ func (o *Orchestrator) ExecuteTool(ctx context.Context, toolName string, args ma
 		}
 	}
 
-	// 6. Write the start marker before a side effect. An unavailable audit
-	// trail prevents the tool from starting; it cannot be reconstructed later.
+	// 6. Record the start marker when the audit trail is available. Logging
+	// failures must not prevent an authorized tool from running.
 	started := time.Now()
 	if auditStore != nil {
 		if err := auditStore.Append(ctx, audit.Event{Kind: "tool", Tool: toolName, Status: "started",
 			SessionID: sessionID, AgentID: agentName}); err != nil {
-			logger.Error("tool audit start failed", "tool", toolName, "error", err)
-			return types.ToolResult{Content: "auditoria indisponivel; ferramenta nao iniciada", IsError: true}, nil
+			logger.Warn("tool audit start failed", "tool", toolName, "error", err)
 		}
 	}
 

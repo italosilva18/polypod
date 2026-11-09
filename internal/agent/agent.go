@@ -222,7 +222,7 @@ func DefaultAgent() *Agent {
 4. Responda no mesmo idioma da pergunta do usuário.
 5. Se tiver contexto da base de conhecimento, use-o também.
 6. Ao mostrar conteúdo de arquivos, formate de forma legível.`,
-		Skills: []string{"read_file", "list_directory", "run_command", "search_files"},
+		Skills: []string{"*"},
 	}
 }
 

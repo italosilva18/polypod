@@ -148,9 +148,12 @@ const (
 	MaximumToolIterations    = 200
 )
 
-// ToolIterationLimit returns a finite budget even for callers that construct
-// AIConfig directly instead of loading a validated YAML file.
+// ToolIterationLimit returns -1 for explicitly unlimited tool rounds.
+// Other invalid or omitted values retain the finite default.
 func (c AIConfig) ToolIterationLimit() int {
+	if c.MaxToolIterations == -1 {
+		return -1
+	}
 	if c.MaxToolIterations <= 0 {
 		return DefaultMaxToolIterations
 	}
@@ -209,8 +212,8 @@ func Load(path string) (*Config, error) {
 	}
 
 	setDefaults(cfg)
-	if cfg.AI.MaxToolIterations < 1 || cfg.AI.MaxToolIterations > MaximumToolIterations {
-		return nil, fmt.Errorf("ai.max_tool_iterations deve estar entre 1 e %d", MaximumToolIterations)
+	if cfg.AI.MaxToolIterations != -1 && (cfg.AI.MaxToolIterations < 1 || cfg.AI.MaxToolIterations > MaximumToolIterations) {
+		return nil, fmt.Errorf("ai.max_tool_iterations deve ser -1 (sem limite) ou estar entre 1 e %d", MaximumToolIterations)
 	}
 	if err := cfg.Permissions.Validate(); err != nil {
 		return nil, fmt.Errorf("validating permissions: %w", err)

@@ -25,9 +25,12 @@ type Message struct {
 	Timestamp time.Time `json:"timestamp" yaml:"timestamp"`
 }
 
-// Session holds conversation state as a ring buffer of messages.
+// Session holds conversation state. Directly created sessions retain the
+// legacy ring behavior; the runtime manager keeps all messages until they are
+// summarized so an unavailable model cannot silently erase history.
 type Session struct {
 	pending   []Message
+	unbounded bool
 	ID        string    `json:"id" yaml:"id"`
 	Channel   string    `json:"channel" yaml:"channel"`
 	UserID    string    `json:"user_id" yaml:"user_id"`
@@ -50,7 +53,7 @@ func NewSession(id, channel, userID string) *Session {
 }
 
 // AddMessage appends a message, evicting the oldest if at capacity.
-func (s *Session) AddMessage(role Role, content string) {
+func (s *Session) AddMessage(role Role, content string) Message {
 	msg := Message{
 		ID:        uuid.NewString(),
 		Role:      role,
@@ -59,13 +62,14 @@ func (s *Session) AddMessage(role Role, content string) {
 	}
 
 	s.pending = append(s.pending, msg)
-	if len(s.Messages) >= MaxMessages {
+	if !s.unbounded && len(s.Messages) >= MaxMessages {
 		// Keep system messages, evict oldest non-system
 		s.Messages = append(s.Messages[1:], msg)
 	} else {
 		s.Messages = append(s.Messages, msg)
 	}
 	s.UpdatedAt = time.Now()
+	return msg
 }
 
 // History returns the messages suitable for the AI API.

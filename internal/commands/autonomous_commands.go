@@ -48,10 +48,6 @@ var autonomousCommandSpecs = []autonomousCommandSpec{
 	{"remote-env", nil, "Sincronizar ambiente remoto", "Sincronize as variaveis e configuracoes de ambiente necessarias com o destino remoto, sem revelar segredos, e valide a sessao."},
 	{"remote-setup", nil, "Preparar ambiente remoto", "Prepare integralmente o ambiente remoto solicitado, instalando dependencias, configurando acesso e executando verificacoes de saude."},
 	{"testgen", nil, "Gerar testes reais", "Gere testes completos para o alvo informado, cobrindo caminhos felizes, erros e casos extremos, e execute-os ate passarem."},
-	{"task-status", nil, "Consultar uma tarefa", "Localize a tarefa indicada e apresente estado, progresso, bloqueios, processos e artefatos relacionados."},
-	{"task-logs", nil, "Ler logs de uma tarefa", "Localize a tarefa indicada, colete seus logs relevantes e diagnostique erros ou falta de progresso."},
-	{"task-restart", nil, "Reiniciar uma tarefa", "Reinicie a tarefa indicada preservando seu contexto, acompanhe a retomada e valide que voltou a progredir."},
-	{"schedule", nil, "Criar ou gerenciar um agendamento", "Crie, altere, liste ou remova o agendamento solicitado usando o scheduler disponivel e valide a expressao e o proximo disparo."},
 	{"advisor", nil, "Obter aconselhamento tecnico autonomo", "Atue como consultor senior: investigue o problema informado, compare alternativas e execute a melhor solucao quando houver uma acao clara."},
 	{"bughunter", nil, "Encontrar e corrigir bugs", "Investigue o alvo informado, reproduza bugs, identifique causas raiz, implemente correcoes e execute testes de regressao."},
 }

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/costa/polypod/internal/types"
 )
@@ -12,23 +11,6 @@ import (
 // ---------------------------------------------------------------------------
 // file_write — standalone tool for creating / overwriting files
 // ---------------------------------------------------------------------------
-
-// forbiddenPrefixes are system directories that must not be written to.
-var forbiddenPrefixes = []string{"/etc/", "/usr/", "/sys/", "/proc/"}
-
-// isPathForbidden returns true when path targets a protected system location
-// or contains ".." traversal components.
-func isPathForbidden(path string) bool {
-	if strings.Contains(path, "..") {
-		return true
-	}
-	for _, prefix := range forbiddenPrefixes {
-		if strings.HasPrefix(path, prefix) || path == strings.TrimSuffix(prefix, "/") {
-			return true
-		}
-	}
-	return false
-}
 
 // NewFileWriteTool returns a types.Tool that creates new files or completely
 // overwrites existing ones. It writes atomically via a temporary file +
@@ -96,17 +78,19 @@ func executeFileWrite(ctx types.ToolContext, args map[string]any) (types.ToolRes
 	}
 	absPath = filepath.Clean(absPath)
 
-	// Security: reject forbidden paths.
-	if isPathForbidden(absPath) {
-		return types.ToolResult{
-			Content: fmt.Sprintf("Operacao recusada: caminho proibido %q (paths com '..' ou em /etc, /usr, /sys, /proc nao sao permitidos)", absPath),
-			IsError: true,
-		}, nil
-	}
-
-	// Check whether the file already exists.
-	_, statErr := os.Stat(absPath)
+	// Keep the version seen at the start of the operation for a final check.
+	info, statErr := os.Stat(absPath)
 	existed := statErr == nil
+	var original []byte
+	if existed {
+		var readErr error
+		original, readErr = os.ReadFile(absPath)
+		if readErr != nil {
+			return types.ToolResult{Content: fmt.Sprintf("Erro ao ler arquivo: %v", readErr), IsError: true}, nil
+		}
+	} else if statErr != nil && !os.IsNotExist(statErr) {
+		return types.ToolResult{Content: fmt.Sprintf("Erro ao verificar arquivo: %v", statErr), IsError: true}, nil
+	}
 
 	// Optionally create parent directories.
 	dir := filepath.Dir(absPath)
@@ -127,18 +111,42 @@ func executeFileWrite(ctx types.ToolContext, args map[string]any) (types.ToolRes
 		}
 	}
 
-	// Atomic write: write to a temp file in the same directory, then rename.
-	tmpPath := absPath + ".tmp"
-	if err := os.WriteFile(tmpPath, []byte(content), 0644); err != nil {
+	if !existed {
+		if err := writeNewFileExclusive(absPath, []byte(content), 0644); err != nil {
+			return types.ToolResult{Content: fmt.Sprintf("Erro ao criar arquivo: %v", err), IsError: true}, nil
+		}
+		return types.ToolResult{Content: fmt.Sprintf("Arquivo criado: %s (%d bytes)", absPath, len(content))}, nil
+	}
+
+	// Atomic replacement with a unique temporary file in the same directory.
+	tmp, err := os.CreateTemp(dir, ".polypod-write-*")
+	if err != nil {
+		return types.ToolResult{Content: fmt.Sprintf("Erro ao criar arquivo temporario: %v", err), IsError: true}, nil
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(info.Mode()); err != nil {
+		tmp.Close()
+		return types.ToolResult{Content: fmt.Sprintf("Erro ao preservar permissoes: %v", err), IsError: true}, nil
+	}
+	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
 		return types.ToolResult{
 			Content: fmt.Sprintf("Erro ao escrever arquivo temporario: %v", err),
 			IsError: true,
 		}, nil
 	}
-
+	if err := tmp.Close(); err != nil {
+		return types.ToolResult{Content: fmt.Sprintf("Erro ao fechar arquivo temporario: %v", err), IsError: true}, nil
+	}
+	matches, err := fileStillMatches(absPath, true, original)
+	if err != nil {
+		return types.ToolResult{Content: fmt.Sprintf("Erro ao verificar arquivo: %v", err), IsError: true}, nil
+	}
+	if !matches {
+		return staleFileResult(absPath), nil
+	}
 	if err := os.Rename(tmpPath, absPath); err != nil {
-		// Clean up temp file on rename failure.
-		os.Remove(tmpPath)
 		return types.ToolResult{
 			Content: fmt.Sprintf("Erro ao renomear arquivo temporario: %v", err),
 			IsError: true,

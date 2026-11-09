@@ -22,6 +22,10 @@ type AutoCompactConfig struct {
 	// and returns a single summary string.
 	CompactFn func(ctx context.Context, messages []string) (string, error)
 
+	// CompactService uses an existing summarizer and its configured hooks.
+	// When nil, the service is built from CompactFn for existing callers.
+	CompactService *CompactService
+
 	// Logger for structured logging. Defaults to slog.Default().
 	Logger *slog.Logger
 
@@ -57,6 +61,7 @@ type AutoCompactService struct {
 	lastPreTokens       int
 	lastPostTokens      int
 	consecutiveFailures int
+	lastFailureTime     time.Time
 }
 
 // NewAutoCompactService creates a service that registers itself as the
@@ -104,7 +109,10 @@ func NewAutoCompactService(cfg AutoCompactConfig) *AutoCompactService {
 		}
 	}
 
-	svc := NewCompactService(compactCfg, summaryFn, logger)
+	svc := cfg.CompactService
+	if svc == nil {
+		svc = NewCompactService(compactCfg, summaryFn, logger)
+	}
 
 	acs := &AutoCompactService{
 		ctxWinMgr: cfg.CtxWinMgr,
@@ -127,38 +135,48 @@ func NewAutoCompactService(cfg AutoCompactConfig) *AutoCompactService {
 			cfg.CtxWinMgr.SetThresholds(cfg.Threshold, critical)
 		}
 
-		cfg.CtxWinMgr.SetAutoCompactCallback(func() {
-			acs.logger.Info("auto-compact callback fired by context window manager")
-			// The callback is invoked asynchronously by the Manager.
-			// We only log here; actual compaction requires messages which
-			// must be passed explicitly via CompactHistory or via the AI
-			// service's buildMessages path.
-		})
 	}
 
 	return acs
 }
 
-// Check examines the current token count and returns true if compaction is
-// needed. It consults both the local threshold and the context window
-// manager's NeedsCompaction signal.
+// Check examines the current token count and returns true if compaction is needed.
 func (s *AutoCompactService) Check(currentTokens int) bool {
+	return s.CheckWithCapacity(currentTokens, false)
+}
+
+// CheckWithCapacity also compacts when the conversation snapshot is about to
+// evict old messages, even if the estimated token count is still small.
+func (s *AutoCompactService) CheckWithCapacity(currentTokens int, atCapacity bool) bool {
 	s.mu.Lock()
 	enabled := s.enabled
+	failures := s.consecutiveFailures
+	lastCompact := s.lastCompactTime
+	lastFailure := s.lastFailureTime
 	s.mu.Unlock()
 
 	if !enabled {
 		return false
 	}
-
-	// Check via the context window manager if available.
 	if s.ctxWinMgr != nil {
-		if s.ctxWinMgr.NeedsCompaction() {
-			return true
-		}
+		s.ctxWinMgr.Update(0, currentTokens, 0)
+	}
+	if atCapacity {
+		return true
+	}
+	if failures >= s.svc.config.MaxConsecutiveFailures && time.Since(lastFailure) < time.Minute {
+		return false
+	}
+	if !lastCompact.IsZero() && time.Since(lastCompact) < s.svc.config.CooldownDuration {
+		return false
+	}
+	// The explicit token estimate belongs to this session. A shared manager's
+	// previous usage must not trigger compaction in another session.
+	if s.ctxWinMgr != nil {
+		limit := s.ctxWinMgr.Limits().MaxContextTokens
+		return limit > 0 && currentTokens >= int(float64(limit)*s.threshold)
 	}
 
-	// Fallback: use the underlying compact service's threshold.
 	return currentTokens >= s.svc.AutoCompactThreshold()
 }
 
@@ -182,11 +200,13 @@ func (s *AutoCompactService) CompactHistory(
 	if err != nil {
 		s.mu.Lock()
 		s.consecutiveFailures++
+		s.lastFailureTime = time.Now()
+		failures := s.consecutiveFailures
 		s.mu.Unlock()
 
 		s.logger.Warn("auto-compact history failed",
 			"error", err,
-			"consecutive_failures", s.consecutiveFailures,
+			"consecutive_failures", failures,
 		)
 		return nil, err
 	}
@@ -201,6 +221,7 @@ func (s *AutoCompactService) CompactHistory(
 	s.lastPreTokens = result.PreCompactTokens
 	s.lastPostTokens = result.PostCompactTokens
 	s.consecutiveFailures = 0
+	s.lastFailureTime = time.Time{}
 	s.mu.Unlock()
 
 	s.logger.Info("auto-compact history succeeded",
@@ -209,9 +230,9 @@ func (s *AutoCompactService) CompactHistory(
 		"messages_removed", result.MessagesRemoved,
 	)
 
-	// Inform the context window manager that usage has dropped.
+	// Record the compacted context for status and the next turn.
 	if s.ctxWinMgr != nil {
-		s.ctxWinMgr.Reset()
+		s.ctxWinMgr.Update(0, result.PostCompactTokens, 0)
 	}
 
 	return compacted, nil
@@ -243,6 +264,13 @@ func (s *AutoCompactService) IsEnabled() bool {
 	return s.enabled
 }
 
+// SetModel keeps the compaction threshold aligned with the active model.
+func (s *AutoCompactService) SetModel(model string) {
+	if s.ctxWinMgr != nil {
+		s.ctxWinMgr.SetModel(model)
+	}
+}
+
 // Stats returns compaction statistics as a map suitable for logging or
 // debug endpoints.
 func (s *AutoCompactService) Stats() map[string]any {
@@ -261,6 +289,9 @@ func (s *AutoCompactService) Stats() map[string]any {
 		stats["last_compact_time"] = s.lastCompactTime.Format(time.RFC3339)
 		stats["last_pre_tokens"] = s.lastPreTokens
 		stats["last_post_tokens"] = s.lastPostTokens
+	}
+	if !s.lastFailureTime.IsZero() {
+		stats["last_failure_time"] = s.lastFailureTime.Format(time.RFC3339)
 	}
 
 	// Include context window stats if available.

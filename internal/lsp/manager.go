@@ -55,6 +55,7 @@ type ServerInstance struct {
 	lastError    error
 	restartCount int
 	crashCount   int
+	diagnostics  *DiagnosticRegistry
 }
 
 // State returns the current server state.
@@ -105,6 +106,11 @@ func (si *ServerInstance) Start(workspaceDir string) error {
 		si.crashCount++
 		si.mu.Unlock()
 	})
+	if si.diagnostics != nil {
+		client.OnNotification("textDocument/publishDiagnostics", func(raw json.RawMessage) {
+			si.diagnostics.RegisterFromPublishDiagnostics(si.Name, raw)
+		})
+	}
 
 	cwd := si.Config.WorkspaceFolder
 	if cwd == "" {
@@ -286,7 +292,9 @@ type LSPServerManager struct {
 	servers      map[string]*ServerInstance
 	extensionMap map[string][]string // ext -> server names
 	openedFiles  map[string]string   // file URI -> server name
+	fileVersions map[string]int      // file URI -> last version sent
 	workspaceDir string
+	diagnostics  *DiagnosticRegistry
 }
 
 // NewLSPServerManager creates a server manager for the given workspace.
@@ -295,8 +303,22 @@ func NewLSPServerManager(workspaceDir string) *LSPServerManager {
 		servers:      make(map[string]*ServerInstance),
 		extensionMap: make(map[string][]string),
 		openedFiles:  make(map[string]string),
+		fileVersions: make(map[string]int),
 		workspaceDir: workspaceDir,
+		diagnostics:  NewDiagnosticRegistry(),
 	}
+}
+
+// Diagnostics returns the registry populated by server notifications.
+func (m *LSPServerManager) Diagnostics() *DiagnosticRegistry {
+	return m.diagnostics
+}
+
+// HasConfiguredServers reports whether any language server is available.
+func (m *LSPServerManager) HasConfiguredServers() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.servers) > 0
 }
 
 // Initialize loads server configurations and registers them.
@@ -321,9 +343,10 @@ func (m *LSPServerManager) Initialize(configs map[string]ServerConfig) {
 		}
 
 		m.servers[name] = &ServerInstance{
-			Name:   name,
-			Config: config,
-			state:  ServerStateStopped,
+			Name:        name,
+			Config:      config,
+			state:       ServerStateStopped,
+			diagnostics: m.diagnostics,
 		}
 	}
 
@@ -365,6 +388,7 @@ func (m *LSPServerManager) Shutdown() error {
 	m.servers = make(map[string]*ServerInstance)
 	m.extensionMap = make(map[string][]string)
 	m.openedFiles = make(map[string]string)
+	m.fileVersions = make(map[string]int)
 	m.mu.Unlock()
 
 	if len(errs) > 0 {
@@ -457,6 +481,7 @@ func (m *LSPServerManager) OpenFile(filePath, content string) error {
 
 	m.mu.Lock()
 	m.openedFiles[fileURI] = server.Name
+	m.fileVersions[fileURI] = 1
 	m.mu.Unlock()
 	return nil
 }
@@ -479,10 +504,14 @@ func (m *LSPServerManager) ChangeFile(filePath, content string) error {
 		return m.OpenFile(filePath, content)
 	}
 
+	m.mu.Lock()
+	version := m.fileVersions[fileURI] + 1
+	m.fileVersions[fileURI] = version
+	m.mu.Unlock()
 	return server.SendNotification("textDocument/didChange", map[string]any{
 		"textDocument": VersionedTextDocumentIdentifier{
 			URI:     fileURI,
-			Version: 1,
+			Version: version,
 		},
 		"contentChanges": []TextDocumentContentChangeEvent{
 			{Text: content},
@@ -517,6 +546,7 @@ func (m *LSPServerManager) CloseFile(filePath string) error {
 
 	m.mu.Lock()
 	delete(m.openedFiles, fileURI)
+	delete(m.fileVersions, fileURI)
 	m.mu.Unlock()
 
 	return err

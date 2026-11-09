@@ -41,7 +41,7 @@ func NewLSPTool(manager *LSPServerManager, registry *DiagnosticRegistry) types.T
 }
 
 func (t *LSPTool) isEnabled() bool {
-	return t.manager != nil && t.manager.IsConnected()
+	return t.manager != nil && t.manager.HasConfiguredServers()
 }
 
 func (t *LSPTool) description() string {

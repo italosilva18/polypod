@@ -260,6 +260,13 @@ Voce NAO cria, modifica ou deleta arquivos. Voce apenas le, analisa e planeja.
 // AutonomousAgents returns all specialized autonomous agent definitions.
 func AutonomousAgents() []*Agent {
 	return []*Agent{
+		{
+			Name:        "general-purpose",
+			Description: "Agente de proposito geral com todas as ferramentas ativas.",
+			Persona:     "Voce e um agente operacional do Polypod. Execute a tarefa solicitada de forma completa, usando as ferramentas disponiveis e relatando o resultado com clareza.",
+			Skills:      []string{"*"},
+			IsBuiltIn:   true,
+		},
 		CoderAgent(),
 		TaskAgent(),
 		ReviewerAgent(),

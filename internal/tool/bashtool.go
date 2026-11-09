@@ -54,7 +54,7 @@ var sensitiveEnvPrefixes = []string{
 	"SSH_PRIVATE",
 }
 
-// interactiveCommands are commands that require a TTY and should be rejected.
+// interactiveCommands are routed to a persistent PTY when run through bash.
 var interactiveCommands = map[string]bool{
 	"vim": true, "nvim": true, "vi": true, "nano": true, "emacs": true,
 	"pico": true, "micro": true, "ed": true,
@@ -63,7 +63,8 @@ var interactiveCommands = map[string]bool{
 	"ftp": true, "sftp": true,
 	"mysql": true, "psql": true, "sqlite3": true, "mongosh": true,
 	"python": true, "python3": true, "ipython": true, "node": true, "irb": true,
-	"ssh": true,
+	"ssh":  true,
+	"bash": true, "sh": true, "zsh": true, "fish": true, "pwsh": true,
 }
 
 // RegisterBashTool creates and registers a production-quality bash tool that
@@ -75,6 +76,7 @@ func RegisterBashTool(reg *Registry, workingDir string) {
 	bt.SetProjectDir(workingDir)
 
 	logger := slog.Default().With("tool", constants.ToolBash)
+	ptyManager := bash.NewPTYManager(bt, logger)
 
 	reg.RegisterDef(types.ToolDef{
 		NameFn: func() string { return constants.ToolBash },
@@ -138,18 +140,6 @@ func RegisterBashTool(reg *Registry, workingDir string) {
 				return types.ValidationResult{Valid: false, Message: "command is required"}
 			}
 
-			// Reject interactive/TUI commands that need a PTY
-			base := bash.GetBaseCommand(cmd)
-			if interactiveCommands[base] {
-				// Allow if arguments suggest non-interactive usage (e.g. python -c, node -e)
-				if !looksNonInteractive(cmd, base) {
-					return types.ValidationResult{
-						Valid:   false,
-						Message: fmt.Sprintf("%q requires an interactive terminal and cannot run here", base),
-					}
-				}
-			}
-
 			return types.ValidationResult{Valid: true}
 		},
 
@@ -189,9 +179,13 @@ func RegisterBashTool(reg *Registry, workingDir string) {
 			secIssues := preflightSecurityCheck(cmd)
 			if len(secIssues) > 0 {
 				logger.Warn("security issues detected",
-					"command", cmd,
 					"issues", len(secIssues),
 				)
+			}
+			if requiresInteractivePTY(cmd) {
+				if sbx := globalBashState.sandbox; sbx == nil || sbx.Policy() == sandbox.SandboxNone {
+					return startPTYResult(ptyManager, cmd, wd, commandEnvOverrides(), 24, 100)
+				}
 			}
 
 			// --- Sandbox routing ---
@@ -225,7 +219,6 @@ func RegisterBashTool(reg *Registry, workingDir string) {
 					}
 
 					logger.Info("routing command through sandbox",
-						"command", cmd,
 						"policy", string(sbx.Policy()),
 						"category", cat.String(),
 					)
@@ -256,16 +249,14 @@ func RegisterBashTool(reg *Registry, workingDir string) {
 			// --- Command audit log ---
 			startTime := time.Now()
 			logger.Info("executing command",
-				"command", cmd,
 				"working_dir", wd,
 				"timeout_ms", timeoutMs,
-				"description", desc,
 				"read_only", bash.IsReadOnlyCommand(cmd),
 				"category", bash.ClassifyCommand(cmd).String(),
 			)
 
-			// --- Build environment with sensitive vars stripped ---
-			sanitizedEnv := sanitizeEnvironment()
+			// Full environment is inherited unless explicit stripping is enabled.
+			commandEnv := commandEnvOverrides()
 
 			// --- Execute ---
 			input := bash.ExecInput{
@@ -273,7 +264,7 @@ func RegisterBashTool(reg *Registry, workingDir string) {
 				Timeout:     timeoutMs,
 				Description: desc,
 				WorkingDir:  wd,
-				Env:         sanitizedEnv,
+				Env:         commandEnv,
 				UseRTK:      !rawOutput && bash.RTKEnabled(),
 			}
 
@@ -283,7 +274,6 @@ func RegisterBashTool(reg *Registry, workingDir string) {
 			elapsed := time.Since(startTime)
 			if err != nil {
 				logger.Error("command failed",
-					"command", cmd,
 					"error", err,
 					"elapsed", elapsed,
 				)
@@ -294,7 +284,6 @@ func RegisterBashTool(reg *Registry, workingDir string) {
 			}
 
 			logger.Info("command completed",
-				"command", cmd,
 				"exit_code", result.ExitCode,
 				"elapsed", elapsed,
 				"truncated", result.OutputTruncated,
@@ -303,6 +292,56 @@ func RegisterBashTool(reg *Registry, workingDir string) {
 			)
 
 			return formatBashResult(result), nil
+		},
+	})
+	RegisterBashOutputTool(reg)
+	RegisterBashPTYTools(reg, ptyManager, bt, workingDir)
+}
+
+// RegisterBashOutputTool makes retained command output readable in bounded chunks.
+func RegisterBashOutputTool(reg *Registry) {
+	reg.RegisterDef(types.ToolDef{
+		NameFn: func() string { return "bash_output" },
+		DescriptionFn: func() string {
+			return "Ler stdout ou stderr preservado de um comando bash cuja saida foi truncada. " +
+				"Use o ID informado por bash e offset para ler os proximos blocos."
+		},
+		InputSchemaFn: func() map[string]any {
+			return map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id":     map[string]any{"type": "string", "description": "ID retornado pela ferramenta bash"},
+					"stream": map[string]any{"type": "string", "enum": []string{"stdout", "stderr"}},
+					"offset": map[string]any{"type": "integer", "description": "Posicao inicial em bytes (padrao 0)"},
+					"limit":  map[string]any{"type": "integer", "description": "Quantidade de bytes (maximo 65536)"},
+				},
+				"required": []string{"id"},
+			}
+		},
+		IsReadOnlyFn:    func(map[string]any) bool { return true },
+		IsConcurrencyFn: func(map[string]any) bool { return true },
+		ValidateFn: func(args map[string]any) types.ValidationResult {
+			if id, ok := args["id"].(string); !ok || id == "" {
+				return types.ValidationResult{Valid: false, Message: "id e obrigatorio"}
+			}
+			return types.ValidationResult{Valid: true}
+		},
+		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
+			id, _ := args["id"].(string)
+			stream, _ := args["stream"].(string)
+			if stream == "" {
+				stream = "stdout"
+			}
+			offset := int64(argInt(args, "offset", 0))
+			limit := int64(argInt(args, "limit", 8192))
+			chunk, total, err := bash.ReadStoredOutput(id, stream, offset, limit)
+			if err != nil {
+				return types.ToolResult{Content: fmt.Sprintf("Erro ao ler saida: %v", err), IsError: true}, nil
+			}
+			end := offset + int64(len(chunk))
+			content := fmt.Sprintf("%s bytes %d-%d de %d (proximo offset: %d)\n%s",
+				stream, offset, end, total, end, strings.ToValidUTF8(string(chunk), "�"))
+			return types.ToolResult{Content: content}, nil
 		},
 	})
 }
@@ -366,6 +405,15 @@ func sanitizeEnvironment() map[string]string {
 	return overrides
 }
 
+// commandEnvOverrides retains credentials in the active unrestricted profile.
+// Operators can opt into the legacy stripping behavior explicitly.
+func commandEnvOverrides() map[string]string {
+	if os.Getenv("POLYPOD_BASH_STRIP_SECRETS") == "1" {
+		return sanitizeEnvironment()
+	}
+	return nil
+}
+
 // currentEnvKeys returns all current environment variable names.
 func currentEnvKeys() []string {
 	environ := os.Environ()
@@ -411,7 +459,11 @@ func formatBashResult(output *bash.ExecOutput) types.ToolResult {
 	}
 
 	if output.OutputTruncated {
-		parts = append(parts, fmt.Sprintf("[output truncated to %dKB]", bash.MaxOutputBytes/1024))
+		if output.OutputID != "" {
+			parts = append(parts, fmt.Sprintf("[saida completa: bash_output id=%s stream=stdout|stderr]", output.OutputID))
+		} else {
+			parts = append(parts, fmt.Sprintf("[saida truncada; falha no armazenamento: %s]", output.OutputStorageError))
+		}
 	}
 
 	content := strings.Join(parts, "\n")
@@ -436,15 +488,20 @@ func formatBashResult(output *bash.ExecOutput) types.ToolResult {
 // node -e "...", mysql -e "...").
 func looksNonInteractive(command, base string) bool {
 	nonInteractiveFlags := map[string][]string{
-		"python":  {"-c", "--version", "-m", "-h"},
-		"python3": {"-c", "--version", "-m", "-h"},
+		"python":  {"-c", "--version", "-h"},
+		"python3": {"-c", "--version", "-h"},
 		"node":    {"-e", "--eval", "--version", "-p", "--print", "-h"},
 		"irb":     {"-e", "--version", "-h"},
 		"mysql":   {"-e", "--execute", "--version", "-h"},
 		"psql":    {"-c", "--command", "--version", "-h"},
 		"sqlite3": {":memory:", "--version", "-h"},
 		"mongosh": {"--eval", "--version", "-h"},
-		"ssh":     {"-o", "-L", "-R", "-D", "-N", "-f"},
+		"ssh":     {"-V", "-G"},
+		"bash":    {"-c", "--version", "-h"},
+		"sh":      {"-c", "--version", "-h"},
+		"zsh":     {"-c", "--version", "-h"},
+		"fish":    {"-c", "--version", "-h"},
+		"pwsh":    {"-Command", "-File", "-c", "-f", "--version"},
 		"less":    {}, // never non-interactive
 		"more":    {}, // never non-interactive
 		"vim":     {}, "nvim": {}, "vi": {}, "nano": {}, "emacs": {},
@@ -465,4 +522,9 @@ func looksNonInteractive(command, base string) bool {
 		}
 	}
 	return false
+}
+
+func requiresInteractivePTY(command string) bool {
+	base := bash.GetBaseCommand(command)
+	return interactiveCommands[base] && !looksNonInteractive(command, base)
 }

@@ -41,6 +41,8 @@ type SubsystemConfig struct {
 
 	// AutoMem is the auto-memory store, created before wiring (depends on data dir).
 	AutoMem *automemory.Store
+	// ActionTrigger runs a full agent task for an AI! comment in a changed file.
+	ActionTrigger func(context.Context, watcher.Trigger)
 }
 
 // ActiveSubsystems holds all the previously-discarded subsystems, now properly
@@ -63,6 +65,7 @@ type ActiveSubsystems struct {
 	WatcherCfg    watcher.WatchConfig
 	FileIndex     *mentions.FileIndex
 	CompactSvc    *compact.CompactService
+	ActionTrigger func(context.Context, watcher.Trigger)
 
 	// fileWatcher is the active watcher instance (started on Start).
 	fileWatcher   *watcher.Watcher
@@ -174,6 +177,7 @@ func WireSubsystems(cfg SubsystemConfig) *ActiveSubsystems {
 		WatcherCfg:    watcherCfg,
 		FileIndex:     fileIndex,
 		CompactSvc:    cfg.CompactSvc,
+		ActionTrigger: cfg.ActionTrigger,
 		providerCount: len(cfg.Providers),
 		logger:        logger,
 	}
@@ -195,9 +199,8 @@ func (a *ActiveSubsystems) Start(ctx context.Context) {
 			"type", t.Type,
 			"prompt", t.Prompt,
 		)
-		// If loop manager has a callback, fire it for action triggers
-		if t.Type == "!" {
-			a.LoopMgr.SetCallback(nil) // ensure no recursive fire
+		if t.Type == "!" && a.ActionTrigger != nil {
+			a.ActionTrigger(ctx, t)
 		}
 	})
 

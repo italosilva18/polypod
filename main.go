@@ -54,6 +54,7 @@ import (
 	"github.com/costa/polypod/internal/hooks"
 	"github.com/costa/polypod/internal/humanloop"
 	"github.com/costa/polypod/internal/initcmd"
+	"github.com/costa/polypod/internal/lsp"
 	"github.com/costa/polypod/internal/mcp"
 	"github.com/costa/polypod/internal/memory"
 	"github.com/costa/polypod/internal/migrate"
@@ -77,12 +78,15 @@ import (
 	"github.com/costa/polypod/internal/skill"
 	"github.com/costa/polypod/internal/sshexec"
 	"github.com/costa/polypod/internal/taskqueue"
+	"github.com/costa/polypod/internal/tasks"
 	"github.com/costa/polypod/internal/template"
 	"github.com/costa/polypod/internal/testgen"
 	"github.com/costa/polypod/internal/tool"
 	"github.com/costa/polypod/internal/tracking"
 	"github.com/costa/polypod/internal/tts"
+	"github.com/costa/polypod/internal/turncheckpoint"
 	"github.com/costa/polypod/internal/types"
+	"github.com/costa/polypod/internal/watcher"
 	"github.com/costa/polypod/internal/web"
 	"github.com/costa/polypod/internal/webhookgateway"
 	"github.com/costa/polypod/internal/whatsappgateway"
@@ -473,6 +477,7 @@ func loadRestoredSession(restorer *session.SessionRestorer, storage session.Sess
 // (late-bound) ai.Client. The aiClient pointer is captured by reference.
 func buildCompactService(aiClientRef **ai.Client, logger *slog.Logger) *compact.CompactService {
 	cfg := compact.DefaultConfig()
+	cfg.PreserveRecentGroups = 2
 	return compact.NewCompactService(cfg, func(ctx context.Context, systemPrompt string, messages []conversation.Message, userPrompt string) (string, error) {
 		client := *aiClientRef
 		if client == nil {
@@ -554,20 +559,43 @@ func buildProviderRegistry(cfg *config.Config, multiAuth *auth.MultiProviderAuth
 	return reg, list
 }
 
+// prepareSessionHistory keeps the persisted session and the next model context aligned.
+func prepareSessionHistory(ctx context.Context, convMgr *conversation.Manager, aiSvc *ai.Service, sess *conversation.Session) ([]conversation.Message, error) {
+	history := append([]conversation.Message(nil), convMgr.GetHistory(sess)...)
+	prepared, changed := aiSvc.PrepareHistory(ctx, history)
+	if !changed {
+		return history, nil
+	}
+	if err := convMgr.ReplaceMessages(ctx, sess, prepared); err != nil {
+		return nil, fmt.Errorf("persisting compacted conversation: %w", err)
+	}
+	return prepared, nil
+}
+
 // makeHandler builds the inline message handler that replaces router.Handler.
-func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service) adapter.MessageHandler {
+func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service, turns *turncheckpoint.Manager, logger *slog.Logger) adapter.MessageHandler {
 	return func(ctx context.Context, msg adapter.InMessage) (adapter.OutMessage, error) {
 		sess, err := convMgr.GetSession(ctx, msg.Channel, msg.UserID)
 		if err != nil {
 			return adapter.OutMessage{Text: "Erro de sessao"}, err
 		}
-		history := append([]conversation.Message(nil), convMgr.GetHistory(sess)...)
-		convMgr.AddUserMessage(ctx, sess, msg.Text)
-		resp, err := aiSvc.Answer(ctx, ai.AnswerRequest{
-			Channel: msg.Channel,
-			UserID:  msg.UserID,
-			Query:   msg.Text,
-			History: history,
+		history, err := prepareSessionHistory(ctx, convMgr, aiSvc, sess)
+		if err != nil {
+			return adapter.OutMessage{Text: "Erro ao preparar o contexto"}, err
+		}
+		userMessage := convMgr.AddUserMessage(ctx, sess, msg.Text)
+		turnCtx := turns.BeginTurn(ctx, sess.ID, userMessage.ID)
+		defer func() {
+			if err := turns.FinishTurn(turnCtx); err != nil {
+				logger.Warn("turn checkpoint finalization failed", "turn_id", userMessage.ID, "error", err)
+			}
+		}()
+		resp, err := aiSvc.Answer(turnCtx, ai.AnswerRequest{
+			Channel:         msg.Channel,
+			UserID:          msg.UserID,
+			Query:           msg.Text,
+			History:         history,
+			HistoryPrepared: true,
 		})
 		if err != nil {
 			return adapter.OutMessage{Text: "Erro ao processar: " + err.Error()}, err
@@ -585,7 +613,7 @@ func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service) adapter.Messa
 }
 
 // makeStreamHandler builds the inline stream handler that replaces router.StreamHandler.
-func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service) adapter.StreamHandler {
+func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, turns *turncheckpoint.Manager, logger *slog.Logger) adapter.StreamHandler {
 	return func(ctx context.Context, msg adapter.InMessage, chunks chan<- adapter.StreamChunk) {
 		defer close(chunks)
 
@@ -609,14 +637,25 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service) adapter
 			chunks <- adapter.StreamChunk{Error: err, Done: true}
 			return
 		}
-		history := append([]conversation.Message(nil), convMgr.GetHistory(sess)...)
-		convMgr.AddUserMessage(ctx, sess, msg.Text)
+		history, err := prepareSessionHistory(ctx, convMgr, aiSvc, sess)
+		if err != nil {
+			chunks <- adapter.StreamChunk{Error: err, Done: true}
+			return
+		}
+		userMessage := convMgr.AddUserMessage(ctx, sess, msg.Text)
+		turnCtx := turns.BeginTurn(ctx, sess.ID, userMessage.ID)
+		defer func() {
+			if err := turns.FinishTurn(turnCtx); err != nil {
+				logger.Warn("turn checkpoint finalization failed", "turn_id", userMessage.ID, "error", err)
+			}
+		}()
 
-		resp, err := aiSvc.AnswerStream(ctx, ai.AnswerRequest{
-			Channel: msg.Channel,
-			UserID:  msg.UserID,
-			Query:   msg.Text,
-			History: history,
+		resp, err := aiSvc.AnswerStream(turnCtx, ai.AnswerRequest{
+			Channel:         msg.Channel,
+			UserID:          msg.UserID,
+			Query:           msg.Text,
+			History:         history,
+			HistoryPrepared: true,
 		}, func(delta string) {
 			chunks <- adapter.StreamChunk{Delta: delta}
 		})
@@ -644,7 +683,7 @@ func autoSaveSession(convMgr *conversation.Manager, sessStorage session.SessionS
 
 	persistedMsgs := make([]session.Message, len(sess.Messages))
 	for i, m := range sess.Messages {
-		persistedMsgs[i] = session.Message{Role: string(m.Role), Content: m.Content}
+		persistedMsgs[i] = session.Message{ID: m.ID, Role: string(m.Role), Content: m.Content, Timestamp: m.Timestamp}
 	}
 
 	title := session.TitleFromFirstMessage(persistedMsgs)
@@ -759,6 +798,25 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		DataDir:     cfg.Data.Dir,
 		MemoryStore: memStore,
 	})
+	defer sys.ToolRegistry.ClosePTY()
+	turnCheckpoint := turncheckpoint.New(filepath.Join(cfg.Data.Dir, "turn-checkpoints"), logger)
+	sys.ToolRegistry.SetBeforeFileWrite(func(toolCtx types.ToolContext, path string, original []byte, existed bool) error {
+		if toolCtx.Context == nil {
+			return nil
+		}
+		if err := turnCheckpoint.CaptureBefore(toolCtx.Context, path, original, existed); err != nil {
+			logger.Warn("turn checkpoint unavailable; continuing file write", "path", path, "error", err)
+		}
+		return nil
+	})
+	lspMgr := lsp.NewLSPServerManager(".")
+	lspMgr.InitializeDefaults()
+	sys.ToolRegistry.AttachLSP(lspMgr)
+	defer func() {
+		if err := lspMgr.Shutdown(); err != nil {
+			logger.Warn("LSP shutdown failed", "error", err)
+		}
+	}()
 	tool.RegisterDocumentKnowledgeTool(sys.ToolRegistry, documentIndex, cfg.WhatsApp.OwnerChat)
 	auditHome, err := os.UserHomeDir()
 	if err != nil {
@@ -943,16 +1001,39 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 
 	restoredSession, currentSessionID := loadRestoredSession(sessRestorer, sessStorage, continueSession, resumeSessionID, logger)
 
-	// If we have a restored session, inject messages into the conversation store
+	// Preserve message identities when resuming so turn checkpoints remain
+	// addressable after a process restart. A newer durable conversation snapshot
+	// wins over an older auto-save when continuing the current CLI session.
 	if restoredSession != nil {
 		if sess, err := convMgr.GetSession(ctx, "cli", "local"); err == nil {
-			for _, msg := range restoredSession.Messages {
-				sess.AddMessage(conversation.Role(msg.Role), msg.Content)
+			if resumeSessionID == "" && sess.UpdatedAt.After(restoredSession.UpdatedAt) {
+				restoredSession.Messages = make([]session.Message, len(sess.Messages))
+				for i, msg := range sess.Messages {
+					restoredSession.Messages[i] = session.Message{
+						ID: msg.ID, Role: string(msg.Role), Content: msg.Content, Timestamp: msg.Timestamp,
+					}
+				}
+				logger.Info("newer conversation snapshot retained", "messages", len(sess.Messages))
+			} else {
+				messages := make([]conversation.Message, 0, len(restoredSession.Messages))
+				for i, msg := range restoredSession.Messages {
+					id := msg.ID
+					if id == "" {
+						id = fmt.Sprintf("restored:%s:%d", restoredSession.ID, i)
+						restoredSession.Messages[i].ID = id
+					}
+					messages = append(messages, conversation.Message{
+						ID: id, Role: conversation.Role(msg.Role), Content: msg.Content, Timestamp: msg.Timestamp,
+					})
+				}
+				if err := convMgr.ReplaceMessages(ctx, sess, messages); err != nil {
+					logger.Warn("failed to save restored messages to conversation store", "error", err)
+				}
+				if err := sessStorage.Save(restoredSession); err != nil {
+					logger.Warn("failed to preserve restored message IDs", "error", err)
+				}
+				logger.Info("restored messages into conversation", "count", len(restoredSession.Messages))
 			}
-			if err := store.Save(ctx, sess); err != nil {
-				logger.Warn("failed to save restored messages to conversation store", "error", err)
-			}
-			logger.Info("restored messages into conversation", "count", len(restoredSession.Messages))
 		}
 	}
 
@@ -1020,6 +1101,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		beforeMCP[name] = true
 	}
 	mcpMgr := mcp.NewManager(logger)
+	tool.GetMCPResourceStore().SetBackend(mcpMgr)
 	for _, mcpCfg := range cfg.MCP {
 		if !mcpCfg.AutoStart {
 			continue
@@ -1137,9 +1219,12 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	ctxWinMgr := sys.ContextWindow
 	var aiClient *ai.Client
 	compactSvc := buildCompactService(&aiClient, logger)
-	ctxWinMgr.SetAutoCompactCallback(func() {
-		logger.Info("context window auto-compact threshold reached — triggering compaction")
-		compactSvc.Compact(ctx, nil, "", true)
+	autoCompactSvc := compact.NewAutoCompactService(compact.AutoCompactConfig{
+		CtxWinMgr:      ctxWinMgr,
+		CompactService: compactSvc,
+		Logger:         logger,
+		Enabled:        true,
+		Threshold:      0.70,
 	})
 
 	// Wire all extra subsystems
@@ -1152,9 +1237,17 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		SkillExecFn: skills.Execute,
 		CompactSvc:  compactSvc,
 		AutoMem:     autoMem,
+		ActionTrigger: func(triggerCtx context.Context, trigger watcher.Trigger) {
+			prompt := fmt.Sprintf("Execute a instrução AI! no arquivo %s, linha %d: %s\n\nContexto do código:\n%s", trigger.File, trigger.Line, trigger.Prompt, trigger.Content)
+			state, spawnErr := tasks.SpawnAgentTask(triggerCtx, sys.TaskRegistry,
+				fmt.Sprintf("AI! %s:%d", trigger.File, trigger.Line), prompt, "general-purpose", logger)
+			if spawnErr != nil {
+				logger.Warn("AI! task could not start", "file", trigger.File, "line", trigger.Line, "error", spawnErr)
+				return
+			}
+			logger.Info("AI! task started", "task_id", state.ID, "file", trigger.File, "line", trigger.Line)
+		},
 	})
-	active.Start(ctx)
-	defer active.Shutdown()
 
 	// Slash commands (project-level, from .polypod/commands/*.md)
 	cmdReg := sys.SlashCommands
@@ -1194,6 +1287,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	commands.RegisterBatch28Skills(sys.Commands)
 	commands.RegisterBatch29Voice(sys.Commands)
 	commands.RegisterAutonomousCommands(sys.Commands)
+	commands.BindTaskRuntime(sys.Commands, sys.TaskRegistry, sched, logger)
 	commands.RegisterPromptReview(sys.PromptCommands)
 	commands.RegisterPromptCommit(sys.PromptCommands)
 
@@ -1220,6 +1314,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	// AI client (no knowledge service in CLI-only build)
 	aiClient = ai.NewClient(cfg.AI, sys.ToolAdapter)
 	aiSvc := ai.NewService(aiClient, nil, agents, "default", memStore, logger)
+	aiSvc.SetAutoCompact(autoCompactSvc)
 
 	// Cost engine
 	costEngine := tracking.NewCostEngine(logger)
@@ -1227,6 +1322,8 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 
 	// Wire the real sub-agent executor now that ai.Client is available
 	wiring.WireAIClient(sys, aiClient, logger)
+	active.Start(ctx)
+	defer active.Shutdown()
 
 	// Log auto-detected provider credentials
 	if detected := multiAuth.AutoDetect(); len(detected) > 0 {
@@ -1238,8 +1335,8 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	}
 
 	// Inline handlers (replace router)
-	handler := makeHandler(convMgr, aiSvc)
-	streamHandler := makeStreamHandler(convMgr, aiSvc)
+	handler := makeHandler(convMgr, aiSvc, turnCheckpoint, logger)
+	streamHandler := makeStreamHandler(convMgr, aiSvc, turnCheckpoint, logger)
 	// Background routines and one-off tasks share the same operational state.
 	// Serialize their full agent turns while leaving interactive messages free.
 	backgroundAgentGate := make(chan struct{}, 1)
@@ -1813,6 +1910,8 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	cliCh.SetPlanSimulator(sys.Orchestrator.PlanSimulator())
 	cliCh.SetConfig(cfg, configPath)
 	cliCh.SetCommandRegistry(sys.Commands)
+	cliCh.SetTurnCheckpointManager(turnCheckpoint)
+	cliCh.SetActiveSessionID(currentSessionID)
 	if bubbleApproval != nil {
 		cliCh.SetApprovalHandler(bubbleApproval)
 	}
@@ -1835,7 +1934,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	}
 
 	// Shutdown
-	autoSaveSession(convMgr, sessStorage, sessMgr, currentSessionID, logger)
+	autoSaveSession(convMgr, sessStorage, sessMgr, cliCh.ActiveSessionID(), logger)
 
 	hookMgr.Fire(context.Background(), hooks.HookPayload{
 		Event:     hooks.EventSessionEnd,

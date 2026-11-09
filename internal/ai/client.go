@@ -41,6 +41,17 @@ func (c *Client) SetCostEngine(ce *tracking.CostEngine) {
 	c.costEngine = ce
 }
 
+func (c *Client) recordProviderUsage(resp *providerapi.ChatResponse) {
+	if c.costEngine == nil || resp == nil {
+		return
+	}
+	model := resp.Model
+	if model == "" {
+		model = c.model
+	}
+	c.costEngine.RecordCompletion(model, resp.PromptTokens, resp.CompletionTokens, resp.CacheReadTokens, resp.CacheWriteTokens)
+}
+
 // SetToolEventCallback sets a callback that is invoked for each tool
 // lifecycle event (start, complete, error) during streaming tool execution.
 func (c *Client) SetToolEventCallback(cb ToolEventCallback) {
@@ -71,6 +82,8 @@ func NewClient(cfg config.AIConfig, skills SkillRegistry) *Client {
 	if cfg.Provider == "chatgpt" {
 		manager := chatgptauth.NewManager(chatgptauth.DefaultCredentialPath())
 		c.responseProvider = providerapi.NewChatGPT(manager.AccessToken)
+	} else if cfg.Provider == "anthropic" || cfg.Provider == "google" || cfg.Provider == "ollama" {
+		c.responseProvider = providerapi.ProviderFactory(cfg.Provider, cfg.APIKey, cfg.BaseURL)
 	}
 	if cfg.FallbackProvider != "" && cfg.FallbackProvider != cfg.Provider && cfg.FallbackModel != "" {
 		primary := c.responseProvider
@@ -90,6 +103,9 @@ func NewClient(cfg config.AIConfig, skills SkillRegistry) *Client {
 }
 
 func (c *Client) toolIterationLimit() int {
+	if c.maxToolIter == -1 {
+		return -1
+	}
 	if c.maxToolIter <= 0 {
 		return config.DefaultMaxToolIterations
 	}
@@ -180,6 +196,7 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req openai.ChatComple
 		if err != nil {
 			return openai.ChatCompletionResponse{}, err
 		}
+		c.recordProviderUsage(resp)
 		message := openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, Content: resp.Content}
 		for _, tc := range resp.ToolCalls {
 			message.ToolCalls = append(message.ToolCalls, openai.ToolCall{ID: tc.ID, Type: openai.ToolTypeFunction, Function: openai.FunctionCall{Name: tc.Name, Arguments: tc.Arguments}})
@@ -227,6 +244,7 @@ func (c *Client) Complete(ctx context.Context, messages []ChatMessage) (*ChatRes
 		if err != nil {
 			return nil, err
 		}
+		c.recordProviderUsage(resp)
 		return &ChatResponse{Content: resp.Content, PromptTokens: resp.PromptTokens, CompletionTokens: resp.CompletionTokens, TotalTokens: resp.TotalTokens}, nil
 	}
 	msgs := make([]openai.ChatCompletionMessage, len(messages))
@@ -284,7 +302,7 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 	var totalPrompt, totalCompletion int
 
 	maxIterations := c.toolIterationLimit()
-	for iter := 0; iter < maxIterations; iter++ {
+	for iter := 0; maxIterations < 0 || iter < maxIterations; iter++ {
 		resp, err := retry(ctx, func() (openai.ChatCompletionResponse, error) {
 			return c.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 				Model:       c.model,
@@ -375,7 +393,7 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 	var totalPrompt, totalCompletion int
 
 	maxIterations := c.toolIterationLimit()
-	for iter := 0; iter < maxIterations; iter++ {
+	for iter := 0; maxIterations < 0 || iter < maxIterations; iter++ {
 		req := openai.ChatCompletionRequest{
 			Model:       c.model,
 			Messages:    msgs,

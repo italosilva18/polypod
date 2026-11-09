@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -165,11 +166,7 @@ func processCommand(input string, deps commandDeps, messages []chatEntry) comman
 		return handleResume(deps, arg)
 
 	case "/rewind":
-		arg := ""
-		if len(parts) >= 2 {
-			arg = parts[1]
-		}
-		return handleRewind(deps, messages, arg)
+		return handleRewind(deps, messages, strings.Join(parts[1:], " "))
 
 	case "/permissions":
 		return handlePermissions(parts, deps)
@@ -281,7 +278,7 @@ func helpText() string {
 		{"/cost", "mostra custo detalhado da sessao"},
 		{"/sessions [search <q>]", "lista ou busca sessoes persistidas"},
 		{"/resume [id]", "lista ou carrega uma sessao persistida"},
-		{"/rewind [n]", "rebobina conversa em N pares de mensagens"},
+		{"/rewind [n] [--conversation|--files]", "restaura turnos, arquivos e conversa"},
 		{"/permissions [sub]", "gerencia regras de permissoes"},
 		{"/plan [on|off|show|execute]", "alterna/gerencia plan mode"},
 		{"/init [--force]", "bootstrap .polypod.md e estrutura do projeto"},
@@ -1003,6 +1000,18 @@ type sessionEntry struct {
 	preview   string
 }
 
+type rewindTurn struct {
+	preview string
+}
+
+type rewindOutcome struct {
+	messages  []chatEntry
+	restored  []string
+	conflicts []string
+	warnings  []string
+	removed   int
+}
+
 // commandDeps holds function callbacks for slash commands.
 type commandDeps struct {
 	commandRegistry *command.Registry
@@ -1040,6 +1049,9 @@ type commandDeps struct {
 	generateText func(prompt string) (string, error)
 	// compactAvailable reports whether the compact service is wired in.
 	compactAvailable func() bool
+	// compactHistory summarizes and persists the active session, then returns
+	// the new display history and estimated token counts.
+	compactHistory func() ([]chatEntry, int, int, error)
 
 	// loadSession loads a persisted session by ID and returns its
 	// messages as chatEntry items in display order. Used by /resume.
@@ -1048,6 +1060,8 @@ type commandDeps struct {
 	// conversation, persists the change, and returns the number actually
 	// removed. Used by /rewind.
 	truncateMessages func(n int) (int, error)
+	rewindTurns      func(n int, withFiles, withConversation bool) (rewindOutcome, error)
+	listRewindTurns  func() ([]rewindTurn, error)
 
 	// permissionsList returns all configured permission rules, each tuple
 	// being (pattern, decision, source).
@@ -1435,11 +1449,20 @@ func handleDiff(parts []string) commandResult {
 	return commandResult{output: strings.TrimRight(b.String(), "\n"), handled: true}
 }
 
-// handleCompact triggers context-window compaction. Right now the command
-// pipeline lacks a direct hook into the compact.CompactService; this handler
-// reports what a full compaction would do and asks the user to use auto-
-// compact (which is wired at the AI-service level) for actual summarization.
+// handleCompact summarizes and persists the active conversation when wired.
 func handleCompact(deps commandDeps, messages []chatEntry) commandResult {
+	if deps.compactHistory != nil {
+		replacement, before, after, err := deps.compactHistory()
+		if err != nil {
+			return commandResult{output: errorStyle.Render("Nao foi possivel compactar: " + err.Error()), handled: true}
+		}
+		return commandResult{
+			output:          cmdLabelStyle.Render(fmt.Sprintf("Contexto compactado: ~%d para ~%d tokens.", before, after)),
+			replaceMessages: replacement,
+			handled:         true,
+		}
+	}
+
 	// Rough token estimate: ~4 chars per token with a small overhead.
 	totalChars := 0
 	for _, m := range messages {
@@ -1764,9 +1787,73 @@ func formatResumeList(sessions []sessionEntry) commandResult {
 
 // ── /rewind ─────────────────────────────────────────────────────────────────
 
+func handleDurableRewind(deps commandDeps, arg string) commandResult {
+	parts := strings.Fields(arg)
+	if len(parts) == 0 {
+		turns, err := deps.listRewindTurns()
+		if err != nil {
+			return commandResult{output: errorStyle.Render("Nao foi possivel listar turnos: " + err.Error()), handled: true}
+		}
+		if len(turns) == 0 {
+			return commandResult{output: cmdLabelStyle.Render("nenhum turno disponivel"), handled: true}
+		}
+		var b strings.Builder
+		b.WriteString(cmdTitleStyle.Render("Turnos disponiveis para rewind"))
+		b.WriteString("\n\n")
+		for i := len(turns) - 1; i >= 0 && len(turns)-i <= 10; i-- {
+			b.WriteString(fmt.Sprintf("  -%d. %s\n", len(turns)-i, truncate(strings.ReplaceAll(turns[i].preview, "\n", " "), 75)))
+		}
+		b.WriteString("\n  /rewind <n> restaura arquivos e conversa\n")
+		b.WriteString("  /rewind <n> --conversation restaura so a conversa\n")
+		b.WriteString("  /rewind <n> --files restaura so arquivos")
+		return commandResult{output: b.String(), handled: true}
+	}
+
+	n, err := strconv.Atoi(parts[0])
+	if err != nil || n <= 0 {
+		return commandResult{output: cmdLabelStyle.Render("uso: /rewind <n> [--conversation|--files]"), handled: true}
+	}
+	withFiles, withConversation := true, true
+	if len(parts) > 2 {
+		return commandResult{output: cmdLabelStyle.Render("uso: /rewind <n> [--conversation|--files]"), handled: true}
+	}
+	if len(parts) == 2 {
+		switch parts[1] {
+		case "--conversation", "--chat":
+			withFiles = false
+		case "--files":
+			withConversation = false
+		case "--both":
+		default:
+			return commandResult{output: cmdLabelStyle.Render("uso: /rewind <n> [--conversation|--files]"), handled: true}
+		}
+	}
+	outcome, err := deps.rewindTurns(n, withFiles, withConversation)
+	if err != nil {
+		return commandResult{output: errorStyle.Render("Rewind falhou: " + err.Error()), handled: true}
+	}
+	var b strings.Builder
+	b.WriteString(notifySuccessStyle.Render(fmt.Sprintf("rewind aplicado a %d turno(s)", outcome.removed)))
+	if withFiles {
+		b.WriteString(fmt.Sprintf("\nArquivos restaurados: %d", len(outcome.restored)))
+	}
+	for _, conflict := range outcome.conflicts {
+		b.WriteString("\nConflito registrado; restauracao aplicada: ")
+		b.WriteString(conflict)
+	}
+	for _, warning := range outcome.warnings {
+		b.WriteString("\nAviso: ")
+		b.WriteString(warning)
+	}
+	return commandResult{output: b.String(), replaceMessages: outcome.messages, handled: true}
+}
+
 // handleRewind rewinds the conversation by N user+assistant pairs.
 // With no argument, shows the last 10 message pairs with numbers.
 func handleRewind(deps commandDeps, messages []chatEntry, arg string) commandResult {
+	if deps.rewindTurns != nil && deps.listRewindTurns != nil {
+		return handleDurableRewind(deps, arg)
+	}
 	// Count only user and assistant messages for pair accounting.
 	var pairs [][2]int // user index, assistant index (−1 if no reply yet)
 	lastUser := -1

@@ -50,19 +50,21 @@ type FileState struct {
 
 // Watcher monitors files for changes and AI comment triggers.
 type Watcher struct {
-	config    WatchConfig
-	states    map[string]FileState
-	onTrigger func(Trigger)
-	onChange  func(path string)
-	logger    *slog.Logger
+	config       WatchConfig
+	states       map[string]FileState
+	seenTriggers map[string]map[string]int
+	onTrigger    func(Trigger)
+	onChange     func(path string)
+	logger       *slog.Logger
 }
 
 // New creates a file watcher.
 func New(cfg WatchConfig, logger *slog.Logger) *Watcher {
 	return &Watcher{
-		config: cfg,
-		states: make(map[string]FileState),
-		logger: logger,
+		config:       cfg,
+		states:       make(map[string]FileState),
+		seenTriggers: make(map[string]map[string]int),
+		logger:       logger,
 	}
 }
 
@@ -137,13 +139,11 @@ func (w *Watcher) poll() {
 			if !known || info.ModTime().After(prev.ModTime) {
 				w.states[path] = FileState{ModTime: info.ModTime()}
 
-				if known {
-					// File changed
-					if w.onChange != nil {
-						w.onChange(path)
-					}
-					w.checkTriggers(path)
+				if w.onChange != nil {
+					w.onChange(path)
 				}
+				// A file created after startup can also contain a new AI! action.
+				w.checkTriggers(path)
 			}
 			return nil
 		})
@@ -162,6 +162,8 @@ func (w *Watcher) checkTriggers(path string) {
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
+	current := make(map[string]int)
+	previous := w.seenTriggers[path]
 	lineNum := 0
 	for scanner.Scan() {
 		lineNum++
@@ -169,6 +171,11 @@ func (w *Watcher) checkTriggers(path string) {
 
 		matches := AICommentPattern.FindStringSubmatch(line)
 		if len(matches) < 3 {
+			continue
+		}
+		key := matches[1] + ":" + strings.TrimSpace(matches[2])
+		current[key]++
+		if current[key] <= previous[key] {
 			continue
 		}
 
@@ -191,6 +198,7 @@ func (w *Watcher) checkTriggers(path string) {
 
 		w.onTrigger(trigger)
 	}
+	w.seenTriggers[path] = current
 }
 
 func (w *Watcher) matchesExtension(path string) bool {

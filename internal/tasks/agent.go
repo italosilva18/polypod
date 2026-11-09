@@ -1,6 +1,8 @@
 package tasks
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -99,6 +101,24 @@ type LocalAgentState struct {
 	Progress        *AgentProgress `json:"progress,omitempty"`
 	IsBackgrounded  bool           `json:"is_backgrounded"`
 	PendingMessages []string       `json:"pending_messages,omitempty"`
+	cancel          context.CancelFunc
+}
+
+// AgentRunFunc runs an agent loop and reports progress without coupling tasks
+// to a particular model provider or subagent implementation.
+type AgentRunFunc func(context.Context, string, string, func(AgentProgress)) (string, error)
+
+// SetAgentRunner connects background agent tasks to the active agent runtime.
+func (r *TaskRegistry) SetAgentRunner(run AgentRunFunc) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.agentRunner = run
+}
+
+func (r *TaskRegistry) getAgentRunner() AgentRunFunc {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.agentRunner
 }
 
 var (
@@ -112,10 +132,23 @@ func setAgentState(taskID string, state *LocalAgentState) {
 	agentStates[taskID] = state
 }
 
-func getAgentState(taskID string) *LocalAgentState {
+// GetAgentState returns a snapshot of agent-specific task state.
+func GetAgentState(taskID string) (LocalAgentState, bool) {
 	agentStatesMu.Lock()
 	defer agentStatesMu.Unlock()
-	return agentStates[taskID]
+	state, ok := agentStates[taskID]
+	if !ok {
+		return LocalAgentState{}, false
+	}
+	snapshot := *state
+	snapshot.cancel = nil
+	snapshot.PendingMessages = append([]string(nil), state.PendingMessages...)
+	if state.Progress != nil {
+		progress := *state.Progress
+		progress.RecentActivities = append([]ToolActivity(nil), progress.RecentActivities...)
+		snapshot.Progress = &progress
+	}
+	return snapshot, true
 }
 
 func removeAgentState(taskID string) {
@@ -139,20 +172,34 @@ func (k *LocalAgentTaskKiller) Type() TaskType { return TaskTypeAgent }
 
 // Kill aborts a running local agent task.
 func (k *LocalAgentTaskKiller) Kill(taskID string, registry *TaskRegistry) error {
-	state, ok := registry.Get(taskID)
-	if !ok {
-		return fmt.Errorf("agent task %s not found", taskID)
-	}
-	if state.Status != StatusRunning {
-		return nil
-	}
-
-	now := time.Now()
-	registry.Update(taskID, func(t *TaskState) {
+	var stopped bool
+	if !registry.Update(taskID, func(t *TaskState) {
+		if t.Status != StatusRunning {
+			return
+		}
+		now := time.Now()
 		t.Status = StatusKilled
 		t.EndTime = &now
 		t.Notified = true
-	})
+		t.Error = "Execucao cancelada pelo usuario."
+		stopped = true
+	}) {
+		return fmt.Errorf("agent task %s not found", taskID)
+	}
+	if !stopped {
+		return nil
+	}
+	agentStatesMu.Lock()
+	state := agentStates[taskID]
+	var cancel context.CancelFunc
+	if state != nil {
+		cancel = state.cancel
+		state.cancel = nil
+	}
+	agentStatesMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 
 	k.logger.Info("agent task killed", "task_id", taskID)
 	return nil
@@ -168,16 +215,36 @@ func RegisterLocalAgent(
 	toolUseID string,
 	logger *slog.Logger,
 ) *TaskState {
+	return registerLocalAgent(registry, agentID, description, prompt, agentType, toolUseID, "", nil, logger)
+}
+
+func registerLocalAgent(
+	registry *TaskRegistry,
+	agentID string,
+	description string,
+	prompt string,
+	agentType string,
+	toolUseID string,
+	outputPath string,
+	cancel context.CancelFunc,
+	logger *slog.Logger,
+) *TaskState {
 	state := NewTaskState(TaskTypeAgent, description)
 	state.ID = agentID // Use agentID as taskID for consistency
 	state.ToolUseID = toolUseID
 	state.Status = StatusRunning
+	state.input = prompt
+	state.AgentName = agentType
+	if outputPath != "" {
+		state.OutputFile = outputPath
+	}
 
 	agentState := &LocalAgentState{
 		AgentID:        agentID,
 		Prompt:         prompt,
 		AgentType:      agentType,
 		IsBackgrounded: true,
+		cancel:         cancel,
 	}
 	setAgentState(agentID, agentState)
 
@@ -191,64 +258,166 @@ func RegisterLocalAgent(
 	return state
 }
 
+// SpawnAgentTask starts a real background agent loop. It retains values from
+// the initiating context for audit and permissions while giving the task an
+// independent cancellation lifetime.
+func SpawnAgentTask(
+	parent context.Context,
+	registry *TaskRegistry,
+	description string,
+	prompt string,
+	agentType string,
+	logger *slog.Logger,
+) (*TaskState, error) {
+	if registry == nil {
+		return nil, errors.New("task registry is not configured")
+	}
+	run := registry.getAgentRunner()
+	if run == nil {
+		return nil, errors.New("agent executor is not configured")
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if agentType == "" {
+		agentType = "general-purpose"
+	}
+	id := GenerateTaskID(TaskTypeAgent)
+	output, err := registry.CreateOutputFile(TaskTypeAgent, id)
+	if err != nil {
+		return nil, fmt.Errorf("creating agent output: %w", err)
+	}
+	base := context.Background()
+	if parent != nil {
+		base = context.WithoutCancel(parent)
+	}
+	runCtx, cancel := context.WithCancel(base)
+	state := registerLocalAgent(registry, id, description, prompt, agentType, "", output.Name(), cancel, logger)
+
+	go func() {
+		defer cancel()
+		defer func() {
+			if closeErr := output.Close(); closeErr != nil {
+				logger.Warn("closing agent output failed", "task_id", id, "error", closeErr)
+			}
+		}()
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				message := fmt.Sprintf("falha interna no agente: %v", recovered)
+				if _, writeErr := fmt.Fprintln(output, message); writeErr != nil {
+					logger.Warn("writing agent failure failed", "task_id", id, "error", writeErr)
+				}
+				FailAgent(registry, id, message)
+				logger.Error("background agent panic", "task_id", id, "panic", recovered)
+			}
+		}()
+		report := func(progress AgentProgress) {
+			UpdateAgentProgress(registry, id, progress)
+			if progress.LastActivity != nil {
+				if _, writeErr := fmt.Fprintf(output, "Ferramenta: %s; tokens: %d\n", progress.LastActivity.ToolName, progress.TokenCount); writeErr != nil {
+					logger.Warn("writing agent progress failed", "task_id", id, "error", writeErr)
+				}
+			}
+		}
+		result, runErr := run(runCtx, agentType, prompt, report)
+		if runErr != nil {
+			if _, writeErr := fmt.Fprintf(output, "Erro: %v\n", runErr); writeErr != nil {
+				logger.Warn("writing agent error failed", "task_id", id, "error", writeErr)
+			}
+			FailAgent(registry, id, runErr.Error())
+			return
+		}
+		if _, writeErr := fmt.Fprintln(output, result); writeErr != nil {
+			FailAgent(registry, id, fmt.Sprintf("writing agent result: %v", writeErr))
+			return
+		}
+		CompleteAgent(registry, id, result)
+	}()
+	return state, nil
+}
+
 // CompleteAgent marks an agent task as completed with result.
 func CompleteAgent(registry *TaskRegistry, agentID string, result string) {
 	now := time.Now()
-	agentState := getAgentState(agentID)
-	if agentState != nil {
-		agentState.Result = result
-	}
+	var completed bool
 	registry.Update(agentID, func(t *TaskState) {
 		if t.Status != StatusRunning {
 			return
 		}
 		t.Status = StatusCompleted
 		t.EndTime = &now
+		t.Result = result
+		t.Error = ""
+		completed = true
 	})
+	if completed {
+		agentStatesMu.Lock()
+		if state := agentStates[agentID]; state != nil {
+			state.Result = result
+			state.cancel = nil
+		}
+		agentStatesMu.Unlock()
+	}
 }
 
 // FailAgent marks an agent task as failed with error.
 func FailAgent(registry *TaskRegistry, agentID string, errMsg string) {
 	now := time.Now()
-	agentState := getAgentState(agentID)
-	if agentState != nil {
-		agentState.Error = errMsg
-	}
+	var failed bool
 	registry.Update(agentID, func(t *TaskState) {
 		if t.Status != StatusRunning {
 			return
 		}
 		t.Status = StatusFailed
 		t.EndTime = &now
+		t.Error = errMsg
+		failed = true
 	})
+	if failed {
+		agentStatesMu.Lock()
+		if state := agentStates[agentID]; state != nil {
+			state.Error = errMsg
+			state.cancel = nil
+		}
+		agentStatesMu.Unlock()
+	}
 }
 
 // UpdateAgentProgress updates progress metrics for an agent task.
 func UpdateAgentProgress(registry *TaskRegistry, agentID string, progress AgentProgress) {
-	agentState := getAgentState(agentID)
-	if agentState == nil {
-		return
+	registry.Update(agentID, func(state *TaskState) {
+		if state.Status == StatusRunning {
+			copy := progress
+			copy.RecentActivities = append([]ToolActivity(nil), progress.RecentActivities...)
+			state.Progress = &copy
+		}
+	})
+	agentStatesMu.Lock()
+	defer agentStatesMu.Unlock()
+	if state := agentStates[agentID]; state != nil {
+		state.Progress = &progress
 	}
-	agentState.Progress = &progress
 }
 
 // QueuePendingMessage adds a message to an agent's pending queue.
 func QueuePendingMessage(agentID string, msg string) {
-	agentState := getAgentState(agentID)
-	if agentState == nil {
-		return
+	agentStatesMu.Lock()
+	defer agentStatesMu.Unlock()
+	if state := agentStates[agentID]; state != nil {
+		state.PendingMessages = append(state.PendingMessages, msg)
 	}
-	agentState.PendingMessages = append(agentState.PendingMessages, msg)
 }
 
 // DrainPendingMessages returns and clears all pending messages for an agent.
 func DrainPendingMessages(agentID string) []string {
-	agentState := getAgentState(agentID)
-	if agentState == nil || len(agentState.PendingMessages) == 0 {
+	agentStatesMu.Lock()
+	defer agentStatesMu.Unlock()
+	state := agentStates[agentID]
+	if state == nil || len(state.PendingMessages) == 0 {
 		return nil
 	}
-	msgs := agentState.PendingMessages
-	agentState.PendingMessages = nil
+	msgs := state.PendingMessages
+	state.PendingMessages = nil
 	return msgs
 }
 

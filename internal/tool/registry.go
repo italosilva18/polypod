@@ -5,19 +5,26 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/costa/polypod/internal/bash"
+	"github.com/costa/polypod/internal/lsp"
 	"github.com/costa/polypod/internal/types"
 )
 
 // Registry holds all registered tools and provides lookup/execution.
 type Registry struct {
-	mu    sync.RWMutex
-	tools map[string]types.Tool
+	mu              sync.RWMutex
+	tools           map[string]types.Tool
+	fileReads       *fileReadTracker
+	lsp             *lsp.LSPServerManager
+	pty             *bash.PTYManager
+	beforeFileWrite func(types.ToolContext, string, []byte, bool) error
 }
 
 // NewRegistry creates an empty tool registry.
 func NewRegistry() *Registry {
 	return &Registry{
-		tools: make(map[string]types.Tool),
+		tools:     make(map[string]types.Tool),
+		fileReads: newFileReadTracker(),
 	}
 }
 

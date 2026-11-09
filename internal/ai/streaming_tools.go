@@ -308,7 +308,7 @@ func (m *StreamingToolManager) executeSingle(ctx context.Context, call ToolCallI
 	return ToolCallResult{
 		ID:      call.ID,
 		Name:    call.Name,
-		Content: truncateToolResult(result.Content),
+		Content: appendProjectInstructions(ctx, call.Name, args, truncateToolResult(result.Content), m.logger),
 		Images:  result.Images,
 		IsError: result.IsError,
 	}

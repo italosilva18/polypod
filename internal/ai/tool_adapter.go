@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/costa/polypod/internal/tool"
 	"github.com/costa/polypod/internal/types"
@@ -41,14 +43,27 @@ func NewToolRegistryAdapter(reg *tool.Registry, orchestrateFn func(string, map[s
 // If names is empty, returns all enabled tools.
 func (a *ToolRegistryAdapter) ToolDefinitions(names []string) []openai.Tool {
 	var tools []types.Tool
-	if len(names) == 0 {
+	wildcard := len(names) == 0
+	excluded := make(map[string]bool)
+	for _, name := range names {
+		if name == "*" {
+			wildcard = true
+		} else if strings.HasPrefix(name, "!") {
+			excluded[strings.TrimPrefix(name, "!")] = true
+		}
+	}
+	if wildcard {
 		tools = a.registry.Enabled()
 	} else {
 		tools = a.registry.FilterByNames(names)
 	}
+	sort.Slice(tools, func(i, j int) bool { return tools[i].Name() < tools[j].Name() })
 
 	result := make([]openai.Tool, 0, len(tools))
 	for _, t := range tools {
+		if excluded[t.Name()] {
+			continue
+		}
 		schema := t.InputSchema()
 
 		// Preserve the complete schema, including $defs and combinators.
@@ -102,6 +117,7 @@ func (a *ToolRegistryAdapter) ExecuteResultContext(ctx context.Context, name str
 		return types.ToolResult{Content: fmt.Sprintf("Erro: %v", err), IsError: true}, nil
 	}
 	result.Content = truncateToolResult(result.Content)
+	result.Content = appendProjectInstructions(ctx, name, args, result.Content, nil)
 	if result.IsError {
 		result.Content = "Erro: " + result.Content
 	}

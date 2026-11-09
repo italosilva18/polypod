@@ -3,7 +3,6 @@ package tool
 import (
 	"fmt"
 	"log/slog"
-	"os"
 	"strings"
 	"time"
 
@@ -17,6 +16,9 @@ import (
 // This replaces the stub implementations with real ones backed by
 // tasktool.TaskList (for todos) and tasks.TaskRegistry (for background tasks).
 func RegisterTaskTools(reg *Registry, taskList *tasktool.TaskList, taskRegistry *tasks.TaskRegistry, logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	registerTodoWriteTool(reg, taskList)
 	registerTodoReadTool(reg, taskList)
 	registerTaskCreateTool(reg, taskRegistry, logger)
@@ -168,6 +170,7 @@ func registerTaskCreateTool(reg *Registry, taskReg *tasks.TaskRegistry, logger *
 					"type":        map[string]any{"type": "string", "enum": []string{"shell", "agent"}, "description": "Task type: 'shell' for bash commands, 'agent' for subagent queries"},
 					"command":     map[string]any{"type": "string", "description": "Shell command to run (required when type=shell)"},
 					"query":       map[string]any{"type": "string", "description": "Query/prompt for the agent (required when type=agent)"},
+					"agent_name":  map[string]any{"type": "string", "description": "Registered agent to run (default: general-purpose)"},
 					"description": map[string]any{"type": "string", "description": "Human-readable description of the task"},
 				},
 				"required": []string{"type", "description"},
@@ -198,12 +201,17 @@ func registerTaskCreateTool(reg *Registry, taskReg *tasks.TaskRegistry, logger *
 				if query == "" {
 					return types.ToolResult{Content: "query is required for agent tasks", IsError: true}, nil
 				}
-
-				agentID := tasks.GenerateTaskID(tasks.TaskTypeAgent)
-				state := tasks.RegisterLocalAgent(taskReg, agentID, description, query, "general-purpose", "", logger)
+				agentName, _ := args["agent_name"].(string)
+				if agentName == "" {
+					agentName = "general-purpose"
+				}
+				state, err := tasks.SpawnAgentTask(ctx.Context, taskReg, description, query, agentName, logger)
+				if err != nil {
+					return types.ToolResult{Content: fmt.Sprintf("Nao foi possivel iniciar o agente: %v", err), IsError: true}, nil
+				}
 
 				return types.ToolResult{
-					Content: fmt.Sprintf("Agent task created and registered.\nTask ID: %s\nQuery: %s\nDescription: %s\n\nUse task_get with this ID to check status.", state.ID, query, description),
+					Content: fmt.Sprintf("Agente iniciado em segundo plano.\nID: %s\nAgente: %s\nDescricao: %s\nUse task_get ou task_output para acompanhar.", state.ID, agentName, description),
 				}, nil
 
 			default:
@@ -256,9 +264,23 @@ func registerTaskGetTool(reg *Registry, taskReg *tasks.TaskRegistry) {
 				sb.WriteString(fmt.Sprintf("Running for: %s\n", time.Since(state.StartTime).Round(time.Second)))
 			}
 
-			// For shell tasks, include output
-			if state.Type == tasks.TaskTypeShell {
-				output, err := tasks.GetShellOutput(taskReg, taskID, 10*1024) // 10KB max
+			if state.Type == tasks.TaskTypeAgent {
+				sb.WriteString(fmt.Sprintf("Agent:       %s\n", state.AgentName))
+				if state.Progress != nil {
+					sb.WriteString(fmt.Sprintf("Progress:    %s; %d tools; %d tokens\n",
+						state.Progress.Summary, state.Progress.ToolUseCount, state.Progress.TokenCount))
+				}
+			}
+			if state.Error != "" {
+				sb.WriteString(fmt.Sprintf("Error:       %s\n", state.Error))
+			}
+			if state.Attempt > 1 {
+				sb.WriteString(fmt.Sprintf("Attempt:     %d (restart of %s)\n", state.Attempt, state.RestartOf))
+			}
+
+			// Include a bounded tail of task output.
+			if state.Type == tasks.TaskTypeShell || state.Type == tasks.TaskTypeAgent {
+				output, err := tasks.ReadTaskOutput(taskReg, taskID, 10*1024)
 				if err == nil && output != "" {
 					sb.WriteString(fmt.Sprintf("\n--- Output (last %d bytes) ---\n%s", len(output), output))
 				}
@@ -283,7 +305,7 @@ func registerTaskListTool(reg *Registry, taskReg *tasks.TaskRegistry) {
 				"properties": map[string]any{
 					"status": map[string]any{
 						"type":        "string",
-						"enum":        []string{"pending", "running", "completed", "failed", "killed"},
+						"enum":        []string{"pending", "running", "completed", "failed", "killed", "interrupted"},
 						"description": "Filter by status (optional). If omitted, returns all tasks.",
 					},
 				},
@@ -372,14 +394,7 @@ func registerTaskStopTool(reg *Registry, taskReg *tasks.TaskRegistry, logger *sl
 
 			if err := taskReg.Kill(taskID); err != nil {
 				logger.Warn("failed to kill task", "task_id", taskID, "error", err)
-				// Fallback: force status update
-				now := time.Now()
-				taskReg.Update(taskID, func(t *tasks.TaskState) {
-					t.Status = tasks.StatusKilled
-					t.EndTime = &now
-					t.Notified = true
-				})
-				return types.ToolResult{Content: fmt.Sprintf("Task %s force-stopped (killer error: %v)", taskID, err)}, nil
+				return types.ToolResult{Content: fmt.Sprintf("Nao foi possivel parar a tarefa %s: %v", taskID, err), IsError: true}, nil
 			}
 
 			return types.ToolResult{Content: fmt.Sprintf("Task %s stopped successfully.", taskID)}, nil
@@ -420,24 +435,13 @@ func registerTaskOutputTool(reg *Registry, taskReg *tasks.TaskRegistry) {
 			var sb strings.Builder
 			sb.WriteString(fmt.Sprintf("=== Output for Task %s (%s) ===\n", state.ID, state.Status))
 
-			// Try reading from output file
-			if state.OutputFile != "" {
-				data, err := os.ReadFile(state.OutputFile)
-				if err == nil {
-					output := string(data)
-					if len(output) > 50*1024 { // 50KB max
-						output = "... [truncated]\n" + output[len(output)-50*1024:]
-					}
-					if output != "" {
-						sb.WriteString(output)
-					} else {
-						sb.WriteString("(no output yet)")
-					}
-				} else {
-					sb.WriteString(fmt.Sprintf("(could not read output file: %v)", err))
-				}
+			output, err := tasks.ReadTaskOutput(taskReg, taskID, 50*1024)
+			if err != nil {
+				sb.WriteString(fmt.Sprintf("(nao foi possivel ler a saida: %v)", err))
+			} else if output == "" {
+				sb.WriteString("(sem saida ainda)")
 			} else {
-				sb.WriteString("(no output file configured for this task)")
+				sb.WriteString(output)
 			}
 
 			return types.ToolResult{Content: sb.String()}, nil
@@ -485,6 +489,8 @@ func taskStatusIcon(status tasks.TaskStatus) string {
 		return "[!]"
 	case tasks.StatusKilled:
 		return "[-]"
+	case tasks.StatusInterrupted:
+		return "[~]"
 	default:
 		return "[?]"
 	}

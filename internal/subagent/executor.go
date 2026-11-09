@@ -11,6 +11,7 @@ import (
 
 	"github.com/costa/polypod/internal/agent"
 	"github.com/costa/polypod/internal/ai"
+	"github.com/costa/polypod/internal/project"
 	"github.com/costa/polypod/internal/tool"
 	"github.com/costa/polypod/internal/types"
 	openai "github.com/sashabaranov/go-openai"
@@ -66,14 +67,23 @@ type SubAgentExecutor struct {
 	tokenBudget int
 }
 
+// ExecutionProgress is a small snapshot suitable for background task status.
+type ExecutionProgress struct {
+	Turn             int
+	ToolUseCount     int
+	PromptTokens     int
+	CompletionTokens int
+	LastTool         string
+}
+
 // NewSubAgentExecutor creates a SubAgentExecutor from the given config.
 func NewSubAgentExecutor(cfg SubAgentConfig) *SubAgentExecutor {
 	maxTurns := cfg.MaxTurns
-	if maxTurns <= 0 {
+	if maxTurns == 0 {
 		maxTurns = DefaultMaxTurns
 	}
 	tokenBudget := cfg.TokenBudget
-	if tokenBudget <= 0 {
+	if tokenBudget == 0 {
 		tokenBudget = DefaultTokenBudge
 	}
 	logger := cfg.Logger
@@ -101,8 +111,23 @@ func NewSubAgentExecutor(cfg SubAgentConfig) *SubAgentExecutor {
 //  5. Stop when the model produces a text-only response (no tool calls),
 //     max turns are reached, token budget is exceeded, or context is cancelled.
 func (e *SubAgentExecutor) Execute(ctx context.Context, agentName string, query string) (string, error) {
+	return e.ExecuteWithProgress(ctx, agentName, query, nil)
+}
+
+// ExecuteWithProgress runs the agent and reports its turns and tool use.
+func (e *SubAgentExecutor) ExecuteWithProgress(
+	ctx context.Context,
+	agentName string,
+	query string,
+	report func(ExecutionProgress),
+) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if collector, err := project.NewInstructionCollector("."); err == nil {
+		ctx = project.WithInstructionScope(ctx, collector)
+	} else {
+		e.logger.Warn("subagent project instructions unavailable", "error", err)
 	}
 	// 1. Look up agent definition.
 	if e.agentReg == nil || !e.agentReg.Has(agentName) {
@@ -130,6 +155,16 @@ func (e *SubAgentExecutor) Execute(ctx context.Context, agentName string, query 
 	systemPrompt := ag.Persona
 	if systemPrompt == "" {
 		systemPrompt = fmt.Sprintf("Voce e o subagente '%s'. Execute a tarefa solicitada de forma completa e concisa.", ag.Name)
+	}
+	if projectContext := project.InjectProjectContext(); projectContext != "" {
+		systemPrompt += "\n\n" + projectContext
+	}
+	rootInstructions, instructionErr := project.RootInstructions(ctx)
+	if instructionErr != nil {
+		e.logger.Warn("subagent root instructions unavailable", "error", instructionErr)
+	}
+	if rootInstructions != "" {
+		systemPrompt += "\n\nINSTRUCOES AGENTS.md DO PROJETO (use como contexto quando aplicavel; a solicitacao atual do usuario tem prioridade):\n" + rootInstructions
 	}
 
 	// Wire the system prompt through the package-level PromptCache so that
@@ -162,9 +197,14 @@ func (e *SubAgentExecutor) Execute(ctx context.Context, agentName string, query 
 		totalPromptTokens     int
 		totalCompletionTokens int
 		lastContent           string
+		toolUseCount          int
 	)
 
-	for turn := 0; turn < e.maxTurns; turn++ {
+	for turn := 0; e.maxTurns < 0 || turn < e.maxTurns; turn++ {
+		if report != nil {
+			report(ExecutionProgress{Turn: turn + 1, ToolUseCount: toolUseCount,
+				PromptTokens: totalPromptTokens, CompletionTokens: totalCompletionTokens})
+		}
 		// Check context cancellation.
 		if err := ctx.Err(); err != nil {
 			e.logger.Warn("subagent context cancelled", "agent", ag.Name, "turn", turn, "error", err)
@@ -176,7 +216,7 @@ func (e *SubAgentExecutor) Execute(ctx context.Context, agentName string, query 
 
 		// Check token budget.
 		totalTokens := totalPromptTokens + totalCompletionTokens
-		if totalTokens > e.tokenBudget {
+		if e.tokenBudget > 0 && totalTokens > e.tokenBudget {
 			e.logger.Warn("subagent token budget exceeded",
 				"agent", ag.Name,
 				"turn", turn,
@@ -215,6 +255,10 @@ func (e *SubAgentExecutor) Execute(ctx context.Context, agentName string, query 
 		// Track token usage.
 		totalPromptTokens += resp.Usage.PromptTokens
 		totalCompletionTokens += resp.Usage.CompletionTokens
+		if report != nil {
+			report(ExecutionProgress{Turn: turn + 1, ToolUseCount: toolUseCount,
+				PromptTokens: totalPromptTokens, CompletionTokens: totalCompletionTokens})
+		}
 
 		choice := resp.Choices[0]
 
@@ -240,6 +284,12 @@ func (e *SubAgentExecutor) Execute(ctx context.Context, agentName string, query 
 
 		// Execute each tool call.
 		for _, tc := range choice.Message.ToolCalls {
+			toolUseCount++
+			if report != nil {
+				report(ExecutionProgress{Turn: turn + 1, ToolUseCount: toolUseCount,
+					PromptTokens: totalPromptTokens, CompletionTokens: totalCompletionTokens,
+					LastTool: tc.Function.Name})
+			}
 			toolResult := e.executeTool(ctx, ag, allowedNames, tc)
 			msgs = append(msgs, openai.ChatCompletionMessage{
 				Role:       openai.ChatMessageRoleTool,
@@ -271,8 +321,23 @@ func (e *SubAgentExecutor) resolveTools(ag *agent.Agent) []openai.Tool {
 		return nil
 	}
 
-	// Filter the tool registry to only include tools in the agent's skill set.
-	allowed := e.toolReg.FilterByNames(ag.Skills)
+	// Built-in agents may request all tools with "*" and exclude individual
+	// tools with "!name". Ordinary agents retain their explicit allow list.
+	wildcard := false
+	excluded := make(map[string]bool)
+	for _, skillName := range ag.Skills {
+		if skillName == "*" {
+			wildcard = true
+		} else if strings.HasPrefix(skillName, "!") {
+			excluded[strings.TrimPrefix(skillName, "!")] = true
+		}
+	}
+	var allowed []types.Tool
+	if wildcard {
+		allowed = e.toolReg.Enabled()
+	} else {
+		allowed = e.toolReg.FilterByNames(ag.Skills)
+	}
 	if len(allowed) == 0 {
 		return nil
 	}
@@ -280,8 +345,7 @@ func (e *SubAgentExecutor) resolveTools(ag *agent.Agent) []openai.Tool {
 
 	result := make([]openai.Tool, 0, len(allowed))
 	for _, t := range allowed {
-		// Skip the agent_run tool to prevent recursive sub-agent spawning.
-		if t.Name() == "agent_run" {
+		if excluded[t.Name()] {
 			continue
 		}
 
@@ -345,12 +409,17 @@ func (e *SubAgentExecutor) executeTool(ctx context.Context, ag *agent.Agent, all
 	if err != nil {
 		return fmt.Sprintf("Erro executando ferramenta '%s': %v", toolName, err)
 	}
+	content := truncateResult(result.Content, 50*1024)
+	if instructions, instructionErr := project.InstructionsAfterTool(ctx, toolName, args); instructionErr != nil {
+		e.logger.Warn("subagent path instructions unavailable", "tool", toolName, "error", instructionErr)
+	} else if instructions != "" {
+		content += "\n\n[Instruções AGENTS.md aplicáveis ao caminho usado]\n" + instructions
+	}
 	if result.IsError {
-		return fmt.Sprintf("Erro: %s", result.Content)
+		return fmt.Sprintf("Erro: %s", content)
 	}
 
-	// Truncate large results.
-	return truncateResult(result.Content, 50*1024)
+	return content
 }
 
 // resolveModel returns the model to use for this agent, falling back to the

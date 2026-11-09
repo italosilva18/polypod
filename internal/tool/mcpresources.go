@@ -1,9 +1,12 @@
 package tool
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
+
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/costa/polypod/internal/types"
 )
@@ -22,12 +25,32 @@ type MCPResource struct {
 type MCPResourceStore struct {
 	mu        sync.Mutex
 	resources map[string]*MCPResource // key = server + ":" + uri
+	backend   MCPResourceBackend
+}
+
+// MCPResourceBackend supplies the live MCP resource catalog and typed content.
+type MCPResourceBackend interface {
+	ListResources(server string) map[string][]*mcpsdk.Resource
+	ReadResource(context.Context, string, string) (*mcpsdk.ReadResourceResult, error)
 }
 
 var globalMCPResourceStore = &MCPResourceStore{resources: make(map[string]*MCPResource)}
 
 // GetMCPResourceStore returns the global MCP resource store.
 func GetMCPResourceStore() *MCPResourceStore { return globalMCPResourceStore }
+
+// SetBackend connects the resource tools to the active MCP manager.
+func (s *MCPResourceStore) SetBackend(backend MCPResourceBackend) {
+	s.mu.Lock()
+	s.backend = backend
+	s.mu.Unlock()
+}
+
+func (s *MCPResourceStore) getBackend() MCPResourceBackend {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.backend
+}
 
 // Register adds or replaces a resource in the store.
 func (s *MCPResourceStore) Register(r *MCPResource) {
@@ -39,6 +62,21 @@ func (s *MCPResourceStore) Register(r *MCPResource) {
 
 // List returns resources, optionally filtered by server. Contents are stripped.
 func (s *MCPResourceStore) List(server string) []*MCPResource {
+	if backend := s.getBackend(); backend != nil {
+		catalog := backend.ListResources(server)
+		out := make([]*MCPResource, 0)
+		for serverName, resources := range catalog {
+			for _, item := range resources {
+				if item != nil {
+					out = append(out, &MCPResource{
+						Server: serverName, URI: item.URI, Name: item.Name, MIME: item.MIMEType,
+						Metadata: map[string]string{"description": item.Description},
+					})
+				}
+			}
+		}
+		return out
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]*MCPResource, 0)
@@ -120,6 +158,21 @@ func NewReadMCPResourceTool() types.ToolDef {
 			uri, _ := args["uri"].(string)
 			if server == "" || uri == "" {
 				return types.ToolResult{IsError: true, Content: "server and uri are required"}, nil
+			}
+			if backend := GetMCPResourceStore().getBackend(); backend != nil {
+				requestCtx := ctx.Context
+				if requestCtx == nil {
+					requestCtx = context.Background()
+				}
+				result, err := backend.ReadResource(requestCtx, server, uri)
+				if err != nil {
+					return types.ToolResult{IsError: true, Content: err.Error()}, nil
+				}
+				data, err := json.Marshal(result.Contents)
+				if err != nil {
+					return types.ToolResult{IsError: true, Content: fmt.Sprintf("encode MCP resource: %v", err)}, nil
+				}
+				return types.ToolResult{Content: string(data)}, nil
 			}
 			r, ok := GetMCPResourceStore().Get(server, uri)
 			if !ok {

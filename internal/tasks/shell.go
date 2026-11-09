@@ -1,7 +1,6 @@
 package tasks
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -51,7 +50,7 @@ func (k *LocalShellTaskKiller) Type() TaskType { return TaskTypeShell }
 // SIGKILL after a grace period.
 func (k *LocalShellTaskKiller) Kill(taskID string, registry *TaskRegistry) error {
 	registry.mu.Lock()
-	state, ok := registry.tasks[taskID]
+	_, ok := registry.tasks[taskID]
 	if !ok {
 		registry.mu.Unlock()
 		return fmt.Errorf("shell task %s not found", taskID)
@@ -63,9 +62,12 @@ func (k *LocalShellTaskKiller) Kill(taskID string, registry *TaskRegistry) error
 	if shellState == nil {
 		// No process to kill — just mark terminal
 		now := time.Now()
-		state.Status = StatusKilled
-		state.EndTime = &now
-		state.Notified = true
+		registry.Update(taskID, func(t *TaskState) {
+			t.Status = StatusKilled
+			t.EndTime = &now
+			t.Notified = true
+			t.Error = "Execucao cancelada pelo usuario."
+		})
 		return nil
 	}
 
@@ -90,9 +92,12 @@ func (k *LocalShellTaskKiller) Kill(taskID string, registry *TaskRegistry) error
 	}
 
 	now := time.Now()
-	state.Status = StatusKilled
-	state.EndTime = &now
-	state.Notified = true
+	registry.Update(taskID, func(t *TaskState) {
+		t.Status = StatusKilled
+		t.EndTime = &now
+		t.Notified = true
+		t.Error = "Execucao cancelada pelo usuario."
+	})
 
 	k.logger.Info("shell task killed", "task_id", taskID)
 	return nil
@@ -137,19 +142,21 @@ func SpawnShellTask(
 	toolUseID string,
 	logger *slog.Logger,
 ) (*TaskHandle, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	// Create task state
 	state := NewTaskState(TaskTypeShell, description)
 	state.ToolUseID = toolUseID
 	state.Status = StatusRunning
+	state.input = command
 
 	// Create output file
-	outputPath := fmt.Sprintf("/tmp/polypod_shell_%s.log", state.ID)
-	state.OutputFile = outputPath
-
-	outFile, err := os.Create(outputPath)
+	outFile, err := registry.CreateOutputFile(TaskTypeShell, state.ID)
 	if err != nil {
 		return nil, fmt.Errorf("creating output file: %w", err)
 	}
+	state.OutputFile = outFile.Name()
 
 	// Create command with process group for cleanup
 	ctx, cancel := context.WithCancel(context.Background())
@@ -182,29 +189,28 @@ func SpawnShellTask(
 		removeShellState(state.ID)
 		return nil, fmt.Errorf("starting command: %w", err)
 	}
+	state.ProcessID = cmd.Process.Pid
 
 	// Register in task registry
 	registry.Register(state)
 
 	taskID := state.ID
 
-	// Stream output to file in background
+	// Drain output fully before waiting, so the process cannot block on a full
+	// pipe and its final bytes are present before terminal status is saved.
+	copyDone := make(chan error, 1)
 	go func() {
-		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 64*1024), 1024*1024) // 1MB max line
-		for scanner.Scan() {
-			line := scanner.Text() + "\n"
-			shellState.mu.Lock()
-			if shellState.outputFile != nil {
-				_, _ = shellState.outputFile.WriteString(line)
-			}
-			shellState.mu.Unlock()
-		}
+		_, copyErr := io.Copy(outFile, stdout)
+		copyDone <- copyErr
 	}()
 
 	// Wait for completion in background
 	go func() {
+		copyErr := <-copyDone
 		err := cmd.Wait()
+		if copyErr != nil && err == nil {
+			err = copyErr
+		}
 
 		shellState.mu.Lock()
 		if shellState.outputFile != nil {
@@ -239,10 +245,15 @@ func SpawnShellTask(
 
 		registry.Update(taskID, func(t *TaskState) {
 			if t.Status.IsTerminal() {
-				return // already killed
+				t.ExitCode = &exitCode
+				return // already killed; retain the confirmed process exit code
 			}
 			t.Status = status
 			t.EndTime = &now
+			t.ExitCode = &exitCode
+			if err != nil {
+				t.Error = err.Error()
+			}
 		})
 
 		logger.Info("shell task completed",

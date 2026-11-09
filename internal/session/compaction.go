@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 )
 
 // CompactionConfig controls when and how context compaction happens.
@@ -15,8 +16,10 @@ type CompactionConfig struct {
 
 // Message mirrors the conversation message type.
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	ID        string    `json:"id,omitempty"`
+	Role      string    `json:"role"`
+	Content   string    `json:"content"`
+	Timestamp time.Time `json:"timestamp,omitempty"`
 }
 
 // Compactor manages context window compression.
