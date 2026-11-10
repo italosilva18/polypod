@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -17,8 +18,8 @@ import (
 
 // registerSwarmTools connects team operations to the live swarm manager and
 // the same full agent executor used by agent_run. Worker turns persist a
-// model/tool checkpoint when the team journal is enabled. team_resume only
-// diagnoses crash boundaries; a journal prompt is not a resume cursor.
+// model/tool checkpoint when the team journal is enabled. team_resume can
+// restore only a run whose durable messages and completed turns are proven.
 func registerSwarmTools(reg *tool.Registry, manager *swarm.SwarmManager, agents *agent.Registry, executor *subagent.SubAgentExecutor) {
 	reg.RegisterDef(types.ToolDef{
 		NameFn: func() string { return "team_create" },
@@ -227,13 +228,23 @@ func registerSwarmTools(reg *tool.Registry, manager *swarm.SwarmManager, agents 
 				if mailbox == nil {
 					return swarmError("caixa do líder indisponível"), nil
 				}
-				matched := mailbox.AcknowledgeMatched(ids)
-				if journal := manager.Journal(); journal != nil && len(matched) > 0 {
-					if err := journal.AcknowledgeLive(team, matched); err != nil {
-						return swarmError("mensagens confirmadas localmente, mas falhou o registro persistente: " + err.Error()), nil
+				selected := make(map[string]bool, len(ids))
+				for _, id := range ids {
+					selected[id] = true
+				}
+				var matched []string
+				for _, msg := range mailbox.Snapshot(0) {
+					if selected[msg.ID] {
+						matched = append(matched, msg.ID)
 					}
 				}
-				return swarmJSON(map[string]any{"acknowledged": len(matched), "pending": mailbox.Pending()}), nil
+				if journal := manager.Journal(); journal != nil && len(matched) > 0 {
+					if err := journal.AcknowledgeLive(team, matched); err != nil {
+						return swarmError("falhou o registro persistente; mensagens continuam na caixa: " + err.Error()), nil
+					}
+				}
+				removed := mailbox.AcknowledgeMatched(matched)
+				return swarmJSON(map[string]any{"acknowledged": len(removed), "pending": mailbox.Pending()}), nil
 			}
 			journal := manager.Journal()
 			if journal == nil {
@@ -277,7 +288,7 @@ func registerSwarmTools(reg *tool.Registry, manager *swarm.SwarmManager, agents 
 			}
 			return swarmJSON(map[string]any{"team": archive.Summary, "members": archive.Members,
 				"leader_pending": len(archive.Pending), "recorded": true,
-				"owner_live": archive.OwnerLive}), nil
+				"owner_live": archive.OwnerLive, "owner_unproven": archive.OwnerUnproven}), nil
 		},
 	})
 
@@ -297,29 +308,21 @@ func registerSwarmTools(reg *tool.Registry, manager *swarm.SwarmManager, agents 
 		ExecuteFn: func(_ types.ToolContext, args map[string]any) (types.ToolResult, error) {
 			name, agentName := swarmArg(args, "team"), swarmArg(args, "name")
 			if team, ok := manager.GetTeam(name); ok {
-				if outputs, running := team.TeammateOutputs(agentName); running {
-					type result struct {
-						Turn     int       `json:"turn"`
-						Response string    `json:"response,omitempty"`
-						Error    string    `json:"error,omitempty"`
-						Started  time.Time `json:"started_at"`
-						Finished time.Time `json:"finished_at"`
-					}
-					items := make([]result, 0, len(outputs))
-					for _, output := range outputs {
-						item := result{Turn: output.TurnIndex, Response: output.Response, Started: output.StartTime, Finished: output.EndTime}
-						if output.Error != nil {
-							item.Error = output.Error.Error()
-						}
-						items = append(items, item)
-					}
-					return swarmJSON(items), nil
-				}
+				outputs, running := team.TeammateOutputs(agentName)
 				archive, err := recordedTeam(manager, name)
-				if err != nil || archive.RunID != team.RunID() {
-					return swarmError("integrante sem executor ativo"), nil
+				if manager.Journal() != nil {
+					if err != nil {
+						return swarmError("não foi possível ler resultados duráveis: " + err.Error()), nil
+					}
+					if archive.RunID != team.RunID() {
+						return swarmError("diário não corresponde à execução ativa"), nil
+					}
+					return swarmJSON(mergeTeamResults(archive.Results[agentName], outputs)), nil
 				}
-				return swarmJSON(archive.Results[agentName]), nil
+				if running {
+					return swarmJSON(mergeTeamResults(nil, outputs)), nil
+				}
+				return swarmError("integrante sem executor ativo"), nil
 			}
 			archive, err := recordedTeam(manager, name)
 			if err != nil {
@@ -358,13 +361,17 @@ func registerSwarmTools(reg *tool.Registry, manager *swarm.SwarmManager, agents 
 	reg.RegisterDef(types.ToolDef{
 		NameFn: func() string { return "team_resume" },
 		DescriptionFn: func() string {
-			return "Diagnosticar checkpoints de uma equipe interrompida. Somente leitura: não restaura a equipe, não inicia integrantes e não executa ferramentas. Mostra turnos, chamadas pendentes e bloqueios da retomada."
+			return "Diagnosticar uma equipe interrompida; apply=true restaura apenas execuções novas com posse exclusiva, mensagens duráveis e nenhum turno incerto. Nunca repete uma ferramenta ou turno iniciado."
 		},
-		IsReadOnlyFn: func(map[string]any) bool { return true },
+		IsReadOnlyFn: func(args map[string]any) bool {
+			apply, _ := args["apply"].(bool)
+			return !apply
+		},
 		InputSchemaFn: func() map[string]any {
 			return swarmSchema(map[string]any{
-				"team": map[string]any{"type": "string", "description": "Nome da equipe"},
-				"name": map[string]any{"type": "string", "description": "Integrante opcional; vazio avalia todos"},
+				"team":  map[string]any{"type": "string", "description": "Nome da equipe"},
+				"name":  map[string]any{"type": "string", "description": "Integrante opcional no diagnóstico"},
+				"apply": map[string]any{"type": "boolean", "description": "Restaurar execução elegível; padrão false mantém diagnóstico somente leitura"},
 			}, "team")
 		},
 		ExecuteFn: func(tc types.ToolContext, args map[string]any) (types.ToolResult, error) {
@@ -375,7 +382,31 @@ func registerSwarmTools(reg *tool.Registry, manager *swarm.SwarmManager, agents 
 			if name == "" {
 				return swarmError("team é obrigatório"), nil
 			}
-			report, err := manager.ResumeInterrupted(name, swarmArg(args, "name"))
+			apply, _ := args["apply"].(bool)
+			if value, specified := args["apply"]; specified {
+				if _, valid := value.(bool); !valid {
+					return swarmError("apply precisa ser booleano"), nil
+				}
+			}
+			var report swarm.TeamResumeReport
+			var err error
+			if apply {
+				if swarmArg(args, "name") != "" {
+					return swarmError("apply restaura a equipe inteira; omita name"), nil
+				}
+				report, err = manager.ApplyResumeInterrupted(name, func(info swarm.MemberInfo) (swarm.TeammateExecutor, error) {
+					if info.AgentType == "" || !agents.Has(info.AgentType) {
+						return nil, fmt.Errorf("agente %s indisponível", info.AgentType)
+					}
+					ag := agents.Get(info.AgentType)
+					if ag == nil || ag.Name != info.AgentType {
+						return nil, fmt.Errorf("agente %s não corresponde ao tipo salvo", info.AgentType)
+					}
+					return checkpointTeammateExecutor(executor, ag.Name), nil
+				})
+			} else {
+				report, err = manager.ResumeInterrupted(name, swarmArg(args, "name"))
+			}
 			if err != nil && len(report.Members) == 0 {
 				return swarmError(err.Error()), nil
 			}
@@ -386,6 +417,33 @@ func registerSwarmTools(reg *tool.Registry, manager *swarm.SwarmManager, agents 
 			return swarmJSON(report), nil
 		},
 	})
+}
+
+// mergeTeamResults keeps earlier durable turns visible after a worker is
+// restored. Live outputs replace the same journal turn with the full response.
+func mergeTeamResults(archived []swarm.ArchivedTurn, live []swarm.TeammateOutput) []swarm.ArchivedTurn {
+	byTurn := make(map[int]swarm.ArchivedTurn, len(archived)+len(live))
+	for _, item := range archived {
+		byTurn[item.Turn] = item
+	}
+	for _, output := range live {
+		item := swarm.ArchivedTurn{Turn: output.TurnIndex, Response: output.Response,
+			Started: output.StartTime, Finished: output.EndTime}
+		if output.Error != nil {
+			item.Error = output.Error.Error()
+		}
+		byTurn[item.Turn] = item
+	}
+	turns := make([]int, 0, len(byTurn))
+	for turn := range byTurn {
+		turns = append(turns, turn)
+	}
+	sort.Ints(turns)
+	result := make([]swarm.ArchivedTurn, 0, len(turns))
+	for _, turn := range turns {
+		result = append(result, byTurn[turn])
+	}
+	return result
 }
 
 func checkpointTeammateExecutor(executor *subagent.SubAgentExecutor, agentName string) swarm.TeammateExecutor {

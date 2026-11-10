@@ -114,15 +114,18 @@ type Team struct {
 	Members    []MemberInfo `json:"members"`
 
 	// Runtime
-	router      *MessageRouter
-	perms       *PermissionBridge
-	cancel      context.CancelFunc
-	ctx         context.Context
-	runners     map[string]*TeammateRunner // agentName → runner
-	logger      *slog.Logger
-	journal     *TeamJournal
-	checkpoints *workerCheckpointStore
-	runID       string
+	router       *MessageRouter
+	perms        *PermissionBridge
+	cancel       context.CancelFunc
+	ctx          context.Context
+	runners      map[string]*TeammateRunner // agentName → runner
+	retiredNames map[string]bool            // guarded by mu; never reuse a mailbox identity in one run
+	logger       *slog.Logger
+	journal      *TeamJournal
+	checkpoints  *workerCheckpointStore
+	runID        string
+	// teamLock excludes another process from creating or restoring this name.
+	teamLock *os.File
 	// resumeLock is held for a team rebuilt from a checkpoint until Stop.
 	resumeLock *os.File
 }
@@ -198,6 +201,14 @@ func (sm *SwarmManager) CreateTeam(name, description string, cfg TeamConfig) (*T
 	if _, exists := sm.teams[name]; exists {
 		return nil, fmt.Errorf("%w: %s", ErrTeamExists, name)
 	}
+	var teamLock *os.File
+	if sm.checkpoints != nil {
+		var err error
+		teamLock, err = sm.checkpoints.lockTeam(name)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -221,29 +232,41 @@ func (sm *SwarmManager) CreateTeam(name, description string, cfg TeamConfig) (*T
 				JoinedAt: time.Now(),
 			},
 		},
-		router:      router,
-		cancel:      cancel,
-		ctx:         ctx,
-		runners:     make(map[string]*TeammateRunner),
-		logger:      sm.logger,
-		journal:     sm.journal,
-		checkpoints: sm.checkpoints,
-		runID:       fmt.Sprintf("%d", time.Now().UnixNano()),
+		router:       router,
+		cancel:       cancel,
+		ctx:          ctx,
+		runners:      make(map[string]*TeammateRunner),
+		retiredNames: make(map[string]bool),
+		logger:       sm.logger,
+		journal:      sm.journal,
+		checkpoints:  sm.checkpoints,
+		teamLock:     teamLock,
+		runID:        fmt.Sprintf("%d", time.Now().UnixNano()),
 	}
 	router.journal = sm.journal
 	router.runID = team.runID
+	if teamLock != nil {
+		if err := persistTeamOwner(teamLock, team.runID); err != nil {
+			cancel()
+			releaseResumeLock(teamLock)
+			return nil, fmt.Errorf("persisting team owner: %w", err)
+		}
+	}
 
 	team.perms = NewPermissionBridge(team, sm.logger)
 
 	if sm.journal != nil {
 		if err := sm.journal.append(journalEvent{Kind: "created", Team: name, RunID: team.runID,
-			Summary: ptrSummary(team.Summary())}); err != nil {
+			ResumeProtocol: teamResumeProtocolVersion, Config: &cfg, Summary: ptrSummary(team.Summary())}); err != nil {
 			cancel()
+			releaseResumeLock(teamLock)
 			return nil, err
 		}
 		if err := sm.journal.append(journalEvent{Kind: "member", Team: name, RunID: team.runID,
 			Member: &team.Members[0]}); err != nil {
-			sm.logger.Warn("team leader journal entry failed", "team", name, "error", err)
+			cancel()
+			releaseResumeLock(teamLock)
+			return nil, err
 		}
 	}
 	sm.teams[name] = team
@@ -271,8 +294,9 @@ func (sm *SwarmManager) DeleteTeam(name string, timeout time.Duration) error {
 		return fmt.Errorf("%w: %s", ErrTeamNotFound, name)
 	}
 
-	if err := team.Stop(timeout); err != nil {
-		return err
+	stopErr := team.Stop(timeout)
+	if stopErr != nil && team.Summary().State != TeamStateStopped.String() {
+		return stopErr
 	}
 	sm.mu.Lock()
 	if sm.teams[name] == team {
@@ -280,7 +304,7 @@ func (sm *SwarmManager) DeleteTeam(name string, timeout time.Duration) error {
 	}
 	sm.mu.Unlock()
 	sm.logger.Info("team deleted", "team", name)
-	return nil
+	return stopErr
 }
 
 // ListTeams returns info about all active teams.
@@ -365,8 +389,10 @@ func (t *Team) Start() error {
 	if t.State != TeamStateCreated && t.State != TeamStatePaused {
 		return fmt.Errorf("cannot start team in state %s", t.State)
 	}
+	if err := t.persistStateLocked(TeamStateRunning); err != nil {
+		return fmt.Errorf("persisting team start: %w", err)
+	}
 	t.State = TeamStateRunning
-	t.recordStateLocked()
 	t.logger.Info("team started", "team", t.Name)
 	return nil
 }
@@ -379,8 +405,10 @@ func (t *Team) Pause() error {
 	if t.State != TeamStateRunning {
 		return fmt.Errorf("cannot pause team in state %s", t.State)
 	}
+	if err := t.persistStateLocked(TeamStatePaused); err != nil {
+		return fmt.Errorf("persisting team pause: %w", err)
+	}
 	t.State = TeamStatePaused
-	t.recordStateLocked()
 	t.logger.Info("team paused", "team", t.Name)
 	return nil
 }
@@ -397,6 +425,14 @@ func (t *Team) Stop(timeout time.Duration) error {
 	if t.State == TeamStateStopped {
 		t.mu.Unlock()
 		return nil
+	}
+	// Commit the stop intent before cancelling workers. After a crash this
+	// prevents a resumer from restarting work the owner chose to terminate.
+	if t.journal != nil {
+		if err := t.journal.append(journalEvent{Kind: "stopping", Team: t.Name, RunID: t.runID}); err != nil {
+			t.mu.Unlock()
+			return fmt.Errorf("persisting team stop intent: %w", err)
+		}
 	}
 	t.State = TeamStateStopping
 
@@ -438,12 +474,18 @@ func (t *Team) Stop(timeout time.Duration) error {
 	t.runners = make(map[string]*TeammateRunner)
 	resumeLock := t.resumeLock
 	t.resumeLock = nil
-	t.recordStateLocked()
+	teamLock := t.teamLock
+	t.teamLock = nil
+	stateErr := t.persistStateLocked(TeamStateStopped)
 	t.mu.Unlock()
 	releaseResumeLock(resumeLock)
+	releaseResumeLock(teamLock)
 
 	t.logger.Info("team stopped", "team", t.Name)
-	return err
+	if stateErr != nil {
+		return fmt.Errorf("persisting team stop: %w", stateErr)
+	}
+	return nil
 }
 
 // AddTeammate creates and registers a new teammate in the team.
@@ -479,9 +521,6 @@ func (t *Team) AddTeammate(cfg TeammateConfig) (*MemberInfo, error) {
 		}
 	}
 
-	// Register mailbox.
-	t.router.Register(uniqueName)
-
 	info := MemberInfo{
 		AgentID:          agentID,
 		Name:             uniqueName,
@@ -493,8 +532,15 @@ func (t *Team) AddTeammate(cfg TeammateConfig) (*MemberInfo, error) {
 		IsIdle:           true,
 		Metadata:         cfg.Metadata,
 	}
+	if t.journal != nil {
+		if err := t.journal.append(journalEvent{Kind: "member", Team: t.Name, RunID: t.runID,
+			Member: &info}); err != nil {
+			return nil, fmt.Errorf("persisting teammate: %w", err)
+		}
+	}
+	// The member becomes visible only after its durable identity exists.
+	t.router.Register(uniqueName)
 	t.Members = append(t.Members, info)
-	t.record(journalEvent{Kind: "member", Member: &info})
 
 	t.logger.Info("teammate added", "agent_id", agentID, "name", uniqueName, "team", t.Name)
 	return &info, nil
@@ -515,9 +561,20 @@ func (t *Team) RemoveTeammate(name string) error {
 		t.mu.Unlock()
 		return fmt.Errorf("%w: %s", ErrAgentNotFound, name)
 	}
+	if t.journal != nil {
+		if err := t.journal.append(journalEvent{Kind: "member_removed", Team: t.Name,
+			RunID: t.runID, Agent: name}); err != nil {
+			t.mu.Unlock()
+			return fmt.Errorf("persisting teammate removal: %w", err)
+		}
+	}
 
 	// Remove from members.
 	t.Members = append(t.Members[:idx], t.Members[idx+1:]...)
+	if t.retiredNames == nil {
+		t.retiredNames = make(map[string]bool)
+	}
+	t.retiredNames[strings.ToLower(name)] = true
 
 	// Stop runner if active.
 	runner, hasRunner := t.runners[name]
@@ -533,7 +590,6 @@ func (t *Team) RemoveTeammate(name string) error {
 	}
 
 	t.router.Unregister(name)
-	t.record(journalEvent{Kind: "member_removed", Agent: name})
 	t.logger.Info("teammate removed", "name", name, "team", t.Name)
 	return nil
 }
@@ -754,14 +810,14 @@ func (t *Team) record(event journalEvent) {
 	}
 }
 
-// recordStateLocked is called only while holding t.mu.
-func (t *Team) recordStateLocked() {
+// persistStateLocked is called only while holding t.mu.
+func (t *Team) persistStateLocked(state TeamState) error {
 	if t.journal == nil {
-		return
+		return nil
 	}
-	summary := TeamSummary{Name: t.Name, Description: t.Description, State: t.State.String(),
+	summary := TeamSummary{Name: t.Name, Description: t.Description, State: state.String(),
 		MemberCount: len(t.Members), CreatedAt: t.CreatedAt, LeaderID: t.LeaderID}
-	t.record(journalEvent{Kind: "state", Summary: &summary})
+	return t.journal.append(journalEvent{Kind: "state", Team: t.Name, RunID: t.runID, Summary: &summary})
 }
 
 // generateUniqueName returns a unique teammate name by appending a
@@ -770,6 +826,9 @@ func (t *Team) generateUniqueName(baseName string) string {
 	existing := make(map[string]struct{})
 	for _, m := range t.Members {
 		existing[strings.ToLower(m.Name)] = struct{}{}
+	}
+	for name := range t.retiredNames {
+		existing[name] = struct{}{}
 	}
 	if _, taken := existing[strings.ToLower(baseName)]; !taken {
 		return baseName

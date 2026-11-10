@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -33,20 +34,24 @@ type TeamJournal struct {
 }
 
 type journalRecord struct {
-	event     journalEvent
-	ownerLive bool
-	self      bool
+	event         journalEvent
+	ownerLive     bool
+	ownerUnproven bool
+	self          bool
 }
 
 type journalEvent struct {
 	Version         int          `json:"version"`
+	ResumeProtocol  int          `json:"resume_protocol,omitempty"`
 	Kind            string       `json:"kind"`
 	Team            string       `json:"team"`
 	RunID           string       `json:"run_id"`
 	At              time.Time    `json:"at"`
 	Summary         *TeamSummary `json:"summary,omitempty"`
+	Config          *TeamConfig  `json:"config,omitempty"`
 	Member          *MemberInfo  `json:"member,omitempty"`
 	Message         *Message     `json:"message,omitempty"`
+	MessageID       string       `json:"message_id,omitempty"`
 	Agent           string       `json:"agent,omitempty"`
 	Turn            int          `json:"turn,omitempty"`
 	CheckpointPhase string       `json:"checkpoint_phase,omitempty"`
@@ -71,6 +76,8 @@ type ArchivedTurn struct {
 type ArchivedTeam struct {
 	RunID     string
 	OwnerLive bool
+	// A missing owner lock is not evidence that its process exited.
+	OwnerUnproven bool `json:"owner_unproven,omitempty"`
 	// A different live process owns the created run.
 	ExternalOwner bool `json:"-"`
 	Summary       TeamSummary
@@ -81,6 +88,7 @@ type ArchivedTeam struct {
 
 const maxJournalText = 256 << 10
 const teamJournalVersion = 1
+const teamResumeProtocolVersion = 1
 const maxJournalRecord = 4 << 20
 const defaultHistoryLimit = 20
 const maxHistoryLimit = 100
@@ -170,13 +178,19 @@ func (j *TeamJournal) append(event journalEvent) error {
 	event.Error = trimJournalText(event.Error)
 	if event.Message != nil {
 		copy := *event.Message
-		copy.Content = trimJournalText(copy.Content)
-		copy.Summary = trimJournalText(copy.Summary)
+		// A queued message must survive byte-for-byte. A truncated prompt
+		// cannot be replayed safely after a crash.
+		if len(copy.Content) > maxJournalText || len(copy.Summary) > maxJournalText {
+			return errors.New("team message exceeds durable journal limit")
+		}
 		event.Message = &copy
 	}
 	data, err := json.Marshal(event)
 	if err != nil {
 		return fmt.Errorf("encoding team event: %w", err)
+	}
+	if len(data)+1 > maxJournalRecord {
+		return errors.New("team event exceeds durable journal record limit")
 	}
 	file, err := os.OpenFile(j.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
@@ -187,7 +201,10 @@ func (j *TeamJournal) append(event journalEvent) error {
 		_ = file.Close()
 		return fmt.Errorf("seeking team journal: %w", err)
 	}
-	_, err = file.Write(append(data, '\n'))
+	n, err := file.Write(append(data, '\n'))
+	if err == nil && n != len(data)+1 {
+		err = io.ErrShortWrite
+	}
 	if err != nil {
 		_ = file.Truncate(before)
 	}
@@ -238,6 +255,7 @@ func archivedTeams(records []journalRecord) []ArchivedTeam {
 	})
 	latest := make(map[string]string)
 	liveOwner := make(map[string]bool)
+	unprovenOwner := make(map[string]bool)
 	externalOwner := make(map[string]bool)
 	for _, record := range records {
 		event := record.event
@@ -247,7 +265,13 @@ func archivedTeams(records []journalRecord) []ArchivedTeam {
 	}
 	for _, record := range records {
 		event := record.event
-		if event.Kind != "created" || latest[event.Team] != event.RunID || !record.ownerLive {
+		if event.Kind != "created" && event.Kind != "resumed" || latest[event.Team] != event.RunID {
+			continue
+		}
+		if record.ownerUnproven {
+			unprovenOwner[event.Team] = true
+		}
+		if !record.ownerLive {
 			continue
 		}
 		liveOwner[event.Team] = true
@@ -257,25 +281,29 @@ func archivedTeams(records []journalRecord) []ArchivedTeam {
 	}
 	archive := make(map[string]*ArchivedTeam, len(latest))
 	pending := make(map[string]map[string]*Message, len(latest))
+	acknowledged := make(map[string]map[string]bool, len(latest))
+	for _, record := range records {
+		event := record.event
+		if event.Kind != "created" || latest[event.Team] != event.RunID || event.Summary == nil {
+			continue
+		}
+		archive[event.Team] = &ArchivedTeam{RunID: event.RunID, Summary: *event.Summary,
+			Results: make(map[string][]ArchivedTurn)}
+		pending[event.Team] = make(map[string]*Message)
+		acknowledged[event.Team] = make(map[string]bool)
+	}
 	for _, record := range records {
 		event := record.event
 		if latest[event.Team] != event.RunID {
 			continue
 		}
 		item := archive[event.Team]
-		if event.Kind == "created" {
-			if event.Summary == nil {
-				continue
-			}
-			item = &ArchivedTeam{RunID: event.RunID, Summary: *event.Summary, Results: make(map[string][]ArchivedTurn)}
-			archive[event.Team] = item
-			pending[event.Team] = make(map[string]*Message)
-			continue
-		}
 		if item == nil {
 			continue
 		}
 		switch event.Kind {
+		case "created":
+			// Initialized above, independent of cross-file timestamp order.
 		case "state":
 			if event.Summary != nil {
 				item.Summary = *event.Summary
@@ -300,7 +328,7 @@ func archivedTeams(records []journalRecord) []ArchivedTeam {
 			}
 		case "ack":
 			for _, id := range event.IDs {
-				delete(pending[event.Team], id)
+				acknowledged[event.Team][id] = true
 			}
 		case "turn_started":
 			item.Results[event.Agent] = append(item.Results[event.Agent], ArchivedTurn{
@@ -328,13 +356,21 @@ func archivedTeams(records []journalRecord) []ArchivedTeam {
 				turns = turns[len(turns)-100:]
 			}
 			item.Results[event.Agent] = turns
-		case "resumed", "turn_resumed":
+		case "resumed":
+			if event.Summary != nil {
+				item.Summary = *event.Summary
+			}
+		case "turn_resumed":
 			// Checkpoint evidence is diagnostic and does not open a new turn.
 		}
 	}
 	items := make([]ArchivedTeam, 0, len(archive))
 	for name, item := range archive {
+		for id := range acknowledged[name] {
+			delete(pending[name], id)
+		}
 		item.OwnerLive = liveOwner[name]
+		item.OwnerUnproven = unprovenOwner[name]
 		item.ExternalOwner = externalOwner[name]
 		if !liveOwner[name] && item.Summary.State != TeamStateStopped.String() {
 			item.Summary.State = "interrupted"
@@ -378,6 +414,17 @@ func (j *TeamJournal) Team(name string) (ArchivedTeam, bool, error) {
 // Acknowledge records delivery of archived leader messages without requiring
 // the original worker goroutines to exist.
 func (j *TeamJournal) Acknowledge(name string, ids []string) (int, int, error) {
+	// An archived acknowledgement must not race restoration of the same
+	// leader mailbox in another process.
+	store := &workerCheckpointStore{dir: filepath.Join(j.dir, "worker-checkpoints")}
+	if err := os.MkdirAll(store.dir, 0o700); err != nil {
+		return 0, 0, err
+	}
+	teamLock, err := store.lockTeam(name)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer releaseResumeLock(teamLock)
 	item, ok, err := j.Team(name)
 	if err != nil {
 		return 0, 0, err
@@ -385,7 +432,7 @@ func (j *TeamJournal) Acknowledge(name string, ids []string) (int, int, error) {
 	if !ok {
 		return 0, 0, fmt.Errorf("equipe %s não encontrada", name)
 	}
-	if item.OwnerLive && item.Summary.State != TeamStateStopped.String() {
+	if (item.OwnerLive || item.OwnerUnproven) && item.Summary.State != TeamStateStopped.String() {
 		return 0, len(item.Pending), fmt.Errorf("equipe %s ainda está ativa em outro processo", name)
 	}
 	selected := make(map[string]bool, len(ids))

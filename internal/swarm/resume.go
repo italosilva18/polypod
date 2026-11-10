@@ -10,8 +10,8 @@ import (
 	"github.com/costa/polypod/internal/tasks"
 )
 
-// TeamResumeReport is a read-only checkpoint diagnosis. Continued stays false
-// until durable mailboxes, team configuration and run ownership are proven.
+// TeamResumeReport describes either a read-only diagnosis or an applied
+// restoration. Continued is true only after the new owner has started.
 type TeamResumeReport struct {
 	Team      string             `json:"team"`
 	RunID     string             `json:"run_id,omitempty"`
@@ -40,8 +40,8 @@ type TeamResumeIssue struct {
 	PendingToolCallID string `json:"pending_tool_call_id,omitempty"`
 }
 
-// workerTurnResume remains the internal runner boundary type. No public tool
-// constructs it while crash recovery is disabled.
+// workerTurnResume remains the internal runner boundary type. Restoration
+// never uses it to replay an uncertain turn.
 type workerTurnResume struct {
 	Turn       int
 	Prompt     string
@@ -50,7 +50,7 @@ type workerTurnResume struct {
 	Checkpoint *tasks.AgentCheckpoint
 }
 
-const resumeDiagnosticNote = "Diagnóstico somente leitura: nenhuma equipe foi restaurada, nenhum integrante iniciado e nenhuma ferramenta de integrante executada. A retomada exige comprovar a posse exclusiva da execução, restaurar as caixas dos integrantes e preservar a configuração original da equipe."
+const resumeDiagnosticNote = "Diagnóstico somente leitura: nenhuma equipe foi restaurada. Para tentar retomar mensagens nunca iniciadas, use apply=true; execuções antigas ou com turnos incertos permanecem bloqueadas."
 
 // ResumeInterrupted inspects checkpoint eligibility without mutating the
 // journal, starting a teammate or invoking an executor. A journal prompt is

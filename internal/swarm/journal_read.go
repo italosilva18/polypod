@@ -634,6 +634,7 @@ func (j *TeamJournal) locatedRecords(files []journalFile, want func(indexEntry) 
 				return nil, readErr
 			}
 			record.self = meta.path == j.path
+			record.ownerUnproven = meta.lockMissing
 			records = append(records, locatedRecord{record: record, file: base, off: entry.Off})
 		}
 		if err := handle.Close(); err != nil {

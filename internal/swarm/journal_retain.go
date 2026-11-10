@@ -428,7 +428,7 @@ func fileHasRun(meta *journalFile, key runKey) bool {
 
 func knownJournalKind(kind string) bool {
 	switch kind {
-	case "created", "state", "member", "member_removed", "message", "ack", "turn_started", "turn_finished", "resumed", "turn_resumed":
+	case "created", "state", "stopping", "member", "member_removed", "message", "ack", "turn_started", "turn_finished", "resumed", "turn_resumed":
 		return true
 	default:
 		return false

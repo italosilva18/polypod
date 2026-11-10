@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -238,6 +239,21 @@ func (s *workerCheckpointStore) Latest(team, runID, agent string) (*workerCheckp
 	return snapshot, err
 }
 
+// ReadTurn requires the exact durable boundary of a completed journal turn.
+// Missing files are an error: a later checkpoint cannot prove this turn safe.
+func (s *workerCheckpointStore) ReadTurn(team, runID, agent string, turn int) (*workerCheckpointSnapshot, error) {
+	if s == nil || turn < 1 {
+		return nil, errors.New("worker checkpoint store or turn is invalid")
+	}
+	dir, err := s.agentDir(team, runID, agent)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return readWorkerCheckpoint(filepath.Join(dir, turnFileName(turn)), team, runID, agent, turn)
+}
+
 func syncWorkerCheckpointDir(path string) error {
 	directory, err := os.Open(path)
 	if err != nil {
@@ -258,6 +274,68 @@ func syncWorkerCheckpointParents(path string) error {
 			return nil
 		}
 	}
+}
+
+// lockTeam excludes another process from creating or restoring this name.
+// The file also stores the last intended run ID, so a clock change cannot
+// make an older journal run appear resumable after a newer creation.
+func (s *workerCheckpointStore) lockTeam(team string) (*os.File, error) {
+	if s == nil {
+		return nil, errors.New("worker checkpoint store is unavailable")
+	}
+	segment, err := checkpointSegment(team)
+	if err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(filepath.Join(s.dir, "team-"+segment+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("opening team ownership lock: %w", err)
+	}
+	if err := lockTeamJournalFile(file); err != nil {
+		_ = file.Close()
+		if teamJournalLockBusy(err) {
+			return nil, errors.New("equipe já está ativa ou em retomada em outro processo")
+		}
+		return nil, fmt.Errorf("locking team ownership: %w", err)
+	}
+	return file, nil
+}
+
+func persistTeamOwner(file *os.File, runID string) error {
+	if file == nil || strings.TrimSpace(runID) == "" {
+		return errors.New("team ownership marker is invalid")
+	}
+	if err := file.Truncate(0); err != nil {
+		return err
+	}
+	marker := []byte(runID + "\n")
+	n, err := file.WriteAt(marker, 0)
+	if err != nil {
+		return err
+	}
+	if n != len(marker) {
+		return io.ErrShortWrite
+	}
+	return file.Sync()
+}
+
+func readTeamOwner(file *os.File) (string, error) {
+	if file == nil {
+		return "", errors.New("team ownership lock is unavailable")
+	}
+	var data [256]byte
+	n, err := file.ReadAt(data[:], 0)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	if n == len(data) || n == 0 {
+		return "", errors.New("team ownership marker is missing or too long")
+	}
+	value := strings.TrimSpace(string(data[:n]))
+	if value == "" || strings.ContainsAny(value, "\r\n") {
+		return "", errors.New("team ownership marker is invalid")
+	}
+	return value, nil
 }
 
 // lockRun excludes a second process from continuing the same team run.

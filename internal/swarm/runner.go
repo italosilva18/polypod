@@ -264,7 +264,7 @@ func (r *TeammateRunner) loop() {
 		atomic.StoreInt32(&r.state, int32(RunnerStateWorking))
 
 		prompt := r.buildPrompt(msg)
-		r.executeTurn(prompt)
+		r.executeTurn(prompt, msg.ID)
 		if r.ctx.Err() != nil {
 			return
 		}
@@ -301,7 +301,7 @@ func (r *TeammateRunner) resumeCheckpointTurn() {
 	atomic.StoreInt32(&r.state, int32(RunnerStateWorking))
 	r.logger.Info("teammate resuming from checkpoint", "agent_name", r.cfg.Identity.AgentName,
 		"turn", resume.Turn, "phase", resume.Checkpoint.Phase)
-	r.executeTurn(resume.Prompt)
+	r.executeTurn(resume.Prompt, "")
 	r.resumeTurn = nil
 	if r.ctx.Err() != nil {
 		return
@@ -331,7 +331,7 @@ func (r *TeammateRunner) bindCheckpoint(ctx context.Context, turn int, initial *
 }
 
 // executeTurn runs one turn of the executor with the given prompt.
-func (r *TeammateRunner) executeTurn(prompt string) {
+func (r *TeammateRunner) executeTurn(prompt, messageID string) {
 	turn := int(atomic.AddInt32(&r.turnCount, 1))
 
 	// Create a per-turn cancellable context.
@@ -344,12 +344,21 @@ func (r *TeammateRunner) executeTurn(prompt string) {
 
 	start := time.Now()
 	resuming := r.resumeTurn != nil && r.resumeTurn.Turn == turn && r.resumeTurn.Checkpoint != nil
+	var startEvent journalEvent
 	if resuming {
 		// turn_resumed does not carry the prompt. The checkpoint is the
 		// only authority for what executes.
-		r.recordTurn(journalEvent{Kind: "turn_resumed", Turn: turn, CheckpointPhase: r.resumeTurn.Checkpoint.Phase})
+		startEvent = journalEvent{Kind: "turn_resumed", Turn: turn, CheckpointPhase: r.resumeTurn.Checkpoint.Phase}
 	} else {
-		r.recordTurn(journalEvent{Kind: "turn_started", Prompt: prompt, Turn: turn})
+		startEvent = journalEvent{Kind: "turn_started", Prompt: prompt, Turn: turn, MessageID: messageID}
+	}
+	// The inbox item was removed already. If the start record cannot be
+	// committed, never execute it: the durable message can be recovered later.
+	if err := r.recordTurn(startEvent); err != nil {
+		r.logger.Error("teammate turn start not durable", "agent_name", r.cfg.Identity.AgentName,
+			"turn", turn, "error", err)
+		r.Stop()
+		return
 	}
 
 	r.logger.Debug("teammate turn starting",
@@ -383,7 +392,11 @@ func (r *TeammateRunner) executeTurn(prompt string) {
 	if err != nil {
 		finished.Error = err.Error()
 	}
-	r.recordTurn(finished)
+	if recordErr := r.recordTurn(finished); recordErr != nil {
+		r.logger.Error("teammate turn finish not durable", "agent_name", r.cfg.Identity.AgentName,
+			"turn", turn, "error", recordErr)
+		r.Stop()
+	}
 
 	if err != nil {
 		if r.ctx.Err() != nil {
@@ -428,17 +441,14 @@ func (r *TeammateRunner) executeTurn(prompt string) {
 	}
 }
 
-func (r *TeammateRunner) recordTurn(event journalEvent) {
+func (r *TeammateRunner) recordTurn(event journalEvent) error {
 	if r.cfg.Journal == nil {
-		return
+		return nil
 	}
 	event.Team = r.cfg.Identity.TeamName
 	event.RunID = r.cfg.RunID
 	event.Agent = r.cfg.Identity.AgentName
-	if err := r.cfg.Journal.append(event); err != nil {
-		r.logger.Warn("team turn journal write failed", "team", event.Team,
-			"agent", event.Agent, "kind", event.Kind, "error", err)
-	}
+	return r.cfg.Journal.append(event)
 }
 
 // buildPrompt formats an incoming message as a prompt string.

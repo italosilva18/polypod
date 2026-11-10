@@ -93,6 +93,9 @@ type Message struct {
 	Metadata  map[string]string `json:"metadata,omitempty"`
 	Timestamp time.Time         `json:"timestamp"`
 	Read      bool              `json:"read"`
+	// DeliverySeq is assigned under the target mailbox lock before journaling.
+	// It preserves FIFO among equal-priority messages after restoration.
+	DeliverySeq uint64 `json:"delivery_seq,omitempty"`
 
 	// For priority queue ordering.
 	priority int
@@ -101,6 +104,15 @@ type Message struct {
 }
 
 var globalSeqNo uint64
+
+func advanceMessageSequenceFloor(floor uint64) {
+	for {
+		current := atomic.LoadUint64(&globalSeqNo)
+		if current >= floor || atomic.CompareAndSwapUint64(&globalSeqNo, current, floor) {
+			return
+		}
+	}
+}
 
 // NewMessage creates a new message with a generated ID and timestamp.
 func NewMessage(msgType MessageType, sender, target, content string) *Message {
@@ -203,6 +215,12 @@ func (m *Mailbox) Owner() string { return m.owner }
 // Deliver enqueues a message. Thread-safe.
 // Returns ErrMailboxClosed if the mailbox has been closed.
 func (m *Mailbox) Deliver(msg *Message) error {
+	return m.deliver(msg, nil)
+}
+
+// deliver keeps the mailbox locked while the optional journal append commits.
+// A receiver cannot observe a message until its durable evidence exists.
+func (m *Mailbox) deliver(msg *Message, persist func() error) error {
 	m.mu.Lock()
 	if atomic.LoadInt32(&m.closed) != 0 {
 		m.mu.Unlock()
@@ -214,6 +232,13 @@ func (m *Mailbox) Deliver(msg *Message) error {
 	}
 	msg.priority = msg.Type.Priority()
 	msg.seqNo = atomic.AddUint64(&globalSeqNo, 1)
+	msg.DeliverySeq = msg.seqNo
+	if persist != nil {
+		if err := persist(); err != nil {
+			m.mu.Unlock()
+			return err
+		}
+	}
 	heap.Push(&m.queue, msg)
 
 	// Append to bounded history.
@@ -433,14 +458,15 @@ func (r *MessageRouter) SendMessage(msg *Message) error {
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrAgentNotFound, msg.Target)
 	}
-	if err := mb.Deliver(msg); err != nil {
-		return fmt.Errorf("deliver to %s: %w", msg.Target, err)
-	}
-	if r.journal != nil {
-		if err := r.journal.append(journalEvent{Kind: "message", Team: r.teamName,
-			RunID: r.runID, Message: msg}); err != nil {
-			r.logger.Warn("team message journal write failed", "team", r.teamName, "error", err)
+	persist := func() error {
+		if r.journal == nil {
+			return nil
 		}
+		return r.journal.append(journalEvent{Kind: "message", Team: r.teamName,
+			RunID: r.runID, Message: msg})
+	}
+	if err := mb.deliver(msg, persist); err != nil {
+		return fmt.Errorf("deliver to %s: %w", msg.Target, err)
 	}
 	r.logger.Debug("message routed",
 		"type", msg.Type.String(),
@@ -470,14 +496,17 @@ func (r *MessageRouter) BroadcastMessage(msg *Message) []string {
 		msgCopy := *msg
 		msgCopy.Target = names[i]
 		msgCopy.seqNo = atomic.AddUint64(&globalSeqNo, 1)
-		if err := mb.Deliver(&msgCopy); err == nil {
-			delivered = append(delivered, names[i])
-			if r.journal != nil {
-				if err := r.journal.append(journalEvent{Kind: "message", Team: r.teamName,
-					RunID: r.runID, Message: &msgCopy}); err != nil {
-					r.logger.Warn("team broadcast journal write failed", "team", r.teamName, "error", err)
-				}
+		persist := func() error {
+			if r.journal == nil {
+				return nil
 			}
+			return r.journal.append(journalEvent{Kind: "message", Team: r.teamName,
+				RunID: r.runID, Message: &msgCopy})
+		}
+		if err := mb.deliver(&msgCopy, persist); err == nil {
+			delivered = append(delivered, names[i])
+		} else {
+			r.logger.Warn("team broadcast delivery failed", "team", r.teamName, "to", names[i], "error", err)
 		}
 	}
 	r.logger.Debug("broadcast",
