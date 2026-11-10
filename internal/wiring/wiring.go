@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 
 	"github.com/costa/polypod/internal/agent"
@@ -193,6 +194,14 @@ func WireAll(cfg Config) *Systems {
 	tracking.RegisterSkills(skillReg, tracker)
 
 	swarmMgr := swarm.NewSwarmManager(logger)
+	if cfg.DataDir != "" {
+		// A root service and an unprivileged CLI can share DataDir. Each UID
+		// owns private journal files while same-UID processes remain visible.
+		journalDir := filepath.Join(cfg.DataDir, fmt.Sprintf("team-journals-uid-%d", os.Geteuid()))
+		if err := swarmMgr.EnableJournal(journalDir); err != nil {
+			logger.Warn("team journal unavailable", "error", err)
+		}
+	}
 
 	// ---------------------------------------------------------------
 	// 6. Slash commands (project-level, from .polypod/commands/*.md)

@@ -63,7 +63,9 @@ func (c CDP) command(ctx context.Context, method, path, query string, out any) e
 	if err != nil {
 		return err
 	}
-	u.Path = path
+	// A paired extension uses an unguessable path prefix on its local CDP
+	// bridge. Keep that prefix for management endpoints as well as /json/list.
+	u.Path = strings.TrimRight(u.Path, "/") + path
 	u.RawQuery = query
 	req, err := http.NewRequestWithContext(ctx, method, u.String(), nil)
 	if err != nil {

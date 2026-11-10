@@ -96,6 +96,8 @@ documents the Piper-based OGG/Opus path for WhatsApp voice notes, and
 [WhatsApp outbound media](docs/integrations/whatsapp-outbound-media.md) covers file delivery.
 The [managed browser](docs/integrations/browser-managed.md) explains the
 isolated profile and desktop handoff.
+The [browser extension](browser-extension/README.md) describes pairing an
+already-open Chrome session without a CDP port.
 The [remote sessions guide](docs/integrations/remote-sessions.md) shows how to
 connect a second terminal to a persistent Polypod session.
 The [self-hosted model guide](docs/integrations/self-hosted-model.md) explains
@@ -105,6 +107,8 @@ The [continuous operations guide](docs/integrations/continuous-operations.md)
 explains scheduled routines, inbox recovery and automatic memory.
 The [agent runtime guide](docs/integrations/agent-runtime.md) covers background
 tasks, interactive terminals, file-triggered work, rewinding and local options.
+The [team journal](docs/integrations/team-journal.md) documents persistent
+team history and what happens to active teammates after a restart.
 The [Claude Code behavior audit](docs/integrations/claude-code-behavior-audit.md)
 tracks Go rewrites and the remaining gaps without copying reference source.
 The [RTK guide](docs/integrations/rtk.md) explains optional compression of

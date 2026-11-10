@@ -117,15 +117,18 @@ type Team struct {
 	ctx     context.Context
 	runners map[string]*TeammateRunner // agentName → runner
 	logger  *slog.Logger
+	journal *TeamJournal
+	runID   string
 }
 
 // --- SwarmManager ---
 
 // SwarmManager manages all active teams in the process.
 type SwarmManager struct {
-	mu     sync.RWMutex
-	teams  map[string]*Team
-	logger *slog.Logger
+	mu      sync.RWMutex
+	teams   map[string]*Team
+	logger  *slog.Logger
+	journal *TeamJournal
 }
 
 // NewSwarmManager creates a new swarm manager.
@@ -134,6 +137,24 @@ func NewSwarmManager(logger *slog.Logger) *SwarmManager {
 		teams:  make(map[string]*Team),
 		logger: logger,
 	}
+}
+
+// EnableJournal keeps team messages and turn outcomes available after restart.
+func (sm *SwarmManager) EnableJournal(path string) error {
+	j, err := NewTeamJournal(path)
+	if err != nil {
+		return err
+	}
+	sm.mu.Lock()
+	sm.journal = j
+	sm.mu.Unlock()
+	return nil
+}
+
+func (sm *SwarmManager) Journal() *TeamJournal {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.journal
 }
 
 // CreateTeam creates a new team and registers the leader.
@@ -173,14 +194,31 @@ func (sm *SwarmManager) CreateTeam(name, description string, cfg TeamConfig) (*T
 		ctx:     ctx,
 		runners: make(map[string]*TeammateRunner),
 		logger:  sm.logger,
+		journal: sm.journal,
+		runID:   fmt.Sprintf("%d", time.Now().UnixNano()),
 	}
+	router.journal = sm.journal
+	router.runID = team.runID
 
 	team.perms = NewPermissionBridge(team, sm.logger)
 
+	if sm.journal != nil {
+		if err := sm.journal.append(journalEvent{Kind: "created", Team: name, RunID: team.runID,
+			Summary: ptrSummary(team.Summary())}); err != nil {
+			cancel()
+			return nil, err
+		}
+		if err := sm.journal.append(journalEvent{Kind: "member", Team: name, RunID: team.runID,
+			Member: &team.Members[0]}); err != nil {
+			sm.logger.Warn("team leader journal entry failed", "team", name, "error", err)
+		}
+	}
 	sm.teams[name] = team
 	sm.logger.Info("team created", "team", name, "leader", leaderID)
 	return team, nil
 }
+
+func ptrSummary(summary TeamSummary) *TeamSummary { return &summary }
 
 // GetTeam returns a team by name.
 func (sm *SwarmManager) GetTeam(name string) (*Team, bool) {
@@ -223,6 +261,29 @@ func (sm *SwarmManager) ListTeams() []TeamSummary {
 	return summaries
 }
 
+// ListRecordedTeams includes teams left behind by a previous process.
+func (sm *SwarmManager) ListRecordedTeams() ([]TeamSummary, error) {
+	live := sm.ListTeams()
+	j := sm.Journal()
+	if j == nil {
+		return live, nil
+	}
+	archives, err := j.Teams()
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(live))
+	for _, item := range live {
+		seen[item.Name] = true
+	}
+	for _, item := range archives {
+		if !seen[item.Summary.Name] {
+			live = append(live, item.Summary)
+		}
+	}
+	return live, nil
+}
+
 // TeamSummary is a read-only snapshot of team state.
 type TeamSummary struct {
 	Name        string    `json:"name"`
@@ -254,6 +315,11 @@ func (sm *SwarmManager) Shutdown(timeout time.Duration) {
 		}(t)
 	}
 	wg.Wait()
+	if sm.journal != nil {
+		if err := sm.journal.Close(); err != nil {
+			sm.logger.Warn("team journal close failed", "error", err)
+		}
+	}
 	sm.logger.Info("swarm manager shut down", "teams_stopped", len(teams))
 }
 
@@ -267,6 +333,7 @@ func (t *Team) Start() error {
 		return fmt.Errorf("cannot start team in state %s", t.State)
 	}
 	t.State = TeamStateRunning
+	t.recordStateLocked()
 	t.logger.Info("team started", "team", t.Name)
 	return nil
 }
@@ -280,6 +347,7 @@ func (t *Team) Pause() error {
 		return fmt.Errorf("cannot pause team in state %s", t.State)
 	}
 	t.State = TeamStatePaused
+	t.recordStateLocked()
 	t.logger.Info("team paused", "team", t.Name)
 	return nil
 }
@@ -335,6 +403,7 @@ func (t *Team) Stop(timeout time.Duration) error {
 	t.mu.Lock()
 	t.State = TeamStateStopped
 	t.runners = make(map[string]*TeammateRunner)
+	t.recordStateLocked()
 	t.mu.Unlock()
 
 	t.logger.Info("team stopped", "team", t.Name)
@@ -389,6 +458,7 @@ func (t *Team) AddTeammate(cfg TeammateConfig) (*MemberInfo, error) {
 		Metadata:         cfg.Metadata,
 	}
 	t.Members = append(t.Members, info)
+	t.record(journalEvent{Kind: "member", Member: &info})
 
 	t.logger.Info("teammate added", "agent_id", agentID, "name", uniqueName, "team", t.Name)
 	return &info, nil
@@ -427,6 +497,7 @@ func (t *Team) RemoveTeammate(name string) error {
 	}
 
 	t.router.Unregister(name)
+	t.record(journalEvent{Kind: "member_removed", Agent: name})
 	t.logger.Info("teammate removed", "name", name, "team", t.Name)
 	return nil
 }
@@ -477,6 +548,8 @@ func (t *Team) StartTeammate(name string, executor TeammateExecutor) error {
 		TokenBudget: t.Config.DefaultTokenBudget,
 		TurnTimeout: t.Config.DefaultTimeout,
 		Logger:      t.logger,
+		Journal:     t.journal,
+		RunID:       t.runID,
 	}
 
 	runner := NewTeammateRunner(t.ctx, runnerCfg)
@@ -530,6 +603,9 @@ func (t *Team) PermissionBridgeRef() *PermissionBridge {
 func (t *Team) Context() context.Context {
 	return t.ctx
 }
+
+// RunID identifies this process-local incarnation in the durable journal.
+func (t *Team) RunID() string { return t.runID }
 
 // Summary returns a read-only snapshot of the team.
 func (t *Team) Summary() TeamSummary {
@@ -593,6 +669,26 @@ func (t *Team) SetMemberIdle(name string, idle bool) {
 			break
 		}
 	}
+}
+
+func (t *Team) record(event journalEvent) {
+	if t.journal == nil {
+		return
+	}
+	event.Team, event.RunID = t.Name, t.runID
+	if err := t.journal.append(event); err != nil {
+		t.logger.Warn("team journal write failed", "team", t.Name, "kind", event.Kind, "error", err)
+	}
+}
+
+// recordStateLocked is called only while holding t.mu.
+func (t *Team) recordStateLocked() {
+	if t.journal == nil {
+		return
+	}
+	summary := TeamSummary{Name: t.Name, Description: t.Description, State: t.State.String(),
+		MemberCount: len(t.Members), CreatedAt: t.CreatedAt, LeaderID: t.LeaderID}
+	t.record(journalEvent{Kind: "state", Summary: &summary})
 }
 
 // generateUniqueName returns a unique teammate name by appending a

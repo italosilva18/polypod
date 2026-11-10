@@ -16,13 +16,13 @@ import (
 )
 
 // registerSwarmTools connects team operations to the live swarm manager and
-// the same full agent executor used by agent_run. Teams are process-local;
-// durable background work remains in task_create and the task queue.
+// the same full agent executor used by agent_run. Worker goroutines are
+// process-local; the team journal retains coordination evidence after restart.
 func registerSwarmTools(reg *tool.Registry, manager *swarm.SwarmManager, agents *agent.Registry, executor *subagent.SubAgentExecutor) {
 	reg.RegisterDef(types.ToolDef{
 		NameFn: func() string { return "team_create" },
 		DescriptionFn: func() string {
-			return "Criar e iniciar uma equipe local de agentes. A equipe existe enquanto este processo estiver ativo."
+			return "Criar e iniciar uma equipe local de agentes; com data_dir configurado, histórico e resultados ficam no diário persistente."
 		},
 		InputSchemaFn: func() map[string]any {
 			return swarmSchema(map[string]any{
@@ -164,14 +164,7 @@ func registerSwarmTools(reg *tool.Registry, manager *swarm.SwarmManager, agents 
 			if _, isWorker := swarm.TeammateIdentityFromContext(tc.Context); isWorker {
 				return swarmError("a caixa do líder é consultada pela sessão principal"), nil
 			}
-			team, err := swarmTeam(manager, swarmArg(args, "team"))
-			if err != nil {
-				return swarmError(err.Error()), nil
-			}
-			mailbox := team.Router().GetMailbox(swarm.TeamLeaderName)
-			if mailbox == nil {
-				return swarmError("caixa do líder indisponível"), nil
-			}
+			name := swarmArg(args, "team")
 			limit := 50
 			if raw, specified := args["limit"]; specified {
 				number, ok := raw.(float64)
@@ -180,7 +173,21 @@ func registerSwarmTools(reg *tool.Registry, manager *swarm.SwarmManager, agents 
 				}
 				limit = int(number)
 			}
-			return swarmJSON(mailbox.Snapshot(limit)), nil
+			if team, ok := manager.GetTeam(name); ok {
+				mailbox := team.Router().GetMailbox(swarm.TeamLeaderName)
+				if mailbox == nil {
+					return swarmError("caixa do líder indisponível"), nil
+				}
+				return swarmJSON(mailbox.Snapshot(limit)), nil
+			}
+			archive, err := recordedTeam(manager, name)
+			if err != nil {
+				return swarmError(err.Error()), nil
+			}
+			if len(archive.Pending) > limit {
+				archive.Pending = archive.Pending[:limit]
+			}
+			return swarmJSON(archive.Pending), nil
 		},
 	})
 
@@ -199,14 +206,7 @@ func registerSwarmTools(reg *tool.Registry, manager *swarm.SwarmManager, agents 
 			if _, isWorker := swarm.TeammateIdentityFromContext(tc.Context); isWorker {
 				return swarmError("a caixa do líder é confirmada pela sessão principal"), nil
 			}
-			team, err := swarmTeam(manager, swarmArg(args, "team"))
-			if err != nil {
-				return swarmError(err.Error()), nil
-			}
-			mailbox := team.Router().GetMailbox(swarm.TeamLeaderName)
-			if mailbox == nil {
-				return swarmError("caixa do líder indisponível"), nil
-			}
+			name := swarmArg(args, "team")
 			raw, ok := args["ids"].([]any)
 			if !ok || len(raw) == 0 || len(raw) > 1024 {
 				return swarmError("ids precisa ser uma lista de 1 a 1024 mensagens"), nil
@@ -219,7 +219,28 @@ func registerSwarmTools(reg *tool.Registry, manager *swarm.SwarmManager, agents 
 				}
 				ids = append(ids, id)
 			}
-			return swarmJSON(map[string]any{"acknowledged": mailbox.Acknowledge(ids), "pending": mailbox.Pending()}), nil
+			if team, ok := manager.GetTeam(name); ok {
+				mailbox := team.Router().GetMailbox(swarm.TeamLeaderName)
+				if mailbox == nil {
+					return swarmError("caixa do líder indisponível"), nil
+				}
+				matched := mailbox.AcknowledgeMatched(ids)
+				if journal := manager.Journal(); journal != nil && len(matched) > 0 {
+					if err := journal.AcknowledgeLive(team, matched); err != nil {
+						return swarmError("mensagens confirmadas localmente, mas falhou o registro persistente: " + err.Error()), nil
+					}
+				}
+				return swarmJSON(map[string]any{"acknowledged": len(matched), "pending": mailbox.Pending()}), nil
+			}
+			journal := manager.Journal()
+			if journal == nil {
+				return swarmError("equipe " + name + " não encontrada"), nil
+			}
+			acknowledged, pending, err := journal.Acknowledge(name, ids)
+			if err != nil {
+				return swarmError(err.Error()), nil
+			}
+			return swarmJSON(map[string]any{"acknowledged": acknowledged, "pending": pending}), nil
 		},
 	})
 
@@ -234,17 +255,26 @@ func registerSwarmTools(reg *tool.Registry, manager *swarm.SwarmManager, agents 
 		ExecuteFn: func(_ types.ToolContext, args map[string]any) (types.ToolResult, error) {
 			name := swarmArg(args, "team")
 			if name == "" {
-				return swarmJSON(manager.ListTeams()), nil
+				items, err := manager.ListRecordedTeams()
+				if err != nil {
+					return swarmError(err.Error()), nil
+				}
+				return swarmJSON(items), nil
 			}
-			team, err := swarmTeam(manager, name)
+			if team, ok := manager.GetTeam(name); ok {
+				pending := 0
+				if mailbox := team.Router().GetMailbox(swarm.TeamLeaderName); mailbox != nil {
+					pending = mailbox.Pending()
+				}
+				return swarmJSON(map[string]any{"team": team.Summary(), "members": team.ListMembers(), "leader_pending": pending}), nil
+			}
+			archive, err := recordedTeam(manager, name)
 			if err != nil {
 				return swarmError(err.Error()), nil
 			}
-			pending := 0
-			if mailbox := team.Router().GetMailbox(swarm.TeamLeaderName); mailbox != nil {
-				pending = mailbox.Pending()
-			}
-			return swarmJSON(map[string]any{"team": team.Summary(), "members": team.ListMembers(), "leader_pending": pending}), nil
+			return swarmJSON(map[string]any{"team": archive.Summary, "members": archive.Members,
+				"leader_pending": len(archive.Pending), "recorded": true,
+				"owner_live": archive.OwnerLive}), nil
 		},
 	})
 
@@ -262,30 +292,37 @@ func registerSwarmTools(reg *tool.Registry, manager *swarm.SwarmManager, agents 
 		IsReadOnlyFn:    func(map[string]any) bool { return true },
 		IsConcurrencyFn: func(map[string]any) bool { return true },
 		ExecuteFn: func(_ types.ToolContext, args map[string]any) (types.ToolResult, error) {
-			team, err := swarmTeam(manager, swarmArg(args, "team"))
+			name, agentName := swarmArg(args, "team"), swarmArg(args, "name")
+			if team, ok := manager.GetTeam(name); ok {
+				if outputs, running := team.TeammateOutputs(agentName); running {
+					type result struct {
+						Turn     int       `json:"turn"`
+						Response string    `json:"response,omitempty"`
+						Error    string    `json:"error,omitempty"`
+						Started  time.Time `json:"started_at"`
+						Finished time.Time `json:"finished_at"`
+					}
+					items := make([]result, 0, len(outputs))
+					for _, output := range outputs {
+						item := result{Turn: output.TurnIndex, Response: output.Response, Started: output.StartTime, Finished: output.EndTime}
+						if output.Error != nil {
+							item.Error = output.Error.Error()
+						}
+						items = append(items, item)
+					}
+					return swarmJSON(items), nil
+				}
+				archive, err := recordedTeam(manager, name)
+				if err != nil || archive.RunID != team.RunID() {
+					return swarmError("integrante sem executor ativo"), nil
+				}
+				return swarmJSON(archive.Results[agentName]), nil
+			}
+			archive, err := recordedTeam(manager, name)
 			if err != nil {
 				return swarmError(err.Error()), nil
 			}
-			outputs, ok := team.TeammateOutputs(swarmArg(args, "name"))
-			if !ok {
-				return swarmError("integrante sem executor ativo"), nil
-			}
-			type result struct {
-				Turn     int       `json:"turn"`
-				Response string    `json:"response,omitempty"`
-				Error    string    `json:"error,omitempty"`
-				Started  time.Time `json:"started_at"`
-				Finished time.Time `json:"finished_at"`
-			}
-			items := make([]result, 0, len(outputs))
-			for _, output := range outputs {
-				item := result{Turn: output.TurnIndex, Response: output.Response, Started: output.StartTime, Finished: output.EndTime}
-				if output.Error != nil {
-					item.Error = output.Error.Error()
-				}
-				items = append(items, item)
-			}
-			return swarmJSON(items), nil
+			return swarmJSON(archive.Results[agentName]), nil
 		},
 	})
 
@@ -338,6 +375,24 @@ func swarmTeam(manager *swarm.SwarmManager, name string) (*swarm.Team, error) {
 		return nil, fmt.Errorf("equipe %s não encontrada", name)
 	}
 	return team, nil
+}
+
+func recordedTeam(manager *swarm.SwarmManager, name string) (swarm.ArchivedTeam, error) {
+	if name == "" {
+		return swarm.ArchivedTeam{}, fmt.Errorf("team é obrigatório")
+	}
+	journal := manager.Journal()
+	if journal == nil {
+		return swarm.ArchivedTeam{}, fmt.Errorf("equipe %s não encontrada", name)
+	}
+	archive, ok, err := journal.Team(name)
+	if err != nil {
+		return swarm.ArchivedTeam{}, err
+	}
+	if !ok {
+		return swarm.ArchivedTeam{}, fmt.Errorf("equipe %s não encontrada", name)
+	}
+	return archive, nil
 }
 
 func swarmError(message string) types.ToolResult {

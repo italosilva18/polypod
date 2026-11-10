@@ -134,6 +134,35 @@ func RegisterPluginTools(reg *Registry, manager *skill.PluginManager) {
 		},
 	})
 	reg.RegisterDef(types.ToolDef{
+		NameFn:          func() string { return "remove_local_plugin" },
+		IsDestructiveFn: func(map[string]any) bool { return true },
+		DescriptionFn: func() string {
+			return "Remove um plugin local pelo ID de list_local_plugins, descarrega suas skills e apaga o diretório publicado."
+		},
+		InputSchemaFn: func() map[string]any {
+			return map[string]any{"type": "object", "properties": map[string]any{
+				"id": map[string]any{"type": "string", "description": "ID retornado por list_local_plugins"},
+			}, "required": []string{"id"}}
+		},
+		ValidateFn: func(args map[string]any) types.ValidationResult {
+			if id, ok := args["id"].(string); !ok || strings.TrimSpace(id) == "" {
+				return types.ValidationResult{Message: "id do plugin é obrigatório"}
+			}
+			return types.ValidationResult{Valid: true}
+		},
+		ExecuteFn: func(tc types.ToolContext, args map[string]any) (types.ToolResult, error) {
+			if manager == nil {
+				return pluginToolError("Gerenciador de plugins indisponível"), nil
+			}
+			id, _ := args["id"].(string)
+			info, err := manager.Uninstall(pluginToolContext(tc), id)
+			if err != nil {
+				return pluginToolError(fmt.Sprintf("Remoção do plugin falhou: %v", err)), nil
+			}
+			return pluginToolJSON(map[string]any{"removed": true, "plugin": info}), nil
+		},
+	})
+	reg.RegisterDef(types.ToolDef{
 		NameFn: func() string { return "reload_local_plugins" },
 		DescriptionFn: func() string {
 			return "Recarrega um plugin local pelo ID ou reconcilia todos, incluindo plugins adicionados e removidos."

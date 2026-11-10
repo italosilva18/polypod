@@ -273,6 +273,7 @@ func (a *Adapter) Start(ctx context.Context, handler adapter.MessageHandler) err
 
 	m := newModel(runCtx, sh, deps, a.dataDir, a.userPromptHandler, a.approvalHandler, a.fileIndex)
 	m.taskQueue = a.taskQueue
+	m.taskRegistry = a.taskRegistry
 	if a.taskRegistry != nil {
 		taskCtx, cancelTasks := context.WithCancel(runCtx)
 		defer cancelTasks()

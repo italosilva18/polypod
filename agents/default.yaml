@@ -56,6 +56,22 @@ persona: |
       estiver indisponivel.
 skills:
   - agent_run
+  - team_create
+  - team_spawn
+  - team_send
+  - team_inbox
+  - team_ack
+  - team_status
+  - team_results
+  - team_stop
+  - plan_create
+  - plan_update
+  - plan_get
+  - plan_list
+  - plan_claim
+  - plan_run
+  - plan_retry
+  - task_update
   - read_file
   - write_file
   - edit_file
@@ -66,11 +82,27 @@ skills:
   - task_queue
   - find_skills
   - install_skill
+  - list_local_plugins
+  - install_local_plugin
+  - update_local_plugin
+  - remove_local_plugin
+  - set_local_plugin_enabled
+  - reload_local_plugins
   - skill_evolution
   - read_file_dir
   - bash
+  - bash_output
+  - bash_pty_start
+  - bash_pty_write
+  - bash_pty_read
+  - bash_pty_resize
+  - bash_pty_close
   - glob
   - grep
+  - multi_edit
+  - tool_output
+  - worktree_enter
+  - worktree_exit
   - save_memory
   - review_memories
   - recall_memory
@@ -118,6 +150,11 @@ skills:
   - polyclaw_skill_creator
   - polyclaw_summarize
   - grok_delegate
+  - mcp_auth
+  - list_mcp_resources
+  - list_mcp_resource_templates
+  - list_mcp_resource_updates
+  - read_mcp_resource
   - web_fetch
   - tor_fetch
   - web_search

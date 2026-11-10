@@ -8,8 +8,9 @@ e `enabled`. As skills podem ser arquivos YAML ou Markdown com frontmatter.
 {"name":"meu-plugin","version":"1.0.0","skills":["skills/exemplo.yaml"]}
 ```
 
-O agente dispõe das ferramentas `list_local_plugins`, `install_local_plugin`,
-`update_local_plugin`, `set_local_plugin_enabled` e `reload_local_plugins`.
+O agente padrão dispõe das ferramentas `list_local_plugins`, `install_local_plugin`,
+`update_local_plugin`, `remove_local_plugin`, `set_local_plugin_enabled` e
+`reload_local_plugins`.
 Para instalar, passe `source` como caminho de uma pasta local ou URL Git HTTPS/SSH
 explícita. O manifesto deve estar na raiz da pasta ou do repositório. Para
 atualizar, passe também o `id` devolvido por `list_local_plugins`:
@@ -18,6 +19,10 @@ atualizar, passe também o `id` devolvido por `list_local_plugins`:
 {"source":"/caminho/para/meu-plugin"}
 {"id":"meu-plugin@12345678","source":"https://exemplo.org/equipe/meu-plugin.git"}
 ```
+
+`remove_local_plugin` recebe o mesmo `id`, retira o diretório do catálogo e
+descarrega as skills do processo. Uma falha ao descarregar restaura o diretório;
+uma queda após a retirada pode deixar uma cópia oculta para limpeza manual.
 
 Na instalação, `enabled` ausente vira `true`. Na atualização, a ausência do
 campo preserva o estado anterior. `false` explícito desativa o plugin. A nova

@@ -66,6 +66,12 @@ type voiceResultMsg struct {
 	err  error
 }
 
+type voicePartialMsg struct {
+	text   string
+	ok     bool
+	source <-chan string
+}
+
 type taskEventMsg struct{ event tasks.TaskEvent }
 
 type queuedInput struct {
@@ -123,13 +129,17 @@ type model struct {
 	queued                 []queuedInput
 	voiceRecording         bool
 	voiceStopping          bool
+	voicePartialText       string
+	voicePartials          <-chan string
 	voiceCancel            context.CancelFunc
 	streamRedrawPending    bool
 	streamRedrawGeneration uint64
 	lastViewportRedraw     time.Time
-	// Ctrl+B only hides the active stream. It does not migrate that turn
-	// into the durable task queue; ordinary submissions still wait for it.
+	// Ctrl+B only hides the active stream. /bg detach separately records that
+	// live turn and routes new prompts to independent durable queue sessions.
 	streamHidden     bool
+	parallelDetached bool
+	detachedTaskID   string
 	historyStart     int
 	historyExpanded  bool
 	historySessionID string
@@ -149,6 +159,7 @@ type model struct {
 	cmdDeps       commandDeps
 	ctx           context.Context
 	taskEvents    <-chan tasks.TaskEvent
+	taskRegistry  *tasks.TaskRegistry
 	taskQueue     *taskqueue.Queue
 
 	width  int
@@ -892,6 +903,11 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if handled, cmd := m.submitBackgroundCommand(raw); handled {
 				return m, cmd
 			}
+			if m.parallelDetached && !strings.HasPrefix(strings.TrimSpace(raw), "/") && !strings.HasPrefix(strings.TrimSpace(raw), "!") {
+				if handled, cmd := m.submitParallelPrompt(raw); handled {
+					return m, cmd
+				}
+			}
 			if strings.TrimSpace(raw) == "/recover" {
 				m.notification = "Aguarde o turno atual terminar para usar /recover; o comando permanece no campo."
 				m.notifyLevel = "info"
@@ -1075,6 +1091,8 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case voiceResultMsg:
 		m.voiceRecording = false
 		m.voiceStopping = false
+		m.voicePartialText = ""
+		m.voicePartials = nil
 		if m.voiceCancel != nil {
 			m.voiceCancel()
 			m.voiceCancel = nil
@@ -1094,10 +1112,20 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.resizeComposer()
 		m.notification = "Transcrição inserida. Revise e pressione Enter para enviar."
 		m.notifyLevel = "success"
+		m.updateViewport()
 		return m, clearNotifyAfter(6*time.Second, m.notification)
+
+	case voicePartialMsg:
+		if !msg.ok || !m.voiceRecording || msg.source != m.voicePartials {
+			return m, nil
+		}
+		m.voicePartialText = strings.TrimSpace(msg.text)
+		m.updateViewport()
+		return m, waitForVoicePartial(m.voicePartials)
 
 	case streamMsg:
 		if msg.err != nil {
+			m.finishDetachedTurn(tasks.StatusFailed, m.streaming.String(), msg.err.Error())
 			m.state = stateIdle
 			wasHidden := m.streamHidden
 			m.streamHidden = false
@@ -1146,11 +1174,12 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.done {
 			elapsed := time.Since(m.streamStart)
+			content := m.streaming.String()
+			m.finishDetachedTurn(tasks.StatusCompleted, content, "")
 			m.state = stateIdle
 			wasHidden := m.streamHidden
 			m.streamHidden = false
 			m.activeTurn = nil
-			content := m.streaming.String()
 			if content != "" {
 				m.messages = append(m.messages, chatEntry{
 					role:      "assistant",
@@ -1314,6 +1343,10 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case taskEventMsg:
 		state := msg.event.State
+		if state.Type == tasks.TaskTypeCLITurn {
+			// The live stream already renders this terminal result in the chat.
+			return m, waitForTaskEvent(m.ctx, m.taskEvents)
+		}
 		level := "warn"
 		verb := "interrompida"
 		switch state.Status {
@@ -1613,9 +1646,21 @@ func (m *model) renderMessages() string {
 			b.WriteString("\n\n")
 		}
 	}
+	if m.voiceRecording && m.voicePartialText != "" {
+		preview := []rune(m.voicePartialText)
+		if len(preview) > 400 {
+			preview = append([]rune("…"), preview[len(preview)-400:]...)
+		}
+		writeWrappedMessage(&b, "Prévia de voz (não enviada): "+string(preview), "  ", "  ", width, notifyInfoStyle)
+		b.WriteString("\n")
+	}
 
 	if m.state == stateStreaming && m.streamHidden {
-		b.WriteString(notifyInfoStyle.Render("  Saída do turno minimizada · Ctrl+B para visualizar · /bg <objetivo> cria outra tarefa"))
+		if m.parallelDetached {
+			b.WriteString(notifyInfoStyle.Render("  Turno destacado " + m.detachedTaskID + " em execução · Ctrl+B para visualizar · novas mensagens criam tarefas"))
+		} else {
+			b.WriteString(notifyInfoStyle.Render("  Saída do turno minimizada · Ctrl+B para visualizar · /bg detach libera novas mensagens"))
+		}
 		b.WriteString("\n")
 		return b.String()
 	}
@@ -1801,6 +1846,9 @@ func (m model) View() string {
 	var status strings.Builder
 	if m.waitingForUserAnswer {
 		status.WriteString(notifyInfoStyle.Render(" Aguardando sua resposta...  Enter para enviar"))
+	} else if m.parallelDetached {
+		elapsed := time.Since(m.streamStart)
+		status.WriteString(notifyInfoStyle.Render(fmt.Sprintf(" Turno destacado %s · %s · mensagens novas em tarefas separadas", m.detachedTaskID, formatDuration(elapsed))))
 	} else if m.streamHidden {
 		elapsed := time.Since(m.streamStart)
 		status.WriteString(notifyInfoStyle.Render(fmt.Sprintf(" Turno minimizado %s · Ctrl+B visualizar", formatDuration(elapsed))))

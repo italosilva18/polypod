@@ -158,7 +158,11 @@ func (r *TaskRegistry) EnablePersistence(path string) (retErr error) {
 			now := time.Now()
 			state.Status = StatusInterrupted
 			state.EndTime = &now
-			state.Error = "Execucao interrompida pelo reinicio do Polypod; use /task-restart para retomar com novo ID."
+			if state.Type == TaskTypeCLITurn {
+				state.Error = "Turno do CLI interrompido pelo reinicio; nao sera repetido automaticamente. Consulte a sessao e o historico de ferramentas antes de iniciar outro trabalho."
+			} else {
+				state.Error = "Execucao interrompida pelo reinicio do Polypod; use /task-restart para retomar com novo ID."
+			}
 			interrupted++
 		}
 		if _, active := r.tasks[state.ID]; !active {
@@ -232,6 +236,60 @@ func (r *TaskRegistry) CreateOutputFile(taskType TaskType, taskID string) (*os.F
 		return nil, fmt.Errorf("creating task output: %w", err)
 	}
 	return file, nil
+}
+
+// RegisterDurable publishes a running external task only after its first
+// snapshot reaches disk. A failed write leaves no task for the UI to claim as
+// backgrounded. The caller keeps executing its original turn either way.
+func (r *TaskRegistry) RegisterDurable(state *TaskState) error {
+	if state == nil || state.ID == "" || state.Status != StatusRunning {
+		return errors.New("estado de tarefa em execucao invalido")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.persistPath == "" {
+		return errors.New("persistencia de tarefas indisponivel")
+	}
+	if _, exists := r.tasks[state.ID]; exists {
+		return fmt.Errorf("tarefa %s ja registrada", state.ID)
+	}
+	copy := snapshotTaskState(state)
+	r.tasks[state.ID] = copy
+	if err := r.saveLocked(); err != nil {
+		delete(r.tasks, state.ID)
+		r.persistErr = err
+		return fmt.Errorf("persistindo tarefa %s: %w", state.ID, err)
+	}
+	r.persistErr = nil
+	return nil
+}
+
+// UpdateDurable commits a state transition before publishing its terminal
+// event. If persistence fails, the previous in-memory state remains visible
+// and recovery will conservatively mark the turn interrupted after a restart.
+func (r *TaskRegistry) UpdateDurable(id string, fn func(*TaskState)) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state, exists := r.tasks[id]
+	if !exists {
+		return fmt.Errorf("tarefa %s nao encontrada", id)
+	}
+	if r.persistPath == "" {
+		return errors.New("persistencia de tarefas indisponivel")
+	}
+	previous := snapshotTaskState(state)
+	previousStatus := state.Status
+	fn(state)
+	if err := r.saveLocked(); err != nil {
+		r.tasks[id] = previous
+		r.persistErr = err
+		return fmt.Errorf("persistindo tarefa %s: %w", id, err)
+	}
+	r.persistErr = nil
+	if state.Status.IsTerminal() && state.Status != previousStatus {
+		r.publishTerminalLocked(state)
+	}
+	return nil
 }
 
 // persistLocked is called with r.mu held after every task transition.

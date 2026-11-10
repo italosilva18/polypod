@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Polypod Browser Bridge",
+  "version": "0.1.0",
+  "description": "Conecta abas do navegador ao Polypod pela ponte local pareada.",
+  "minimum_chrome_version": "116",
+  "permissions": ["tabs", "debugger", "storage", "alarms"],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
+  "background": {"service_worker": "service-worker.js"},
+  "action": {"default_popup": "popup.html", "default_title": "Polypod Browser Bridge"}
+}

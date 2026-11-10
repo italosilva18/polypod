@@ -281,8 +281,14 @@ func (m *Mailbox) Snapshot(limit int) []*Message {
 
 // Acknowledge removes only the listed message IDs from the pending mailbox.
 func (m *Mailbox) Acknowledge(ids []string) int {
+	return len(m.AcknowledgeMatched(ids))
+}
+
+// AcknowledgeMatched returns precisely the IDs removed under the mailbox lock.
+// Callers can persist this list without accidentally acknowledging absent IDs.
+func (m *Mailbox) AcknowledgeMatched(ids []string) []string {
 	if len(ids) == 0 {
-		return 0
+		return nil
 	}
 	selected := make(map[string]struct{}, len(ids))
 	for _, id := range ids {
@@ -291,11 +297,11 @@ func (m *Mailbox) Acknowledge(ids []string) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	retained := make(messageHeap, 0, m.queue.Len())
-	removed := 0
+	var removed []string
 	for _, msg := range m.queue {
 		if _, ok := selected[msg.ID]; ok {
 			msg.Read = true
-			removed++
+			removed = append(removed, msg.ID)
 			continue
 		}
 		retained = append(retained, msg)
@@ -357,6 +363,8 @@ type MessageRouter struct {
 	boxes    map[string]*Mailbox // agentName → mailbox
 	teamName string
 	logger   *slog.Logger
+	journal  *TeamJournal
+	runID    string
 }
 
 // NewMessageRouter creates a router for a team.
@@ -415,6 +423,12 @@ func (r *MessageRouter) SendMessage(msg *Message) error {
 	if err := mb.Deliver(msg); err != nil {
 		return fmt.Errorf("deliver to %s: %w", msg.Target, err)
 	}
+	if r.journal != nil {
+		if err := r.journal.append(journalEvent{Kind: "message", Team: r.teamName,
+			RunID: r.runID, Message: msg}); err != nil {
+			r.logger.Warn("team message journal write failed", "team", r.teamName, "error", err)
+		}
+	}
 	r.logger.Debug("message routed",
 		"type", msg.Type.String(),
 		"from", msg.Sender,
@@ -445,6 +459,12 @@ func (r *MessageRouter) BroadcastMessage(msg *Message) []string {
 		msgCopy.seqNo = atomic.AddUint64(&globalSeqNo, 1)
 		if err := mb.Deliver(&msgCopy); err == nil {
 			delivered = append(delivered, names[i])
+			if r.journal != nil {
+				if err := r.journal.append(journalEvent{Kind: "message", Team: r.teamName,
+					RunID: r.runID, Message: &msgCopy}); err != nil {
+					r.logger.Warn("team broadcast journal write failed", "team", r.teamName, "error", err)
+				}
+			}
 		}
 	}
 	r.logger.Debug("broadcast",

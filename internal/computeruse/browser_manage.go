@@ -3,6 +3,7 @@ package computeruse
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -14,11 +15,11 @@ func registerBrowserManageTool(reg ToolRegistry, runtime *browserRuntime) {
 	reg.RegisterDef(types.ToolDef{
 		NameFn: func() string { return "browser_manage" },
 		DescriptionFn: func() string {
-			return "Gerencia Chrome/Chromium: status, attach, use_desktop, detach, start, stop, tabs, new_tab, switch_tab, close_tab, navigate, snapshot, text e evaluate. attach conecta a sessão já aberta com CDP local, por endpoint ou profile_dir; use_desktop observa a tela do usuário quando CDP não está disponível. detach retorna à configuração anterior. Sem conexão externa, abre perfil privado sob demanda. Avalie JavaScript apenas quando necessário e observe o efeito após ações."
+			return "Gerencia Chrome/Chromium: status, extension_pair, attach, use_desktop, detach, start, stop, tabs, new_tab, switch_tab, close_tab, navigate, snapshot, text e evaluate. extension_pair conecta uma extensão instalada no navegador pessoal sem porta CDP; attach usa CDP local. Sem conexão externa, abre perfil privado sob demanda."
 		},
 		InputSchemaFn: func() map[string]any {
 			return map[string]any{"type": "object", "properties": map[string]any{
-				"action":      map[string]any{"type": "string", "enum": []string{"status", "attach", "use_desktop", "detach", "start", "stop", "tabs", "new_tab", "switch_tab", "activate_tab", "close_tab", "navigate", "snapshot", "text", "evaluate"}},
+				"action":      map[string]any{"type": "string", "enum": []string{"status", "extension_pair", "attach", "use_desktop", "detach", "start", "stop", "tabs", "new_tab", "switch_tab", "activate_tab", "close_tab", "navigate", "snapshot", "text", "evaluate"}},
 				"endpoint":    map[string]any{"type": "string", "description": "Endpoint HTTP CDP local, por exemplo http://127.0.0.1:9222"},
 				"profile_dir": map[string]any{"type": "string", "description": "Diretório absoluto do perfil de um navegador já aberto com CDP"},
 				"tab_id":      map[string]any{"type": "string"},
@@ -53,7 +54,7 @@ func registerBrowserManageTool(reg ToolRegistry, runtime *browserRuntime) {
 func validateBrowserManage(args map[string]any) types.ValidationResult {
 	action := stringArg(args, "action", "")
 	switch action {
-	case "status", "use_desktop", "detach", "start", "stop", "tabs", "snapshot", "text":
+	case "status", "extension_pair", "use_desktop", "detach", "start", "stop", "tabs", "snapshot", "text":
 	case "attach":
 		endpoint := strings.TrimSpace(stringArg(args, "endpoint", ""))
 		profileDir := strings.TrimSpace(stringArg(args, "profile_dir", ""))
@@ -99,12 +100,18 @@ func executeBrowserManage(ctx types.ToolContext, runtime *browserRuntime, args m
 			if source == "desktop" {
 				return browserJSON(map[string]any{"mode": "desktop", "display_configured": IsDisplayAvailable()})
 			}
-			state := map[string]any{"mode": "attached", "source": source, "connected": false, "tabs": 0}
+			mode := "attached"
+			if source == "extension" {
+				mode = "extension"
+			}
+			state := map[string]any{"mode": mode, "source": source, "connected": false, "tabs": 0}
 			if err == nil {
 				var tabs []browser.Tab
 				tabs, err = client.Tabs(ctx.Context)
 				state["tabs"] = len(tabs)
-				state["endpoint"] = client.Endpoint
+				if source != "extension" {
+					state["endpoint"] = client.Endpoint
+				}
 			}
 			if err != nil {
 				state["error"] = err.Error()
@@ -114,6 +121,20 @@ func executeBrowserManage(ctx types.ToolContext, runtime *browserRuntime, args m
 			return browserJSON(state)
 		}
 		return browserJSON(runtime.managed.Status())
+	}
+	if action == "extension_pair" {
+		pairURL, connected, err := runtime.pairExtension()
+		if err != nil {
+			return browserError(err)
+		}
+		state := map[string]any{"mode": "extension", "connected": connected, "pair_url": pairURL}
+		if wd, err := os.Getwd(); err == nil {
+			path := filepath.Join(wd, "browser-extension")
+			if _, err := os.Stat(filepath.Join(path, "manifest.json")); err == nil {
+				state["extension_dir"] = path
+			}
+		}
+		return browserJSON(state)
 	}
 	if action == "use_desktop" {
 		if !IsDisplayAvailable() {

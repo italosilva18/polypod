@@ -26,6 +26,9 @@ const (
 	TaskTypeWorkflow TaskType = "local_workflow"
 	TaskTypeMonitor  TaskType = "monitor_mcp"
 	TaskTypeDream    TaskType = "dream"
+	// TaskTypeCLITurn observes a detached live CLI turn. It is never restarted
+	// from its prompt because the live model/tool transcript is not replayable.
+	TaskTypeCLITurn TaskType = "cli_turn"
 )
 
 // ---------------------------------------------------------------------------
@@ -72,6 +75,7 @@ var DefaultTaskConfigs = map[TaskType]TaskConfig{
 	TaskTypeWorkflow: {MaxConcurrent: 5, DefaultTimeout: 0, CanBackground: true},
 	TaskTypeMonitor:  {MaxConcurrent: 10, DefaultTimeout: 0, CanBackground: true},
 	TaskTypeDream:    {MaxConcurrent: 1, DefaultTimeout: 10 * time.Minute, CanBackground: true},
+	TaskTypeCLITurn:  {MaxConcurrent: 1, DefaultTimeout: 0, CanBackground: true},
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +91,7 @@ var taskIDPrefixes = map[TaskType]string{
 	TaskTypeWorkflow: "w",
 	TaskTypeMonitor:  "m",
 	TaskTypeDream:    "d",
+	TaskTypeCLITurn:  "c",
 }
 
 const taskIDAlphabet = "0123456789abcdefghijklmnopqrstuvwxyz"

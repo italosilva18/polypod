@@ -105,6 +105,8 @@ type browserRuntime struct {
 	configuredEndpoint string
 	attachedEndpoint   string
 	attachedProfileDir string
+	extension          *browser.ExtensionBridge
+	extensionSelected  bool
 	desktopSelected    bool
 	managed            *browser.ManagedBrowser
 }
@@ -137,7 +139,14 @@ func (r *browserRuntime) client(ctx context.Context) (browser.CDP, error) {
 func (r *browserRuntime) external(ctx context.Context) (browser.CDP, string, bool, error) {
 	r.mu.RLock()
 	profileDir, endpoint, configured, desktop := r.attachedProfileDir, r.attachedEndpoint, r.configuredEndpoint, r.desktopSelected
+	extension, extensionSelected := r.extension, r.extensionSelected
 	r.mu.RUnlock()
+	if extensionSelected {
+		if extension == nil || !extension.Connected() {
+			return browser.CDP{}, "extension", true, fmt.Errorf("extensão ainda não conectada; abra o popup e informe a URL de pareamento")
+		}
+		return browser.CDP{Endpoint: extension.Endpoint()}, "extension", true, ctx.Err()
+	}
 	if desktop {
 		return browser.CDP{}, "desktop", true, fmt.Errorf("modo desktop ativo; use captura e entrada de tela para operar o navegador aberto")
 	}
@@ -173,6 +182,8 @@ func (r *browserRuntime) attach(ctx context.Context, endpoint, profileDir string
 		return browser.CDP{}, nil, err
 	}
 	r.mu.Lock()
+	oldExtension := r.extension
+	r.extension, r.extensionSelected = nil, false
 	r.attachedEndpoint, r.attachedProfileDir = "", ""
 	r.desktopSelected = false
 	if profileDir != "" {
@@ -181,21 +192,50 @@ func (r *browserRuntime) attach(ctx context.Context, endpoint, profileDir string
 		r.attachedEndpoint = client.Endpoint
 	}
 	r.mu.Unlock()
+	if oldExtension != nil {
+		_ = oldExtension.Close()
+	}
 	return client, tabs, nil
 }
 
 func (r *browserRuntime) detach() {
 	r.mu.Lock()
+	oldExtension := r.extension
+	r.extension, r.extensionSelected = nil, false
 	r.attachedEndpoint, r.attachedProfileDir = "", ""
 	r.desktopSelected = false
 	r.mu.Unlock()
+	if oldExtension != nil {
+		_ = oldExtension.Close()
+	}
 }
 
 func (r *browserRuntime) useDesktop() {
 	r.mu.Lock()
+	oldExtension := r.extension
+	r.extension, r.extensionSelected = nil, false
 	r.attachedEndpoint, r.attachedProfileDir = "", ""
 	r.desktopSelected = true
 	r.mu.Unlock()
+	if oldExtension != nil {
+		_ = oldExtension.Close()
+	}
+}
+
+func (r *browserRuntime) pairExtension() (string, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.extension == nil {
+		bridge, err := browser.NewExtensionBridge()
+		if err != nil {
+			return "", false, err
+		}
+		r.extension = bridge
+	}
+	r.extensionSelected = true
+	r.attachedEndpoint, r.attachedProfileDir = "", ""
+	r.desktopSelected = false
+	return r.extension.PairURL(), r.extension.Connected(), nil
 }
 
 func browserActionResult(result *browser.ActionResult) types.ToolResult {

@@ -51,6 +51,8 @@ type RunnerConfig struct {
 	TokenBudget int           // 0 = unlimited
 	TurnTimeout time.Duration // per-turn timeout; 0 = 5 minutes
 	Logger      *slog.Logger
+	Journal     *TeamJournal
+	RunID       string
 }
 
 // RunnerState tracks the teammate runner's lifecycle.
@@ -272,6 +274,7 @@ func (r *TeammateRunner) executeTurn(prompt string) {
 	defer workCancel()
 
 	start := time.Now()
+	r.recordTurn(journalEvent{Kind: "turn_started", Prompt: prompt, Turn: turn})
 
 	r.logger.Debug("teammate turn starting",
 		"agent_name", r.cfg.Identity.AgentName,
@@ -296,6 +299,11 @@ func (r *TeammateRunner) executeTurn(prompt string) {
 		r.outputs = append([]TeammateOutput(nil), r.outputs[len(r.outputs)-100:]...)
 	}
 	r.outputsMu.Unlock()
+	finished := journalEvent{Kind: "turn_finished", Turn: turn, Result: response}
+	if err != nil {
+		finished.Error = err.Error()
+	}
+	r.recordTurn(finished)
 
 	if err != nil {
 		if r.ctx.Err() != nil {
@@ -330,6 +338,19 @@ func (r *TeammateRunner) executeTurn(prompt string) {
 			"used", r.TokensUsed(),
 		)
 		r.Stop()
+	}
+}
+
+func (r *TeammateRunner) recordTurn(event journalEvent) {
+	if r.cfg.Journal == nil {
+		return
+	}
+	event.Team = r.cfg.Identity.TeamName
+	event.RunID = r.cfg.RunID
+	event.Agent = r.cfg.Identity.AgentName
+	if err := r.cfg.Journal.append(event); err != nil {
+		r.logger.Warn("team turn journal write failed", "team", event.Team,
+			"agent", event.Agent, "kind", event.Kind, "error", err)
 	}
 }
 

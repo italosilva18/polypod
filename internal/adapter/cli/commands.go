@@ -312,6 +312,7 @@ func helpText() string {
 		{"/voice [segundos|stop]", "grava ate Ctrl+G ou /voice stop; segundos sao opcionais"},
 		{"Ctrl+G", "inicia ou para a gravacao de voz"},
 		{"/bg <objetivo>", "cria tarefa durável separada; list/status/retry/cancel para acompanhar"},
+		{"/bg detach", "destaca o turno ativo; mensagens novas viram tarefas separadas"},
 		{"/run <cmd>  ou  !<cmd>", "executa comando shell inline"},
 		{"/file <path>", "mostra conteudo de arquivo"},
 		{"/search <pattern>", "busca texto no projeto (grep)"},
@@ -1065,7 +1066,7 @@ type rewindOutcome struct {
 // commandDeps holds function callbacks for slash commands.
 type commandDeps struct {
 	workingDir   func() string
-	captureVoice func(context.Context, context.Context, time.Duration) (string, error)
+	captureVoice func(context.Context, context.Context, time.Duration, func(string)) (string, error)
 	// bindBranches connects /branch to persisted transcripts and the active
 	// conversation. The CLI state binds lazily on the first /branch command.
 	bindBranches     func(*cliSessionState) error

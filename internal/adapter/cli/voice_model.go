@@ -29,6 +29,9 @@ func (m *model) beginVoiceCapture(duration time.Duration, announce bool) (model,
 	m.voiceCancel = cancel
 	m.voiceRecording = true
 	m.voiceStopping = false
+	m.voicePartialText = ""
+	partials := make(chan string, 1)
+	m.voicePartials = partials
 	if announce {
 		message := "Gravando. Pressione Ctrl+G novamente ou digite /voice stop para transcrever."
 		if duration > 0 {
@@ -38,9 +41,34 @@ func (m *model) beginVoiceCapture(duration time.Duration, announce bool) (model,
 	}
 	m.updateViewport()
 	capture := m.cmdDeps.captureVoice
-	return *m, func() tea.Msg {
-		text, err := capture(recordCtx, parent, duration)
+	final := func() tea.Msg {
+		defer close(partials)
+		text, err := capture(recordCtx, parent, duration, func(text string) {
+			select {
+			case partials <- text:
+			default:
+				select {
+				case <-partials:
+				default:
+				}
+				select {
+				case partials <- text:
+				default:
+				}
+			}
+		})
 		return voiceResultMsg{text: text, err: err}
+	}
+	return *m, tea.Batch(final, waitForVoicePartial(partials))
+}
+
+func waitForVoicePartial(partials <-chan string) tea.Cmd {
+	if partials == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		text, ok := <-partials
+		return voicePartialMsg{text: text, ok: ok, source: partials}
 	}
 }
 

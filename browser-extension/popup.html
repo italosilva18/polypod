@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Polypod Browser Bridge</title>
+  <style>
+    body { width: 320px; margin: 0; padding: 18px; font: 14px system-ui, sans-serif; color: #e9eff5; background: #14212b; }
+    h1 { font-size: 16px; margin: 0 0 8px; }
+    p { margin: 0 0 14px; color: #a8bbc8; line-height: 1.4; }
+    label { display: block; margin-bottom: 5px; font-weight: 600; }
+    input { box-sizing: border-box; width: 100%; padding: 9px; border: 1px solid #577183; border-radius: 5px; background: #0c171f; color: #fff; }
+    .row { display: flex; gap: 8px; margin-top: 12px; }
+    button { flex: 1; padding: 9px; border: 0; border-radius: 5px; background: #39c6a0; color: #082018; font-weight: 700; cursor: pointer; }
+    button.secondary { background: #3c5261; color: #fff; }
+    #status { margin-top: 13px; min-height: 18px; }
+  </style>
+</head>
+<body>
+  <h1>Polypod Browser Bridge</h1>
+  <p>Cole a URL fornecida por <code>browser_manage extension_pair</code> para conectar este navegador.</p>
+  <label for="pairURL">URL de pareamento</label>
+  <input id="pairURL" type="password" autocomplete="off" spellcheck="false" placeholder="ws://127.0.0.1:...">
+  <div class="row">
+    <button id="connect" type="button">Conectar</button>
+    <button id="disconnect" class="secondary" type="button">Desconectar</button>
+  </div>
+  <div id="status" role="status" aria-live="polite"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

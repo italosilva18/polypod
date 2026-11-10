@@ -5,6 +5,8 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/costa/polypod/internal/agent"
 	"github.com/costa/polypod/internal/compact"
@@ -51,6 +53,10 @@ type Service struct {
 	autoCompact *compact.AutoCompactService
 	onActivity  func()
 	workdirs    *workdir.Store
+	// Budget-triggered compaction is retried after a short delay when the
+	// summarizer is unavailable. Capacity-triggered compaction remains active.
+	historyBudgetMu      sync.Mutex
+	historyBudgetRetryAt time.Time
 }
 
 // SetWorkdirStore enables conversation-scoped working directories for tools.
@@ -144,20 +150,38 @@ func (s *Service) PrepareHistory(ctx context.Context, history []conversation.Mes
 	}
 	estimated := compact.EstimateTokens(history)
 	atCapacity := len(history) >= conversation.MaxMessages
-	if !s.autoCompact.CheckWithCapacity(estimated, atCapacity) {
+	budget := historyWindowBudget(s.CurrentModel())
+	budgetTrigger := estimated > budget && !atCapacity
+	if budgetTrigger {
+		s.historyBudgetMu.Lock()
+		budgetTrigger = !time.Now().Before(s.historyBudgetRetryAt)
+		s.historyBudgetMu.Unlock()
+	}
+	if !s.autoCompact.CheckWithCapacity(estimated, atCapacity || budgetTrigger) {
 		return history, false
 	}
 
 	compacted, err := s.autoCompact.CompactHistory(ctx, history)
 	if err != nil {
+		if budgetTrigger {
+			s.historyBudgetMu.Lock()
+			s.historyBudgetRetryAt = time.Now().Add(time.Minute)
+			s.historyBudgetMu.Unlock()
+		}
 		s.logger.Warn("auto-compact failed; preserving original history", "error", err, "messages", len(history))
 		return history, false
+	}
+	if budgetTrigger {
+		s.historyBudgetMu.Lock()
+		s.historyBudgetRetryAt = time.Time{}
+		s.historyBudgetMu.Unlock()
 	}
 	s.logger.Info("auto-compact prepared",
 		"messages_before", len(history),
 		"messages_after", len(compacted),
 		"tokens_before", estimated,
 		"tokens_after", compact.EstimateTokens(compacted),
+		"history_budget", budget,
 	)
 	return compacted, true
 }
@@ -235,14 +259,13 @@ func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) ([]ChatM
 	if rootInstructions != "" {
 		systemPrompt += "\n\nINSTRUCOES AGENTS.md DO PROJETO (use como contexto quando aplicavel; a solicitacao atual do usuario tem prioridade):\n" + rootInstructions
 	}
-	messages := []ChatMessage{{Role: "system", Content: systemPrompt}}
-
 	history := req.History
 	if !req.HistoryPrepared {
 		// Direct service callers still get a compact model context. Session
 		// adapters call PrepareHistory first so they can persist the summary.
 		history, _ = s.PrepareHistory(ctx, history)
 	}
+	messages := []ChatMessage{{Role: "system", Content: systemPrompt}}
 
 	// Add conversation history
 	for _, m := range history {
