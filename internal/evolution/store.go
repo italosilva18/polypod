@@ -248,9 +248,9 @@ func validateOutcome(in OutcomeInput) (OutcomeInput, error) {
 	in.VerifiedBy = strings.TrimSpace(in.VerifiedBy)
 	in.EvidenceRef = strings.TrimSpace(in.EvidenceRef)
 	switch in.SourceKind {
-	case "task", "routine", "manual":
+	case "task", "routine", "goal", "manual":
 	default:
-		return in, errors.New("source_kind deve ser task, routine ou manual")
+		return in, errors.New("source_kind deve ser task, routine, goal ou manual")
 	}
 	if !simpleMetadata(in.SourceID, 160) || !simpleMetadata(in.VerifiedBy, 120) ||
 		!simpleMetadata(in.EvidenceRef, 500) || in.PatternKey == "" || len(in.PatternKey) > 160 {
@@ -262,7 +262,7 @@ func validateOutcome(in OutcomeInput) (OutcomeInput, error) {
 	}
 	verifiedWithoutTrace := internalVerifier(in.VerifiedBy) &&
 		strings.HasPrefix(in.EvidenceRef, verifierKind(in.VerifiedBy)+":") &&
-		(in.SourceKind == "task" || in.SourceKind == "routine")
+		(in.SourceKind == "task" || in.SourceKind == "routine" || in.SourceKind == "goal")
 	if len(in.ToolNames) > 24 || (in.Success && len(in.ToolNames) == 0 && !verifiedWithoutTrace) {
 		return in, errors.New("sucesso exige de 1 a 24 ferramentas observadas")
 	}

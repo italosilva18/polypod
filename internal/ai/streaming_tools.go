@@ -260,7 +260,8 @@ func (m *StreamingToolManager) executeSerial(ctx context.Context, calls []ToolCa
 // executeSingle runs a single tool call. When an OrchestratorExecutor is
 // configured, the call is routed through the full orchestration pipeline
 // (plan simulation → permission enforcer → PreToolUse hooks → tool execute
-// → PostToolUse hooks → memory auto-extraction). Otherwise it falls back
+// → PostToolUse hooks). Conversation-backed memory extraction runs separately.
+// Otherwise it falls back
 // to direct registry execution, which performs only validation and the
 // per-tool CheckPermissions hook.
 func (m *StreamingToolManager) executeSingle(ctx context.Context, call ToolCallInfo) ToolCallResult {

@@ -113,7 +113,7 @@ func New(cfg Config) *Orchestrator {
 // 4. Fire PreToolUse hooks
 // 5. Execute
 // 6. Fire PostToolUse hooks
-// 7. Auto-extract memories
+// 7. Return the tool result; conversation-backed extraction runs separately
 func (o *Orchestrator) ExecuteTool(ctx context.Context, toolName string, args map[string]any) (types.ToolResult, error) {
 	o.mu.RLock()
 	tCtx := o.toolContext(ctx)
@@ -125,7 +125,6 @@ func (o *Orchestrator) ExecuteTool(ctx context.Context, toolName string, args ma
 	hookManager := o.hooks
 	auditStore := o.audit
 	logger := o.logger
-	memoryStore := o.memory
 	sessionID := o.sessionID.String()
 	agentName := o.agentName
 	o.mu.RUnlock()
@@ -252,10 +251,9 @@ func (o *Orchestrator) ExecuteTool(ctx context.Context, toolName string, args ma
 		})
 	}
 
-	// 9. Auto-extract memories from tool results
-	if memoryStore != nil && !result.IsError {
-		o.autoExtractMemory(toolName, args, result)
-	}
+	// Conversation-backed Dream extraction owns learned facts. Raw file-write
+	// arguments are not evidence of a user's durable preference and may contain
+	// private project data from a different conversation.
 	return result, nil
 }
 
@@ -323,18 +321,6 @@ func (o *Orchestrator) toolContext(ctx context.Context) types.ToolContext {
 		SessionID:  o.sessionID,
 		AgentID:    o.agents.AgentID(o.agentName),
 		WorkingDir: workdir.Dir(ctx, "."),
-	}
-}
-
-// autoExtractMemory extracts memories from tool interactions.
-func (o *Orchestrator) autoExtractMemory(toolName string, args map[string]any, result types.ToolResult) {
-	// Extract decisions from write/edit operations
-	if toolName == "write_file" || toolName == "edit_file" {
-		if content, ok := args["content"].(string); ok {
-			if mem := memory.ExtractDecision(content); mem != nil {
-				o.memory.SaveWithMeta(context.Background(), *mem)
-			}
-		}
 	}
 }
 

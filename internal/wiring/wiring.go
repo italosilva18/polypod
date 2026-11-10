@@ -15,6 +15,7 @@ import (
 	"github.com/costa/polypod/internal/command"
 	"github.com/costa/polypod/internal/commands"
 	"github.com/costa/polypod/internal/contextwindow"
+	"github.com/costa/polypod/internal/conversation"
 	"github.com/costa/polypod/internal/hooks"
 	"github.com/costa/polypod/internal/memory"
 	"github.com/costa/polypod/internal/modes"
@@ -40,6 +41,8 @@ type Config struct {
 
 	// Optional overrides — if nil, defaults are created.
 	MemoryStore memory.Store
+	// ConversationStore supplies the immutable journal for scoped history tools.
+	ConversationStore *conversation.Store
 }
 
 // Systems holds all wired subsystems so main.go can use them.
@@ -91,6 +94,7 @@ func WireAll(cfg Config) *Systems {
 		workingDir = "."
 	}
 	tool.RegisterBuiltinTools(toolReg, workingDir)
+	tool.RegisterHistoryRecallTools(toolReg, cfg.ConversationStore)
 
 	// 1c. Subagent runner + AgentTool
 	// The AgentTool is initially registered with a placeholder executor.
@@ -269,6 +273,7 @@ func WireAIClient(sys *Systems, aiClient *ai.Client, logger *slog.Logger) {
 		AgentReg:    sys.Agents,
 		ToolReg:     sys.ToolRegistry,
 		Executor:    sys.Orchestrator,
+		Hooks:       sys.Hooks,
 		Logger:      logger,
 		MaxTurns:    maxTurns,
 		TokenBudget: tokenBudget,

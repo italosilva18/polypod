@@ -20,6 +20,8 @@ type JournalEntry struct {
 	Sequence  uint64  `json:"sequence"`
 	SessionID string  `json:"session_id"`
 	Channel   string  `json:"channel"`
+	BranchID  string  `json:"branch_id,omitempty"`
+	AgentName string  `json:"agent_name,omitempty"`
 	Message   Message `json:"message"`
 }
 
@@ -39,6 +41,16 @@ func (s *Store) loadJournal(ctx context.Context) error {
 	if s.sqliteDB != nil {
 		if _, err := s.sqliteDB.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS conversation_journal (sequence INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, entry TEXT NOT NULL)`); err != nil {
 			return err
+		}
+		// The scope expression narrows recall without rewriting older journal
+		// rows or changing their immutable JSON evidence.
+		if _, err := s.sqliteDB.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS conversation_journal_scope_idx ON conversation_journal(json_extract(entry, '$.session_id'), sequence DESC)`); err != nil {
+			return fmt.Errorf("indexing conversation journal scope: %w", err)
+		}
+		if _, err := s.sqliteDB.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS conversation_journal_forks (
+			child_branch TEXT PRIMARY KEY, parent_branch TEXT NOT NULL, session_id TEXT NOT NULL,
+			channel TEXT NOT NULL, fork_sequence INTEGER NOT NULL)`); err != nil {
+			return fmt.Errorf("opening conversation journal forks: %w", err)
 		}
 		if err := s.validateSQLiteFirstSequence(ctx); err != nil {
 			return err
@@ -72,6 +84,9 @@ func (s *Store) loadJournal(ctx context.Context) error {
 	s.journalEntries = memory
 	s.journalIDs = ids
 	s.journalLast = last
+	if err := s.loadJournalForksFile(); err != nil {
+		return err
+	}
 	s.journalLoaded = true
 	return nil
 }
@@ -159,6 +174,10 @@ func (s *Store) appendJournal(ctx context.Context, sess *Session) error {
 }
 
 func (s *Store) journalSlice(ctx context.Context, sess *Session, msgs []Message) error {
+	scope, err := journalScopeForEntry(ctx, sess)
+	if err != nil {
+		return err
+	}
 	for i := range msgs {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -168,7 +187,7 @@ func (s *Store) journalSlice(ctx context.Context, sess *Session, msgs []Message)
 		}
 		msg := msgs[i]
 		if s.sqliteDB != nil {
-			if err := s.appendSQLiteJournalMessage(ctx, sess, msg); err != nil {
+			if err := s.appendSQLiteJournalMessage(ctx, sess, scope, msg); err != nil {
 				return err
 			}
 			continue
@@ -177,7 +196,8 @@ func (s *Store) journalSlice(ctx context.Context, sess *Session, msgs []Message)
 			continue
 		}
 		seq := s.journalLast + 1
-		e := JournalEntry{Sequence: seq, SessionID: sess.ID, Channel: sess.Channel, Message: msg}
+		e := JournalEntry{Sequence: seq, SessionID: sess.ID, Channel: sess.Channel,
+			BranchID: scope.BranchID, AgentName: scope.AgentName, Message: msg}
 		raw, err := json.Marshal(e)
 		if err != nil {
 			return err
@@ -214,7 +234,7 @@ func (s *Store) journalSlice(ctx context.Context, sess *Session, msgs []Message)
 // so another Polypod process cannot leave this store's cached sequence stale.
 // A competing insert is retried only when the primary key advanced; a row
 // with the same message ID is checked before it is treated as already saved.
-func (s *Store) appendSQLiteJournalMessage(ctx context.Context, sess *Session, msg Message) error {
+func (s *Store) appendSQLiteJournalMessage(ctx context.Context, sess *Session, scope JournalScope, msg Message) error {
 	prior, found, err := s.sqliteEntryByID(ctx, msg.ID)
 	if err != nil {
 		return err
@@ -228,7 +248,8 @@ func (s *Store) appendSQLiteJournalMessage(ctx context.Context, sess *Session, m
 			return err
 		}
 		seq := uint64(last) + 1
-		e := JournalEntry{Sequence: seq, SessionID: sess.ID, Channel: sess.Channel, Message: msg}
+		e := JournalEntry{Sequence: seq, SessionID: sess.ID, Channel: sess.Channel,
+			BranchID: scope.BranchID, AgentName: scope.AgentName, Message: msg}
 		raw, err := json.Marshal(e)
 		if err != nil {
 			return err

@@ -10,7 +10,7 @@ var (
 )
 
 type OutcomeInput struct {
-	SourceKind  string   `json:"source_kind"` // task, routine, or manual
+	SourceKind  string   `json:"source_kind"` // task, routine, goal, or manual
 	SourceID    string   `json:"source_id"`   // stable ID of the verified run
 	PatternKey  string   `json:"pattern_key"` // caller-assigned stable task category
 	Success     bool     `json:"success"`
@@ -19,8 +19,8 @@ type OutcomeInput struct {
 	ToolNames   []string `json:"tool_names"`
 }
 
-// VerificationPlanInput describes an independent state check for a queued task
-// or routine. SubjectID is stable; each completed run has its own RunID.
+// VerificationPlanInput describes an independent state check for a queued task,
+// routine, or goal. SubjectID is stable; each completed run has its own RunID.
 // ExpectedJSON is accepted only while registering a plan and is never stored.
 type VerificationPlanInput struct {
 	SourceKind     string `json:"source_kind"`

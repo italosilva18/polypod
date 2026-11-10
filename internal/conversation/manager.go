@@ -2,6 +2,7 @@ package conversation
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 )
@@ -58,6 +59,26 @@ func (m *Manager) GetHistory(sess *Session) []Message {
 // ListSessions returns all active sessions.
 func (m *Manager) ListSessions() []*Session {
 	return m.store.GetAllSessions()
+}
+
+// RegisterJournalFork freezes the parent history visible to a new CLI branch
+// at the messages actually copied into the child snapshot.
+func (m *Manager) RegisterJournalFork(ctx context.Context, parentBranch, childBranch, agentName string, sess *Session) error {
+	if sess == nil || sess.ID != "cli:local" || sess.Channel != "cli" || sess.UserID != "local" {
+		return fmt.Errorf("cannot fork an unrelated conversation")
+	}
+	ctx = WithJournalScope(ctx, "cli", "local", parentBranch, agentName)
+	if err := m.store.Save(ctx, sess); err != nil {
+		return fmt.Errorf("saving parent journal before fork: %w", err)
+	}
+	ids := make([]string, 0, len(sess.Messages))
+	for _, message := range sess.Messages {
+		if message.ID == "" {
+			return fmt.Errorf("cannot fork an unjournaled conversation message")
+		}
+		ids = append(ids, message.ID)
+	}
+	return m.store.RegisterJournalFork(ctx, "cli", "local", parentBranch, childBranch, ids)
 }
 
 // ClearSession resets all messages in a session and persists the change.

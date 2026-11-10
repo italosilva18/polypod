@@ -51,12 +51,18 @@ func (s *ManagedStore) SaveWithMeta(ctx context.Context, m Memory) error {
 		if old.Topic != m.Topic {
 			continue
 		}
+		// A model extraction must never replace a fact the user explicitly
+		// saved. Matching evidence can still be attached below without
+		// changing the user's text or source.
+		if old.Source == "user" && m.Source != "user" && old.Content != m.Content {
+			return nil
+		}
 		// Explicit forget blocks automatic re-learning, even after cursor resets.
 		// A later explicit save is the only operation which revokes suppression.
 		if hasTag(old, forgottenTag) && m.Source != "user" {
 			return nil
 		}
-		if old.Content == m.Content && old.Source == m.Source {
+		if old.Content == m.Content && (old.Source == m.Source || old.Source == "user") {
 			// Merge additional evidence without manufacturing a new content revision.
 			changed := false
 			hadVerifiedEvidence := hasTag(old, "evidence:quote_verified")
@@ -111,20 +117,28 @@ func (s *ManagedStore) Delete(ctx context.Context, topic string) error {
 		return err
 	}
 	found := false
+	var targetScope string
 	for _, m := range all {
 		if m.Topic == topic {
-			found = true
-		}
-		if hasTag(m, "memory:parent="+topic) {
-			if err := s.Store.Delete(ctx, m.Topic); err != nil {
-				return err
+			if !memoryVisible(ctx, m) {
+				return fmt.Errorf("memoria '%s' nao encontrada", topic)
 			}
+			found = true
+			targetScope = m.SessionID
 		}
 	}
 	if !found {
 		return fmt.Errorf("memoria '%s' nao encontrada", topic)
 	}
-	return s.Store.SaveWithMeta(ctx, Memory{Topic: topic, Source: "user", Tags: []string{forgottenTag}, Confidence: 1})
+	for _, m := range all {
+		if m.SessionID == targetScope && memoryVisible(ctx, m) && hasTag(m, "memory:parent="+topic) {
+			if err := s.Store.Delete(ctx, m.Topic); err != nil {
+				return err
+			}
+		}
+	}
+	return s.Store.SaveWithMeta(ctx, Memory{Topic: topic, SessionID: targetScope,
+		Source: "user", Tags: []string{forgottenTag}, Confidence: 1})
 }
 
 func (s *ManagedStore) Get(ctx context.Context, topic string) (*Memory, error) {
@@ -155,12 +169,19 @@ func (s *ManagedStore) SearchRelevant(ctx context.Context, q string, max int, mi
 	s.mu.Lock()
 	embedder := s.embedder
 	s.mu.Unlock()
+	// Rank before applying the caller's limit. Otherwise a set of stronger
+	// matches from other sessions can fill the candidate window and hide the
+	// current conversation's fact after the visibility filter runs.
+	searchMax := max
+	if sessionScope(ctx) != "" {
+		searchMax = 0
+	}
 	var all []Memory
 	var err error
 	if named, ok := embedder.(interface{ Name() string }); ok && named.Name() != "" {
-		all, err = hybridSearchIndexed(ctx, s.Store, embedder, s.index, q, max, min)
+		all, err = hybridSearchIndexed(ctx, s.Store, embedder, s.index, q, searchMax, min)
 	} else {
-		all, err = HybridSearch(ctx, s.Store, embedder, q, max, min)
+		all, err = HybridSearch(ctx, s.Store, embedder, q, searchMax, min)
 	}
 	if err != nil {
 		return nil, err
@@ -181,18 +202,25 @@ func activeOnly(all []Memory) []Memory {
 	return out
 }
 
-// Review includes inactive revisions and forget markers for inspection only.
+// Review includes inactive revisions and forget markers visible to the
+// authenticated scope. Legacy automated facts without an owner remain in the
+// underlying store for offline audit, never in an agent-facing review.
 func (s *ManagedStore) Review(ctx context.Context, topic string) ([]Memory, error) {
 	all, err := s.Store.List(ctx)
 	if err != nil {
 		return nil, err
 	}
-	all = visibleOnly(ctx, all)
+	reviewable := make([]Memory, 0, len(all))
+	for _, m := range all {
+		if memoryVisible(ctx, m) {
+			reviewable = append(reviewable, m)
+		}
+	}
 	if topic == "" {
-		return all, nil
+		return reviewable, nil
 	}
 	out := []Memory{}
-	for _, m := range all {
+	for _, m := range reviewable {
 		if m.Topic == topic || hasTag(m, "memory:parent="+topic) {
 			out = append(out, m)
 		}

@@ -57,8 +57,9 @@ type sessionHeader struct {
 type Store struct {
 	journalInitErr error
 	journalMu      sync.Mutex
-	journalEntries []JournalEntry  // bodies for memory or YAML-only journals
-	journalIDs     map[string]bool // YAML or memory stores only; SQLite uses its unique index
+	journalEntries []JournalEntry         // bodies for memory or YAML-only journals
+	journalIDs     map[string]bool        // YAML or memory stores only; SQLite uses its unique index
+	journalForks   map[string]journalFork // branch ancestry for YAML or memory stores
 	journalLast    uint64
 	journalLoaded  bool
 	mu             sync.RWMutex

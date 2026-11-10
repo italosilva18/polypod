@@ -105,6 +105,12 @@ how to connect a private OpenAI-compatible inference server without changing
 the existing WhatsApp and scheduler configuration.
 The [continuous operations guide](docs/integrations/continuous-operations.md)
 explains scheduled routines, inbox recovery and automatic memory.
+The [conversation recall guide](docs/integrations/history-recall.md) explains
+exact retrieval of older journal messages after compaction and branch forks.
+The [Markdown memory guide](docs/memory-markdown.md) covers project notes and
+their automatic selection for local turns.
+The [backup and restore guide](docs/backup-restore.md) covers private state
+archives, inspection and controlled restoration.
 The [agent runtime guide](docs/integrations/agent-runtime.md) covers background
 tasks, interactive terminals, file-triggered work, rewinding and local options.
 The [team journal](docs/integrations/team-journal.md) documents persistent

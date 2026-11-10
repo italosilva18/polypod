@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/costa/polypod/internal/skill"
+	"github.com/costa/polypod/internal/types"
 	"github.com/sashabaranov/go-openai/jsonschema"
 )
 
@@ -54,6 +55,9 @@ func RegisterSkills(reg *skill.Registry, store Store) {
 			}
 			return out.String(), nil
 		},
+		ExecuteResult: func(ctx context.Context, args map[string]any) (types.ToolResult, error) {
+			return executeScopedMemorySkill(ctx, store, "review_memories", args)
+		},
 	})
 
 	reg.Register(&skill.Skill{
@@ -77,6 +81,9 @@ func RegisterSkills(reg *skill.Registry, store Store) {
 				return "", err
 			}
 			return fmt.Sprintf("Memoria salva com sucesso: [%s]", topic), nil
+		},
+		ExecuteResult: func(ctx context.Context, args map[string]any) (types.ToolResult, error) {
+			return executeScopedMemorySkill(ctx, store, "save_memory", args)
 		},
 	})
 
@@ -108,6 +115,9 @@ func RegisterSkills(reg *skill.Registry, store Store) {
 			}
 			return sb.String(), nil
 		},
+		ExecuteResult: func(ctx context.Context, args map[string]any) (types.ToolResult, error) {
+			return executeScopedMemorySkill(ctx, store, "recall_memory", args)
+		},
 	})
 
 	reg.Register(&skill.Skill{
@@ -132,6 +142,9 @@ func RegisterSkills(reg *skill.Registry, store Store) {
 			}
 			return sb.String(), nil
 		},
+		ExecuteResult: func(ctx context.Context, args map[string]any) (types.ToolResult, error) {
+			return executeScopedMemorySkill(ctx, store, "list_memories", args)
+		},
 	})
 
 	reg.Register(&skill.Skill{
@@ -153,6 +166,9 @@ func RegisterSkills(reg *skill.Registry, store Store) {
 				return "", err
 			}
 			return fmt.Sprintf("Memoria deletada: [%s]", topic), nil
+		},
+		ExecuteResult: func(ctx context.Context, args map[string]any) (types.ToolResult, error) {
+			return executeScopedMemorySkill(ctx, store, "delete_memory", args)
 		},
 	})
 }

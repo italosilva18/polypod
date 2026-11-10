@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"unicode"
 	"unicode/utf8"
 )
@@ -209,8 +208,7 @@ func (s *Store) readAppliedBody(name string) ([]byte, error) {
 		return nil, err
 	}
 	defer root.Close()
-	f, err := root.OpenFile(filepath.Join(name, "SKILL.md"),
-		os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+	f, err := root.OpenFile(filepath.Join(name, "SKILL.md"), os.O_RDONLY|readOnlyNoFollowFlags, 0)
 	if err != nil {
 		return nil, err
 	}

@@ -80,6 +80,7 @@ import (
 	"github.com/costa/polypod/internal/skill"
 	"github.com/costa/polypod/internal/smartroute"
 	"github.com/costa/polypod/internal/sshexec"
+	"github.com/costa/polypod/internal/statebackup"
 	"github.com/costa/polypod/internal/taskplan"
 	"github.com/costa/polypod/internal/taskqueue"
 	"github.com/costa/polypod/internal/tasks"
@@ -193,6 +194,12 @@ func handleSubcommand() bool {
 		return true
 	}
 	switch os.Args[1] {
+	case "backup":
+		if err := statebackup.RunCLI(context.Background(), os.Args[2:], os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "erro no backup: %v\n", err)
+			os.Exit(1)
+		}
+		return true
 	case "doctor":
 		dotenv.Load(".")
 		configPath, live := defaultConfigPath, false
@@ -639,6 +646,7 @@ func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionm
 			return adapter.OutMessage{Text: "Erro de sessao"}, err
 		}
 		scope := sessionMemoryScope(msg, sess)
+		ctx = conversation.WithJournalScope(ctx, msg.Channel, msg.UserID, scope, aiSvc.ActiveAgent())
 		history, err := prepareSessionHistory(ctx, convMgr, aiSvc, mem, scope, sess)
 		if err != nil {
 			return adapter.OutMessage{Text: "Erro ao preparar o contexto"}, err
@@ -688,6 +696,7 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *se
 			return
 		}
 		scope := sessionMemoryScope(msg, sess)
+		ctx = conversation.WithJournalScope(ctx, msg.Channel, msg.UserID, scope, aiSvc.ActiveAgent())
 		history, err := prepareSessionHistory(ctx, convMgr, aiSvc, mem, scope, sess)
 		if err != nil {
 			chunks <- adapter.StreamChunk{Error: err, Done: true}
@@ -922,11 +931,12 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	}
 	defer documentIndex.Close()
 	sys := wiring.WireAll(wiring.Config{
-		Logger:      logger,
-		WorkingDir:  ".",
-		Model:       cfg.AI.Model,
-		DataDir:     cfg.Data.Dir,
-		MemoryStore: memStore,
+		Logger:            logger,
+		WorkingDir:        ".",
+		Model:             cfg.AI.Model,
+		DataDir:           cfg.Data.Dir,
+		MemoryStore:       memStore,
+		ConversationStore: store,
 	})
 	defer sys.ToolRegistry.ClosePTY()
 	turnCheckpoint := turncheckpoint.New(filepath.Join(cfg.Data.Dir, "turn-checkpoints"), logger)
@@ -1227,6 +1237,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	if err != nil {
 		return fmt.Errorf("initializing operational goals: %w", err)
 	}
+	goalStore.AttachVerifier(evolutionStore)
 	goals.RegisterSkills(skills, goalStore)
 	humanStore, err := humanloop.NewStore(filepath.Join(cfg.Data.Dir, "humanloop.json"), 500)
 	if err != nil {
@@ -2059,7 +2070,13 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	const heartbeatID = "system_heartbeat"
 	if cfg.Scheduler.Enabled && cfg.Scheduler.HeartbeatEnabled {
 		heartbeatSchedule := "@every " + cfg.Scheduler.HeartbeatInterval
-		const heartbeatPrompt = "Consulte goal_review, inbox_list (especialmente itens failed), scheduler_list, task_queue action=status (depois list para failed quando preciso), skill_evolution action=patterns e memoria de pendencias. Avance somente proximas acoes prontas e autorizadas; confirme o resultado e registre evidencia com goal_update. Para padroes repetidos e verificados, proponha/revise/aplique skill util. Respeite metas paused/blocked e dependencias. Avise o dono quando houver algo relevante. Se faltar uma informacao essencial, use ask_user. Se nao houver nada a fazer ou relatar, responda exatamente NO_REPLY."
+		const heartbeatPrompt = "Consulte goal_review, inbox_list (especialmente itens failed), scheduler_list, task_queue action=status (depois list para failed quando preciso), skill_evolution action=patterns e memoria de pendencias. " +
+			"Para cada meta pronta e autorizada, chame goal_attempt_start antes da acao, execute pelo caminho normal e registre resultado com goal_attempt_finish. " +
+			"Para metas com plano objetivo, chame goal_attempt_verify apos goal_attempt_finish; use goal_attempt_review somente depois dessa observacao. " +
+			"Para metas em in_flight ou needs_verification, confirme o efeito anterior antes de repetir; use goal_attempt_review com a evidencia observada. " +
+			"So conclua com goal_update e evidencia depois de revisao aceita e dependencias resolvidas. Se a revisao rejeitar o efeito, ajuste next_action antes de nova tentativa. " +
+			"Para padroes repetidos e verificados, proponha/revise/aplique skill util. Respeite metas paused/blocked e dependencias. Avise o dono quando houver algo relevante. " +
+			"Se faltar uma informacao essencial, use ask_user. Se nao houver nada a fazer ou relatar, responda exatamente NO_REPLY."
 		if existing, ok := sched.GetTask(heartbeatID); !ok {
 			if err := sched.AddTask(&scheduler.Task{ID: heartbeatID, Name: "Acompanhamento operacional", Schedule: heartbeatSchedule, Prompt: heartbeatPrompt, Channel: "system", UserID: "owner", MisfirePolicy: "skip", MaxRetries: 1}); err != nil {
 				logger.Error("failed to create operational heartbeat", "error", err)

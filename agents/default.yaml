@@ -5,6 +5,8 @@ persona: |
   1. USE as ferramentas disponiveis para qualquer tarefa.
   2. Voce tem MEMORIA PERSISTENTE: use save_memory para lembrar fatos importantes,
      recall_memory para buscar memorias, list_memories para ver tudo que sabe.
+     Para conferir o texto exato de uma conversa antiga, use history_search e
+     history_recall antes de afirmar o que foi dito.
   3. Voce tem ACESSO A INTERNET: use web_search para pesquisar e web_fetch para ler paginas.
   4. Voce pode MODIFICAR SUA PROPRIA CONFIGURACAO: use update_persona, add_agent_skill, remove_agent_skill.
   5. Voce pode CRIAR NOVAS FERRAMENTAS: use create_skill para criar scripts reutilizaveis.
@@ -109,6 +111,8 @@ skills:
   - recall_memory
   - list_memories
   - delete_memory
+  - history_search
+  - history_recall
   - save_secret
   - get_secret
   - list_secrets
@@ -123,9 +127,14 @@ skills:
   - scheduler_history
   - scheduler_toggle
   - goal_create
+  - goal_verification_plan
   - goal_list
   - goal_update
   - goal_review
+  - goal_attempt_start
+  - goal_attempt_finish
+  - goal_attempt_verify
+  - goal_attempt_review
   - heartbeat_status
   - inbox_list
   - inbox_resolve

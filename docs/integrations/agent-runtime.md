@@ -19,6 +19,8 @@ O estado e os logs são salvos em `task-registry.d` dentro do diretório de dado
 
 O CLI mostra um aviso quando uma tarefa termina, falha ou é interrompida. É possível digitar e enfileirar a próxima mensagem enquanto a resposta atual chega; a fila aparece na barra de status e pertence apenas à janela atual. Depois de corrigir a causa de uma falha de resposta, `/retry` reenvia a última entrada que falhou.
 
+Cada execução de subagente emite `SubagentStart` e `SubagentStop` nos hooks configurados. O payload legado traz `tool_name` com o nome do agente e, em `tool_args`, `agent_name`, `agent_type`, `agent_id` e `run_id`; a parada acrescenta `duration_ms`, `status` e eventual `error`. O registro interno `agent_lifecycle` também recebe início, término ou erro. Esses eventos permitem observar tarefas em primeiro plano e em segundo plano; as ferramentas continuam passando pelo orquestrador normal. Não há caminho de transcript de subagente no payload atual.
+
 Durante uma resposta, `Ctrl+B` minimiza a saída ao vivo; pressione novamente para voltar a acompanhá-la. O processamento continua na mesma sessão, e mensagens enviadas nesse intervalo ficam na fila até o turno terminar. Para conversas longas, o TUI renderiza as 60 mensagens mais recentes e `PgUp` revela blocos anteriores sem perder a posição de leitura. A sessão JSON ainda é carregada inteira do disco; a paginação reduz o trabalho de renderização, não a leitura do arquivo.
 
 ## Rotinas e gatilhos

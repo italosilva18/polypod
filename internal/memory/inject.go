@@ -66,8 +66,9 @@ func AutoInject(ctx context.Context, store Store, query string) string {
 	out.WriteString(header)
 	runesUsed := len([]rune(header))
 	for _, m := range selected {
-		line := fmt.Sprintf("- topico=%s; origem=%s; confianca=%.2f; conteudo=%s\n",
-			strconv.Quote(trimRunes(m.Topic, maxMemoryTopicRunes)), memorySourceLabel(m.Source),
+		line := fmt.Sprintf("- topico=%s; escopo=%s; origem=%s; confianca=%.2f; conteudo=%s\n",
+			strconv.Quote(trimRunes(displayMemoryTopic(m), maxMemoryTopicRunes)), memoryScopeLabel(m),
+			memorySourceLabel(m.Source),
 			m.Confidence, strconv.Quote(trimRunes(m.Content, maxMemoryContentRunes)))
 		lineRunes := len([]rune(line))
 		if runesUsed+lineRunes > maxAutoInjectRunes {

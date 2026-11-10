@@ -284,9 +284,14 @@ func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) ([]ChatM
 	}
 
 	// Auto-inject relevant memories
-	memoryCtxScope := ctx
+	memoryCtxScope := s.ownerMemoryContext(ctx, req)
 	if req.Channel != "" && req.UserID != "" {
-		memoryCtxScope = memory.WithSessionScope(ctx, req.Channel+":"+req.UserID)
+		scope := req.Channel + ":" + req.UserID
+		if req.Channel == "cli" && req.SessionMemoryScope != "" {
+			memoryCtxScope = memory.WithLegacyEpisodeScope(memoryCtxScope, scope)
+			scope = "cli-branch:" + req.SessionMemoryScope
+		}
+		memoryCtxScope = memory.WithSessionScope(memoryCtxScope, scope)
 	}
 	memoryCtx := memory.AutoInject(memoryCtxScope, s.memStore, req.Query)
 	if s.sessionMem != nil && req.SessionMemoryScope != "" {
@@ -308,6 +313,12 @@ func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) ([]ChatM
 			}
 			memoryCtx += section
 		}
+	}
+	if notes := s.relevantMarkdownMemory(ctx, req); notes != "" {
+		if memoryCtx != "" {
+			memoryCtx += "\n\n"
+		}
+		memoryCtx += notes
 	}
 
 	// Build messages using agent persona
@@ -355,6 +366,7 @@ func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) ([]ChatM
 
 // Answer processes a query through the full pipeline (synchronous).
 func (s *Service) Answer(ctx context.Context, req AnswerRequest) (*AnswerResponse, error) {
+	ctx = s.ownerMemoryContext(ctx, req)
 	if s.onActivity != nil {
 		s.onActivity()
 	}
@@ -363,7 +375,7 @@ func (s *Service) Answer(ctx context.Context, req AnswerRequest) (*AnswerRespons
 	ctx = s.withProjectInstructions(ctx)
 	messages, names := s.buildMessages(ctx, req)
 
-	ctx = withRequestToolSession(ctx, req.Channel, req.UserID, s.agentName)
+	ctx = withRequestToolSession(ctx, req.Channel, req.UserID, s.agentName, req.SessionMemoryScope)
 	resp, err := s.client.CompleteWithTools(withRequestSkillNames(ctx, names), messages, s.logger)
 	if err != nil {
 		return nil, err
@@ -387,6 +399,7 @@ func (s *Service) Answer(ctx context.Context, req AnswerRequest) (*AnswerRespons
 // AnswerStream processes a query through the full pipeline with streaming.
 // callback is called for each content delta token.
 func (s *Service) AnswerStream(ctx context.Context, req AnswerRequest, callback StreamCallback) (*AnswerResponse, error) {
+	ctx = s.ownerMemoryContext(ctx, req)
 	if s.onActivity != nil {
 		s.onActivity()
 	}
@@ -395,7 +408,7 @@ func (s *Service) AnswerStream(ctx context.Context, req AnswerRequest, callback 
 	ctx = s.withProjectInstructions(ctx)
 	messages, names := s.buildMessages(ctx, req)
 
-	ctx = withRequestToolSession(ctx, req.Channel, req.UserID, s.agentName)
+	ctx = withRequestToolSession(ctx, req.Channel, req.UserID, s.agentName, req.SessionMemoryScope)
 	resp, err := s.client.CompleteWithToolsStream(withRequestSkillNames(ctx, names), messages, callback, s.logger)
 	if err != nil {
 		return nil, err

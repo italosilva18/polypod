@@ -289,6 +289,7 @@ func (s *CompactService) Compact(
 	boundaryMsg := conversation.Message{
 		Role:      conversation.RoleSystem,
 		Content:   "[compact_boundary] Conversation compacted",
+		Origin:    conversation.OriginCompaction,
 		Timestamp: now,
 	}
 
@@ -298,6 +299,7 @@ func (s *CompactService) Compact(
 			"This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n%s\n\nContinue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with \"I'll continue\" or similar. Pick up the last task as if the break never happened.",
 			summary,
 		),
+		Origin:    conversation.OriginCompaction,
 		Timestamp: now,
 	}
 
@@ -409,11 +411,13 @@ func (s *CompactService) PartialCompact(
 	boundaryMsg := conversation.Message{
 		Role:      conversation.RoleSystem,
 		Content:   "[compact_boundary] Partial conversation compacted",
+		Origin:    conversation.OriginCompaction,
 		Timestamp: now,
 	}
 	summaryMsg := conversation.Message{
 		Role:      conversation.RoleUser,
 		Content:   fmt.Sprintf("This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n%s", summary),
+		Origin:    conversation.OriginCompaction,
 		Timestamp: now,
 	}
 

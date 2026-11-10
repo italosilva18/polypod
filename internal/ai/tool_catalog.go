@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/costa/polypod/internal/conversation"
 	providerapi "github.com/costa/polypod/internal/provider"
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -34,6 +35,7 @@ var inlineToolNames = map[string]bool{
 	"computer_scroll": true, "computer_key_press": true,
 	"task_create": true, "task_get": true, "task_list": true, "task_output": true,
 	"agent_run": true, "memory_add": true, "memory_search": true,
+	"history_search": true, "history_recall": true,
 	"send_message": true, "send_message_enqueue": true,
 }
 
@@ -43,13 +45,17 @@ type toolSessionID struct {
 	channel string
 	user    string
 	agent   string
+	branch  string
 }
 
-func withRequestToolSession(ctx context.Context, channel, user, agent string) context.Context {
+func withRequestToolSession(ctx context.Context, channel, user, agent, branch string) context.Context {
 	if channel == "" || user == "" {
 		return ctx
 	}
-	return context.WithValue(ctx, requestToolSessionKey{}, toolSessionID{channel: channel, user: user, agent: agent})
+	ctx = conversation.WithJournalScope(ctx, channel, user, branch, agent)
+	return context.WithValue(ctx, requestToolSessionKey{}, toolSessionID{
+		channel: channel, user: user, agent: agent, branch: branch,
+	})
 }
 
 type toolSelection struct {
@@ -89,7 +95,7 @@ func (c *Client) catalogFor(ctx context.Context) *toolCatalog {
 			catalog.active[name] = true
 		}
 	}
-	// Keep selected tools available across turns of the same channel/user/agent.
+	// Keep selected tools available across turns of the same conversation branch.
 	if session, ok := ctx.Value(requestToolSessionKey{}).(toolSessionID); ok {
 		for _, name := range c.previouslySelectedTools(session) {
 			if catalog.has(name) {

@@ -27,7 +27,7 @@ const (
 var ErrVerificationUnstable = errors.New("alvo mudou durante a verificação")
 var ErrVerificationStartUnknown = errors.New("verificação exige início durável da execução")
 
-// RegisterVerificationPlan stores an immutable check for a task or routine.
+// RegisterVerificationPlan stores an immutable check for a task, routine, or goal.
 // The plan is registered when work is created, before the work can satisfy it.
 // No agent narrative or exit status can satisfy a plan; only a later state read
 // can do so. A matching preexisting state is rejected to avoid learning from a
@@ -74,8 +74,8 @@ func normalizeVerificationPlan(input VerificationPlanInput) (VerificationPlanInp
 	input.Path = strings.TrimSpace(input.Path)
 	input.Selector = strings.TrimSpace(input.Selector)
 	input.ExpectedSHA256 = strings.ToLower(strings.TrimSpace(input.ExpectedSHA256))
-	if input.SourceKind != "task" && input.SourceKind != "routine" {
-		return input, errors.New("verificação exige fonte task ou routine")
+	if input.SourceKind != "task" && input.SourceKind != "routine" && input.SourceKind != "goal" {
+		return input, errors.New("verificação exige fonte task, routine ou goal")
 	}
 	if !evidenceTokenPattern.MatchString(input.SubjectID) || len(input.SubjectID) > 160 ||
 		input.PatternKey == "" || len(input.PatternKey) > 160 {
@@ -193,7 +193,7 @@ type verificationRun struct {
 // when a routine retries after partially producing its artifact.
 func (s *Store) BeginVerificationRun(ctx context.Context, sourceKind, subjectID, runID string) (bool, error) {
 	sourceKind, subjectID, runID = strings.TrimSpace(sourceKind), strings.TrimSpace(subjectID), strings.TrimSpace(runID)
-	if sourceKind != "task" && sourceKind != "routine" ||
+	if sourceKind != "task" && sourceKind != "routine" && sourceKind != "goal" ||
 		!evidenceTokenPattern.MatchString(subjectID) || len(subjectID) > 160 ||
 		!evidenceTokenPattern.MatchString(runID) || len(runID) > 160 {
 		return false, errors.New("identificadores da execução de verificação inválidos")
@@ -249,7 +249,7 @@ func (s *Store) FinishVerificationRun(ctx context.Context, sourceKind, subjectID
 	s.verifyMu.Lock()
 	defer s.verifyMu.Unlock()
 	sourceKind, subjectID, runID = strings.TrimSpace(sourceKind), strings.TrimSpace(subjectID), strings.TrimSpace(runID)
-	if sourceKind != "task" && sourceKind != "routine" ||
+	if sourceKind != "task" && sourceKind != "routine" && sourceKind != "goal" ||
 		!evidenceTokenPattern.MatchString(subjectID) || len(subjectID) > 160 ||
 		!evidenceTokenPattern.MatchString(runID) || len(runID) > 160 {
 		return false, errors.New("identificadores do fim da verificação inválidos")

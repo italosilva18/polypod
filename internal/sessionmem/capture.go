@@ -164,7 +164,7 @@ func (s *FileStore) CaptureCompaction(scope string, before, after []conversation
 	seen := make(map[string]bool)
 	for i := len(removed) - 1; i >= 0 && len(entries) < maxCapturedPerCompact; i-- {
 		msg := removed[i]
-		if msg.Role != conversation.RoleUser {
+		if !conversation.IsOriginalUserMessage(msg) {
 			continue
 		}
 		statements := splitStatements(msg.Content)

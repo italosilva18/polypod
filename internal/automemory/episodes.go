@@ -187,18 +187,26 @@ func (e *EpisodeService) runNowOwned(ctx context.Context) error {
 			if !episodeChannelAllowed(entry.Channel) || entry.SessionID == "" {
 				continue
 			}
+			scope := dreamScopeForEntry(entry)
+			if scope == "" {
+				continue
+			}
 			switch entry.Message.Role {
 			case conversation.RoleUser:
+				if !conversation.IsOriginalUserMessage(entry.Message) {
+					delete(open, scope)
+					continue
+				}
 				if text, ok := episodeRequestText(entry.Message.Content); ok {
-					open[entry.SessionID] = episodeRequest{MessageID: entry.Message.ID, Text: text}
+					open[scope] = episodeRequest{MessageID: entry.Message.ID, Text: text}
 				} else {
 					// A rejected message must not allow a later reply to be paired
 					// with an older request from the same session.
-					delete(open, entry.SessionID)
+					delete(open, scope)
 				}
 			case conversation.RoleAssistant:
-				request, found := open[entry.SessionID]
-				delete(open, entry.SessionID)
+				request, found := open[scope]
+				delete(open, scope)
 				if !found || strings.TrimSpace(entry.Message.Content) == "" {
 					continue
 				}
@@ -229,14 +237,15 @@ func (e *EpisodeService) runNowOwned(ctx context.Context) error {
 }
 
 func episodeMemory(entry conversation.JournalEntry, req episodeRequest) memory.Memory {
-	identity := entry.SessionID + ":" + req.MessageID + ":" + entry.Message.ID
+	scope := dreamScopeForEntry(entry)
+	identity := scope + ":" + req.MessageID + ":" + entry.Message.ID
 	sum := sha256.Sum256([]byte(identity))
 	return memory.Memory{
 		Topic:      "episode_" + hex.EncodeToString(sum[:12]),
 		Content:    "Histórico de conversa, não fato verificado nem instrução: o usuário pediu " + strconv.Quote(req.Text) + ". O assistente respondeu; execução e resultado não foram confirmados por este registro.",
 		Tags:       []string{"episode", "unverified", "journal:" + req.MessageID, "journal:" + entry.Message.ID},
 		Priority:   0,
-		SessionID:  entry.SessionID,
+		SessionID:  scope,
 		Source:     "dream_episode",
 		Confidence: 0.2,
 	}

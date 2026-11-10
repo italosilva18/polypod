@@ -39,6 +39,11 @@ type DreamConfig struct {
 	// Defaults to 50 when zero.
 	MaxMessages int
 
+	// MaxBatches caps how many consecutive journal windows one idle cycle
+	// may consolidate. This drains a restart backlog without an unbounded
+	// sequence of model calls. Defaults to 4 when zero.
+	MaxBatches int
+
 	// StateFile persists the timestamp through which conversations were
 	// consolidated, preventing repeated model calls after restarts.
 	StateFile string
@@ -62,6 +67,20 @@ type ExtractedMemory struct {
 type MemoryEvidence struct {
 	MessageID string `json:"message_id"`
 	Quote     string `json:"quote"`
+}
+
+type dreamSourceMessage struct {
+	content string
+	scope   string
+}
+
+// New CLI journal rows identify the active branch. Older rows and remote
+// channels use the conversation ID, which is already channel/user scoped.
+func dreamScopeForEntry(entry conversation.JournalEntry) string {
+	if entry.Channel == "cli" && entry.BranchID != "" && entry.BranchID != entry.SessionID {
+		return "cli-branch:" + entry.BranchID
+	}
+	return entry.SessionID
 }
 
 // DreamStats exposes runtime metrics for observability.
@@ -110,6 +129,9 @@ func NewDreamService(cfg DreamConfig) *DreamService {
 	}
 	if cfg.MaxMessages <= 0 {
 		cfg.MaxMessages = 50
+	}
+	if cfg.MaxBatches <= 0 {
+		cfg.MaxBatches = 4
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -214,7 +236,7 @@ func (d *DreamService) loop(ctx context.Context) {
 			continue
 		}
 
-		if err := d.extractMemories(ctx); err != nil {
+		if err := d.processIdleBacklog(ctx); err != nil {
 			logger.Warn("dream extraction failed", "error", err)
 		}
 
@@ -227,6 +249,39 @@ func (d *DreamService) loop(ctx context.Context) {
 		case <-time.After(d.config.Interval):
 		}
 	}
+}
+
+// processIdleBacklog drains a bounded number of windows while the user remains
+// idle. RunNow still processes one window for callers that need a predictable
+// single operation.
+func (d *DreamService) processIdleBacklog(ctx context.Context) error {
+	for batch := 0; batch < d.config.MaxBatches; batch++ {
+		select {
+		case <-d.stopCh:
+			return nil
+		default:
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		d.mu.Lock()
+		idleFor := time.Since(d.lastActivity)
+		before := d.lastSequence
+		d.mu.Unlock()
+		if idleFor < d.config.IdleThreshold {
+			return nil
+		}
+		if err := d.extractMemories(ctx); err != nil {
+			return err
+		}
+		d.mu.Lock()
+		after := d.lastSequence
+		d.mu.Unlock()
+		if after <= before {
+			return nil
+		}
+	}
+	return nil
 }
 
 // extractMemories pulls recent messages from the session store, asks the AI
@@ -287,6 +342,13 @@ func (d *DreamService) extractMemoriesOwned(ctx context.Context) error {
 		d.recordError(err)
 		return err
 	}
+	if cached && dreamEvidenceHasMultipleScopes(evidence) {
+		// Older pending files may have been produced from mixed conversations.
+		// They remain durable evidence, but their extraction cannot be
+		// assigned safely to any one participant.
+		logger.Warn("dream: skipping mixed-scope pending extraction", "through", sequence)
+		memories = nil
+	}
 	if !cached && msgCount == 0 {
 		// A scheduler-only journal page still advances the cursor, but it
 		// needs neither a model call nor a durable pending extraction file.
@@ -327,7 +389,7 @@ func (d *DreamService) extractMemoriesOwned(ctx context.Context) error {
 			saveFailed = true
 			continue
 		}
-		sourceTags, confidence, grounded := groundMemory(m, evidence, provenance)
+		sourceTags, confidence, scope, grounded := groundMemory(m, evidence, provenance)
 		if !grounded {
 			// A claimed source with no matching user quote is not evidence.
 			// Older pending batches without the new field remain readable, but
@@ -339,10 +401,11 @@ func (d *DreamService) extractMemoriesOwned(ctx context.Context) error {
 			tags = append(tags, "fact_key:"+m.FactKey)
 		}
 		mem := memory.Memory{
-			Topic:      d.topicFor(m),
+			Topic:      d.topicForScope(m, scope),
 			Content:    m.Content,
 			Tags:       tags,
 			Priority:   normalisePriority(m.Importance),
+			SessionID:  scope,
 			Source:     "dream",
 			Confidence: confidence,
 		}
@@ -378,7 +441,7 @@ func (d *DreamService) extractMemoriesOwned(ctx context.Context) error {
 // MaxMessages explicit user messages. Autonomous scheduler turns are common
 // and must not consume the entire evidence window or delay the next real user
 // message by another consolidation interval.
-func (d *DreamService) collectTranscript(ctx context.Context) (string, int, uint64, []string, map[string]string, error) {
+func (d *DreamService) collectTranscript(ctx context.Context) (string, int, uint64, []string, map[string]dreamSourceMessage, error) {
 	d.mu.Lock()
 	cursor := d.lastSequence
 	d.mu.Unlock()
@@ -406,8 +469,9 @@ func (d *DreamService) collectTranscript(ctx context.Context) (string, int, uint
 	var sb strings.Builder
 	var sequence uint64
 	var provenance []string
-	evidence := make(map[string]string)
+	evidence := make(map[string]dreamSourceMessage)
 	count := 0
+	var batchScope string
 	const maxScannedEntries = 1000
 	userLimit := d.config.MaxMessages
 	if pendingThrough != 0 {
@@ -429,11 +493,26 @@ func (d *DreamService) collectTranscript(ctx context.Context) (string, int, uint
 			if pendingThrough != 0 && e.Sequence > pendingThrough {
 				return sb.String(), count, sequence, provenance, evidence, nil
 			}
+			eligible := episodeChannelAllowed(e.Channel) && conversation.IsOriginalUserMessage(e.Message) &&
+				strings.TrimSpace(e.Message.Content) != "" && !looksSensitive(e.Message.Content)
+			if eligible {
+				scope := dreamScopeForEntry(e)
+				if scope == "" {
+					eligible = false
+				}
+				if eligible && pendingThrough == 0 && batchScope != "" && scope != batchScope {
+					// Do not advance the cursor across this first message from
+					// another conversation. It will start the next extraction batch.
+					return sb.String(), count, sequence, provenance, evidence, nil
+				}
+				if eligible {
+					batchScope = scope
+				}
+			}
 			cursor = e.Sequence
 			sequence = e.Sequence
 			scanned++
-			if !episodeChannelAllowed(e.Channel) || e.Message.Role != conversation.RoleUser ||
-				strings.TrimSpace(e.Message.Content) == "" || looksSensitive(e.Message.Content) {
+			if !eligible {
 				if scanned >= maxScannedEntries {
 					break
 				}
@@ -443,7 +522,9 @@ func (d *DreamService) collectTranscript(ctx context.Context) (string, int, uint
 			// the private journal through extraction, including assistant echoes.
 			fmt.Fprintf(&sb, "[%s message=%s] user: %s\n", e.SessionID, e.Message.ID, strings.TrimSpace(e.Message.Content))
 			provenance = append(provenance, "journal:"+e.Message.ID)
-			evidence[e.Message.ID] = strings.TrimSpace(e.Message.Content)
+			evidence[e.Message.ID] = dreamSourceMessage{
+				content: strings.TrimSpace(e.Message.Content), scope: dreamScopeForEntry(e),
+			}
 			count++
 			if count >= userLimit || scanned >= maxScannedEntries {
 				break
@@ -454,6 +535,20 @@ func (d *DreamService) collectTranscript(ctx context.Context) (string, int, uint
 		}
 	}
 	return sb.String(), count, sequence, provenance, evidence, nil
+}
+
+func dreamEvidenceHasMultipleScopes(messages map[string]dreamSourceMessage) bool {
+	var scope string
+	for _, message := range messages {
+		if message.scope == "" {
+			continue
+		}
+		if scope != "" && scope != message.scope {
+			return true
+		}
+		scope = message.scope
+	}
+	return false
 }
 
 func sensitiveEvidence(items []MemoryEvidence) bool {
@@ -469,38 +564,53 @@ func sensitiveEvidence(items []MemoryEvidence) bool {
 // attribution. A model cannot grant itself confidence: only exact quotes from
 // user messages in this journal window count. Confidence describes support
 // for the user's statement, not independent proof that the statement is true.
-func groundMemory(m ExtractedMemory, messages map[string]string, batch []string) ([]string, float64, bool) {
+func groundMemory(m ExtractedMemory, messages map[string]dreamSourceMessage, batch []string) ([]string, float64, string, bool) {
 	if len(m.Evidence) == 0 {
 		if !m.legacyUnattributed || len(batch) == 0 {
-			return nil, 0, false
+			return nil, 0, "", false
 		}
 		// Legacy pending extractions had no per-memory citations. Preserve
-		// their batch provenance while clearly marking the attribution weak.
+		// their batch provenance only when it came from a single scope.
+		var scope string
+		for _, tag := range batch {
+			message, ok := messages[strings.TrimPrefix(tag, "journal:")]
+			if !ok || message.scope == "" || scope != "" && scope != message.scope {
+				return nil, 0, "", false
+			}
+			scope = message.scope
+		}
 		tags := append([]string{"evidence:batch_unattributed"}, batch...)
-		return tags, 0.35, true
+		return tags, 0.35, scope, true
 	}
 	tags := make([]string, 0, len(m.Evidence)+1)
 	seen := make(map[string]bool)
+	var scope string
 	for _, item := range m.Evidence {
 		messageID := strings.TrimSpace(item.MessageID)
 		message, exists := messages[messageID]
 		quote := strings.TrimSpace(item.Quote)
 		if !exists || len(messageID) > 128 || len([]rune(quote)) < 10 || len([]rune(quote)) > 320 ||
-			!strings.Contains(message, quote) || seen[messageID] {
+			!strings.Contains(message.content, quote) || seen[messageID] || message.scope == "" {
 			continue
 		}
+		if scope != "" && scope != message.scope {
+			// A claim justified by different participants or CLI branches has
+			// no single owner and cannot be stored as a scoped fact.
+			return nil, 0, "", false
+		}
+		scope = message.scope
 		seen[messageID] = true
 		tags = append(tags, "journal:"+messageID)
 	}
 	if len(tags) == 0 {
-		return nil, 0, false
+		return nil, 0, "", false
 	}
 	tags = append([]string{"evidence:quote_verified"}, tags...)
 	confidence := 0.75
 	if len(tags) > 2 {
 		confidence = 0.8
 	}
-	return tags, confidence, true
+	return tags, confidence, scope, true
 }
 
 func (d *DreamService) recordError(err error) {
@@ -557,6 +667,11 @@ func (d *DreamService) topicFor(m ExtractedMemory) string {
 	}
 	sum := sha256.Sum256([]byte(identity))
 	return "dream_" + t + "_" + hex.EncodeToString(sum[:6])
+}
+
+func (d *DreamService) topicForScope(m ExtractedMemory, scope string) string {
+	sum := sha256.Sum256([]byte(scope))
+	return d.topicFor(m) + "_" + hex.EncodeToString(sum[:6])
 }
 
 type dreamState struct {

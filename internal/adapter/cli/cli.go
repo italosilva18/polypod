@@ -358,6 +358,9 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 	if a.convMgr != nil && a.sessStorage != nil {
 		controller := newPersistentBranchController(a.dataDir, a.sessStorage, a.convMgr,
 			a.ActiveSessionID, a.SetActiveSessionSnapshot, a.saveActiveSession)
+		if a.aiSvc != nil {
+			controller.activeAgent = a.aiSvc.ActiveAgent
+		}
 		controller.activate = a.restoreSessionMetadata
 		if a.sessionMemory != nil {
 			controller.forkMemory = a.sessionMemory.Fork

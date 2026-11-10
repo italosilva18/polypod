@@ -28,6 +28,7 @@ type persistentBranchController struct {
 	storage          session.SessionStorage
 	conversation     *conversation.Manager
 	activeID         func() string
+	activeAgent      func() string
 	setActiveID      func(string, string)
 	saveActive       func(*conversation.Session) error
 	activate         func(session.SessionMetadata) []string
@@ -154,6 +155,13 @@ func (r *persistentBranchController) create(name string, _ []chatEntry) (branchS
 		metadata = parent.Metadata
 	}
 	childID := uuid.NewString()
+	agentName := "default"
+	if r.activeAgent != nil && r.activeAgent() != "" {
+		agentName = r.activeAgent()
+	}
+	if err := r.conversation.RegisterJournalFork(context.Background(), parentID, childID, agentName, active); err != nil {
+		return branchSnapshot{}, fmt.Errorf("registrando ancestralidade do historico: %w", err)
+	}
 	now := time.Now()
 	child := &session.RestoredSession{
 		ID: childID, CreatedAt: now, UpdatedAt: now,

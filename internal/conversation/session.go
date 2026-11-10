@@ -1,6 +1,7 @@
 package conversation
 
 import (
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -12,9 +13,10 @@ const MaxMessages = 20
 type Role string
 
 const (
-	RoleUser      Role = "user"
-	RoleAssistant Role = "assistant"
-	RoleSystem    Role = "system"
+	RoleUser         Role = "user"
+	RoleAssistant    Role = "assistant"
+	RoleSystem       Role = "system"
+	OriginCompaction      = "compaction"
 )
 
 // Message is a single entry in a conversation.
@@ -22,7 +24,19 @@ type Message struct {
 	ID        string    `json:"id,omitempty" yaml:"id,omitempty"`
 	Role      Role      `json:"role" yaml:"role"`
 	Content   string    `json:"content" yaml:"content"`
+	Origin    string    `json:"origin,omitempty" yaml:"origin,omitempty"`
 	Timestamp time.Time `json:"timestamp" yaml:"timestamp"`
+}
+
+// IsSyntheticMessage identifies model-generated compaction markers and
+// summaries. The content check covers rows written before Origin existed.
+func IsSyntheticMessage(m Message) bool {
+	return m.Origin == OriginCompaction || strings.HasPrefix(m.Content, "[compact_boundary]") ||
+		strings.HasPrefix(m.Content, "This session is being continued from a previous conversation")
+}
+
+func IsOriginalUserMessage(m Message) bool {
+	return m.Role == RoleUser && !IsSyntheticMessage(m)
 }
 
 // Session holds conversation state. Directly created sessions retain the

@@ -11,11 +11,13 @@ import (
 
 	"github.com/costa/polypod/internal/agent"
 	"github.com/costa/polypod/internal/ai"
+	"github.com/costa/polypod/internal/hooks"
 	"github.com/costa/polypod/internal/project"
 	"github.com/costa/polypod/internal/swarm"
 	"github.com/costa/polypod/internal/tasks"
 	"github.com/costa/polypod/internal/tool"
 	"github.com/costa/polypod/internal/types"
+	"github.com/google/uuid"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -32,6 +34,7 @@ type SubAgentConfig struct {
 	AgentReg    *agent.Registry
 	ToolReg     *tool.Registry
 	Executor    ToolExecutor
+	Hooks       *hooks.Manager
 	Logger      *slog.Logger
 	MaxTurns    int
 	TokenBudget int
@@ -64,6 +67,7 @@ type SubAgentExecutor struct {
 	agentReg    *agent.Registry
 	toolReg     *tool.Registry
 	executor    ToolExecutor
+	hooks       *hooks.Manager
 	logger      *slog.Logger
 	maxTurns    int
 	tokenBudget int
@@ -97,6 +101,7 @@ func NewSubAgentExecutor(cfg SubAgentConfig) *SubAgentExecutor {
 		agentReg:    cfg.AgentReg,
 		toolReg:     cfg.ToolReg,
 		executor:    cfg.Executor,
+		hooks:       cfg.Hooks,
 		logger:      logger,
 		maxTurns:    maxTurns,
 		tokenBudget: tokenBudget,
@@ -135,7 +140,7 @@ func (e *SubAgentExecutor) ExecuteWithCheckpoint(
 	initial *tasks.AgentCheckpoint,
 	report func(ExecutionProgress),
 	save func(*tasks.AgentCheckpoint) error,
-) (string, error) {
+) (answer string, runErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -150,6 +155,12 @@ func (e *SubAgentExecutor) ExecuteWithCheckpoint(
 	}
 	ag := e.agentReg.Get(agentName)
 	ctx = context.WithValue(ctx, agentContextKey{}, ag.Name)
+	runID := uuid.NewString()
+	started := time.Now()
+	e.fireLifecycle(ctx, hooks.EventSubagentStart, ag.Name, runID, 0, nil)
+	defer func() {
+		e.fireLifecycle(ctx, hooks.EventSubagentStop, ag.Name, runID, time.Since(started), runErr)
+	}()
 	e.logger.Info("subagent executing",
 		"agent", ag.Name,
 		"query_len", len(query),
