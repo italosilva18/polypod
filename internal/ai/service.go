@@ -54,10 +54,14 @@ type Service struct {
 	onActivity  func()
 	workdirs    *workdir.Store
 	// Budget-triggered compaction is retried after a short delay when the
-	// summarizer is unavailable. Capacity-triggered compaction remains active.
+	// summarizer is unavailable. Each session has its own delay so one failed
+	// summary does not hold back another session. Capacity-triggered compaction
+	// remains active.
 	historyBudgetMu      sync.Mutex
-	historyBudgetRetryAt time.Time
+	historyBudgetRetryAt map[string]time.Time
 }
+
+const maxHistoryBudgetCooldowns = 1024
 
 // SetWorkdirStore enables conversation-scoped working directories for tools.
 func (s *Service) SetWorkdirStore(store *workdir.Store) { s.workdirs = store }
@@ -145,6 +149,13 @@ func (s *Service) SetSessionMemory(store *sessionmem.FileStore) {
 // It also runs at the session snapshot limit so short conversations are not
 // silently evicted without a continuity summary.
 func (s *Service) PrepareHistory(ctx context.Context, history []conversation.Message) ([]conversation.Message, bool) {
+	return s.PrepareHistoryForScope(ctx, "", history)
+}
+
+// PrepareHistoryForScope applies the budget retry delay only to the trusted
+// conversation scope supplied by the caller. An empty scope never delays a
+// retry because it cannot safely identify the conversation.
+func (s *Service) PrepareHistoryForScope(ctx context.Context, scope string, history []conversation.Message) ([]conversation.Message, bool) {
 	if s.autoCompact == nil || !s.autoCompact.IsEnabled() || len(history) < 4 {
 		return history, false
 	}
@@ -153,9 +164,7 @@ func (s *Service) PrepareHistory(ctx context.Context, history []conversation.Mes
 	budget := historyWindowBudget(s.CurrentModel())
 	budgetTrigger := estimated > budget && !atCapacity
 	if budgetTrigger {
-		s.historyBudgetMu.Lock()
-		budgetTrigger = !time.Now().Before(s.historyBudgetRetryAt)
-		s.historyBudgetMu.Unlock()
+		budgetTrigger = s.historyBudgetRetryReady(scope)
 	}
 	if !s.autoCompact.CheckWithCapacity(estimated, atCapacity || budgetTrigger) {
 		return history, false
@@ -164,24 +173,15 @@ func (s *Service) PrepareHistory(ctx context.Context, history []conversation.Mes
 	compacted, err := s.autoCompact.CompactHistory(ctx, history)
 	if err != nil {
 		if budgetTrigger {
-			s.historyBudgetMu.Lock()
-			s.historyBudgetRetryAt = time.Now().Add(time.Minute)
-			s.historyBudgetMu.Unlock()
+			s.setHistoryBudgetRetry(scope, true)
 		}
 		s.logger.Warn("auto-compact failed; preserving original history", "error", err, "messages", len(history))
 		return history, false
 	}
-	if budgetTrigger {
-		s.historyBudgetMu.Lock()
-		// A single oversized turn or summary may remain above the budget even
-		// after successful compaction. Avoid re-summarizing it every turn.
-		if compact.EstimateTokens(compacted) > budget {
-			s.historyBudgetRetryAt = time.Now().Add(time.Minute)
-		} else {
-			s.historyBudgetRetryAt = time.Time{}
-		}
-		s.historyBudgetMu.Unlock()
-	}
+	// A single oversized turn or summary may remain above the budget even
+	// after successful compaction. Avoid re-summarizing it every turn. A
+	// capacity-triggered success also clears an earlier delay for this scope.
+	s.setHistoryBudgetRetry(scope, compact.EstimateTokens(compacted) > budget)
 	s.logger.Info("auto-compact prepared",
 		"messages_before", len(history),
 		"messages_after", len(compacted),
@@ -190,6 +190,52 @@ func (s *Service) PrepareHistory(ctx context.Context, history []conversation.Mes
 		"history_budget", budget,
 	)
 	return compacted, true
+}
+
+func (s *Service) historyBudgetRetryReady(scope string) bool {
+	if scope == "" {
+		return true
+	}
+	s.historyBudgetMu.Lock()
+	defer s.historyBudgetMu.Unlock()
+	retryAt := s.historyBudgetRetryAt[scope]
+	if time.Now().Before(retryAt) {
+		return false
+	}
+	delete(s.historyBudgetRetryAt, scope)
+	return true
+}
+
+func (s *Service) setHistoryBudgetRetry(scope string, delay bool) {
+	if scope == "" {
+		return
+	}
+	s.historyBudgetMu.Lock()
+	defer s.historyBudgetMu.Unlock()
+	if !delay {
+		delete(s.historyBudgetRetryAt, scope)
+		return
+	}
+	if s.historyBudgetRetryAt == nil {
+		s.historyBudgetRetryAt = make(map[string]time.Time)
+	}
+	now := time.Now()
+	for key, retryAt := range s.historyBudgetRetryAt {
+		if !now.Before(retryAt) {
+			delete(s.historyBudgetRetryAt, key)
+		}
+	}
+	if len(s.historyBudgetRetryAt) >= maxHistoryBudgetCooldowns {
+		var oldestKey string
+		var oldestAt time.Time
+		for key, retryAt := range s.historyBudgetRetryAt {
+			if oldestKey == "" || retryAt.Before(oldestAt) {
+				oldestKey, oldestAt = key, retryAt
+			}
+		}
+		delete(s.historyBudgetRetryAt, oldestKey)
+	}
+	s.historyBudgetRetryAt[scope] = now.Add(time.Minute)
 }
 
 // CompactHistory performs a user-requested compaction. The caller persists the
@@ -269,7 +315,11 @@ func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) ([]ChatM
 	if !req.HistoryPrepared {
 		// Direct service callers still get a compact model context. Session
 		// adapters call PrepareHistory first so they can persist the summary.
-		history, _ = s.PrepareHistory(ctx, history)
+		scope := req.SessionMemoryScope
+		if scope == "" && req.Channel != "" && req.UserID != "" {
+			scope = req.Channel + ":" + req.UserID
+		}
+		history, _ = s.PrepareHistoryForScope(ctx, scope, history)
 	}
 	messages := []ChatMessage{{Role: "system", Content: systemPrompt}}
 

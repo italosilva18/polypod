@@ -15,14 +15,28 @@ import (
 )
 
 const (
-	maxStoredEntries = 64
-	maxStoredBytes   = 1 << 20
-	maxEntryValue    = 600
+	maxStoredEntries  = 64
+	maxStoredBytes    = 1 << 20
+	maxEntryValue     = 600
+	storeLeaseTimeout = 30 * time.Second
 )
+
+func withStoreLease(dir string, action func() error) (err error) {
+	release, err := lockStoreDirectory(dir)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err = errors.Join(err, release())
+	}()
+	return action()
+}
 
 // FileStore keeps a small, private memory for each persisted conversation ID.
 // Branches use different IDs, so their later decisions cannot overwrite one
 // another. Files are addressed by a hash; the raw ID is never a path component.
+// mu protects this instance; withStoreLease serializes read/modify/write
+// operations with other processes that use the same directory.
 type FileStore struct {
 	mu  sync.Mutex
 	dir string
@@ -86,7 +100,12 @@ func (s *FileStore) loadLocked(scope string) ([]Entry, error) {
 func (s *FileStore) Load(scope string) ([]Entry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	entries, err := s.loadLocked(scope)
+	var entries []Entry
+	err := withStoreLease(s.dir, func() error {
+		var loadErr error
+		entries, loadErr = s.loadLocked(scope)
+		return loadErr
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -98,6 +117,12 @@ func (s *FileStore) Load(scope string) ([]Entry, error) {
 func (s *FileStore) Merge(scope string, additions []Entry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return withStoreLease(s.dir, func() error {
+		return s.mergeLocked(scope, additions)
+	})
+}
+
+func (s *FileStore) mergeLocked(scope string, additions []Entry) error {
 	current, err := s.loadLocked(scope)
 	if err != nil {
 		return err
@@ -128,6 +153,12 @@ func (s *FileStore) Merge(scope string, additions []Entry) error {
 func (s *FileStore) Fork(parent, child string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return withStoreLease(s.dir, func() error {
+		return s.forkLocked(parent, child)
+	})
+}
+
+func (s *FileStore) forkLocked(parent, child string) error {
 	if parent == child {
 		return nil
 	}
@@ -146,6 +177,12 @@ func (s *FileStore) Fork(parent, child string) error {
 func (s *FileStore) Delete(scope string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return withStoreLease(s.dir, func() error {
+		return s.deleteLocked(scope)
+	})
+}
+
+func (s *FileStore) deleteLocked(scope string) error {
 	path, err := s.path(scope)
 	if err != nil {
 		return err

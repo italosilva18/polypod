@@ -569,7 +569,7 @@ func buildProviderRegistry(cfg *config.Config, multiAuth *auth.MultiProviderAuth
 // prepareSessionHistory keeps the persisted session and the next model context aligned.
 func prepareSessionHistory(ctx context.Context, convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionmem.FileStore, scope string, sess *conversation.Session) ([]conversation.Message, error) {
 	history := append([]conversation.Message(nil), convMgr.GetHistory(sess)...)
-	prepared, changed := aiSvc.PrepareHistory(ctx, history)
+	prepared, changed := aiSvc.PrepareHistoryForScope(ctx, scope, history)
 	if !changed {
 		return history, nil
 	}
