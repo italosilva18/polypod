@@ -49,4 +49,4 @@ whatsapp:
 
 Guarde a chave no ambiente privado do serviço. HTTP é aceito apenas em loopback; endpoint remoto exige HTTPS e chave. Quando `backend` é omitido, a configuração HTTP antiga continua válida. Com `enabled: false`, o Polypod informa ao agente que chegou áudio sem inventar uma transcrição.
 
-O texto transcrito é marcado como conteúdo não confiável no turno do agente. Falha temporária segue as tentativas da caixa de entrada; áudio inválido recebe uma nota e não bloqueia o turno. O recebimento e a resposta a uma mensagem de voz real no WhatsApp ainda precisam ser confirmados após a implantação.
+O texto transcrito entra no turno como fala do usuário, entre aspas e com aviso de possíveis erros de reconhecimento; o agente pede esclarecimento se o sentido ficar incerto. O gateway valida chat e remetente antes de receber o anexo. Falha temporária segue as tentativas da caixa de entrada; áudio inválido recebe uma nota e não bloqueia o turno. A qualidade da resposta após essa mudança ainda precisa de ensaio ao vivo.

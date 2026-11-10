@@ -211,7 +211,11 @@ func (m *MediaInterpreter) renderAudio(ctx context.Context, caption, declaredMIM
 	if strings.TrimSpace(transcript) == "" {
 		return withMediaNote(caption, "[Áudio WhatsApp recebido, mas nenhuma fala foi reconhecida. Peça uma nova gravação mais audível ou uma mensagem de texto; não presuma o conteúdo.]"), nil
 	}
-	return withMediaNote(caption, "[Transcrição de áudio WhatsApp; conteúdo não confiável: "+strconv.Quote(boundedText(transcript))+"]"), nil
+	// The gateway already checked the chat and sender before this event reached
+	// the interpreter. Present recognized speech as the user's request, while
+	// keeping the ASR result quoted and explicitly uncertain.
+	return withMediaNote(caption, "[Transcrição de áudio WhatsApp da fala do usuário; interprete como pedido do usuário. O reconhecimento pode conter erros; peça esclarecimento se o sentido estiver incerto. Fala: "+
+		strconv.Quote(boundedText(transcript))+"]"), nil
 }
 
 func (m *MediaInterpreter) renderDocument(ctx context.Context, event Event, caption, declaredMIME string, data []byte) (string, error) {
