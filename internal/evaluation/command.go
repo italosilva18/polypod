@@ -112,6 +112,15 @@ func (r *CommandRunner) Execute(ctx context.Context, task Task) (Execution, erro
 	if !ok {
 		return Execution{}, fmt.Errorf("caso não configurado: %q", task.ID)
 	}
+	if c.ExpectedFile != "" {
+		initial, err := observedFileSHA256(ctx, c.WorkingDir, c.ExpectedFile)
+		if err != nil {
+			return Execution{}, fmt.Errorf("estado inicial de %q: %w", task.ID, err)
+		}
+		if strings.EqualFold(initial, c.ExpectedSHA256) {
+			return Execution{}, fmt.Errorf("resultado de %q já existia antes da execução", task.ID)
+		}
+	}
 	argv := append([]string(nil), c.Command...)
 	for i := range argv {
 		argv[i] = strings.ReplaceAll(argv[i], "{prompt}", task.Prompt)
@@ -152,35 +161,49 @@ func (r *CommandRunner) Verify(ctx context.Context, task Task, _ Execution) (Ver
 	if err := ctx.Err(); err != nil {
 		return Verification{}, err
 	}
-	path := filepath.Join(c.WorkingDir, c.ExpectedFile)
-	// Refuse symlink traversal so the verifier reads only its case workspace.
-	if err := ensureNoSymlinks(c.WorkingDir, c.ExpectedFile); err != nil {
-		return Verification{Status: "failure", VerifiedBy: "file_sha256", Evidence: "arquivo inválido"}, nil
+	actual, err := observedFileSHA256(ctx, c.WorkingDir, c.ExpectedFile)
+	if err != nil {
+		return Verification{}, err
 	}
-	f, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
+	if actual == "missing" {
 		return Verification{Status: "failure", VerifiedBy: "file_sha256", Evidence: "arquivo ausente"}, nil
 	}
-	if err != nil {
-		return Verification{}, err
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return Verification{}, err
-	}
-	if !info.Mode().IsRegular() {
-		return Verification{Status: "failure", VerifiedBy: "file_sha256", Evidence: "não é arquivo regular"}, nil
-	}
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return Verification{}, err
-	}
-	actual := hex.EncodeToString(h.Sum(nil))
 	if !strings.EqualFold(actual, c.ExpectedSHA256) {
 		return Verification{Status: "failure", VerifiedBy: "file_sha256", Evidence: "sha256:" + actual}, nil
 	}
 	return Verification{Status: "success", VerifiedBy: "file_sha256", Evidence: "sha256:" + actual}, nil
+}
+
+func observedFileSHA256(ctx context.Context, root, relative string) (string, error) {
+	// Refuse symlink traversal so the verifier reads only its case workspace.
+	if err := ensureNoSymlinks(root, relative); errors.Is(err, os.ErrNotExist) {
+		return "missing", nil
+	} else if err != nil {
+		return "", err
+	}
+	f, err := os.Open(filepath.Join(root, relative))
+	if errors.Is(err, os.ErrNotExist) {
+		return "missing", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", errors.New("não é arquivo regular")
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func ensureNoSymlinks(root, relative string) error {

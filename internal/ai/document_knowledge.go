@@ -102,12 +102,12 @@ func (s *DocumentKnowledgeSearcher) scopes(ctx context.Context, channel, userID 
 	if channel == whatsappgateway.Channel {
 		return nil
 	}
-	// These are local entry points. All other channels must carry the remote
-	// scope set by the durable inbox processor above.
+	// Only direct local entry points inherit local documents. Queued tasks and
+	// routines can be created from a remote chat, but their execution currently
+	// carries no authenticated creator scope, so they must not inherit local
+	// documents here.
 	if (channel == "cli" && userID == "local") ||
-		(channel == "system" && userID == "owner") ||
-		(channel == "scheduler" && userID != "") ||
-		(channel == "task_queue" && userID != "") {
+		(channel == "system" && userID == "owner") {
 		return []string{document.LocalScope}
 	}
 	return nil

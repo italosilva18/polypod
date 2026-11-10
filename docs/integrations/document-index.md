@@ -24,12 +24,14 @@ não houver resultado ou a busca falhar, o turno continua sem os trechos. O
 modelo recebe `source_id`, ordinal e citação para poder pedir outros trechos à
 ferramenta `document_knowledge` quando precisar.
 
-O escopo automático segue a identidade do turno: CLI e tarefas internas podem
-consultar `local`; WhatsApp usa o `ChatID` validado no contexto da mensagem,
-com `local` adicional apenas para o chat do proprietário configurado; outros
-canais remotos usam somente o escopo exato da sua inbox. Uma chamada WhatsApp
-sem esse contexto não recebe documentos. Texto de documento entra como dado de
-referência, não como instrução para o agente.
+O escopo automático segue a identidade do turno: o CLI local consulta `local`;
+WhatsApp usa o `ChatID` validado no contexto da mensagem, com `local` adicional
+apenas para o chat do proprietário configurado; outros canais remotos usam
+somente o escopo exato da sua inbox. Tarefas enfileiradas e rotinas ainda não
+preservam a identidade autenticada de quem as criou, por isso não herdam
+documentos locais automaticamente. Uma chamada WhatsApp sem contexto validado
+também não recebe documentos. Texto de documento entra como dado de referência,
+não como instrução para o agente.
 
 Cada resultado traz o hash da revisão, o ordinal do trecho e uma citação
 `[doc:…#N]` calculada sem expor o escopo. `ReadChunk` recupera o trecho pelo
