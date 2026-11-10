@@ -22,10 +22,13 @@ func renderDraft(name string, sequence []string, successes, total int, evidence 
 	var body strings.Builder
 	fmt.Fprintf(&body, "---\nname: %s\ndescription: Use este fluxo quando uma rotina da categoria %s se repetir.\n---\n\n", name, name)
 	body.WriteString("# Procedimento verificado\n\n")
-	body.WriteString("## Quando usar\n\nConfirme que o objetivo atual corresponde a esta rotina antes de agir.\n\n")
-	body.WriteString("## Etapas observadas\n\n")
-	body.WriteString("1. Observe o estado atual e confirme as entradas necessárias.\n")
-	body.WriteString("2. Execute a sequência de ferramentas que se repetiu nos resultados verificados: ")
+	body.WriteString("## Pré-condições\n\n")
+	body.WriteString("- Confirme que o pedido atual pertence à mesma categoria dos resultados abaixo.\n")
+	body.WriteString("- Identifique as entradas atuais, o sistema de destino e o estado desejado antes de agir.\n")
+	body.WriteString("- Defina como conferir o efeito no sistema de destino. Se a tarefa puder repetir efeitos, confira o estado atual primeiro.\n\n")
+	body.WriteString("## Procedimento observado\n\n")
+	body.WriteString("1. Leia o estado inicial e anote o que ainda precisa mudar.\n")
+	body.WriteString("2. Use a sequência de ferramentas que se repetiu nos resultados verificados: ")
 	for i, tool := range sequence {
 		if i > 0 {
 			body.WriteString(" → ")
@@ -33,10 +36,17 @@ func renderDraft(name string, sequence []string, successes, total int, evidence 
 		fmt.Fprintf(&body, "`%s`", tool)
 	}
 	body.WriteString(". Use parâmetros do pedido atual; não reutilize argumentos, credenciais ou respostas históricas.\n")
-	body.WriteString("3. Confira o resultado no sistema de destino antes de concluir a tarefa.\n\n")
+	body.WriteString("3. Leia novamente o estado do sistema de destino e compare com o critério definido antes da execução.\n\n")
+	body.WriteString("## Critério de conclusão\n\n")
+	body.WriteString("Conclua somente quando a verificação independente do efeito esperado passar. Uma resposta do agente ou o retorno sem erro de uma ferramenta não comprovam o resultado.\n\n")
+	body.WriteString("## Recuperação de falhas\n\n")
+	body.WriteString("- Se a execução falhar, leia o estado atual antes de repetir qualquer ação.\n")
+	body.WriteString("- Se o efeito já ocorreu, evite repeti-lo e confira a saída.\n")
+	body.WriteString("- Se o estado for parcial ou incerto, descreva o que foi observado e peça os dados necessários para continuar.\n")
+	body.WriteString("- Registre a falha com o verificador; não transforme uma tentativa sem prova em sucesso.\n\n")
 	fmt.Fprintf(&body, "## Evidência para revisão\n\n%d resultados confirmados em %d registros. IDs de origem recentes:\n\n", successes, total)
 	for _, item := range evidence {
-		fmt.Fprintf(&body, "- `%s` (%s)\n", item.OutcomeID, outcomeLabel(item.Success))
+		fmt.Fprintf(&body, "- `%s` (%s; verificador `%s`)\n", item.OutcomeID, outcomeLabel(item.Success), item.VerifiedBy)
 	}
 	return body.String()
 }

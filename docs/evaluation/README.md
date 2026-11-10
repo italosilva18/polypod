@@ -19,6 +19,37 @@ go vet ./internal/evaluation/...
 
 O comando fica dentro de `internal/` para seguir a convenção do repositório. Para um executável separado: `go build -o /tmp/polypod-eval ./internal/evaluation/cmd`.
 
+## Execução real de casos locais
+
+`go run ./internal/evaluation/runcli` agora executa o agente por subprocesso em um diretório preparado para cada tarefa. Ele passa apenas `prompt` ao comando e compara um arquivo produzido com um SHA-256 previamente definido em um plano separado. A resposta do agente não é gravada no resultado. Um caso sem verificador fica `skipped`; uma resposta declarando sucesso não ganha ponto.
+
+Prepare três JSONs: um manifesto com `prompt` em todas as tarefas, os `Metadata` de reprodução no mesmo formato do campo `metadata` dos resultados, e um plano de comandos com um caso por tarefa. Exemplo de plano para um único caso:
+
+```json
+{
+  "cases": [
+    {
+      "task_id": "edit-file",
+      "working_dir": "/caminho/absoluto/para/vm/caso-1",
+      "command": ["/caminho/absoluto/polypod", "config.yaml", "-p", "{prompt}", "--output-format", "json"],
+      "expected_file": "resultado.txt",
+      "expected_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ]
+}
+```
+
+```bash
+go run ./internal/evaluation/runcli \
+  -manifest /caminho/manifesto-real.json \
+  -metadata /caminho/metadata.json \
+  -plan /caminho/plano.json \
+  -output /caminho/resultados.json
+go run ./internal/evaluation/cmd -manifest /caminho/manifesto-real.json -results /caminho/resultados.json
+```
+
+O runner valida todos os casos antes da primeira execução, limita cada processo pelo prazo da tarefa, captura a saída sem publicá-la e grava resultados com permissão `0600`. O processo deve devolver um único JSON no formato headless contendo `content`. O verificador registra apenas o digest observado. Prepare cada diretório a partir de uma fixture conhecida e execute o runner dentro de uma VM ou contêiner descartável: o diretório de trabalho não limita o acesso do agente ao restante do host. Este adaptador não mede custo nem passos; esses campos permanecem ausentes e o relatório não atesta o cumprimento dos respectivos orçamentos. Para GUI, memória, canais e segurança, acrescente verificadores externos específicos ao protocolo antes de interpretar `skipped` como capacidade ausente.
+
 ## Runner programático
 
 Para uma execução real, forneça `prompt` a cada tarefa do manifesto. `timeout_seconds` é opcional; o limite aplicado por caso é o menor entre ele e `metadata.budget.max_seconds`. Fixe prompts, estado inicial e verificadores antes do teste. O manifesto de exemplo não contém prompts executáveis, por isso o runner o rejeita até que uma cópia de teste acrescente esses campos.
