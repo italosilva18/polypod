@@ -51,7 +51,16 @@ type ExtractedMemory struct {
 	Type       string // "fact", "preference", "skill", "context"
 	Content    string
 	Tags       []string
-	Importance int // 1-5
+	Importance int              // 1-5
+	Evidence   []MemoryEvidence `json:"evidence,omitempty"`
+}
+
+// MemoryEvidence is a verbatim excerpt from one user message. It grounds an
+// extracted memory in the private journal without asking the model to grade
+// its own confidence.
+type MemoryEvidence struct {
+	MessageID string `json:"message_id"`
+	Quote     string `json:"quote"`
 }
 
 // DreamStats exposes runtime metrics for observability.
@@ -262,7 +271,7 @@ func (d *DreamService) extractMemoriesOwned(ctx context.Context) error {
 		return err
 	}
 
-	transcript, msgCount, sequence, provenance, err := d.collectTranscript(ctx)
+	transcript, msgCount, sequence, provenance, evidence, err := d.collectTranscript(ctx)
 	if err != nil {
 		d.recordError(err)
 		return err
@@ -294,7 +303,8 @@ func (d *DreamService) extractMemoriesOwned(ctx context.Context) error {
 	if !cached {
 		clean := make([]ExtractedMemory, 0, len(memories))
 		for _, m := range memories {
-			if strings.TrimSpace(m.Content) != "" && !looksSensitive(m.Content) && !looksSensitive(strings.Join(m.Tags, " ")) {
+			if strings.TrimSpace(m.Content) != "" && !looksSensitive(m.Content) &&
+				!looksSensitive(strings.Join(m.Tags, " ")) && !sensitiveEvidence(m.Evidence) {
 				clean = append(clean, m)
 			}
 		}
@@ -308,14 +318,22 @@ func (d *DreamService) extractMemoriesOwned(ctx context.Context) error {
 	added := 0
 	saveFailed := false
 	for _, m := range memories {
-		if strings.TrimSpace(m.Content) == "" || looksSensitive(m.Content) || looksSensitive(strings.Join(m.Tags, " ")) {
+		if strings.TrimSpace(m.Content) == "" || looksSensitive(m.Content) ||
+			looksSensitive(strings.Join(m.Tags, " ")) || sensitiveEvidence(m.Evidence) {
 			continue
 		}
 		if d.config.Memory == nil {
 			saveFailed = true
 			continue
 		}
-		tags := append(append([]string(nil), m.Tags...), provenance...)
+		sourceTags, confidence, grounded := groundMemory(m, evidence, provenance)
+		if !grounded {
+			// A claimed source with no matching user quote is not evidence.
+			// Older pending batches without the new field remain readable, but
+			// their batch-level attribution is explicitly uncertain.
+			continue
+		}
+		tags := append(append([]string(nil), m.Tags...), sourceTags...)
 		if m.FactKey != "" {
 			tags = append(tags, "fact_key:"+m.FactKey)
 		}
@@ -325,7 +343,7 @@ func (d *DreamService) extractMemoriesOwned(ctx context.Context) error {
 			Tags:       tags,
 			Priority:   normalisePriority(m.Importance),
 			Source:     "dream",
-			Confidence: float64(m.Importance) / 5.0,
+			Confidence: confidence,
 		}
 		if err := d.config.Memory.SaveWithMeta(ctx, mem); err != nil {
 			logger.Warn("dream: failed saving memory", "error", err)
@@ -359,7 +377,7 @@ func (d *DreamService) extractMemoriesOwned(ctx context.Context) error {
 // MaxMessages explicit user messages. Autonomous scheduler turns are common
 // and must not consume the entire evidence window or delay the next real user
 // message by another consolidation interval.
-func (d *DreamService) collectTranscript(ctx context.Context) (string, int, uint64, []string, error) {
+func (d *DreamService) collectTranscript(ctx context.Context) (string, int, uint64, []string, map[string]string, error) {
 	d.mu.Lock()
 	cursor := d.lastSequence
 	d.mu.Unlock()
@@ -369,16 +387,16 @@ func (d *DreamService) collectTranscript(ctx context.Context) (string, int, uint
 	if d.config.StateFile != "" {
 		raw, readErr := os.ReadFile(d.config.StateFile + ".pending")
 		if readErr != nil && !os.IsNotExist(readErr) {
-			return "", 0, 0, nil, readErr
+			return "", 0, 0, nil, nil, readErr
 		}
 		if readErr == nil {
 			var pending pendingDream
 			if err := json.Unmarshal(raw, &pending); err != nil {
-				return "", 0, 0, nil, err
+				return "", 0, 0, nil, nil, err
 			}
 			if pending.Cursor == cursor {
 				if pending.Through <= cursor {
-					return "", 0, 0, nil, fmt.Errorf("dream: limite de lote pendente inválido")
+					return "", 0, 0, nil, nil, fmt.Errorf("dream: limite de lote pendente inválido")
 				}
 				pendingThrough = pending.Through
 			}
@@ -387,6 +405,7 @@ func (d *DreamService) collectTranscript(ctx context.Context) (string, int, uint
 	var sb strings.Builder
 	var sequence uint64
 	var provenance []string
+	evidence := make(map[string]string)
 	count := 0
 	const maxScannedEntries = 1000
 	userLimit := d.config.MaxMessages
@@ -400,14 +419,14 @@ func (d *DreamService) collectTranscript(ctx context.Context) (string, int, uint
 		pageSize := min(d.config.MaxMessages, maxScannedEntries-scanned)
 		entries, err := d.config.SessionStore.JournalAfter(ctx, cursor, pageSize)
 		if err != nil {
-			return "", 0, 0, nil, err
+			return "", 0, 0, nil, nil, err
 		}
 		if len(entries) == 0 {
 			break
 		}
 		for _, e := range entries {
 			if pendingThrough != 0 && e.Sequence > pendingThrough {
-				return sb.String(), count, sequence, provenance, nil
+				return sb.String(), count, sequence, provenance, evidence, nil
 			}
 			cursor = e.Sequence
 			sequence = e.Sequence
@@ -423,6 +442,7 @@ func (d *DreamService) collectTranscript(ctx context.Context) (string, int, uint
 			// the private journal through extraction, including assistant echoes.
 			fmt.Fprintf(&sb, "[%s message=%s] user: %s\n", e.SessionID, e.Message.ID, strings.TrimSpace(e.Message.Content))
 			provenance = append(provenance, "journal:"+e.Message.ID)
+			evidence[e.Message.ID] = strings.TrimSpace(e.Message.Content)
 			count++
 			if count >= userLimit || scanned >= maxScannedEntries {
 				break
@@ -432,7 +452,54 @@ func (d *DreamService) collectTranscript(ctx context.Context) (string, int, uint
 			break
 		}
 	}
-	return sb.String(), count, sequence, provenance, nil
+	return sb.String(), count, sequence, provenance, evidence, nil
+}
+
+func sensitiveEvidence(items []MemoryEvidence) bool {
+	for _, item := range items {
+		if looksSensitive(item.MessageID) || looksSensitive(item.Quote) {
+			return true
+		}
+	}
+	return false
+}
+
+// groundMemory distinguishes usefulness (Importance) from confidence in its
+// attribution. A model cannot grant itself confidence: only exact quotes from
+// user messages in this journal window count. Confidence describes support
+// for the user's statement, not independent proof that the statement is true.
+func groundMemory(m ExtractedMemory, messages map[string]string, batch []string) ([]string, float64, bool) {
+	if len(m.Evidence) == 0 {
+		if len(batch) == 0 {
+			return nil, 0, false
+		}
+		// Legacy pending extractions had no per-memory citations. Preserve
+		// their batch provenance while clearly marking the attribution weak.
+		tags := append([]string{"evidence:batch_unattributed"}, batch...)
+		return tags, 0.35, true
+	}
+	tags := make([]string, 0, len(m.Evidence)+1)
+	seen := make(map[string]bool)
+	for _, item := range m.Evidence {
+		messageID := strings.TrimSpace(item.MessageID)
+		message, exists := messages[messageID]
+		quote := strings.TrimSpace(item.Quote)
+		if !exists || len(messageID) > 128 || len([]rune(quote)) < 10 || len([]rune(quote)) > 320 ||
+			!strings.Contains(message, quote) || seen[messageID] {
+			continue
+		}
+		seen[messageID] = true
+		tags = append(tags, "journal:"+messageID)
+	}
+	if len(tags) == 0 {
+		return nil, 0, false
+	}
+	tags = append([]string{"evidence:quote_verified"}, tags...)
+	confidence := 0.75
+	if len(tags) > 2 {
+		confidence = 0.8
+	}
+	return tags, confidence, true
 }
 
 func (d *DreamService) recordError(err error) {

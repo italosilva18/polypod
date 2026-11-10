@@ -18,9 +18,12 @@ type ManagedStore struct {
 	Store
 	embedder Embedder
 	mu       sync.Mutex // serializes fact transitions and forget operations
+	index    *semanticIndex
 }
 
-func NewManagedStore(base Store) *ManagedStore { return &ManagedStore{Store: base} }
+func NewManagedStore(base Store) *ManagedStore {
+	return &ManagedStore{Store: base, index: newSemanticIndex()}
+}
 
 func hasTag(m Memory, tag string) bool {
 	for _, t := range m.Tags {
@@ -39,6 +42,7 @@ func (s *ManagedStore) Save(ctx context.Context, topic, content string) error {
 func (s *ManagedStore) SaveWithMeta(ctx context.Context, m Memory) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer s.index.invalidate()
 	all, err := s.Store.List(ctx)
 	if err != nil {
 		return err
@@ -55,12 +59,27 @@ func (s *ManagedStore) SaveWithMeta(ctx context.Context, m Memory) error {
 		if old.Content == m.Content && old.Source == m.Source {
 			// Merge additional evidence without manufacturing a new content revision.
 			changed := false
+			hadVerifiedEvidence := hasTag(old, "evidence:quote_verified")
 			old.Tags = append([]string(nil), old.Tags...)
 			for _, tag := range m.Tags {
 				if !hasTag(old, tag) {
 					old.Tags = append(old.Tags, tag)
 					changed = true
 				}
+			}
+			if m.Source == "dream" && hasTag(m, "evidence:quote_verified") &&
+				!hadVerifiedEvidence && old.Confidence > m.Confidence {
+				// Older dreaming tied confidence to importance. Once this exact
+				// fact gains a checked quote, replace that inflated estimate.
+				old.Confidence = m.Confidence
+				changed = true
+			} else if m.Confidence > old.Confidence {
+				old.Confidence = m.Confidence
+				changed = true
+			}
+			if m.Priority > old.Priority {
+				old.Priority = m.Priority
+				changed = true
 			}
 			if !changed {
 				return nil
@@ -86,6 +105,7 @@ func (s *ManagedStore) SaveWithMeta(ctx context.Context, m Memory) error {
 func (s *ManagedStore) Delete(ctx context.Context, topic string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer s.index.invalidate()
 	all, err := s.Store.List(ctx)
 	if err != nil {
 		return err
@@ -135,7 +155,13 @@ func (s *ManagedStore) SearchRelevant(ctx context.Context, q string, max int, mi
 	s.mu.Lock()
 	embedder := s.embedder
 	s.mu.Unlock()
-	all, err := HybridSearch(ctx, s.Store, embedder, q, 0, min)
+	var all []Memory
+	var err error
+	if named, ok := embedder.(interface{ Name() string }); ok && named.Name() != "" {
+		all, err = hybridSearchIndexed(ctx, s.Store, embedder, s.index, q, max, min)
+	} else {
+		all, err = HybridSearch(ctx, s.Store, embedder, q, max, min)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -180,4 +206,5 @@ func (s *ManagedStore) SetEmbedder(embedder Embedder) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.embedder = embedder
+	s.index.invalidate()
 }

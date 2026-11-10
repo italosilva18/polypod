@@ -19,13 +19,16 @@ Guarde requisitos continuos como requisitos declarados, nunca como funcionalidad
 Nao memorize respostas inventadas pelo assistente, resultados temporarios, conversa casual,
 senhas, tokens, chaves, codigos 2FA, cookies ou qualquer outro segredo.
 Retorne APENAS um array JSON. Cada item deve ter:
-{"type":"fact|preference|skill|context","fact_key":"sujeito.propriedade","content":"...","tags":["..."],"importance":1-5}
+{"type":"fact|preference|skill|context","fact_key":"sujeito.propriedade","content":"...","tags":["..."],"importance":1-5,"evidence":[{"message_id":"ID","quote":"trecho literal do usuario"}]}
+Em evidence, cite o ID de message= no transcriptado e um trecho literal da mesma fala do usuario,
+com pelo menos 10 caracteres. Cite somente mensagens que sustentam diretamente o item.
+Importance mede utilidade futura, nao confiabilidade. Nao forneca uma nota de confianca.
 Use fact_key estavel e especifica, sem incluir o valor: usuario.cidade, usuario.linguagem_preferida,
 projeto_polypod.banco_de_dados. Uma mudanca do mesmo fato deve reutilizar a mesma chave.
 Se o mesmo fato mudar no lote, retorne apenas a ultima declaracao explicita do usuario.
 Nao deduza contradicoes entre propriedades diferentes. Nunca use chaves genericas como fato ou contexto.
-Quando o usuario disser "prefiro respostas curtas", uma memoria apropriada e
-{"type":"preference","fact_key":"usuario.estilo_resposta","content":"Prefere respostas curtas.","tags":["respostas"],"importance":3}.
+Quando o usuario disser "prefiro respostas curtas", use fact_key usuario.estilo_resposta,
+content "Prefere respostas curtas.", importance 3 e cite a mesma fala em evidence.
 Se nada merecer memoria de longo prazo, retorne [].`
 
 // ParseExtractedMemories validates the model's JSON before anything reaches
@@ -74,6 +77,12 @@ func ParseExtractedMemories(content string) ([]ExtractedMemory, error) {
 			}
 		}
 		memory.Tags = cleanTags
+		if len(memory.Evidence) > 3 {
+			memory.Evidence = memory.Evidence[:3]
+		}
+		if sensitiveEvidence(memory.Evidence) {
+			continue
+		}
 		result = append(result, memory)
 	}
 	return result, nil

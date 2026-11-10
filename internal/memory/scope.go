@@ -17,15 +17,20 @@ func WithSessionScope(ctx context.Context, sessionID string) context.Context {
 	return context.WithValue(ctx, sessionScopeKey{}, sessionID)
 }
 
+func sessionScope(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	sessionID, _ := ctx.Value(sessionScopeKey{}).(string)
+	return sessionID
+}
+
 func memoryVisible(ctx context.Context, m Memory) bool {
 	if m.Source != "dream_episode" {
 		return true
 	}
-	if ctx == nil {
-		return false
-	}
-	sessionID, ok := ctx.Value(sessionScopeKey{}).(string)
-	return ok && sessionID != "" && m.SessionID == sessionID
+	sessionID := sessionScope(ctx)
+	return sessionID != "" && m.SessionID == sessionID
 }
 
 func visibleOnly(ctx context.Context, memories []Memory) []Memory {

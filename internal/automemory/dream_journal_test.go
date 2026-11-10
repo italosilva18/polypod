@@ -96,7 +96,9 @@ func TestDreamReplaysPersistedBatchAfterWriteFailure(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("model called again for interrupted batch: %d", calls)
 	}
-	if len(mem.saved) != 1 || len(mem.saved[0].Tags) != 1 || !strings.HasPrefix(mem.saved[0].Tags[0], "journal:") {
+	if len(mem.saved) != 1 || len(mem.saved[0].Tags) != 2 ||
+		mem.saved[0].Tags[0] != "evidence:batch_unattributed" ||
+		!strings.HasPrefix(mem.saved[0].Tags[1], "journal:") {
 		t.Fatal("missing provenance")
 	}
 }

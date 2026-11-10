@@ -429,7 +429,8 @@ func TestDreamService_RunNow_SavesExtractedMemories(t *testing.T) {
 		t.Fatalf("expected 2 memories saved (blank skipped), got %d", len(saved))
 	}
 
-	// Verify topic, priority normalisation, and confidence mapping.
+	// Importance controls priority, while a legacy extraction without a
+	// per-memory quote retains only weak batch-level attribution.
 	var gotFact, gotPref bool
 	for _, m := range saved {
 		switch {
@@ -438,8 +439,8 @@ func TestDreamService_RunNow_SavesExtractedMemories(t *testing.T) {
 			if m.Priority != 2 { // importance 5 → critical (2)
 				t.Errorf("importance 5 should map to priority 2, got %d", m.Priority)
 			}
-			if m.Confidence != 1.0 {
-				t.Errorf("expected confidence 1.0 for importance 5, got %v", m.Confidence)
+			if m.Confidence != 0.35 {
+				t.Errorf("expected weak confidence for unquoted extraction, got %v", m.Confidence)
 			}
 		case strings.HasPrefix(m.Topic, "dream_preference_"):
 			gotPref = true

@@ -48,6 +48,16 @@ stdin/stdout privados do processo Python; erros e logs não incluem esse texto.
   e vetores, separado pela identidade do modelo, sem guardar o texto original.
   Consultas repetidas reutilizam os vetores em vez de recalcular toda a memória.
   O arquivo e seu diretório recebem permissões privadas.
+- O processo conserva por até um minuto um índice de vetores por sessão, com
+  no máximo quatro escopos recentes. Escritas locais invalidam o índice de
+  imediato; alterações feitas por outro processo aparecem após a atualização
+  periódica. Episódios de outra sessão são excluídos antes de gerar vetores.
+- Em consultas com limite final, a busca normalmente preserva até 128
+  candidatos lexicais e os vizinhos semânticos mais próximos antes de ordenar
+  por relevância e confiança. O limiar semântico
+  mínimo permanece em 0,80 e uma janela relativa de 0,08 descarta vizinhos
+  bem mais fracos que o melhor resultado. Limites finais menores reduzem o
+  conjunto candidato; sem um limite final, a busca mantém todos os resultados.
 - O wrapper aceita até 100.000 textos por chamada e repassa faltas ao worker
   em lotes de 32; cada texto tem até 128.000 bytes. O modelo trunca cada
   entrada após 128 tokens; documentos longos são divididos em trechos pelo
@@ -57,6 +67,16 @@ stdin/stdout privados do processo Python; erros e logs não incluem esse texto.
   parciais.
 - Isso melhora a recuperação por sentido; não cria fatos novos nem substitui
   a consolidação automática da memória.
+
+O dreaming agora pede uma citação literal e o ID da mensagem do usuário para
+cada fato. O serviço confere ambos no journal antes de atribuir a origem da
+memória. Uma citação confirmada recebe confiança 0,75 e a marca
+`evidence:quote_verified`; duas mensagens distintas recebem 0,80. A
+importância de 1 a 5 continua definindo prioridade, separada da
+confiança. Um lote antigo sem citações individuais mantém a origem do lote com
+confiança 0,35 e a marca `evidence:batch_unattributed`. Citações inválidas não
+são gravadas. A conferência comprova que o trecho veio daquela mensagem, mas
+não verifica se a interpretação do modelo ou a afirmação do usuário é verdadeira.
 
 Para testar a instalação real sem rede:
 
