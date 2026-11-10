@@ -125,6 +125,7 @@ type model struct {
 	history  *inputHistory
 
 	messages               []chatEntry
+	transcriptCache        transcriptRenderCache
 	streaming              *strings.Builder
 	streamCh               <-chan streamMsg
 	state                  state
@@ -1646,32 +1647,14 @@ func (m *model) renderMessages() string {
 	}
 
 	if len(m.messages) == 0 && m.state != stateStreaming {
+		m.transcriptCache = transcriptRenderCache{}
 		b.WriteString(m.renderWelcome())
 		return b.String()
 	}
 
 	start := min(max(0, m.historyStart), len(m.messages))
 	older := start + m.historyBefore
-	if older > 0 {
-		b.WriteString(subtleStyle.Render(fmt.Sprintf("  ↑ %d mensagens anteriores; PgUp para carregar", older)))
-		b.WriteString("\n\n")
-	}
-	for i := start; i < len(m.messages); i++ {
-		entry := &m.messages[i]
-		if entry.renderedWidth != width {
-			entry.renderedBody = renderChatEntry(*entry, width)
-			entry.renderedWidth = width
-		}
-		b.WriteString(entry.renderedBody)
-
-		// Subtle separator between message pairs
-		if i < len(m.messages)-1 && entry.role == "assistant" {
-			sep := separatorStyle.Render(strings.Repeat("─", width/2))
-			b.WriteString("  ")
-			b.WriteString(sep)
-			b.WriteString("\n\n")
-		}
-	}
+	b.WriteString(m.renderStaticTranscript(width, start, older))
 	if m.voiceRecording && m.voicePartialText != "" {
 		preview := []rune(m.voicePartialText)
 		if len(preview) > 400 {
