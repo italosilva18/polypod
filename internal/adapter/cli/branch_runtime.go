@@ -28,7 +28,7 @@ type persistentBranchController struct {
 	storage          session.SessionStorage
 	conversation     *conversation.Manager
 	activeID         func() string
-	setActiveID      func(string)
+	setActiveID      func(string, string)
 	saveActive       func(*conversation.Session) error
 	activate         func(session.SessionMetadata) []string
 	forkMemory       func(string, string) error
@@ -68,7 +68,7 @@ func newPersistentBranchController(
 	storage session.SessionStorage,
 	conv *conversation.Manager,
 	activeID func() string,
-	setActiveID func(string),
+	setActiveID func(string, string),
 	saveActive func(*conversation.Session) error,
 ) *persistentBranchController {
 	return &persistentBranchController{
@@ -165,32 +165,13 @@ func (r *persistentBranchController) create(name string, _ []chatEntry) (branchS
 	}
 	if r.forkMemory != nil {
 		if err := r.forkMemory(parentID, childID); err != nil {
-			if cleanupErr := r.storage.Delete(childID); cleanupErr != nil {
-				slog.Warn("nao foi possivel remover sessao filha apos falha de memoria", "error", cleanupErr)
-			}
-			if r.deleteMemory != nil {
-				if cleanupErr := r.deleteMemory(childID); cleanupErr != nil {
-					slog.Warn("nao foi possivel remover memoria filha apos falha de copia", "error", cleanupErr)
-				}
-			}
+			r.cleanupNewChild(child, false, "falha de memória")
 			return branchSnapshot{}, fmt.Errorf("copiando memoria da branch: %w", err)
 		}
 	}
 	if r.forkTranscript != nil {
 		if err := r.forkTranscript(parentID, childID); err != nil {
-			if cleanupErr := r.storage.Delete(childID); cleanupErr != nil {
-				slog.Warn("nao foi possivel remover sessao filha apos falha de transcript", "error", cleanupErr)
-			}
-			if r.deleteMemory != nil {
-				if cleanupErr := r.deleteMemory(childID); cleanupErr != nil {
-					slog.Warn("nao foi possivel remover memoria filha apos falha de transcript", "error", cleanupErr)
-				}
-			}
-			if r.deleteTranscript != nil {
-				if cleanupErr := r.deleteTranscript(childID); cleanupErr != nil {
-					slog.Warn("nao foi possivel remover transcript filho apos falha de copia", "error", cleanupErr)
-				}
-			}
+			r.cleanupNewChild(child, true, "falha de transcript")
 			return branchSnapshot{}, fmt.Errorf("copiando transcript da branch: %w", err)
 		}
 	}
@@ -203,23 +184,43 @@ func (r *persistentBranchController) create(name string, _ []chatEntry) (branchS
 	if err := r.writeManifest(manifest); err != nil {
 		delete(manifest.Branches, name)
 		manifest.Active = previous
-		if cleanupErr := r.storage.Delete(childID); cleanupErr != nil {
-			slog.Warn("nao foi possivel remover sessao filha apos falha do indice", "error", cleanupErr)
-		}
-		if r.deleteMemory != nil {
-			if cleanupErr := r.deleteMemory(childID); cleanupErr != nil {
-				slog.Warn("nao foi possivel remover memoria filha apos falha do indice", "error", cleanupErr)
-			}
-		}
-		if r.deleteTranscript != nil {
-			if cleanupErr := r.deleteTranscript(childID); cleanupErr != nil {
-				slog.Warn("nao foi possivel remover transcript filho apos falha do indice", "error", cleanupErr)
-			}
-		}
+		r.cleanupNewChild(child, true, "falha do índice")
 		return branchSnapshot{}, err
 	}
-	r.setActiveID(childID)
+	r.setActiveID(childID, child.Revision)
 	return r.snapshot(manifest, active.Messages)
+}
+
+// cleanupNewChild removes only the child revision created by this operation.
+// If another process has changed the child, its session and auxiliary stores
+// are left intact for recovery instead of deleting newer work.
+func (r *persistentBranchController) cleanupNewChild(child *session.RestoredSession, transcript bool, reason string) {
+	var err error
+	if pinned, ok := r.storage.(interface {
+		DeleteAtRevision(string, string) error
+	}); ok {
+		if child.Revision == "" {
+			slog.Warn("não foi possível remover sessão filha sem revisão", "session", child.ID, "reason", reason)
+			return
+		}
+		err = pinned.DeleteAtRevision(child.ID, child.Revision)
+	} else {
+		err = r.storage.Delete(child.ID)
+	}
+	if err != nil {
+		slog.Warn("não foi possível remover sessão filha após "+reason, "session", child.ID, "error", err)
+		return
+	}
+	if r.deleteMemory != nil {
+		if err := r.deleteMemory(child.ID); err != nil {
+			slog.Warn("não foi possível remover memória filha após "+reason, "session", child.ID, "error", err)
+		}
+	}
+	if transcript && r.deleteTranscript != nil {
+		if err := r.deleteTranscript(child.ID); err != nil {
+			slog.Warn("não foi possível remover transcript filho após "+reason, "session", child.ID, "error", err)
+		}
+	}
 }
 
 func (r *persistentBranchController) switchTo(name string, _ []chatEntry) (branchSnapshot, error) {
@@ -267,7 +268,7 @@ func (r *persistentBranchController) switchTo(name string, _ []chatEntry) (branc
 		}
 		return branchSnapshot{}, err
 	}
-	r.setActiveID(target.SessionID)
+	r.setActiveID(target.SessionID, stored.Revision)
 	snapshot, err := r.snapshot(manifest, next)
 	if err != nil {
 		return branchSnapshot{}, err

@@ -144,8 +144,13 @@ type model struct {
 	historyExpanded  bool
 	historySessionID string
 	historyBefore    int
-	activeTurn       *retryTurn
-	failedTurn       *retryTurn
+	// historyRetain is the persisted index where the anchor page begins.
+	// Pages prepended below it can be dropped on return to the bottom.
+	// historyLoadFailed stops reads after a manifest revision conflict.
+	historyRetain     int
+	historyLoadFailed bool
+	activeTurn        *retryTurn
+	failedTurn        *retryTurn
 	// /recover fills the composer only after the user asks for it. It never
 	// starts a model turn or reissues a tool call by itself.
 	recoveryDraft string
@@ -312,6 +317,11 @@ type chatEntry struct {
 	// and wrapping at the current terminal width; paging preserves these fields.
 	renderedWidth int
 	renderedBody  string
+	// loadedFromSession marks an immutable copy of one persisted transcript
+	// message. persistedIndex is its zero-based index. Notices, unsaved
+	// turns, streaming results, and ask_user text leave the flag false.
+	loadedFromSession bool
+	persistedIndex    int
 }
 
 func newModel(ctx context.Context, streamHandler adapter.StreamHandler, deps commandDeps, dataDir string, userPrompt *tool.UserPromptHandler, approvalHandler *BubbleteaApprovalHandler, fileIndex *mentions.FileIndex) model {
@@ -840,10 +850,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case msg.Type == tea.KeyCtrlL && m.state == stateIdle:
 			m.messages = nil
-			m.historyStart = 0
-			m.historyExpanded = false
-			m.historySessionID = ""
-			m.historyBefore = 0
+			m.resetHistoryPaging()
 			m.updateViewport()
 			return m, nil
 
@@ -1020,18 +1027,12 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if result.clearDisplay {
 					m.messages = nil
 					m.recoveryDraft = ""
-					m.historyStart = 0
-					m.historyExpanded = false
-					m.historySessionID = ""
-					m.historyBefore = 0
+					m.resetHistoryPaging()
 				}
 				if result.replaceMessages != nil {
 					m.messages = append([]chatEntry{}, result.replaceMessages...)
 					m.recoveryDraft = result.recoveryDraft
-					m.historyStart = max(0, len(m.messages)-historyPageSize)
-					m.historyExpanded = false
-					m.historySessionID = result.resumeSessionID
-					m.historyBefore = result.historyBefore
+					m.adoptHistoryPaging(result.resumeSessionID, result.historyBefore)
 					m.viewport.GotoBottom()
 				}
 				if result.output != "" {
@@ -1510,8 +1511,13 @@ func (m *model) updateViewport() {
 	// Keep the viewport small while the user follows the latest messages.
 	// Scrolling up preserves the current page until PgUp requests older entries.
 	atBottom := m.viewport.AtBottom()
-	if atBottom && !m.historyExpanded && len(m.messages) > historyPageSize {
-		m.historyStart = len(m.messages) - historyPageSize
+	if atBottom && !m.historyExpanded {
+		// Drop only the older persisted cache. The snap below still renders
+		// the newest history page; local messages are not a bounded window.
+		m.evictOldHistory()
+		if len(m.messages) > historyPageSize {
+			m.historyStart = len(m.messages) - historyPageSize
+		}
 	}
 	m.viewport.Height = m.viewportHeight()
 	content := m.renderMessages()

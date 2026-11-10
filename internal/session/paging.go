@@ -28,6 +28,7 @@ type SessionHeader struct {
 	Version      int
 	MessageCount int
 	Preview      string
+	Revision     string
 }
 
 // SessionPage is a chronological window of messages. Start is the zero-based
@@ -37,6 +38,7 @@ type SessionPage struct {
 	Start    int
 	Total    int
 	HasMore  bool
+	Revision string
 }
 
 type messagePageRef struct {
@@ -78,7 +80,7 @@ func headerFromLegacy(sess *RestoredSession) *SessionHeader {
 	h := &SessionHeader{
 		ID: sess.ID, Title: sess.Title, Metadata: sess.Metadata,
 		CreatedAt: sess.CreatedAt, UpdatedAt: sess.UpdatedAt, Version: sess.Version,
-		MessageCount: len(sess.Messages),
+		MessageCount: len(sess.Messages), Revision: sess.Revision,
 	}
 	if len(sess.Messages) > 0 {
 		h.Preview = previewContent(sess.Messages[0].Content)
@@ -102,56 +104,68 @@ func (fs *FileSystemStorage) pageDir(id string) string {
 	return filepath.Join(fs.dir, id+".pages")
 }
 
+func documentRevision(data []byte) string {
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
+}
+
 func (fs *FileSystemStorage) readDocument(id string) (*sessionManifest, *RestoredSession, error) {
+	manifest, legacy, _, err := fs.readDocumentWithRevision(id)
+	return manifest, legacy, err
+}
+
+func (fs *FileSystemStorage) readDocumentWithRevision(id string) (*sessionManifest, *RestoredSession, string, error) {
 	if !validSessionID(id) {
-		return nil, nil, fmt.Errorf("invalid session ID %q", id)
+		return nil, nil, "", fmt.Errorf("invalid session ID %q", id)
 	}
 	data, err := os.ReadFile(fs.sessionPath(id))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil, nil
+			return nil, nil, "", nil
 		}
-		return nil, nil, fmt.Errorf("reading session %s: %w", id, err)
+		return nil, nil, "", fmt.Errorf("reading session %s: %w", id, err)
 	}
+	revision := documentRevision(data)
 	var envelope struct {
 		Format string `json:"format"`
 	}
 	if err := json.Unmarshal(data, &envelope); err != nil {
-		return nil, nil, fmt.Errorf("parsing session %s: %w", id, err)
+		return nil, nil, "", fmt.Errorf("parsing session %s: %w", id, err)
 	}
 	if envelope.Format == "" {
 		var legacy RestoredSession
 		if err := json.Unmarshal(data, &legacy); err != nil {
-			return nil, nil, fmt.Errorf("parsing session %s: %w", id, err)
+			return nil, nil, "", fmt.Errorf("parsing session %s: %w", id, err)
 		}
 		if legacy.ID == "" {
 			legacy.ID = id
 		} else if legacy.ID != id {
-			return nil, nil, fmt.Errorf("session ID mismatch in %s", id)
+			return nil, nil, "", fmt.Errorf("session ID mismatch in %s", id)
 		}
-		return nil, &legacy, nil
+		legacy.Revision = revision
+		return nil, &legacy, revision, nil
 	}
 	if envelope.Format != pagedFormat {
-		return nil, nil, fmt.Errorf("unsupported session format %q", envelope.Format)
+		return nil, nil, "", fmt.Errorf("unsupported session format %q", envelope.Format)
 	}
 	var manifest sessionManifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
-		return nil, nil, fmt.Errorf("parsing session manifest %s: %w", id, err)
+		return nil, nil, "", fmt.Errorf("parsing session manifest %s: %w", id, err)
 	}
 	if manifest.ID != id || manifest.MessageCount < 0 {
-		return nil, nil, fmt.Errorf("invalid session manifest %s", id)
+		return nil, nil, "", fmt.Errorf("invalid session manifest %s", id)
 	}
 	count := 0
 	for _, ref := range manifest.Pages {
 		if ref.Count <= 0 || ref.Count > messagePageSize || !validPageName(ref.File) {
-			return nil, nil, fmt.Errorf("invalid page reference in session %s", id)
+			return nil, nil, "", fmt.Errorf("invalid page reference in session %s", id)
 		}
 		count += ref.Count
 	}
 	if count != manifest.MessageCount {
-		return nil, nil, fmt.Errorf("message count mismatch in session %s", id)
+		return nil, nil, "", fmt.Errorf("message count mismatch in session %s", id)
 	}
-	return &manifest, nil, nil
+	return &manifest, nil, revision, nil
 }
 
 func validPageName(name string) bool {
@@ -189,37 +203,51 @@ func (fs *FileSystemStorage) readPage(id string, ref messagePageRef) ([]Message,
 func (fs *FileSystemStorage) LoadHeader(id string) (*SessionHeader, error) {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
-	manifest, legacy, err := fs.readDocument(id)
+	manifest, legacy, revision, err := fs.readDocumentWithRevision(id)
 	if err != nil || (manifest == nil && legacy == nil) {
 		return nil, err
 	}
 	if legacy != nil {
 		return headerFromLegacy(legacy), nil
 	}
-	return manifest.header(), nil
+	header := manifest.header()
+	header.Revision = revision
+	return header, nil
 }
 
 // LoadPage loads at most limit messages immediately preceding before. A zero
 // before value starts at the newest message. Pages are read only as needed.
 func (fs *FileSystemStorage) LoadPage(id string, before, limit int) (*SessionPage, error) {
+	return fs.LoadPageAtRevision(id, before, limit, "")
+}
+
+// LoadPageAtRevision refuses to mix pages from another saved version of the
+// session. Pass the Revision returned by Load, LoadHeader, or an earlier page.
+// An empty expected revision keeps LoadPage's historical unpinned behavior.
+func (fs *FileSystemStorage) LoadPageAtRevision(id string, before, limit int, expectedRevision string) (*SessionPage, error) {
 	if before < 0 || limit <= 0 {
 		return nil, fmt.Errorf("invalid session page bounds")
 	}
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
-	manifest, legacy, err := fs.readDocument(id)
+	manifest, legacy, revision, err := fs.readDocumentWithRevision(id)
 	if err != nil || (manifest == nil && legacy == nil) {
 		return nil, err
 	}
+	if expectedRevision != "" && expectedRevision != revision {
+		return nil, fmt.Errorf("%w: sessão %s mudou desde o carregamento", ErrSessionConflict, id)
+	}
 	if legacy != nil {
-		return pageFromMessages(legacy.Messages, before, limit), nil
+		page := pageFromMessages(legacy.Messages, before, limit)
+		page.Revision = revision
+		return page, nil
 	}
 	end := manifest.MessageCount
 	if before > 0 && before < end {
 		end = before
 	}
 	start := max(0, end-limit)
-	result := &SessionPage{Start: start, Total: manifest.MessageCount, HasMore: start > 0}
+	result := &SessionPage{Start: start, Total: manifest.MessageCount, HasMore: start > 0, Revision: revision}
 	position := 0
 	for _, ref := range manifest.Pages {
 		pageEnd := position + ref.Count

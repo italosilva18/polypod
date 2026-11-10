@@ -738,7 +738,7 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *se
 }
 
 // autoSaveSession persists the current CLI conversation to disk on shutdown.
-func autoSaveSession(convMgr *conversation.Manager, sessStorage session.SessionStorage, sessMgr *session.Manager, currentSessionID, agentName, mode string, logger *slog.Logger) {
+func autoSaveSession(convMgr *conversation.Manager, sessStorage session.SessionStorage, sessMgr *session.Manager, currentSessionID, expectedRevision, agentName, mode string, logger *slog.Logger) {
 	sess, err := convMgr.GetSession(context.Background(), "cli", "local")
 	if err != nil || len(sess.Messages) == 0 {
 		return
@@ -784,6 +784,7 @@ func autoSaveSession(convMgr *conversation.Manager, sessStorage session.SessionS
 		UpdatedAt: now,
 		Version:   session.CurrentSessionVersion,
 		Metadata:  metadata,
+		Revision:  expectedRevision,
 	}
 	if persisted.Metadata.GitBranch == "" && filepath.Clean(persisted.Metadata.ProjectRoot) == filepath.Clean(cwd) {
 		if env := session.DetectEnvironment(cwd); env != nil && env.GitBranch != "" {
@@ -791,14 +792,56 @@ func autoSaveSession(convMgr *conversation.Manager, sessStorage session.SessionS
 		}
 	}
 
+	savedID := currentSessionID
 	if err := sessStorage.Save(persisted); err != nil {
-		logger.Warn("failed to auto-save session", "error", err)
-	} else {
-		logger.Info("session auto-saved", "id", currentSessionID, "messages", len(persistedMsgs), "title", title)
+		if !errors.Is(err, session.ErrSessionConflict) {
+			logger.Warn("failed to auto-save session", "error", err)
+			return
+		}
+		// This process edited an older snapshot. Preserve its turns under a new
+		// ID rather than replacing the version published by another process.
+		// The metadata read above may belong to that other process, so the
+		// recovery snapshot uses only this process's known CLI context.
+		persisted.Metadata = session.SessionMetadata{
+			ProjectRoot: cwd,
+			Tag:         "cli",
+			AgentName:   agentName,
+			Mode:        mode,
+		}
+		if cwd != "" {
+			if env := session.DetectEnvironment(cwd); env != nil {
+				persisted.Metadata.GitBranch = env.GitBranch
+			}
+		}
+		createdAt = sess.CreatedAt
+		if createdAt.IsZero() {
+			createdAt = now
+		}
+		persisted.CreatedAt = createdAt
+		for attempt := 0; attempt < 3; attempt++ {
+			persisted.ID = session.GenerateSessionID()
+			persisted.Revision = ""
+			if recoveryErr := sessStorage.Save(persisted); recoveryErr == nil {
+				savedID = persisted.ID
+				break
+			} else if !errors.Is(recoveryErr, session.ErrSessionConflict) {
+				logger.Error("failed to preserve conflicting CLI session", "original_id", currentSessionID, "error", recoveryErr)
+				fmt.Fprintln(os.Stderr, "Não foi possível preservar a sessão local após conflito de gravação.")
+				return
+			}
+		}
+		if savedID == currentSessionID {
+			logger.Error("failed to allocate recovery session ID", "original_id", currentSessionID)
+			fmt.Fprintln(os.Stderr, "Não foi possível reservar um ID para a sessão de recuperação.")
+			return
+		}
+		logger.Warn("CLI session save conflict; local transcript preserved", "original_id", currentSessionID, "recovery_id", savedID)
+		fmt.Fprintf(os.Stderr, "A sessão foi alterada por outro processo. Sua conversa local foi salva como %s. Use /resume %s para abri-la.\n", savedID, savedID)
 	}
+	logger.Info("session auto-saved", "id", savedID, "messages", len(persistedMsgs), "title", title)
 
 	sessMgr.SaveSessionIndex(session.SessionIndex{
-		ID:        currentSessionID,
+		ID:        savedID,
 		Channel:   "cli",
 		UserID:    "local",
 		Title:     title,
@@ -2136,7 +2179,11 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	cliCh.SetSessionEmbedder(embedder)
 	cliCh.SetSessionMemory(sessionMemory)
 	cliCh.SetToolTranscriptStore(toolTranscript)
-	cliCh.SetActiveSessionID(currentSessionID)
+	if restoredSession != nil {
+		cliCh.SetActiveSessionSnapshot(currentSessionID, restoredSession.Revision)
+	} else {
+		cliCh.SetActiveSessionSnapshot(currentSessionID, "")
+	}
 	if bubbleApproval != nil {
 		cliCh.SetApprovalHandler(bubbleApproval)
 	}
@@ -2159,7 +2206,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	}
 
 	// Shutdown
-	autoSaveSession(convMgr, sessStorage, sessMgr, cliCh.ActiveSessionID(), aiSvc.ActiveAgent(), string(modeState.Current), logger)
+	autoSaveSession(convMgr, sessStorage, sessMgr, cliCh.ActiveSessionID(), cliCh.ActiveSessionRevision(), aiSvc.ActiveAgent(), string(modeState.Current), logger)
 
 	hookMgr.Fire(context.Background(), hooks.HookPayload{
 		Event:     hooks.EventSessionEnd,

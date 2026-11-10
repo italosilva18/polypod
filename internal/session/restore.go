@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -19,6 +20,10 @@ type RestoredSession struct {
 	CreatedAt time.Time       `json:"created_at"`
 	UpdatedAt time.Time       `json:"updated_at"`
 	Version   int             `json:"version"`
+	// Revision identifies the exact persisted manifest this snapshot came from.
+	// It is intentionally absent from exported/legacy session JSON. Save uses it
+	// as an optimistic concurrency token and updates it after a successful write.
+	Revision string `json:"-"`
 }
 
 // SessionMetadata stores auxiliary session data that's persisted alongside
@@ -208,7 +213,11 @@ func (r *SessionRestorer) CleanupStaleSessions(maxAge time.Duration) (int, error
 			}
 		}
 
-		if err := storage.Delete(strings.TrimSuffix(entry.Name(), ".json")); err != nil {
+		id := strings.TrimSuffix(entry.Name(), ".json")
+		if err := storage.DeleteAtRevision(id, documentRevision(data)); err != nil {
+			if errors.Is(err, ErrSessionConflict) {
+				continue
+			}
 			r.logger.Warn("failed to remove stale session", "path", path, "error", err)
 			continue
 		}

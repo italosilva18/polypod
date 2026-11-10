@@ -43,36 +43,41 @@ type RestoredMessage struct {
 
 // Adapter implements an interactive CLI chat channel using Bubbletea.
 type Adapter struct {
-	streamHandler     adapter.StreamHandler
-	aiSvc             *ai.Service
-	memStore          memory.Store
-	convMgr           *conversation.Manager
-	agents            *agent.Registry
-	skills            *skill.Registry
-	logger            *slog.Logger
-	dataDir           string
-	sessStorage       session.SessionStorage
-	restoredMessages  []RestoredMessage
-	costEngine        *tracking.CostEngine
-	userPromptHandler *tool.UserPromptHandler
-	mcpMgr            *mcp.Manager
-	hookMgr           *hooks.Manager
-	permMgr           *permissions.Manager
-	modeState         *modes.State
-	planSim           *modes.PlanSimulator
-	fileIndex         *mentions.FileIndex
-	approvalHandler   *BubbleteaApprovalHandler
-	cfg               *config.Config
-	cfgPath           string
-	commandRegistry   *command.Registry
-	turnCheckpoint    *turncheckpoint.Manager
-	activeSessionID   string
-	taskRegistry      *tasks.TaskRegistry
-	taskQueue         *taskqueue.Queue
-	sessionPeers      *session.ConcurrentSessionManager
-	sessionEmbedder   session.TextEmbedder
-	sessionMemory     *sessionmem.FileStore
-	toolTranscript    *session.ToolTranscriptStore
+	streamHandler         adapter.StreamHandler
+	aiSvc                 *ai.Service
+	memStore              memory.Store
+	convMgr               *conversation.Manager
+	agents                *agent.Registry
+	skills                *skill.Registry
+	logger                *slog.Logger
+	dataDir               string
+	sessStorage           session.SessionStorage
+	restoredMessages      []RestoredMessage
+	costEngine            *tracking.CostEngine
+	userPromptHandler     *tool.UserPromptHandler
+	mcpMgr                *mcp.Manager
+	hookMgr               *hooks.Manager
+	permMgr               *permissions.Manager
+	modeState             *modes.State
+	planSim               *modes.PlanSimulator
+	fileIndex             *mentions.FileIndex
+	approvalHandler       *BubbleteaApprovalHandler
+	cfg                   *config.Config
+	cfgPath               string
+	commandRegistry       *command.Registry
+	turnCheckpoint        *turncheckpoint.Manager
+	activeSessionID       string
+	activeSessionRevision string
+	// The viewport keeps the manifest it loaded even if the active session is
+	// saved again. PgUp must never combine pages from two manifest revisions.
+	displayHistoryID       string
+	displayHistoryRevision string
+	taskRegistry           *tasks.TaskRegistry
+	taskQueue              *taskqueue.Queue
+	sessionPeers           *session.ConcurrentSessionManager
+	sessionEmbedder        session.TextEmbedder
+	sessionMemory          *sessionmem.FileStore
+	toolTranscript         *session.ToolTranscriptStore
 }
 
 // SetTaskRegistry connects live background-task notices to the CLI.
@@ -108,6 +113,11 @@ func (a *Adapter) SetTurnCheckpointManager(manager *turncheckpoint.Manager) {
 
 // SetActiveSessionID identifies the persisted CLI session updated by rewind.
 func (a *Adapter) SetActiveSessionID(id string) {
+	if a.activeSessionID != id {
+		a.activeSessionRevision = ""
+		a.displayHistoryID = ""
+		a.displayHistoryRevision = ""
+	}
 	a.activeSessionID = id
 	if a.sessionPeers != nil {
 		if err := a.sessionPeers.UpdateSessionID(id); err != nil {
@@ -115,6 +125,15 @@ func (a *Adapter) SetActiveSessionID(id string) {
 		}
 	}
 }
+
+// SetActiveSessionSnapshot pins the persisted version used by this CLI turn.
+// Later saves refuse to overwrite a manifest changed by another process.
+func (a *Adapter) SetActiveSessionSnapshot(id, revision string) {
+	a.SetActiveSessionID(id)
+	a.activeSessionRevision = revision
+}
+
+func (a *Adapter) ActiveSessionRevision() string { return a.activeSessionRevision }
 
 // ActiveSessionID returns the session selected by startup or /resume.
 func (a *Adapter) ActiveSessionID() string {
@@ -136,6 +155,7 @@ func (a *Adapter) saveActiveSession(sess *conversation.Session) error {
 			Metadata:  session.SessionMetadata{Tag: "cli", Mode: "interactive"},
 		}
 	}
+	persisted.Revision = a.activeSessionRevision
 	persisted.Metadata = a.currentSessionMetadata(persisted.Metadata)
 	persisted.Messages = make([]session.Message, len(sess.Messages))
 	for i, msg := range sess.Messages {
@@ -143,7 +163,11 @@ func (a *Adapter) saveActiveSession(sess *conversation.Session) error {
 	}
 	persisted.Title = session.TitleFromFirstMessage(persisted.Messages)
 	persisted.UpdatedAt = time.Now()
-	return a.sessStorage.Save(persisted)
+	if err := a.sessStorage.Save(persisted); err != nil {
+		return err
+	}
+	a.activeSessionRevision = persisted.Revision
+	return nil
 }
 
 func isCompactSummaryMessage(content string) bool {
@@ -333,7 +357,7 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 	}
 	if a.convMgr != nil && a.sessStorage != nil {
 		controller := newPersistentBranchController(a.dataDir, a.sessStorage, a.convMgr,
-			a.ActiveSessionID, a.SetActiveSessionID, a.saveActiveSession)
+			a.ActiveSessionID, a.SetActiveSessionSnapshot, a.saveActiveSession)
 		controller.activate = a.restoreSessionMetadata
 		if a.sessionMemory != nil {
 			controller.forkMemory = a.sessionMemory.Fork
@@ -571,7 +595,20 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 			}
 			displayMessages := restored.Messages
 			start := 0
+			fromPage := false
 			if paged, ok := a.sessStorage.(interface {
+				LoadPageAtRevision(string, int, int, string) (*session.SessionPage, error)
+			}); ok {
+				page, err := paged.LoadPageAtRevision(id, 0, historyPageSize, restored.Revision)
+				if err != nil {
+					return sessionLoad{}, err
+				}
+				if page != nil {
+					displayMessages = page.Messages
+					start = page.Start
+					fromPage = true
+				}
+			} else if paged, ok := a.sessStorage.(interface {
 				LoadPage(string, int, int) (*session.SessionPage, error)
 			}); ok {
 				page, err := paged.LoadPage(id, 0, historyPageSize)
@@ -581,15 +618,21 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 				if page != nil {
 					displayMessages = page.Messages
 					start = page.Start
+					fromPage = true
 				}
 			}
 			entries := make([]chatEntry, 0, len(displayMessages))
-			for _, m := range displayMessages {
-				entries = append(entries, chatEntry{
+			for i, m := range displayMessages {
+				entry := chatEntry{
 					role:      m.Role,
 					content:   m.Content,
 					timestamp: m.Timestamp,
-				})
+				}
+				if fromPage {
+					entry.loadedFromSession = true
+					entry.persistedIndex = start + i
+				}
+				entries = append(entries, entry)
 			}
 
 			// Also replay the messages into the active conversation
@@ -600,6 +643,8 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 					return sessionLoad{}, fmt.Errorf("abrindo sessao retomada: %w", sessErr)
 				}
 				if restored.ID == a.activeSessionID {
+					a.displayHistoryID = ""
+					a.displayHistoryRevision = ""
 					activeEntries := toBranchEntries(sess.Messages)
 					activeEntries = a.appendTranscriptHistory(restored.ID, activeEntries)
 					notice, draft := a.inspectRecovery(restored.ID, recoveryMessages(sess.Messages))
@@ -636,7 +681,9 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 			for _, warning := range a.restoreSessionMetadata(restored.Metadata) {
 				entries = append(entries, chatEntry{role: "system", content: warning, timestamp: time.Now()})
 			}
-			a.SetActiveSessionID(restored.ID)
+			a.SetActiveSessionSnapshot(restored.ID, restored.Revision)
+			a.displayHistoryID = restored.ID
+			a.displayHistoryRevision = restored.Revision
 			entries = a.appendTranscriptHistory(restored.ID, entries)
 			notice, draft := a.inspectRecovery(restored.ID, restored.Messages)
 			if notice != "" {
@@ -647,18 +694,29 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 			}, nil
 		}
 		deps.loadOlderHistory = func(id string, before, limit int) ([]chatEntry, int, error) {
-			paged, ok := a.sessStorage.(interface {
-				LoadPage(string, int, int) (*session.SessionPage, error)
-			})
-			if !ok {
-				return nil, 0, fmt.Errorf("paginação de sessão indisponível")
+			var page *session.SessionPage
+			var err error
+			if pinned, ok := a.sessStorage.(interface {
+				LoadPageAtRevision(string, int, int, string) (*session.SessionPage, error)
+			}); ok {
+				if id != a.displayHistoryID || a.displayHistoryRevision == "" {
+					return nil, before, fmt.Errorf("%w: retome a sessão para carregar páginas antigas", session.ErrSessionConflict)
+				}
+				page, err = pinned.LoadPageAtRevision(id, before, limit, a.displayHistoryRevision)
+			} else {
+				paged, ok := a.sessStorage.(interface {
+					LoadPage(string, int, int) (*session.SessionPage, error)
+				})
+				if !ok {
+					return nil, before, fmt.Errorf("paginação de sessão indisponível")
+				}
+				page, err = paged.LoadPage(id, before, limit)
 			}
-			page, err := paged.LoadPage(id, before, limit)
 			if err != nil {
-				return nil, 0, err
+				return nil, before, err
 			}
 			if page == nil {
-				return nil, 0, fmt.Errorf("sessao %s nao encontrada", id)
+				return nil, before, fmt.Errorf("sessao %s nao encontrada", id)
 			}
 			entries := make([]chatEntry, 0, len(page.Messages))
 			for _, m := range page.Messages {

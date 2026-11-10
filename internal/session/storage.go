@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -13,6 +14,23 @@ import (
 	"sync"
 	"time"
 )
+
+// ErrSessionConflict means the caller saved or deleted a session based on an
+// older manifest. Reload the session before deciding how to reconcile changes.
+var ErrSessionConflict = errors.New("a sessão foi alterada por outro processo")
+
+const sessionLeaseTimeout = 30 * time.Second
+
+func withSessionLease(dir string, action func() error) (err error) {
+	release, err := lockSessionDirectory(dir)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err = errors.Join(err, release())
+	}()
+	return action()
+}
 
 // SessionStorage is the interface for persisting and retrieving sessions.
 type SessionStorage interface {
@@ -76,7 +94,9 @@ func (fs *FileSystemStorage) sessionPath(id string) string {
 	return filepath.Join(fs.dir, id+".json")
 }
 
-// Save persists a session to disk.
+// Save persists a session to disk. A new session has an empty Revision. Once a
+// manifest exists, callers must save the Revision returned by Load (or from a
+// prior Save); stale or unversioned replacements are refused.
 func (fs *FileSystemStorage) Save(sess *RestoredSession) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -90,11 +110,17 @@ func (fs *FileSystemStorage) Save(sess *RestoredSession) error {
 	if err := inheritSessionDirOwner(fs.dir); err != nil {
 		return fmt.Errorf("setting sessions dir owner: %w", err)
 	}
-	previous, _, err := fs.readDocument(sess.ID)
-	if err != nil {
-		fs.logger.Warn("cannot read previous session manifest", "session", sess.ID, "error", err)
-	}
+	return withSessionLease(fs.dir, func() error { return fs.saveLocked(sess) })
+}
 
+func (fs *FileSystemStorage) saveLocked(sess *RestoredSession) error {
+	previous, _, revision, err := fs.readDocumentWithRevision(sess.ID)
+	if err != nil {
+		return fmt.Errorf("reading previous session manifest: %w", err)
+	}
+	if revision != sess.Revision {
+		return fmt.Errorf("%w: %s", ErrSessionConflict, sess.ID)
+	}
 	sess.Version = CurrentSessionVersion
 	pageDir := fs.pageDir(sess.ID)
 	if err := os.MkdirAll(pageDir, 0700); err != nil {
@@ -139,6 +165,7 @@ func (fs *FileSystemStorage) Save(sess *RestoredSession) error {
 	if err := atomicWriteFile(fs.sessionPath(sess.ID), data); err != nil {
 		return fmt.Errorf("writing session manifest: %w", err)
 	}
+	sess.Revision = documentRevision(data)
 	fs.retireOldPages(sess.ID, previous, manifest.Pages)
 	fs.pruneUnreferencedPages(sess.ID, manifest.Pages)
 	return nil
@@ -148,7 +175,7 @@ func (fs *FileSystemStorage) Save(sess *RestoredSession) error {
 func (fs *FileSystemStorage) Load(sessionID string) (*RestoredSession, error) {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
-	manifest, legacy, err := fs.readDocument(sessionID)
+	manifest, legacy, revision, err := fs.readDocumentWithRevision(sessionID)
 	if err != nil || (manifest == nil && legacy == nil) {
 		return nil, err
 	}
@@ -156,6 +183,7 @@ func (fs *FileSystemStorage) Load(sessionID string) (*RestoredSession, error) {
 		return legacy, nil
 	}
 	sess := manifest.session()
+	sess.Revision = revision
 	sess.Messages = make([]Message, 0, manifest.MessageCount)
 	for _, ref := range manifest.Pages {
 		messages, err := fs.readPage(sessionID, ref)
@@ -167,14 +195,45 @@ func (fs *FileSystemStorage) Load(sessionID string) (*RestoredSession, error) {
 	return sess, nil
 }
 
-// Delete removes a session file.
+// Delete removes a session file without a revision check. It is intended for
+// explicit deletion; cleanup uses DeleteAtRevision to avoid deleting a save
+// that happened after its stale-session scan.
 func (fs *FileSystemStorage) Delete(sessionID string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	if !validSessionID(sessionID) {
 		return fmt.Errorf("invalid session ID %q", sessionID)
 	}
+	if err := os.MkdirAll(fs.dir, 0700); err != nil {
+		return fmt.Errorf("creating sessions dir: %w", err)
+	}
+	return withSessionLease(fs.dir, func() error { return fs.deleteLocked(sessionID, "") })
+}
 
+// DeleteAtRevision removes a session only if the manifest is still the one
+// the caller inspected. This is useful for cleanup and other conditional work.
+func (fs *FileSystemStorage) DeleteAtRevision(sessionID, expectedRevision string) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if !validSessionID(sessionID) || expectedRevision == "" {
+		return fmt.Errorf("invalid session ID or revision")
+	}
+	if err := os.MkdirAll(fs.dir, 0700); err != nil {
+		return fmt.Errorf("creating sessions dir: %w", err)
+	}
+	return withSessionLease(fs.dir, func() error { return fs.deleteLocked(sessionID, expectedRevision) })
+}
+
+func (fs *FileSystemStorage) deleteLocked(sessionID, expectedRevision string) error {
+	if expectedRevision != "" {
+		_, _, currentRevision, err := fs.readDocumentWithRevision(sessionID)
+		if err != nil {
+			return err
+		}
+		if currentRevision != expectedRevision {
+			return fmt.Errorf("%w: %s", ErrSessionConflict, sessionID)
+		}
+	}
 	path := fs.sessionPath(sessionID)
 	if err := os.Remove(path); err != nil {
 		if !os.IsNotExist(err) {
