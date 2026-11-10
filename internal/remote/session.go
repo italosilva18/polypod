@@ -1,12 +1,16 @@
 // Package remote provides Polypod-owned persistent shared sessions over HTTP
 // long polling. The server stores ordered messages and delivery cursors in
-// SQLite; clients acknowledge each message after dispatching it.
+// SQLite; clients acknowledge each message after dispatching it. The caller
+// may supply a TLS listener when the host is reachable beyond loopback.
 package remote
 
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -45,6 +49,11 @@ type SessionConfig struct {
 	// StateFile optionally stores the auto-created SessionID for process
 	// restarts. The acknowledged message cursor is stored on the server.
 	StateFile string
+
+	// RootCAs, when non-nil, is the only set of trust anchors for this client.
+	// Nil keeps the default HTTP client and the process trust store.
+	// Certificate verification stays enabled in both cases.
+	RootCAs *x509.CertPool
 
 	// Logger receives structured log messages.  If nil a no-op logger is
 	// used.
@@ -129,13 +138,66 @@ func NewSessionManager(cfg SessionConfig) *SessionManager {
 	}
 
 	return &SessionManager{
-		cfg: cfg,
-		log: log,
-		client: &http.Client{
-			Timeout: defaultHTTPTimeout,
-		},
-		state: stateDisconnected,
+		cfg:    cfg,
+		log:    log,
+		client: sessionHTTPClient(cfg.RootCAs),
+		state:  stateDisconnected,
 	}
+}
+
+// SessionTrustPoolFromPEM returns a pool that contains only CERTIFICATE blocks
+// from pemBytes. System roots are not added. A private-key block, or a bundle
+// with no certificate, is rejected. The result is intended for
+// SessionConfig.RootCAs and does not disable verification.
+func SessionTrustPoolFromPEM(pemBytes []byte) (*x509.CertPool, error) {
+	if pemBundleHasPrivateKey(pemBytes) {
+		return nil, fmt.Errorf("remote: o PEM contém chave privada")
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return nil, fmt.Errorf("remote: PEM sem certificado")
+	}
+	return pool, nil
+}
+
+func pemBundleHasPrivateKey(pemBytes []byte) bool {
+	rest := pemBytes
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			return false
+		}
+		if strings.Contains(block.Type, "PRIVATE KEY") {
+			return true
+		}
+	}
+}
+
+func sessionHTTPClient(rootCAs *x509.CertPool) *http.Client {
+	if rootCAs == nil {
+		return &http.Client{Timeout: defaultHTTPTimeout, CheckRedirect: rejectSessionRedirect}
+	}
+	var transport *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = base.Clone()
+	} else {
+		transport = &http.Transport{}
+	}
+	transport.ForceAttemptHTTP2 = false
+	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	transport.TLSClientConfig = &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		RootCAs:    rootCAs,
+	}
+	return &http.Client{Timeout: defaultHTTPTimeout, Transport: transport, CheckRedirect: rejectSessionRedirect}
+}
+
+// The session API does not use redirects. Refusing every redirect prevents
+// the bearer token from being forwarded to another origin or downgraded to
+// cleartext HTTP on the same host.
+func rejectSessionRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 // ---------------------------------------------------------------------------

@@ -4,8 +4,11 @@ O serviço instalado nesta máquina é `polypod-root.service`. Ele executa a CLI
 interativa como `root` dentro da sessão tmux `polypod-root`. O serviço usa o
 checkout em `/home/costa/Área de trabalho/CLI/polypod`, o arquivo local
 `config.yaml` e o binário em `/usr/local/libexec/polypod-root`. Não há
-dependência de PostgreSQL. O servidor de sessões remotas usa HTTP somente em
-`127.0.0.1:8789` quando o token privado está configurado.
+dependência de PostgreSQL. Nesta unidade o servidor de sessões remotas segue
+em HTTP no loopback `127.0.0.1:8789` quando o token privado está configurado.
+Um IP fora de loopback só sobe com certificado e chave TLS explícitos; o
+[guia de sessões remotas](../docs/integrations/remote-sessions.md) descreve
+permissão da chave, rotação e confiança do cliente.
 
 Os arquivos `polypod-root.service`, `polypod-root-supervisor` e
 `polypod-root-session` espelham a instalação atual. O caminho do checkout, o

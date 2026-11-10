@@ -6,10 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -21,9 +19,11 @@ import (
 const remoteSessionChannel = "remote_session"
 const remoteMessageContentLimit = 256 << 10
 
-// remoteSessionRuntime owns the local HTTP listener. Only the configured host
-// process starts it; other Polypod processes can still process durable inbox
-// entries and defer outbound delivery until the host is available.
+// remoteSessionRuntime owns the session listener. Only the configured host
+// process starts it. Without TLS the listener stays on loopback HTTP. With an
+// explicit certificate pair the same socket speaks TLS and may bind beyond
+// loopback. Other Polypod processes can still process durable inbox entries
+// and defer outbound delivery until the host is available.
 type remoteSessionRuntime struct {
 	server *remote.Server
 	cancel context.CancelFunc
@@ -40,19 +40,18 @@ func startRemoteSessionRuntime(parent context.Context, dataDir string, store *hu
 	if len(token) < 32 || len(token) > 512 {
 		return nil, fmt.Errorf("POLYPOD_REMOTE_SESSION_TOKEN precisa ter entre 32 e 512 caracteres")
 	}
+	tlsConfig, err := loadRemoteSessionTLS()
+	if err != nil {
+		return nil, err
+	}
 	listen := strings.TrimSpace(os.Getenv("POLYPOD_REMOTE_SESSION_LISTEN"))
 	if listen == "" {
 		listen = "127.0.0.1:8789"
 	}
-	host, port, err := net.SplitHostPort(listen)
-	if err != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
-		return nil, fmt.Errorf("POLYPOD_REMOTE_SESSION_LISTEN precisa usar IP de loopback e porta")
+	if err := validateRemoteSessionListen(listen, tlsConfig != nil); err != nil {
+		return nil, err
 	}
-	portNumber, err := strconv.Atoi(port)
-	if err != nil || portNumber < 1 || portNumber > 65535 {
-		return nil, fmt.Errorf("POLYPOD_REMOTE_SESSION_LISTEN tem porta inválida")
-	}
-	listener, err := net.Listen("tcp", listen)
+	listener, err := listenRemoteSession(listen, tlsConfig)
 	if err != nil {
 		return nil, fmt.Errorf("abrindo sessões remotas: %w", err)
 	}
@@ -92,7 +91,7 @@ func startRemoteSessionRuntime(parent context.Context, dataDir string, store *hu
 		}
 		runtime.done <- err
 	}()
-	logger.Info("sessões remotas disponíveis", "listen", listen)
+	logger.Info("sessões remotas disponíveis", "listen", listen, "tls", tlsConfig != nil)
 	return runtime, nil
 }
 

@@ -90,7 +90,9 @@ func (s *Server) ListenAndServe(ctx context.Context, address string) error {
 }
 
 // Serve runs on an already-bound listener, allowing the caller to verify bind
-// synchronously before starting the server in a goroutine.
+// synchronously before starting the server in a goroutine. TLS is the caller's
+// responsibility: pass either a cleartext listener or one already wrapped with
+// tls.NewListener. Serve does not wrap the listener again.
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	if listener == nil {
 		return fmt.Errorf("listener das sessões remotas é obrigatório")

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -47,6 +48,7 @@ func runRemoteClient(args []string, input io.Reader, output, diagnostic io.Write
 	flags.Usage = func() {
 		fmt.Fprintln(diagnostic, "Uso: polypod remote [--list | --new | --session ID] [--url URL] --participant NOME")
 		fmt.Fprintln(diagnostic, "Token: configure POLYPOD_REMOTE_SESSION_TOKEN no ambiente ou .env privado.")
+		fmt.Fprintln(diagnostic, "TLS: POLYPOD_REMOTE_SESSION_TLS_CA define a única CA ou certificado confiável para esta sessão.")
 		fmt.Fprintln(diagnostic, "No chat: digite uma mensagem e pressione Enter; /exit encerra o cliente.")
 		flags.PrintDefaults()
 	}
@@ -88,9 +90,13 @@ func runRemoteClient(args []string, input io.Reader, output, diagnostic io.Write
 			return err
 		}
 	}
+	rootCAs, err := loadRemoteSessionRootCAs()
+	if err != nil {
+		return err
+	}
 	manager := remote.NewSessionManager(remote.SessionConfig{
 		ServerURL: baseURL, SessionID: *sessionID, AuthToken: token,
-		ParticipantID: *participant, StateFile: *stateFile,
+		ParticipantID: *participant, StateFile: *stateFile, RootCAs: rootCAs,
 	})
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -198,6 +204,22 @@ func runRemoteClient(args []string, input io.Reader, output, diagnostic io.Write
 			}
 		}
 	}
+}
+
+func loadRemoteSessionRootCAs() (*x509.CertPool, error) {
+	caFile := strings.TrimSpace(os.Getenv("POLYPOD_REMOTE_SESSION_TLS_CA"))
+	if caFile == "" {
+		return nil, nil
+	}
+	pemBytes, err := readRemoteSessionCAFile(caFile)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := remote.SessionTrustPoolFromPEM(pemBytes)
+	if err != nil {
+		return nil, fmt.Errorf("POLYPOD_REMOTE_SESSION_TLS_CA: %w", err)
+	}
+	return pool, nil
 }
 
 func envOr(name, fallback string) string {
