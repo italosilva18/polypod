@@ -914,6 +914,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if handled, cmd := m.submitBackgroundCommand(raw); handled {
 				return m, cmd
 			}
+			if handled, cmd := m.submitLiveCommand(raw); handled {
+				return m, cmd
+			}
 			if m.parallelDetached && !strings.HasPrefix(strings.TrimSpace(raw), "/") && !strings.HasPrefix(strings.TrimSpace(raw), "!") {
 				if handled, cmd := m.submitParallelPrompt(raw); handled {
 					return m, cmd
@@ -1386,6 +1389,10 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case backgroundWorkMsg:
 		m.showBackgroundResult(msg)
 		return m, clearNotifyAfter(6*time.Second, m.notification)
+
+	case liveCommandResultMsg:
+		m.showLiveCommandResult(msg.result)
+		return m, nil
 
 	case queuedInputMsg:
 		return m.startQueuedInput()
