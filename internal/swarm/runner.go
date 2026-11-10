@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 // TeammateIdentity identifies a teammate within a team. Equivalent to
@@ -45,6 +46,7 @@ type TeammateExecutor func(ctx context.Context, prompt string, identity Teammate
 type RunnerConfig struct {
 	Identity    TeammateIdentity
 	Mailbox     *Mailbox
+	Router      *MessageRouter
 	Executor    TeammateExecutor
 	TokenBudget int           // 0 = unlimited
 	TurnTimeout time.Duration // per-turn timeout; 0 = 5 minutes
@@ -79,13 +81,14 @@ type TeammateOutput struct {
 // This mirrors Claude Code's inProcessRunner.ts which loops
 // runAgent() + waitForNextPromptOrShutdown().
 type TeammateRunner struct {
-	mu     sync.Mutex
-	cfg    RunnerConfig
-	state  int32 // atomic RunnerState
-	cancel context.CancelFunc
-	ctx    context.Context
-	done   chan struct{}
-	logger *slog.Logger
+	mu      sync.Mutex
+	cfg     RunnerConfig
+	state   int32 // atomic RunnerState
+	started atomic.Bool
+	cancel  context.CancelFunc
+	ctx     context.Context
+	done    chan struct{}
+	logger  *slog.Logger
 
 	// Accumulated outputs.
 	outputsMu sync.Mutex
@@ -132,7 +135,7 @@ func NewTeammateRunner(parentCtx context.Context, cfg RunnerConfig) *TeammateRun
 
 // Start launches the runner goroutine. Idempotent if already started.
 func (r *TeammateRunner) Start() {
-	if !atomic.CompareAndSwapInt32(&r.state, int32(RunnerStateIdle), int32(RunnerStateWorking)) {
+	if !r.started.CompareAndSwap(false, true) {
 		return // already running or stopped
 	}
 	go r.loop()
@@ -202,6 +205,7 @@ func (r *TeammateRunner) loop() {
 	)
 
 	for {
+		atomic.StoreInt32(&r.state, int32(RunnerStateIdle))
 		// Check lifecycle cancellation.
 		if r.ctx.Err() != nil {
 			r.logger.Debug("teammate runner context cancelled",
@@ -288,6 +292,9 @@ func (r *TeammateRunner) executeTurn(prompt string) {
 
 	r.outputsMu.Lock()
 	r.outputs = append(r.outputs, output)
+	if len(r.outputs) > 100 {
+		r.outputs = append([]TeammateOutput(nil), r.outputs[len(r.outputs)-100:]...)
+	}
 	r.outputsMu.Unlock()
 
 	if err != nil {
@@ -295,14 +302,15 @@ func (r *TeammateRunner) executeTurn(prompt string) {
 			// Lifecycle cancellation — don't log as error.
 			r.logger.Debug("teammate turn cancelled by shutdown",
 				"agent_name", r.cfg.Identity.AgentName, "turn", turn)
+			r.sendTurnNotification("cancelled", err.Error(), turn)
 		} else if workCtx.Err() != nil {
 			r.logger.Warn("teammate turn aborted",
 				"agent_name", r.cfg.Identity.AgentName, "turn", turn, "error", err)
+			r.sendTurnNotification("cancelled", err.Error(), turn)
 		} else {
 			r.logger.Error("teammate turn failed",
 				"agent_name", r.cfg.Identity.AgentName, "turn", turn, "error", err)
-			// Send failure notification.
-			r.sendFailureNotification(err)
+			r.sendTurnNotification("failed", err.Error(), turn)
 		}
 	} else {
 		r.logger.Debug("teammate turn completed",
@@ -311,6 +319,7 @@ func (r *TeammateRunner) executeTurn(prompt string) {
 			"duration", output.EndTime.Sub(output.StartTime),
 			"response_len", len(response),
 		)
+		r.sendTurnNotification("completed", response, turn)
 	}
 
 	// Check token budget.
@@ -355,39 +364,36 @@ func (r *TeammateRunner) sendIdleNotification() {
 	r.sendToLeader(idleMsg)
 }
 
-// sendFailureNotification tells the leader this teammate's turn failed.
-func (r *TeammateRunner) sendFailureNotification(err error) {
-	failMsg := NewMessage(MessageStatusUpdate, r.cfg.Identity.AgentName, TeamLeaderName,
-		fmt.Sprintf(`{"type":"idle","from":"%s","reason":"failed","error":"%s"}`,
-			r.cfg.Identity.AgentName, err.Error()))
-	if failMsg.Metadata == nil {
-		failMsg.Metadata = make(map[string]string)
+// sendTurnNotification delivers a bounded preview; the complete result stays
+// available through Outputs for explicit inspection by the team lead.
+func (r *TeammateRunner) sendTurnNotification(status, content string, turn int) {
+	const maxPreviewBytes = 16 << 10
+	truncated := false
+	if len(content) > maxPreviewBytes {
+		cut := maxPreviewBytes
+		for cut > 0 && !utf8.RuneStart(content[cut]) {
+			cut--
+		}
+		content = content[:cut]
+		truncated = true
 	}
-	failMsg.Metadata["idle_reason"] = "failed"
-	r.sendToLeader(failMsg)
+	msg := NewMessage(MessageStatusUpdate, r.cfg.Identity.AgentName, TeamLeaderName, content)
+	msg.Metadata = map[string]string{"status": status, "turn": fmt.Sprint(turn)}
+	if truncated {
+		msg.Metadata["truncated"] = "true"
+	}
+	r.sendToLeader(msg)
 }
 
-// sendToLeader attempts to deliver a message to the team-lead mailbox.
-// Best-effort: logs but does not propagate errors.
+// sendToLeader routes a status or completion into the leader's real mailbox.
 func (r *TeammateRunner) sendToLeader(msg *Message) {
-	// The runner only has its own mailbox. To send to the leader we need
-	// the router. We can discover it through the parent team if available.
-	// For now, deliver by finding the leader's mailbox in the same router.
-	// This is set up in Team.StartTeammate which shares the router.
-	//
-	// We access the router indirectly: the mailbox's owner is in the same
-	// router. Since we can't hold a reference to the router here (to avoid
-	// import cycles), we use a different approach: the mailbox notify
-	// channel. In practice the Team holds the router and routes messages.
-	//
-	// The preferred pattern is for the runner to yield output via its
-	// Outputs() slice, and the Team's coordinator goroutine polls them.
-	// We log a debug message for observability.
-	r.logger.Debug("teammate → leader",
-		"agent_name", r.cfg.Identity.AgentName,
-		"type", msg.Type.String(),
-		"content_len", len(msg.Content),
-	)
+	if r.cfg.Router == nil {
+		r.logger.Warn("teammate leader mailbox unavailable", "agent_name", r.cfg.Identity.AgentName)
+		return
+	}
+	if err := r.cfg.Router.SendMessage(msg); err != nil {
+		r.logger.Warn("teammate leader delivery failed", "agent_name", r.cfg.Identity.AgentName, "error", err)
+	}
 }
 
 // fireIdleCallbacks invokes and clears all registered idle callbacks.
@@ -415,18 +421,18 @@ func (r *TeammateRunner) Identity() TeammateIdentity {
 
 // --- System prompt generation ---
 
-// TeammateSystemPromptAddendum is appended to every teammate's system prompt.
-// Mirrors Claude Code's TEAMMATE_SYSTEM_PROMPT_ADDENDUM.
+// TeammateSystemPromptAddendum explains the runtime team tools to workers.
 const TeammateSystemPromptAddendum = `
-# Agent Teammate Communication
+# Comunicação da equipe
 
-IMPORTANT: You are running as an agent in a team. To communicate with anyone on your team:
-- Use the SendMessage tool with to: "<name>" to send messages to specific teammates
-- Use the SendMessage tool with to: "*" sparingly for team-wide broadcasts
+Você está trabalhando em uma equipe de agentes. Para se comunicar:
+- Use team_send com to: "<nome>" para falar com outro integrante ou com team-lead.
+- Use team_send com to: "*" para uma mensagem a toda a equipe.
+- Use team_status para consultar os integrantes.
 
-Just writing a response in text is not visible to others on your team - you MUST use the SendMessage tool.
+Sua resposta final é entregue automaticamente ao líder da equipe. Use team_send para atualizações durante a tarefa.
 
-The user interacts primarily with the team lead. Your work is coordinated through the task system and teammate messaging.
+O usuário interage principalmente com o líder, que coordena as tarefas.
 `
 
 // BuildTeammateSystemPrompt constructs the full system prompt for a teammate.

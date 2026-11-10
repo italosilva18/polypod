@@ -45,8 +45,11 @@ type LocalTranscriber struct {
 	ffmpeg   string
 	language string
 	timeout  time.Duration
-	gate     chan struct{}
 }
+
+// The WhatsApp gateway and CLI each construct a LocalTranscriber. A shared
+// gate prevents both from loading large model copies at the same time.
+var localTranscriptionGate = make(chan struct{}, 1)
 
 func NewLocalTranscriber(cfg LocalConfig) (*LocalTranscriber, error) {
 	if strings.TrimSpace(cfg.PythonBinary) == "" {
@@ -82,7 +85,7 @@ func NewLocalTranscriber(cfg LocalConfig) (*LocalTranscriber, error) {
 	}
 	return &LocalTranscriber{
 		python: python, script: script, model: model, ffmpeg: ffmpeg,
-		language: cfg.Language, timeout: cfg.Timeout, gate: make(chan struct{}, 1),
+		language: cfg.Language, timeout: cfg.Timeout,
 	}, nil
 }
 
@@ -105,11 +108,18 @@ func (t *LocalTranscriber) Transcribe(ctx context.Context, data []byte, declared
 	// Admit one transcription at a time so concurrent WhatsApp deliveries do
 	// not launch multiple model copies and exhaust this machine's memory.
 	select {
-	case t.gate <- struct{}{}:
-		defer func() { <-t.gate }()
+	case localTranscriptionGate <- struct{}{}:
+		defer func() { <-localTranscriptionGate }()
 	case <-runCtx.Done():
 		return "", runCtx.Err()
 	}
+	// The service and an independently launched CLI may be separate processes.
+	// Coordinate on the same local model inode before loading either copy.
+	releaseModel, err := acquireModelLock(runCtx, t.model)
+	if err != nil {
+		return "", fmt.Errorf("aguardando modelo de transcrição local: %w", err)
+	}
+	defer releaseModel()
 	dir, err := os.MkdirTemp("", "polypod-asr-")
 	if err != nil {
 		return "", fmt.Errorf("criar diretório temporário de áudio: %w", err)
@@ -129,7 +139,7 @@ func (t *LocalTranscriber) Transcribe(ctx context.Context, data []byte, declared
 		"-i", input, "-map", "0:a:0", "-vn", "-sn", "-dn",
 		"-t", "301", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
 		"-f", "wav", wav)
-	if err := runLocalCommand(runCtx, ffmpeg, maxDiagnosticBytes); err != nil {
+	if err := runLocalCommand(runCtx, ffmpeg, maxDiagnosticBytes, "decoder"); err != nil {
 		return "", fmt.Errorf("conversão de áudio local falhou: %w", err)
 	}
 	if err := validateWAV(wav); err != nil {
@@ -138,7 +148,7 @@ func (t *LocalTranscriber) Transcribe(ctx context.Context, data []byte, declared
 
 	worker := exec.CommandContext(runCtx, t.python, t.script, wav,
 		"--model-path", t.model, "--language", t.language)
-	stdout, err := runLocalCommandWithOutput(runCtx, worker, maxTranscriptBytes)
+	stdout, err := runLocalCommandWithOutput(runCtx, worker, maxTranscriptBytes, "worker")
 	if err != nil {
 		return "", fmt.Errorf("transcrição local falhou: %w", err)
 	}
@@ -290,12 +300,12 @@ func (b *boundedOutput) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-func runLocalCommand(ctx context.Context, cmd *exec.Cmd, limit int) error {
-	_, err := runLocalCommandWithOutput(ctx, cmd, limit)
+func runLocalCommand(ctx context.Context, cmd *exec.Cmd, limit int, stage string) error {
+	_, err := runLocalCommandWithOutput(ctx, cmd, limit, stage)
 	return err
 }
 
-func runLocalCommandWithOutput(ctx context.Context, cmd *exec.Cmd, limit int) ([]byte, error) {
+func runLocalCommandWithOutput(ctx context.Context, cmd *exec.Cmd, limit int, stage string) ([]byte, error) {
 	stdout := &boundedOutput{limit: limit}
 	stderr := &boundedOutput{limit: maxDiagnosticBytes}
 	cmd.Stdout = stdout
@@ -305,10 +315,38 @@ func runLocalCommandWithOutput(ctx context.Context, cmd *exec.Cmd, limit int) ([
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, err
+		return nil, classifyLocalProcessError(stage, stderr.buf.String(), err)
 	}
 	if stdout.truncated {
 		return nil, errors.New("saída excede limite")
 	}
 	return stdout.buf.Bytes(), nil
+}
+
+// Worker stderr may contain private paths or model output. Map only known
+// failure signatures to stable, actionable categories before persisting it.
+func classifyLocalProcessError(stage, diagnostic string, cause error) error {
+	lower := strings.ToLower(diagnostic)
+	switch {
+	case strings.Contains(lower, "no space left on device"):
+		return fmt.Errorf("sem espaço para áudio temporário: %w", cause)
+	case strings.Contains(lower, "out of memory"), strings.Contains(lower, "cannot allocate memory"),
+		strings.Contains(lower, "memoryerror"), strings.Contains(lower, "bad_alloc"):
+		return fmt.Errorf("memória insuficiente para transcrição local: %w", cause)
+	case stage == "decoder" && (strings.Contains(lower, "invalid data found when processing input") ||
+		strings.Contains(lower, "moov atom not found") || strings.Contains(lower, "could not find codec parameters") ||
+		strings.Contains(lower, "unsupported codec") || strings.Contains(lower, "decoder (codec") ||
+		strings.Contains(lower, "stream map '0:a:0' matches no streams")):
+		return fmt.Errorf("%w: decodificador rejeitou o conteúdo: %v", ErrUnsupportedAudio, cause)
+	case stage == "worker" && (strings.Contains(lower, "modulenotfounderror") ||
+		strings.Contains(lower, "importerror") || strings.Contains(lower, "error while loading shared libraries")):
+		return fmt.Errorf("dependência Python de transcrição indisponível: %w", cause)
+	case stage == "worker" && (strings.Contains(lower, "filenotfounderror") ||
+		strings.Contains(lower, "model.bin") && strings.Contains(lower, "no such file")):
+		return fmt.Errorf("modelo local de transcrição não pode ser lido: %w", cause)
+	case stage == "decoder":
+		return fmt.Errorf("ffmpeg não conseguiu converter o áudio: %w", cause)
+	default:
+		return fmt.Errorf("worker de transcrição local falhou: %w", cause)
+	}
 }

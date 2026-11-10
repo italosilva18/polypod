@@ -20,6 +20,7 @@ import (
 	"github.com/costa/polypod/internal/messages"
 	"github.com/costa/polypod/internal/permissions"
 	"github.com/costa/polypod/internal/sliceansi"
+	"github.com/costa/polypod/internal/taskqueue"
 	"github.com/costa/polypod/internal/tasks"
 	"github.com/costa/polypod/internal/tool"
 )
@@ -124,9 +125,9 @@ type model struct {
 	streamRedrawPending    bool
 	streamRedrawGeneration uint64
 	lastViewportRedraw     time.Time
-	// A background turn keeps processing in the same conversation. Later
-	// submissions stay queued until it completes.
-	backgroundTurn   bool
+	// Ctrl+B only hides the active stream. It does not migrate that turn
+	// into the durable task queue; ordinary submissions still wait for it.
+	streamHidden     bool
 	historyStart     int
 	historyExpanded  bool
 	historySessionID string
@@ -146,6 +147,7 @@ type model struct {
 	cmdDeps       commandDeps
 	ctx           context.Context
 	taskEvents    <-chan tasks.TaskEvent
+	taskQueue     *taskqueue.Queue
 
 	width  int
 	height int
@@ -293,6 +295,10 @@ type chatEntry struct {
 	content   string
 	timestamp time.Time
 	elapsed   time.Duration // time to generate (assistant only)
+	// Entries are immutable after insertion. Cache their expensive Markdown
+	// and wrapping at the current terminal width; paging preserves these fields.
+	renderedWidth int
+	renderedBody  string
 }
 
 func newModel(ctx context.Context, streamHandler adapter.StreamHandler, deps commandDeps, dataDir string, userPrompt *tool.UserPromptHandler, approvalHandler *BubbleteaApprovalHandler, fileIndex *mentions.FileIndex) model {
@@ -436,7 +442,7 @@ func waitForApprovalRequest(h *BubbleteaApprovalHandler) tea.Cmd {
 // ── Slash command completions ───────────────────────────────────────────────
 
 var slashCommands = []string{
-	"/help", "/clear", "/quit", "/exit",
+	"/help", "/clear", "/quit", "/exit", "/bg",
 	"/agents", "/agent switch ",
 	"/skills",
 	"/memory list", "/memory search ",
@@ -673,6 +679,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.prependHistoryPage()
 		} else if msg.Button == tea.MouseButtonWheelDown && m.viewport.AtBottom() {
 			m.historyExpanded = false
+			m.updateViewport()
 		}
 		return m, cmd
 
@@ -752,9 +759,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case msg.Type == tea.KeyCtrlB && m.state == stateStreaming && !m.waitingForUserAnswer:
-			m.backgroundTurn = !m.backgroundTurn
-			m.updateViewport()
-			return m, nil
+			return handleKeyCtrlB(&m)
 
 		case msg.Type == tea.KeyPgUp:
 			wasAtTop := m.viewport.AtTop()
@@ -770,6 +775,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport, cmd = m.viewport.Update(msg)
 			if m.viewport.AtBottom() {
 				m.historyExpanded = false
+				m.updateViewport()
 			}
 			return m, cmd
 
@@ -878,6 +884,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.textarea.InsertString("\n")
 				return m, nil
 			}
+			if handled, cmd := m.submitBackgroundCommand(raw); handled {
+				return m, cmd
+			}
 			if strings.TrimSpace(raw) == "/recover" {
 				m.notification = "Aguarde o turno atual terminar para usar /recover; o comando permanece no campo."
 				m.notifyLevel = "info"
@@ -890,8 +899,10 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pastedImages = nil
 			m.textarea.SetValue("")
 			m.textarea.Reset()
+			m.notification = "Mensagem aguardando este turno; /bg <objetivo> cria uma tarefa separada"
+			m.notifyLevel = "info"
 			m.updateViewport()
-			return m, nil
+			return m, clearNotifyAfter(6*time.Second, m.notification)
 
 		case msg.Type == tea.KeyEnter && !msg.Alt && m.state == stateIdle:
 			m.resetTab()
@@ -909,6 +920,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !ShouldSubmitOnEnter(raw) {
 				m.textarea.InsertString("\n")
 				return m, nil
+			}
+			if handled, cmd := m.submitBackgroundCommand(raw); handled {
+				return m, cmd
 			}
 			if isRetryCommand(raw) {
 				return m.retryFailedTurn()
@@ -1034,7 +1048,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			})
 			m.recoveryDraft = ""
 			m.state = stateStreaming
-			m.backgroundTurn = false
+			m.streamHidden = false
 			m.activeTurn = &retryTurn{raw: raw, images: turnImages}
 			m.streamStart = time.Now()
 			m.streaming.Reset()
@@ -1078,8 +1092,8 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamMsg:
 		if msg.err != nil {
 			m.state = stateIdle
-			wasBackground := m.backgroundTurn
-			m.backgroundTurn = false
+			wasHidden := m.streamHidden
+			m.streamHidden = false
 			m.failedTurn = m.activeTurn
 			m.activeTurn = nil
 			m.messages = append(m.messages, chatEntry{
@@ -1087,8 +1101,8 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				content:   msg.err.Error() + retryFailureHint(msg.err),
 				timestamp: time.Now(),
 			})
-			if wasBackground {
-				m.notification = "resposta em segundo plano falhou; use /retry após corrigir a causa"
+			if wasHidden {
+				m.notification = "turno minimizado falhou; use /retry após corrigir a causa"
 				m.notifyLevel = "error"
 			}
 			m.streaming.Reset()
@@ -1099,7 +1113,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshStatusBar()
 			m.refreshTokenWarning()
 			m.updateViewport()
-			if wasBackground {
+			if wasHidden {
 				return m, tea.Batch(m.startQueuedCmd(), clearNotifyAfter(6*time.Second, m.notification))
 			}
 			return m, m.startQueuedCmd()
@@ -1126,8 +1140,8 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.done {
 			elapsed := time.Since(m.streamStart)
 			m.state = stateIdle
-			wasBackground := m.backgroundTurn
-			m.backgroundTurn = false
+			wasHidden := m.streamHidden
+			m.streamHidden = false
 			m.activeTurn = nil
 			content := m.streaming.String()
 			if content != "" {
@@ -1139,8 +1153,8 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				})
 			}
 			m.streaming.Reset()
-			if wasBackground {
-				m.notification = "resposta em segundo plano concluída"
+			if wasHidden {
+				m.notification = "turno minimizado concluído"
 				m.notifyLevel = "success"
 			}
 			m.streamCh = nil
@@ -1153,7 +1167,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshStatusBar()
 			m.refreshTokenWarning()
 			m.updateViewport()
-			if wasBackground {
+			if wasHidden {
 				return m, tea.Batch(m.startQueuedCmd(), clearNotifyAfter(6*time.Second, m.notification))
 			}
 			return m, m.startQueuedCmd()
@@ -1315,6 +1329,10 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateViewport()
 		return m, tea.Batch(waitForTaskEvent(m.ctx, m.taskEvents), clearNotifyAfter(6*time.Second, m.notification))
 
+	case backgroundWorkMsg:
+		m.showBackgroundResult(msg)
+		return m, clearNotifyAfter(6*time.Second, m.notification)
+
 	case queuedInputMsg:
 		return m.startQueuedInput()
 
@@ -1468,6 +1486,11 @@ func (m *model) queueStreamRedraw() tea.Cmd {
 	if !m.ready || m.streamRedrawPending {
 		return nil
 	}
+	// New tokens cannot be seen while the user reads older lines. Keep the
+	// current viewport stable and refresh the accumulated stream on return.
+	if !m.viewport.AtBottom() {
+		return nil
+	}
 	elapsed := time.Since(m.lastViewportRedraw)
 	if m.lastViewportRedraw.IsZero() || elapsed >= streamRedrawInterval {
 		m.updateViewport()
@@ -1549,7 +1572,7 @@ func (m model) viewportHeight() int {
 
 // ── Render messages ─────────────────────────────────────────────────────────
 
-func (m model) renderMessages() string {
+func (m *model) renderMessages() string {
 	var b strings.Builder
 	width := m.width
 	if width <= 0 {
@@ -1568,37 +1591,12 @@ func (m model) renderMessages() string {
 		b.WriteString("\n\n")
 	}
 	for i := start; i < len(m.messages); i++ {
-		entry := m.messages[i]
-		switch entry.role {
-		case "user":
-			writeWrappedMessage(&b, entry.content, userStyle.Render("  > "), "    ", width, contentStyle)
-			b.WriteString("\n")
-
-		case "assistant":
-			rendered := RenderMarkdown(entry.content, max(1, width-4))
-			// Indent the markdown block
-			for _, line := range strings.Split(rendered, "\n") {
-				b.WriteString("  ")
-				b.WriteString(line)
-				b.WriteString("\n")
-			}
-			// Show elapsed time
-			if entry.elapsed > 0 {
-				elapsed := formatDuration(entry.elapsed)
-				b.WriteString("  ")
-				b.WriteString(subtleStyle.Render(elapsed))
-				b.WriteString("\n")
-			}
-			b.WriteString("\n")
-
-		case "system":
-			writeWrappedMessage(&b, entry.content, "  ", "  ", width, lipgloss.NewStyle())
-			b.WriteString("\n")
-
-		case "error":
-			writeWrappedMessage(&b, entry.content, "  "+errorStyle.Render("erro "), "       ", width, contentStyle)
-			b.WriteString("\n")
+		entry := &m.messages[i]
+		if entry.renderedWidth != width {
+			entry.renderedBody = renderChatEntry(*entry, width)
+			entry.renderedWidth = width
 		}
+		b.WriteString(entry.renderedBody)
 
 		// Subtle separator between message pairs
 		if i < len(m.messages)-1 && entry.role == "assistant" {
@@ -1609,8 +1607,8 @@ func (m model) renderMessages() string {
 		}
 	}
 
-	if m.state == stateStreaming && m.backgroundTurn {
-		b.WriteString(notifyInfoStyle.Render("  Resposta em segundo plano · Ctrl+B para visualizar"))
+	if m.state == stateStreaming && m.streamHidden {
+		b.WriteString(notifyInfoStyle.Render("  Saída do turno minimizada · Ctrl+B para visualizar · /bg <objetivo> cria outra tarefa"))
 		b.WriteString("\n")
 		return b.String()
 	}
@@ -1641,6 +1639,35 @@ func (m model) renderMessages() string {
 		b.WriteString("\n")
 	}
 
+	return b.String()
+}
+
+func renderChatEntry(entry chatEntry, width int) string {
+	var b strings.Builder
+	switch entry.role {
+	case "user":
+		writeWrappedMessage(&b, entry.content, userStyle.Render("  > "), "    ", width, contentStyle)
+		b.WriteString("\n")
+	case "assistant":
+		rendered := RenderMarkdown(entry.content, max(1, width-4))
+		for _, line := range strings.Split(rendered, "\n") {
+			b.WriteString("  ")
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
+		if entry.elapsed > 0 {
+			b.WriteString("  ")
+			b.WriteString(subtleStyle.Render(formatDuration(entry.elapsed)))
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	case "system":
+		writeWrappedMessage(&b, entry.content, "  ", "  ", width, lipgloss.NewStyle())
+		b.WriteString("\n")
+	case "error":
+		writeWrappedMessage(&b, entry.content, "  "+errorStyle.Render("erro "), "       ", width, contentStyle)
+		b.WriteString("\n")
+	}
 	return b.String()
 }
 
@@ -1767,9 +1794,9 @@ func (m model) View() string {
 	var status strings.Builder
 	if m.waitingForUserAnswer {
 		status.WriteString(notifyInfoStyle.Render(" Aguardando sua resposta...  Enter para enviar"))
-	} else if m.backgroundTurn {
+	} else if m.streamHidden {
 		elapsed := time.Since(m.streamStart)
-		status.WriteString(notifyInfoStyle.Render(fmt.Sprintf(" Em segundo plano %s · Ctrl+B visualizar", formatDuration(elapsed))))
+		status.WriteString(notifyInfoStyle.Render(fmt.Sprintf(" Turno minimizado %s · Ctrl+B visualizar", formatDuration(elapsed))))
 	} else if m.notification != "" {
 		switch m.notifyLevel {
 		case "success":
@@ -1793,7 +1820,7 @@ func (m model) View() string {
 			status.WriteString(streamingDimStyle.Render(fmt.Sprintf(" pensando... %s", formatDuration(elapsed))))
 		}
 		if m.width >= 80 {
-			status.WriteString(statusBarStyle.Render("  Ctrl+B segundo plano"))
+			status.WriteString(statusBarStyle.Render("  Ctrl+B minimizar saída"))
 		}
 	} else {
 		// Show tab completion hints or default status

@@ -502,7 +502,13 @@ func mediaInfo(m *waE2E.Message) (string, uint64, string, *waE2E.ContextInfo) {
 		return v.GetMimetype(), v.GetFileLength(), v.GetCaption(), v.GetContextInfo()
 	case m.AudioMessage != nil:
 		v := m.AudioMessage
-		return v.GetMimetype(), v.GetFileLength(), "", v.GetContextInfo()
+		mediaType := v.GetMimetype()
+		if strings.TrimSpace(mediaType) == "" {
+			// Keep the attachment so MediaInterpreter can identify its actual
+			// format from the downloaded bytes instead of dropping the voice note.
+			mediaType = "audio/x-unknown"
+		}
+		return mediaType, v.GetFileLength(), "", v.GetContextInfo()
 	case m.VideoMessage != nil:
 		v := m.VideoMessage
 		return v.GetMimetype(), v.GetFileLength(), v.GetCaption(), v.GetContextInfo()

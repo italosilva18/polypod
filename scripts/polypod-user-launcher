@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo='/home/costa/Área de trabalho/CLI/polypod'
+polypod_bin="$repo/polypod"
+polypod_profile='/home/costa/.config/polypod/cli.yaml'
+
+export POLYPOD_CHATGPT_AUTH_FILE="$repo/data/conversations/chatgpt-auth.enc"
+export POLYPOD_RTK_ENABLED=1
+export POLYPOD_RTK_BIN=/home/costa/.local/bin/rtk
+export RTK_RECALL=0
+export RTK_TELEMETRY_DISABLED=1
+
+case "${1:-}" in
+  doctor)
+    shift
+    exec "$polypod_bin" doctor "$@" "$polypod_profile"
+    ;;
+  remote)
+    # The remote client loads the host token from the repo's private .env.
+    cd "$repo"
+    exec "$polypod_bin" "$@"
+    ;;
+  init|completion|hook|auth|--version|-v|--setup)
+    exec "$polypod_bin" "$@"
+    ;;
+  *)
+    # The interactive CLI keeps its own data and SQLite files under costa's
+    # profile, separate from the privileged background service.
+    exec "$polypod_bin" "$polypod_profile" "$@"
+    ;;
+esac

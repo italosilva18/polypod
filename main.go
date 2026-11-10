@@ -187,6 +187,9 @@ func handleSubcommand() bool {
 	if len(os.Args) < 2 {
 		return false
 	}
+	if handleRemoteClientSubcommand() {
+		return true
+	}
 	switch os.Args[1] {
 	case "doctor":
 		dotenv.Load(".")
@@ -920,7 +923,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		return fmt.Errorf("opening planned tasks: %w", err)
 	}
 	defer planStore.Close()
-	tool.RegisterPlanTaskTools(sys.ToolRegistry, planStore)
+	tool.RegisterPlanTaskTools(sys.ToolRegistry, planStore, taskQueue)
 
 	tool.RegisterAdvancedTools(sys.ToolRegistry, ".")
 	tool.RegisterHardwareTools(sys.ToolRegistry)
@@ -1071,9 +1074,9 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	for _, name := range skills.List() {
 		beforePlugins[name] = true
 	}
-	pluginLoader := skill.NewPluginLoader(skill.DefaultSkillDirs(), logger)
-	if n, err := pluginLoader.LoadAll(skills); err != nil {
-		logger.Warn("plugin skill loader error", "error", err)
+	pluginManager := skill.NewPluginManager(skill.DefaultSkillDirs(), skills, logger)
+	if n, err := pluginManager.Reconcile(ctx); err != nil {
+		logger.Warn("plugin skill reconciliation error", "error", err)
 	} else if n > 0 {
 		logger.Info("plugin skills loaded", "count", n)
 	}
@@ -1274,9 +1277,11 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 			agents.RemoveSkill("default", name)
 		}
 	})
+	tool.RegisterPluginTools(sys.ToolRegistry, pluginManager)
 	if skillWatcher != nil {
 		go skillWatcher.Start(ctx)
 	}
+	pluginManager.Start(ctx)
 
 	// Hooks
 	hookMgr := sys.Hooks
@@ -1469,6 +1474,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 
 	// Wire the real sub-agent executor now that ai.Client is available
 	wiring.WireAIClient(sys, aiClient, logger)
+	defer sys.Swarm.Shutdown(15 * time.Second)
 	active.Start(ctx)
 	defer active.Shutdown()
 
@@ -1529,6 +1535,9 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		}
 		return out.Text, err
 	})
+	if err := planStore.ReconcileExecutions(ctx, taskQueue); err != nil {
+		logger.Warn("planned execution reconciliation incomplete", "error", err)
+	}
 
 	// Optional remote human relay for questions and notifications. Credentials
 	// come from environment-expanded config and are never written by Polypod.
@@ -1557,6 +1566,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	}
 
 	localNotifier := notifier.NewNotifier(logger)
+	var remoteSessions *remoteSessionRuntime
 	var whatsapp *whatsappgateway.Gateway
 	var whatsappNative *whatsappgateway.Native
 	var whatsappMedia *whatsappgateway.MediaInterpreter
@@ -1730,6 +1740,15 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 			return out.Text, processErr
 		},
 		Deliver: func(deliverCtx context.Context, msg humanloop.Message) error {
+			if msg.Channel == remoteSessionChannel {
+				if humanStore.DeliveredTo(msg.ID, remoteSessionChannel) {
+					return nil
+				}
+				if err := remoteSessions.Deliver(deliverCtx, msg); err != nil {
+					return err
+				}
+				return humanStore.MarkDelivered(msg.ID, remoteSessionChannel)
+			}
 			if msg.Channel == whatsappgateway.Channel {
 				if whatsapp == nil {
 					return errors.New("whatsapp delivery is not configured")
@@ -1787,8 +1806,31 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	if err != nil {
 		return fmt.Errorf("initializing heartbeat: %w", err)
 	}
+	remoteSessions, err = startRemoteSessionRuntime(ctx, cfg.Data.Dir, humanStore, heartbeat.Wake, logger)
+	if err != nil {
+		return fmt.Errorf("initializing remote sessions: %w", err)
+	}
+	if remoteSessions != nil {
+		defer func() {
+			if closeErr := remoteSessions.Close(); closeErr != nil {
+				logger.Warn("remote sessions close failed", "error", closeErr)
+			}
+		}()
+	}
 	taskQueue.SetNotifier(func(noticeCtx context.Context, notice taskqueue.Notice) error {
-		message := fmt.Sprintf("Tarefa %s concluiu com status %s.", notice.TaskID, notice.Status)
+		label := fmt.Sprintf("Tarefa %s", notice.TaskID)
+		if notice.Channel == "plan" {
+			queued, err := taskQueue.Get(noticeCtx, notice.TaskID)
+			if err != nil {
+				return fmt.Errorf("consultando execução do plano: %w", err)
+			}
+			planned, err := planStore.SyncExecution(noticeCtx, queued)
+			if err != nil {
+				return fmt.Errorf("atualizando resultado do plano: %w", err)
+			}
+			label = fmt.Sprintf("Plano %s (execução %s)", planned.ID, notice.TaskID)
+		}
+		message := fmt.Sprintf("%s concluiu com status %s.", label, notice.Status)
 		if notice.Error != "" {
 			message += " Erro: " + notice.Error
 		} else if strings.TrimSpace(notice.Result) != "" {
@@ -2059,6 +2101,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	cliCh.SetCommandRegistry(sys.Commands)
 	cliCh.SetTurnCheckpointManager(turnCheckpoint)
 	cliCh.SetTaskRegistry(sys.TaskRegistry)
+	cliCh.SetTaskQueue(taskQueue)
 	cliCh.SetSessionMemory(sessionMemory)
 	cliCh.SetToolTranscriptStore(toolTranscript)
 	cliCh.SetActiveSessionID(currentSessionID)

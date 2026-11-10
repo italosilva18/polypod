@@ -4,7 +4,8 @@ O serviço instalado nesta máquina é `polypod-root.service`. Ele executa a CLI
 interativa como `root` dentro da sessão tmux `polypod-root`. O serviço usa o
 checkout em `/home/costa/Área de trabalho/CLI/polypod`, o arquivo local
 `config.yaml` e o binário em `/usr/local/libexec/polypod-root`. Não há
-dependência de PostgreSQL nem servidor REST nesse serviço.
+dependência de PostgreSQL. O servidor de sessões remotas usa HTTP somente em
+`127.0.0.1:8789` quando o token privado está configurado.
 
 Os arquivos `polypod-root.service`, `polypod-root-supervisor` e
 `polypod-root-session` espelham a instalação atual. O caminho do checkout, o
@@ -42,6 +43,16 @@ artefatos anteriores e tenta reativar o serviço. O backup fica preservado para
 inspeção. O script não copia nem substitui `config.yaml`, `.env`, os dados SQLite
 ou outros arquivos de estado.
 
+O lançamento interativo do usuário `costa` usa
+`/home/costa/.local/bin/polypod`, reproduzido por
+`scripts/polypod-user-launcher`. Esse perfil lê
+`/home/costa/.config/polypod/cli.yaml` e grava seus próprios bancos em
+`/home/costa/.local/share/polypod/cli/`, separados dos bancos do serviço root.
+Após atualizar o código, compile o binário local com `make build` e instale o
+lançador com `install -m 0755 scripts/polypod-user-launcher /home/costa/.local/bin/polypod`.
+O comando `polypod remote` usa a mesma instalação e lê o token privado do
+checkout; veja o [guia de sessões remotas](../docs/integrations/remote-sessions.md).
+
 O deploy também instala uma cópia do RTK de `~/.local/bin/rtk` em
 `/usr/local/libexec/polypod-rtk`, pertencente a `root`, e compara o hash antes de
 ativar a unidade. `POLYPOD_RTK_SOURCE` permite escolher outro executável de
@@ -69,10 +80,8 @@ sh scripts/test-polypod-root-supervisor.sh
 ## Acesso e dados
 
 A unidade espelha o serviço instalado: roda sem isolamento de privilégios como
-`root`, recebe acesso à sessão gráfica do usuário e usa `UMask=0000`. Assim, a
-CLI pode alterar arquivos e processos do sistema, e novos arquivos podem ficar
-graváveis por outros usuários. Restrinja o acesso ao host, mantenha
-`config.yaml` e `.env` privados e revise o perfil de permissões antes de
-habilitar integrações externas. O banco SQLite e as sessões ficam nos caminhos
-configurados; faça backup deles com o serviço parado para obter uma cópia
-consistente.
+`root`, recebe acesso à sessão gráfica do usuário e usa `UMask=0077`. Assim, a
+CLI pode alterar arquivos e processos do sistema, enquanto os novos arquivos
+ficam privados por padrão. Mantenha `config.yaml` e `.env` privados. O banco
+SQLite e as sessões ficam nos caminhos configurados; faça backup deles com o
+serviço parado para obter uma cópia consistente.

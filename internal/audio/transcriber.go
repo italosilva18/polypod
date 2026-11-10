@@ -144,3 +144,17 @@ func audioExtension(mediaType string, data []byte) (string, bool) {
 		return "", false
 	}
 }
+
+// DetectAudioMIME recognizes the bounded formats accepted by the transcribers
+// from their file signature. WhatsApp's declared MIME can be missing or wrong;
+// callers can use this result while still rejecting unrecognized bytes.
+func DetectAudioMIME(data []byte) string {
+	for _, mediaType := range [...]string{
+		"audio/ogg", "audio/wav", "audio/mpeg", "audio/flac", "audio/webm", "audio/mp4",
+	} {
+		if _, ok := audioExtension(mediaType, data); ok {
+			return mediaType
+		}
+	}
+	return ""
+}

@@ -165,6 +165,9 @@ func (sw *SkillWatcher) scan(ctx context.Context) {
 				return ctx.Err()
 			}
 			if entry.IsDir() {
+				if hasPluginManifest(path) {
+					return filepath.SkipDir
+				}
 				return nil
 			}
 			ext := filepath.Ext(entry.Name())
@@ -247,6 +250,9 @@ func (sw *SkillWatcher) scheduleReload(abs string) {
 // handleReload reads, parses, and re-registers the skill from the given
 // file. It updates the tracked state on success.
 func (sw *SkillWatcher) handleReload(abs string) {
+	if insidePluginDirectory(abs) {
+		return
+	}
 	data, err := os.ReadFile(abs)
 	if err != nil {
 		sw.log.Warn("skill watcher: read error", "path", abs, "err", err)
@@ -336,6 +342,17 @@ func (sw *SkillWatcher) handleReload(abs string) {
 
 	sw.notifyChange(s.Name, true)
 	sw.log.Info("skill watcher: reloaded skill", "name", s.Name, "path", abs)
+}
+
+func insidePluginDirectory(path string) bool {
+	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
+		if hasPluginManifest(dir) {
+			return true
+		}
+		if parent := filepath.Dir(dir); parent == dir {
+			return false
+		}
+	}
 }
 
 // handleDelete unregisters the skill that was loaded from the given path and

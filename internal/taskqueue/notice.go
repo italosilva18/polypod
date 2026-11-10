@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // ProcessNextNotice moves one terminal result to the downstream notifier.
@@ -22,7 +24,17 @@ func (q *Queue) ProcessNextNotice(ctx context.Context) (bool, error) {
 	if err != nil || !ok {
 		return false, err
 	}
-	deliveryErr := notifier(ctx, notice)
+	deliveryCtx, cancel := context.WithCancel(ctx)
+	leaseDone := make(chan error, 1)
+	go func() { leaseDone <- q.keepNoticeLease(deliveryCtx, notice, cancel) }()
+	deliveryErr := notifier(deliveryCtx, notice)
+	if deliveryCtx.Err() != nil && deliveryErr == nil {
+		deliveryErr = deliveryCtx.Err()
+	}
+	cancel()
+	if err := <-leaseDone; err != nil {
+		return true, err
+	}
 	if err := q.finishNotice(notice, deliveryErr); err != nil {
 		return true, err
 	}
@@ -48,7 +60,14 @@ func (q *Queue) claimNotice(ctx context.Context) (Notice, bool, error) {
 		return Notice{}, false, err
 	}
 	defer tx.Rollback()
-	row := tx.QueryRowContext(ctx, `SELECT key,task_id,attempt,status,result,error,channel,owner,created_at,delivery_attempts,next_delivery_at,last_delivery_error FROM task_notices WHERE delivery_state='pending' AND next_delivery_at<=? ORDER BY created_at ASC,key ASC LIMIT 1`, time.Now().UnixMilli())
+	now := time.Now().UnixMilli()
+	token := q.workerID + ":" + uuid.NewString()
+	row := tx.QueryRowContext(ctx, `UPDATE task_notices SET delivery_state='delivering',delivery_attempts=delivery_attempts+1,
+	 claim_token=?,lease_until=?
+	 WHERE key=(SELECT key FROM task_notices WHERE delivery_state='pending' AND next_delivery_at<=?
+	 ORDER BY created_at ASC,key ASC LIMIT 1) AND delivery_state='pending'
+	 RETURNING key,task_id,attempt,status,result,error,channel,owner,created_at,delivery_attempts,next_delivery_at,last_delivery_error`,
+		token, now+leaseDuration.Milliseconds(), now)
 	notice, err := scanNotice(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Notice{}, false, nil
@@ -56,20 +75,43 @@ func (q *Queue) claimNotice(ctx context.Context) (Notice, bool, error) {
 	if err != nil {
 		return Notice{}, false, err
 	}
-	notice.Attempts++
-	res, err := tx.ExecContext(ctx, `UPDATE task_notices SET delivery_state='delivering',delivery_attempts=? WHERE key=? AND delivery_state='pending'`, notice.Attempts, notice.Key)
-	if err != nil {
-		return Notice{}, false, err
-	}
-	if n, err := res.RowsAffected(); err != nil {
-		return Notice{}, false, err
-	} else if n != 1 {
-		return Notice{}, false, errors.New("notificacao mudou durante claim")
-	}
 	if err := tx.Commit(); err != nil {
 		return Notice{}, false, err
 	}
+	notice.claimToken = token
 	return notice, true, nil
+}
+
+func (q *Queue) keepNoticeLease(ctx context.Context, notice Notice, cancel context.CancelFunc) error {
+	ticker := time.NewTicker(leaseRenewal)
+	defer ticker.Stop()
+	leaseUntil := time.Now().Add(leaseDuration)
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+		now := time.Now().UnixMilli()
+		res, err := q.db.ExecContext(ctx, `UPDATE task_notices SET lease_until=? WHERE key=? AND delivery_state='delivering' AND delivery_attempts=? AND claim_token=?`,
+			now+leaseDuration.Milliseconds(), notice.Key, notice.Attempts, notice.claimToken)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if time.Now().After(leaseUntil) {
+				cancel()
+				return fmt.Errorf("renovando posse da notificacao %s: %w", notice.Key, err)
+			}
+			continue
+		}
+		n, err := res.RowsAffected()
+		if err != nil || n != 1 {
+			cancel()
+			return ErrLeaseLost
+		}
+		leaseUntil = time.UnixMilli(now).Add(leaseDuration)
+	}
 }
 
 func (q *Queue) finishNotice(notice Notice, deliveryErr error) error {
@@ -90,15 +132,15 @@ func (q *Queue) finishNotice(notice Notice, deliveryErr error) error {
 		next = time.Now().Add(backoff).UnixMilli()
 		lastError = bounded(deliveryErr.Error(), 4<<10)
 	}
-	res, err := q.db.ExecContext(ctx, `UPDATE task_notices SET delivery_state=?,next_delivery_at=?,delivered_at=?,last_delivery_error=? WHERE key=? AND delivery_state='delivering' AND delivery_attempts=?`,
-		state, next, deliveredAt, lastError, notice.Key, notice.Attempts)
+	res, err := q.db.ExecContext(ctx, `UPDATE task_notices SET delivery_state=?,next_delivery_at=?,delivered_at=?,last_delivery_error=?,claim_token='',lease_until=0 WHERE key=? AND delivery_state='delivering' AND delivery_attempts=? AND claim_token=?`,
+		state, next, deliveredAt, lastError, notice.Key, notice.Attempts, notice.claimToken)
 	if err != nil {
 		return err
 	}
 	if n, err := res.RowsAffected(); err != nil {
 		return err
 	} else if n != 1 {
-		return fmt.Errorf("notificacao %s nao encontrada para concluir", notice.Key)
+		return fmt.Errorf("notificacao %s: %w", notice.Key, ErrLeaseLost)
 	}
 	return nil
 }

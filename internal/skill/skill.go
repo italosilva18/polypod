@@ -44,6 +44,12 @@ func FileSkillOrigin(path string) string {
 	return "file:" + filepath.Clean(abs)
 }
 
+// PluginSkillOrigin keeps plugin ownership separate from ordinary filesystem
+// skills, even when both refer to the same path during a manifest transition.
+func PluginSkillOrigin(path string) string {
+	return "plugin:" + strings.TrimPrefix(FileSkillOrigin(path), "file:")
+}
+
 // Registry holds all registered skills.
 type Registry struct {
 	mu                sync.RWMutex
@@ -200,8 +206,9 @@ func (r *Registry) register(s *Skill, trusted bool) error {
 			return err
 		}
 	}
-	if !trusted && strings.HasPrefix(s.Origin, "file:") {
-		if existing, ok := r.skills[s.Name]; ok && existing.Origin != s.Origin {
+	if !trusted {
+		if existing, ok := r.skills[s.Name]; ok && existing.Origin != s.Origin &&
+			(sourceOwnedSkill(existing.Origin) || sourceOwnedSkill(s.Origin)) {
 			r.mu.Unlock()
 			return fmt.Errorf("skill %q pertence a outra origem", s.Name)
 		}
@@ -213,6 +220,10 @@ func (r *Registry) register(s *Skill, trusted bool) error {
 		onChange(s.Name, true)
 	}
 	return nil
+}
+
+func sourceOwnedSkill(origin string) bool {
+	return strings.HasPrefix(origin, "file:") || strings.HasPrefix(origin, "plugin:")
 }
 
 // Unregister removes a skill from the registry.

@@ -11,6 +11,8 @@ var (
 	ErrAgentNotFound = errors.New("agent not found")
 	// ErrMailboxClosed is returned when delivering to a closed mailbox.
 	ErrMailboxClosed = errors.New("mailbox closed")
+	// ErrMailboxFull is returned when an unread inbox reaches its capacity.
+	ErrMailboxFull = errors.New("mailbox full")
 	// ErrTeamFull is returned when the team has reached its max member count.
 	ErrTeamFull = errors.New("team is at maximum capacity")
 	// ErrTeamNotRunning is returned for operations on a non-running team.

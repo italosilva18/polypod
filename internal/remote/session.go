@@ -1,13 +1,6 @@
-// Package remote manages remote/shared sessions via WebSocket (or HTTP
-// long-polling fallback when no WebSocket library is available in go.mod).
-//
-// Ported from the TypeScript remote/ directory (RemoteSessionManager,
-// SessionsWebSocket, sdkMessageAdapter).
-//
-// Because neither nhooyr.io/websocket nor gorilla/websocket are present in the
-// module, the implementation uses stdlib net/http for HTTP-based long-polling as
-// a transport layer, with the same reconnect/backoff semantics as the TS
-// WebSocket client.
+// Package remote provides Polypod-owned persistent shared sessions over HTTP
+// long polling. The server stores ordered messages and delivery cursors in
+// SQLite; clients acknowledge each message after dispatching it.
 package remote
 
 import (
@@ -19,6 +12,11 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -30,8 +28,7 @@ import (
 // SessionConfig holds the parameters needed to connect to the remote session
 // server.
 type SessionConfig struct {
-	// ServerURL is the base URL of the session server (e.g.
-	// "https://api.anthropic.com").
+	// ServerURL is the base URL of a Polypod remote server.
 	ServerURL string
 
 	// SessionID is the identifier of an existing session to join, or empty
@@ -40,6 +37,14 @@ type SessionConfig struct {
 
 	// AuthToken is sent as a Bearer token in the Authorization header.
 	AuthToken string
+
+	// ParticipantID is a stable, unique identity for this subscriber. Clients
+	// using the same ID share one acknowledged cursor across process restarts.
+	ParticipantID string
+
+	// StateFile optionally stores the auto-created SessionID for process
+	// restarts. The acknowledged message cursor is stored on the server.
+	StateFile string
 
 	// Logger receives structured log messages.  If nil a no-op logger is
 	// used.
@@ -61,6 +66,8 @@ type RemoteSession struct {
 
 // Message is a single message exchanged with a remote session.
 type Message struct {
+	ID        string    `json:"id,omitempty"`
+	Sequence  int64     `json:"sequence,omitempty"`
 	Type      string    `json:"type"`
 	Sender    string    `json:"sender"`
 	Content   string    `json:"content"`
@@ -85,9 +92,8 @@ const (
 
 const (
 	reconnectDelay     = 2 * time.Second
-	maxReconnect       = 5
-	pollInterval       = 2 * time.Second
 	defaultHTTPTimeout = 30 * time.Second
+	maxResponseBytes   = 2 << 20
 )
 
 // ---------------------------------------------------------------------------
@@ -105,6 +111,8 @@ type SessionManager struct {
 	mu       sync.Mutex
 	state    connState
 	handlers []func(Message)
+	cursor   int64
+	epoch    uint64
 
 	// polling
 	pollCancel context.CancelFunc
@@ -138,56 +146,63 @@ func NewSessionManager(cfg SessionConfig) *SessionManager {
 // background goroutine that long-polls for incoming messages and dispatches
 // them to registered handlers.
 //
-// The method returns an error only if the initial handshake (an HTTP GET to
-// verify reachability) fails.
+// Connect creates or joins the configured session before polling. A stable
+// ParticipantID lets the server resume from its persisted cursor on restart.
 func (sm *SessionManager) Connect(ctx context.Context) error {
+	if strings.TrimSpace(sm.cfg.ServerURL) == "" || sm.cfg.AuthToken == "" || !publicParticipant(sm.cfg.ParticipantID) {
+		return fmt.Errorf("remote: URL, token e ParticipantID válido são obrigatórios")
+	}
+	if err := sm.restoreSessionID(); err != nil {
+		return err
+	}
 	sm.mu.Lock()
-	if sm.state != stateDisconnected {
+	if sm.state == stateConnected {
 		sm.mu.Unlock()
 		return nil
 	}
+	if sm.state == stateConnecting {
+		sm.mu.Unlock()
+		return fmt.Errorf("remote: conexão já está em andamento")
+	}
 	sm.state = stateConnecting
+	sm.epoch++
+	epoch := sm.epoch
+	sessionID := sm.cfg.SessionID
 	sm.mu.Unlock()
 
 	sm.log.Info("connecting to remote session",
 		"server", sm.cfg.ServerURL,
-		"session", sm.cfg.SessionID,
+		"session", sessionID,
 	)
-
-	// Verify that the server is reachable.
-	u := fmt.Sprintf("%s/v1/sessions/%s", sm.cfg.ServerURL, sm.cfg.SessionID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	var err error
+	if sessionID == "" {
+		_, err = sm.CreateSession(ctx)
+	} else {
+		err = sm.JoinSession(ctx, sessionID)
+	}
 	if err != nil {
-		sm.setState(stateDisconnected)
-		return fmt.Errorf("remote: build request: %w", err)
+		sm.abortConnect(epoch)
+		return fmt.Errorf("remote: establishing session: %w", err)
 	}
-	sm.setAuth(req)
-
-	resp, err := sm.client.Do(req)
-	if err != nil {
-		sm.setState(stateDisconnected)
-		return fmt.Errorf("remote: connect handshake: %w", err)
-	}
-	resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		sm.setState(stateDisconnected)
-		return fmt.Errorf("remote: connect handshake: HTTP %d", resp.StatusCode)
-	}
-
-	sm.setState(stateConnected)
-	sm.log.Info("connected to remote session", "session", sm.cfg.SessionID)
 
 	// Start long-polling loop.
 	pollCtx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 
 	sm.mu.Lock()
+	if sm.state != stateConnecting || sm.epoch != epoch {
+		sm.mu.Unlock()
+		cancel()
+		return context.Canceled
+	}
 	sm.pollCancel = cancel
 	sm.pollDone = done
+	sm.state = stateConnected
+	sessionID = sm.cfg.SessionID
 	sm.mu.Unlock()
 
 	go sm.pollLoop(pollCtx, done)
+	sm.log.Info("connected to remote session", "session", sessionID)
 
 	return nil
 }
@@ -200,6 +215,7 @@ func (sm *SessionManager) Disconnect() error {
 	sm.pollCancel = nil
 	sm.pollDone = nil
 	sm.state = stateDisconnected
+	sm.epoch++
 	sm.mu.Unlock()
 
 	if cancel != nil {
@@ -209,7 +225,7 @@ func (sm *SessionManager) Disconnect() error {
 		<-done
 	}
 
-	sm.log.Info("disconnected from remote session", "session", sm.cfg.SessionID)
+	sm.log.Info("disconnected from remote session", "session", sm.sessionID())
 	return nil
 }
 
@@ -222,41 +238,75 @@ func (sm *SessionManager) SendMessage(ctx context.Context, msg Message) error {
 	if !sm.isConnected() {
 		return errors.New("remote: not connected")
 	}
-
-	if msg.Timestamp.IsZero() {
-		msg.Timestamp = time.Now()
+	if strings.TrimSpace(msg.Type) != "user" {
+		return fmt.Errorf("remote: cliente remoto só pode enviar mensagem type=user")
 	}
-
+	msg.Type = "user"
+	if strings.TrimSpace(msg.Content) == "" || len(msg.Content) > 256<<10 || len(msg.ID) > 128 ||
+		(msg.ID != "" && strings.TrimSpace(msg.ID) == "") {
+		return fmt.Errorf("remote: conteúdo ou ID da mensagem inválido")
+	}
+	msg.Sender = ""
+	msg.Sequence = 0
+	msg.Timestamp = time.Time{}
+	if msg.ID == "" {
+		id, err := newID("message_")
+		if err != nil {
+			return err
+		}
+		msg.ID = id
+	}
 	body, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("remote: marshal message: %w", err)
 	}
-
-	u := fmt.Sprintf("%s/v1/sessions/%s/messages", sm.cfg.ServerURL, sm.cfg.SessionID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("remote: build request: %w", err)
+	if len(body) > 512<<10 {
+		return fmt.Errorf("remote: mensagem excede 512 KiB")
 	}
-	sm.setAuth(req)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := sm.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("remote: send message: %w", err)
+	u := sm.sessionURL("/messages")
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("remote: build request: %w", err)
+		}
+		sm.setAuth(req)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := sm.client.Do(req)
+		if err == nil {
+			status := resp.StatusCode
+			closeErr := resp.Body.Close()
+			if closeErr != nil {
+				sm.log.Warn("falha ao fechar resposta remota", "error", closeErr)
+			}
+			if status >= 200 && status < 300 {
+				sm.log.Debug("message sent", "type", msg.Type, "session", sm.sessionID(), "id", msg.ID)
+				return nil
+			}
+			lastErr = fmt.Errorf("remote: send message: HTTP %d", status)
+			if status < 500 {
+				return lastErr
+			}
+		} else {
+			lastErr = fmt.Errorf("remote: send message: %w", err)
+		}
+		if attempt < 2 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(attempt+1) * reconnectDelay):
+			}
+		}
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("remote: send message: HTTP %d", resp.StatusCode)
-	}
-
-	sm.log.Debug("message sent", "type", msg.Type, "session", sm.cfg.SessionID)
-	return nil
+	return lastErr
 }
 
 // OnMessage registers a handler that is called for every incoming message.
 // Multiple handlers can be registered; they are called in order.
 func (sm *SessionManager) OnMessage(handler func(Message)) {
+	if handler == nil {
+		return
+	}
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.handlers = append(sm.handlers, handler)
@@ -268,7 +318,7 @@ func (sm *SessionManager) OnMessage(handler func(Message)) {
 
 // ListSessions returns all sessions available on the server.
 func (sm *SessionManager) ListSessions(ctx context.Context) ([]RemoteSession, error) {
-	u := fmt.Sprintf("%s/v1/sessions", sm.cfg.ServerURL)
+	u := sm.baseURL() + "/v1/sessions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("remote: build request: %w", err)
@@ -286,7 +336,7 @@ func (sm *SessionManager) ListSessions(ctx context.Context) ([]RemoteSession, er
 	}
 
 	var sessions []RemoteSession
-	if err := json.NewDecoder(resp.Body).Decode(&sessions); err != nil {
+	if err := decodeLimitedResponse(resp.Body, &sessions); err != nil {
 		return nil, fmt.Errorf("remote: decode sessions: %w", err)
 	}
 	return sessions, nil
@@ -294,7 +344,13 @@ func (sm *SessionManager) ListSessions(ctx context.Context) ([]RemoteSession, er
 
 // CreateSession creates a new remote session on the server and returns it.
 func (sm *SessionManager) CreateSession(ctx context.Context) (*RemoteSession, error) {
-	u := fmt.Sprintf("%s/v1/sessions", sm.cfg.ServerURL)
+	sm.mu.Lock()
+	connected := sm.state == stateConnected
+	sm.mu.Unlock()
+	if connected {
+		return nil, fmt.Errorf("remote: desconecte antes de trocar de sessão")
+	}
+	u := sm.baseURL() + "/v1/sessions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("remote: build request: %w", err)
@@ -313,8 +369,15 @@ func (sm *SessionManager) CreateSession(ctx context.Context) (*RemoteSession, er
 	}
 
 	var session RemoteSession
-	if err := json.NewDecoder(resp.Body).Decode(&session); err != nil {
+	if err := decodeLimitedResponse(resp.Body, &session); err != nil {
 		return nil, fmt.Errorf("remote: decode session: %w", err)
+	}
+	sm.mu.Lock()
+	sm.cfg.SessionID = session.ID
+	sm.cursor = 0
+	sm.mu.Unlock()
+	if err := sm.persistSessionID(session.ID); err != nil {
+		return nil, err
 	}
 	return &session, nil
 }
@@ -323,7 +386,16 @@ func (sm *SessionManager) CreateSession(ctx context.Context) (*RemoteSession, er
 // sends a POST to the join endpoint and updates the manager's session ID on
 // success.
 func (sm *SessionManager) JoinSession(ctx context.Context, sessionID string) error {
-	u := fmt.Sprintf("%s/v1/sessions/%s/join", sm.cfg.ServerURL, sessionID)
+	if !validSessionID(sessionID) {
+		return fmt.Errorf("remote: ID de sessão inválido")
+	}
+	sm.mu.Lock()
+	connected := sm.state == stateConnected
+	sm.mu.Unlock()
+	if connected {
+		return fmt.Errorf("remote: desconecte antes de trocar de sessão")
+	}
+	u := sm.baseURL() + "/v1/sessions/" + url.PathEscape(sessionID) + "/join"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
 	if err != nil {
 		return fmt.Errorf("remote: build request: %w", err)
@@ -342,7 +414,11 @@ func (sm *SessionManager) JoinSession(ctx context.Context, sessionID string) err
 
 	sm.mu.Lock()
 	sm.cfg.SessionID = sessionID
+	sm.cursor = 0
 	sm.mu.Unlock()
+	if err := sm.persistSessionID(sessionID); err != nil {
+		return err
+	}
 
 	sm.log.Info("joined remote session", "session", sessionID)
 	return nil
@@ -356,11 +432,115 @@ func (sm *SessionManager) setAuth(req *http.Request) {
 	if sm.cfg.AuthToken != "" {
 		req.Header.Set("Authorization", "Bearer "+sm.cfg.AuthToken)
 	}
+	req.Header.Set(participantHeader, sm.cfg.ParticipantID)
 }
 
-func (sm *SessionManager) setState(s connState) {
+// SessionID returns the persisted session ID, including one created by Connect.
+func (sm *SessionManager) SessionID() string { return sm.sessionID() }
+
+func (sm *SessionManager) sessionID() string {
 	sm.mu.Lock()
-	sm.state = s
+	defer sm.mu.Unlock()
+	return sm.cfg.SessionID
+}
+
+func (sm *SessionManager) baseURL() string { return strings.TrimRight(sm.cfg.ServerURL, "/") }
+
+func (sm *SessionManager) sessionURL(suffix string) string {
+	return sm.baseURL() + "/v1/sessions/" + url.PathEscape(sm.sessionID()) + suffix
+}
+
+func (sm *SessionManager) restoreSessionID() error {
+	sm.mu.Lock()
+	needed := sm.cfg.SessionID == "" && sm.cfg.StateFile != ""
+	path := sm.cfg.StateFile
+	sm.mu.Unlock()
+	if !needed {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("remote: reading session state: %w", err)
+	}
+	if len(raw) > 256 {
+		return fmt.Errorf("remote: arquivo de sessão inválido")
+	}
+	id := strings.TrimSpace(string(raw))
+	if !validSessionID(id) {
+		return fmt.Errorf("remote: ID persistido de sessão inválido")
+	}
+	sm.mu.Lock()
+	if sm.cfg.SessionID == "" {
+		sm.cfg.SessionID = id
+	}
+	sm.mu.Unlock()
+	return nil
+}
+
+func (sm *SessionManager) persistSessionID(id string) error {
+	if sm.cfg.StateFile == "" {
+		return nil
+	}
+	dir := filepath.Dir(sm.cfg.StateFile)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("remote: creating session state directory: %w", err)
+	}
+	file, err := os.CreateTemp(dir, ".remote-session-*")
+	if err != nil {
+		return fmt.Errorf("remote: creating session state: %w", err)
+	}
+	tmp := file.Name()
+	defer os.Remove(tmp)
+	if _, err := file.WriteString(id + "\n"); err != nil {
+		file.Close()
+		return fmt.Errorf("remote: writing session state: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return fmt.Errorf("remote: syncing session state: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("remote: closing session state: %w", err)
+	}
+	if err := os.Rename(tmp, sm.cfg.StateFile); err != nil {
+		return fmt.Errorf("remote: publishing session state: %w", err)
+	}
+	return nil
+}
+
+func (sm *SessionManager) currentCursor() int64 {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	return sm.cursor
+}
+
+func (sm *SessionManager) advanceCursor(sequence int64) {
+	sm.mu.Lock()
+	if sequence > sm.cursor {
+		sm.cursor = sequence
+	}
+	sm.mu.Unlock()
+}
+
+func decodeLimitedResponse(body io.Reader, target any) error {
+	raw, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(raw) > maxResponseBytes {
+		return fmt.Errorf("resposta excede %d bytes", maxResponseBytes)
+	}
+	return json.Unmarshal(raw, target)
+}
+
+func (sm *SessionManager) abortConnect(epoch uint64) {
+	sm.mu.Lock()
+	if sm.epoch == epoch && sm.state == stateConnecting {
+		sm.state = stateDisconnected
+	}
 	sm.mu.Unlock()
 }
 
@@ -370,20 +550,35 @@ func (sm *SessionManager) isConnected() bool {
 	return sm.state == stateConnected
 }
 
-func (sm *SessionManager) dispatch(msg Message) {
+func (sm *SessionManager) dispatch(msg Message) error {
 	sm.mu.Lock()
 	handlers := make([]func(Message), len(sm.handlers))
 	copy(handlers, sm.handlers)
 	sm.mu.Unlock()
+	if len(handlers) == 0 {
+		return fmt.Errorf("remote: nenhum handler registrado para receber mensagens")
+	}
 
 	for _, h := range handlers {
-		h(msg)
+		if err := invokeHandler(h, msg); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-// pollLoop long-polls the server for new messages.  It implements
-// exponential back-off on transient errors, mirroring the reconnect
-// behaviour of the TS WebSocket client.
+func invokeHandler(handler func(Message), msg Message) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("remote: handler de mensagem falhou: %v", recovered)
+		}
+	}()
+	handler(msg)
+	return nil
+}
+
+// pollLoop retries transient failures without dropping its durable server
+// cursor. A handler is at-least-once: a crash between dispatch and ack replays.
 func (sm *SessionManager) pollLoop(ctx context.Context, done chan struct{}) {
 	defer close(done)
 
@@ -397,20 +592,33 @@ func (sm *SessionManager) pollLoop(ctx context.Context, done chan struct{}) {
 		}
 
 		msgs, err := sm.poll(ctx)
+		if err == nil {
+			for _, msg := range msgs {
+				if msg.Sequence <= 0 {
+					err = fmt.Errorf("remote: servidor retornou mensagem sem sequência")
+					break
+				}
+				if msg.Sequence <= sm.currentCursor() {
+					continue
+				}
+				if err = sm.dispatch(msg); err != nil {
+					break
+				}
+				if err = sm.ackCursor(ctx, msg.Sequence); err != nil {
+					break
+				}
+				sm.advanceCursor(msg.Sequence)
+			}
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
 			failures++
-			if failures > maxReconnect {
-				sm.log.Error("polling stopped: too many failures",
-					"failures", failures,
-					"session", sm.cfg.SessionID,
-				)
-				sm.setState(stateDisconnected)
-				return
+			if failures > 5 {
+				failures = 5
 			}
-			backoff := reconnectDelay * time.Duration(failures)
+			backoff := reconnectDelay * time.Duration(1<<uint(failures-1))
 			sm.log.Warn("poll error, backing off",
 				"err", err,
 				"backoff", backoff,
@@ -425,21 +633,12 @@ func (sm *SessionManager) pollLoop(ctx context.Context, done chan struct{}) {
 		}
 
 		failures = 0
-		for _, m := range msgs {
-			sm.dispatch(m)
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(pollInterval):
-		}
 	}
 }
 
 // poll performs a single long-poll request and returns any new messages.
 func (sm *SessionManager) poll(ctx context.Context) ([]Message, error) {
-	u := fmt.Sprintf("%s/v1/sessions/%s/messages/poll", sm.cfg.ServerURL, sm.cfg.SessionID)
+	u := sm.sessionURL("/messages/poll") + "?after=" + strconv.FormatInt(sm.currentCursor(), 10) + "&wait=20"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("remote: build poll request: %w", err)
@@ -462,8 +661,37 @@ func (sm *SessionManager) poll(ctx context.Context) ([]Message, error) {
 	}
 
 	var msgs []Message
-	if err := json.NewDecoder(resp.Body).Decode(&msgs); err != nil {
+	if err := decodeLimitedResponse(resp.Body, &msgs); err != nil {
 		return nil, fmt.Errorf("remote: decode poll response: %w", err)
 	}
+	for i := 1; i < len(msgs); i++ {
+		if msgs[i].Sequence <= msgs[i-1].Sequence {
+			return nil, fmt.Errorf("remote: mensagens retornadas fora de ordem")
+		}
+	}
 	return msgs, nil
+}
+
+func (sm *SessionManager) ackCursor(ctx context.Context, sequence int64) error {
+	body, err := json.Marshal(struct {
+		Sequence int64 `json:"sequence"`
+	}{Sequence: sequence})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, sm.sessionURL("/cursor"), bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("remote: build cursor request: %w", err)
+	}
+	sm.setAuth(req)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := sm.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("remote: acknowledge cursor: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("remote: acknowledge cursor: HTTP %d", resp.StatusCode)
+	}
+	return nil
 }

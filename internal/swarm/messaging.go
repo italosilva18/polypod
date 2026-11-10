@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -166,7 +167,10 @@ type Mailbox struct {
 	maxHist int
 }
 
-const defaultMaxHistory = 200
+const (
+	defaultMaxHistory  = 200
+	maxPendingMessages = 1024
+)
 
 // NewMailbox creates a mailbox for the given agent name.
 func NewMailbox(owner string, logger *slog.Logger) *Mailbox {
@@ -186,10 +190,15 @@ func (m *Mailbox) Owner() string { return m.owner }
 // Deliver enqueues a message. Thread-safe.
 // Returns ErrMailboxClosed if the mailbox has been closed.
 func (m *Mailbox) Deliver(msg *Message) error {
+	m.mu.Lock()
 	if atomic.LoadInt32(&m.closed) != 0 {
+		m.mu.Unlock()
 		return ErrMailboxClosed
 	}
-	m.mu.Lock()
+	if m.queue.Len() >= maxPendingMessages {
+		m.mu.Unlock()
+		return ErrMailboxFull
+	}
 	msg.priority = msg.Type.Priority()
 	msg.seqNo = atomic.AddUint64(&globalSeqNo, 1)
 	heap.Push(&m.queue, msg)
@@ -248,6 +257,54 @@ func (m *Mailbox) Pending() int {
 	return m.queue.Len()
 }
 
+// Snapshot returns pending messages without acknowledging them. The caller
+// should acknowledge IDs only after it has safely consumed the result.
+func (m *Mailbox) Snapshot(limit int) []*Message {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	msgs := make([]*Message, 0, m.queue.Len())
+	for _, queued := range m.queue {
+		copy := *queued
+		msgs = append(msgs, &copy)
+	}
+	sort.Slice(msgs, func(i, j int) bool {
+		if msgs[i].priority != msgs[j].priority {
+			return msgs[i].priority < msgs[j].priority
+		}
+		return msgs[i].seqNo < msgs[j].seqNo
+	})
+	if limit > 0 && len(msgs) > limit {
+		msgs = msgs[:limit]
+	}
+	return msgs
+}
+
+// Acknowledge removes only the listed message IDs from the pending mailbox.
+func (m *Mailbox) Acknowledge(ids []string) int {
+	if len(ids) == 0 {
+		return 0
+	}
+	selected := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		selected[id] = struct{}{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	retained := make(messageHeap, 0, m.queue.Len())
+	removed := 0
+	for _, msg := range m.queue {
+		if _, ok := selected[msg.ID]; ok {
+			msg.Read = true
+			removed++
+			continue
+		}
+		retained = append(retained, msg)
+	}
+	m.queue = retained
+	heap.Init(&m.queue)
+	return removed
+}
+
 // History returns a copy of the bounded message history.
 func (m *Mailbox) History() []*Message {
 	m.mu.Lock()
@@ -273,7 +330,10 @@ func (m *Mailbox) Drain() []*Message {
 // Close marks the mailbox as closed. Subsequent Deliver calls return
 // ErrMailboxClosed. Pending Receive calls unblock with ErrMailboxClosed.
 func (m *Mailbox) Close() {
-	if atomic.CompareAndSwapInt32(&m.closed, 0, 1) {
+	m.mu.Lock()
+	closed := atomic.CompareAndSwapInt32(&m.closed, 0, 1)
+	m.mu.Unlock()
+	if closed {
 		// Wake up any blocking receiver.
 		select {
 		case m.notify <- struct{}{}:

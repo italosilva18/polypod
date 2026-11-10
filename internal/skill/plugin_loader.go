@@ -2,6 +2,7 @@ package skill
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -59,7 +60,20 @@ func NewPluginLoader(dirs []string, logger *slog.Logger) *PluginLoader {
 // Individual errors (missing/malformed manifests, unreadable directories) are
 // logged and skipped so one bad plugin cannot block the rest.
 func (pl *PluginLoader) Discover() ([]PluginManifest, error) {
+	manifests, _ := pl.discover(false)
+	return manifests, nil
+}
+
+// DiscoverAll includes disabled plugins and reports unreadable or malformed
+// manifests. Runtime reconciliation uses errors to avoid mistaking a transient
+// read failure for removal of an already loaded plugin.
+func (pl *PluginLoader) DiscoverAll() ([]PluginManifest, error) {
+	return pl.discover(true)
+}
+
+func (pl *PluginLoader) discover(includeDisabled bool) ([]PluginManifest, error) {
 	var manifests []PluginManifest
+	var errs []error
 
 	for _, dir := range pl.dirs {
 		info, err := os.Stat(dir)
@@ -72,11 +86,13 @@ func (pl *PluginLoader) Discover() ([]PluginManifest, error) {
 			pl.logger.Warn("cannot stat plugin search dir",
 				slog.String("dir", dir),
 				slog.String("err", err.Error()))
+			errs = append(errs, fmt.Errorf("stat plugin dir %s: %w", dir, err))
 			continue
 		}
 		if !info.IsDir() {
 			pl.logger.Warn("plugin search path is not a directory",
 				slog.String("path", dir))
+			errs = append(errs, fmt.Errorf("plugin search path %s is not a directory", dir))
 			continue
 		}
 
@@ -85,6 +101,7 @@ func (pl *PluginLoader) Discover() ([]PluginManifest, error) {
 			pl.logger.Warn("cannot read plugin search dir",
 				slog.String("dir", dir),
 				slog.String("err", err.Error()))
+			errs = append(errs, fmt.Errorf("read plugin dir %s: %w", dir, err))
 			continue
 		}
 
@@ -101,6 +118,7 @@ func (pl *PluginLoader) Discover() ([]PluginManifest, error) {
 					pl.logger.Warn("cannot read plugin manifest",
 						slog.String("path", manifestPath),
 						slog.String("err", err.Error()))
+					errs = append(errs, fmt.Errorf("read plugin manifest %s: %w", manifestPath, err))
 				}
 				continue
 			}
@@ -110,17 +128,22 @@ func (pl *PluginLoader) Discover() ([]PluginManifest, error) {
 				pl.logger.Warn("invalid plugin manifest JSON",
 					slog.String("path", manifestPath),
 					slog.String("err", err.Error()))
+				errs = append(errs, fmt.Errorf("invalid plugin manifest %s", manifestPath))
 				continue
 			}
 
-			if !m.Enabled {
+			if !m.Enabled && !includeDisabled {
 				pl.logger.Debug("plugin disabled, skipping",
 					slog.String("plugin", m.Name),
 					slog.String("dir", pluginDir))
 				continue
 			}
 
-			m.dir = pluginDir
+			m.dir, err = filepath.Abs(pluginDir)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("absolute plugin path %s: %w", pluginDir, err))
+				continue
+			}
 			manifests = append(manifests, m)
 			pl.logger.Debug("discovered plugin",
 				slog.String("plugin", m.Name),
@@ -129,7 +152,28 @@ func (pl *PluginLoader) Discover() ([]PluginManifest, error) {
 		}
 	}
 
-	return manifests, nil
+	return manifests, errors.Join(errs...)
+}
+
+// resolveSkillPath keeps a plugin's declared skill paths within that plugin,
+// including when a listed file or ancestor is a symlink.
+func (pl *PluginLoader) resolveSkillPath(baseDir, relPath string) (string, error) {
+	if !filepath.IsLocal(relPath) {
+		return "", fmt.Errorf("skill path must stay within plugin: %q", relPath)
+	}
+	base, err := filepath.EvalSymlinks(baseDir)
+	if err != nil {
+		return "", err
+	}
+	path, err := filepath.EvalSymlinks(filepath.Join(baseDir, relPath))
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(base, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("skill path leaves plugin: %q", relPath)
+	}
+	return path, nil
 }
 
 // LoadPlugin reads the skill files listed in manifest.Skills, builds a *Skill
@@ -148,8 +192,11 @@ func (pl *PluginLoader) LoadPlugin(manifest PluginManifest, reg interface{ Regis
 
 	var failed []string
 	for _, relPath := range manifest.Skills {
-		skillPath := filepath.Join(baseDir, relPath)
-
+		skillPath, err := pl.resolveSkillPath(baseDir, relPath)
+		if err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", relPath, err))
+			continue
+		}
 		s, err := pl.loadSkillFile(skillPath)
 		if err != nil {
 			pl.logger.Warn("failed to load plugin skill",
@@ -160,7 +207,10 @@ func (pl *PluginLoader) LoadPlugin(manifest PluginManifest, reg interface{ Regis
 			continue
 		}
 
-		reg.Register(s)
+		if err := registerPluginSkill(reg, s); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", relPath, err))
+			continue
+		}
 		pl.logger.Debug("registered plugin skill",
 			slog.String("plugin", manifest.Name),
 			slog.String("skill", s.Name))
@@ -213,8 +263,11 @@ func (pl *PluginLoader) loadAndCount(manifest PluginManifest, reg interface{ Reg
 	var failed []string
 
 	for _, relPath := range manifest.Skills {
-		skillPath := filepath.Join(baseDir, relPath)
-
+		skillPath, err := pl.resolveSkillPath(baseDir, relPath)
+		if err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", relPath, err))
+			continue
+		}
 		s, err := pl.loadSkillFile(skillPath)
 		if err != nil {
 			pl.logger.Warn("failed to load plugin skill",
@@ -225,7 +278,10 @@ func (pl *PluginLoader) loadAndCount(manifest PluginManifest, reg interface{ Reg
 			continue
 		}
 
-		reg.Register(s)
+		if err := registerPluginSkill(reg, s); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", relPath, err))
+			continue
+		}
 		count++
 		pl.logger.Debug("registered plugin skill",
 			slog.String("plugin", manifest.Name),
@@ -237,6 +293,14 @@ func (pl *PluginLoader) loadAndCount(manifest PluginManifest, reg interface{ Reg
 			manifest.Name, len(failed), strings.Join(failed, "; "))
 	}
 	return count, nil
+}
+
+func registerPluginSkill(reg interface{ Register(*Skill) }, s *Skill) error {
+	if checked, ok := reg.(interface{ TryRegister(*Skill) error }); ok {
+		return checked.TryRegister(s)
+	}
+	reg.Register(s)
+	return nil
 }
 
 // loadSkillFile reads a single skill file and converts it to a *Skill.
@@ -252,16 +316,22 @@ func (pl *PluginLoader) loadSkillFile(path string) (*Skill, error) {
 	}
 
 	lower := strings.ToLower(filepath.Base(path))
+	var s *Skill
 	if strings.HasSuffix(lower, ".md") {
-		return skillFromParsed(path, data)
+		s, err = skillFromParsed(path, data)
+	} else {
+		ext := strings.ToLower(filepath.Ext(path))
+		if ext == ".yaml" || ext == ".yml" {
+			s, err = skillFromYAML(path, data)
+		} else {
+			return nil, fmt.Errorf("unsupported skill file extension %q (want .yaml, .yml, or .md)", filepath.Ext(path))
+		}
 	}
-
-	ext := strings.ToLower(filepath.Ext(path))
-	if ext == ".yaml" || ext == ".yml" {
-		return skillFromYAML(path, data)
+	if err != nil {
+		return nil, err
 	}
-
-	return nil, fmt.Errorf("unsupported skill file extension %q (want .yaml, .yml, or .md)", filepath.Ext(path))
+	s.Origin = PluginSkillOrigin(path)
+	return s, nil
 }
 
 // skillFromParsed converts a Markdown-with-frontmatter skill file into a

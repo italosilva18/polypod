@@ -5,12 +5,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -116,9 +113,12 @@ type PromptRunner func(ctx context.Context, task *Task) (string, error)
 
 // Scheduler runs tasks on cron schedules.
 type Scheduler struct {
-	mu           sync.RWMutex
-	saveMu       sync.Mutex
-	tasks        map[string]*Task
+	mu     sync.RWMutex
+	saveMu sync.Mutex
+	tasks  map[string]*Task
+	// baseline is the last committed JSON for each task seen by this process.
+	// Save overlays only tasks changed since that snapshot.
+	baseline     map[string][]byte
 	dataFile     string
 	quit         chan struct{}
 	stopOnce     sync.Once
@@ -135,6 +135,7 @@ type Scheduler struct {
 func New(dataFile string, logger *slog.Logger) *Scheduler {
 	return &Scheduler{
 		tasks:     make(map[string]*Task),
+		baseline:  make(map[string][]byte),
 		running:   make(map[string]bool),
 		notifying: make(map[string]bool),
 		dataFile:  dataFile,
@@ -173,20 +174,25 @@ func (s *Scheduler) SetDurableCallback(fn func(task *Task, notice CompletionNoti
 
 // Load reads tasks from the data file.
 func (s *Scheduler) Load() error {
-	data, err := os.ReadFile(s.dataFile)
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	stateLease, err := s.stateLease()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
 		return err
 	}
-	var tasks []*Task
-	if err := json.Unmarshal(data, &tasks); err != nil {
+	defer stateLease.Close()
+	tasks, baseline, err := s.readSnapshot()
+	if err != nil {
 		return err
 	}
-	journal, journalErr := s.readRunJournal()
+	journal, journalErr := s.readRunJournalUnlocked()
 	if journalErr != nil {
 		s.logger.Warn("historico de execucoes indisponivel para reconciliacao", "error", journalErr)
+		for _, task := range tasks {
+			if task.CurrentRunID != "" {
+				return fmt.Errorf("nao e seguro retomar rotina %s sem ler o journal de tentativas: %w", task.ID, journalErr)
+			}
+		}
 	}
 	latest := make(map[string]RunRecord)
 	for _, record := range journal {
@@ -201,13 +207,38 @@ func (s *Scheduler) Load() error {
 	now := time.Now()
 	recovered := false
 	recoveredRecords := make([]RunRecord, 0)
+	var runLeases []*fileLease
+	defer func() {
+		for _, lease := range runLeases {
+			if err := lease.Close(); err != nil {
+				s.logger.Warn("falha ao soltar lock de rotina", "error", err)
+			}
+		}
+	}()
 	s.mu.Lock()
+	s.tasks = make(map[string]*Task, len(tasks))
+	s.baseline = baseline
 	for _, t := range tasks {
 		if t == nil || t.ID == "" {
 			continue
 		}
+		if t.CurrentRunID != "" {
+			lease, acquired, leaseErr := s.taskLease(t.ID)
+			if leaseErr != nil {
+				s.mu.Unlock()
+				return leaseErr
+			}
+			if !acquired {
+				// Another process still owns the live attempt. It alone may
+				// finalize or recover this run.
+				s.tasks[t.ID] = t
+				continue
+			}
+			runLeases = append(runLeases, lease)
+		}
 		if t.MisfirePolicy == "" {
 			t.MisfirePolicy = "run_once"
+			recovered = true
 		}
 		if t.CurrentRunID != "" {
 			if record, ok := latest[t.ID+":"+t.CurrentRunID]; ok && record.Attempt == t.CurrentAttempt && (record.Status == "success" || record.Status == "failed") {
@@ -265,14 +296,17 @@ func (s *Scheduler) Load() error {
 				s.tasks[t.ID] = t
 				continue
 			}
-			record := RunRecord{
-				ID: fmt.Sprintf("%s_interrupted_%d", t.CurrentRunID, t.CurrentAttempt), TaskID: t.ID, RunID: t.CurrentRunID,
-				ScheduledFor: t.CurrentDueAt, Attempt: t.CurrentAttempt,
-				StartedAt: t.CurrentStartedAt, FinishedAt: now,
-				Status: "interrupted", Error: "processo interrompido antes de confirmar resultado",
+			prior, exists := latest[t.ID+":"+t.CurrentRunID]
+			if !exists || prior.Attempt != t.CurrentAttempt || prior.Status != "interrupted" {
+				record := RunRecord{
+					ID: fmt.Sprintf("%s_interrupted_%d", t.CurrentRunID, t.CurrentAttempt), TaskID: t.ID, RunID: t.CurrentRunID,
+					ScheduledFor: t.CurrentDueAt, Attempt: t.CurrentAttempt,
+					StartedAt: t.CurrentStartedAt, FinishedAt: now,
+					Status: "interrupted", Error: "processo interrompido antes de confirmar resultado",
+				}
+				t.History = append(t.History, record)
+				recoveredRecords = append(recoveredRecords, record)
 			}
-			t.History = append(t.History, record)
-			recoveredRecords = append(recoveredRecords, record)
 			if t.CurrentAttempt <= t.MaxRetries {
 				t.LastStatus = "retrying"
 				t.NextRetryAt = now
@@ -300,12 +334,12 @@ func (s *Scheduler) Load() error {
 	}
 	s.mu.Unlock()
 	for _, record := range recoveredRecords {
-		if err := s.writeRunRecord(record); err != nil {
+		if err := s.writeRunRecordUnlocked(record); err != nil {
 			return err
 		}
 	}
 	if recovered {
-		return s.Save()
+		return s.saveUnderStateLock()
 	}
 	return nil
 }
@@ -314,49 +348,12 @@ func (s *Scheduler) Load() error {
 func (s *Scheduler) Save() error {
 	s.saveMu.Lock()
 	defer s.saveMu.Unlock()
-	s.mu.RLock()
-	tasks := make([]*Task, 0, len(s.tasks))
-	for _, t := range s.tasks {
-		copy := *t
-		copy.History = append([]RunRecord(nil), t.History...)
-		copy.PendingNotices = append([]CompletionNotice(nil), t.PendingNotices...)
-		tasks = append(tasks, &copy)
-	}
-	s.mu.RUnlock()
-	data, err := json.MarshalIndent(tasks, "", "  ")
+	lease, err := s.stateLease()
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(s.dataFile), 0o700); err != nil {
-		return fmt.Errorf("criando diretorio do agendador: %w", err)
-	}
-	// A fixed .tmp path lets separate Polypod processes truncate each other's
-	// in-progress save. Give every writer its own private staging file.
-	f, err := os.CreateTemp(filepath.Dir(s.dataFile), "."+filepath.Base(s.dataFile)+".tmp-*")
-	if err != nil {
-		return fmt.Errorf("abrindo estado temporario do agendador: %w", err)
-	}
-	tmp := f.Name()
-	defer os.Remove(tmp)
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return fmt.Errorf("gravando estado temporario do agendador: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return fmt.Errorf("sincronizando estado do agendador: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("fechando estado temporario do agendador: %w", err)
-	}
-	if err := os.Rename(tmp, s.dataFile); err != nil {
-		return fmt.Errorf("publicando estado do agendador: %w", err)
-	}
-	if dir, err := os.Open(filepath.Dir(s.dataFile)); err == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
-	}
-	return nil
+	defer lease.Close()
+	return s.saveUnderStateLock()
 }
 
 // Start begins the scheduler loop. A persisted due time lets it recover one
@@ -364,6 +361,7 @@ func (s *Scheduler) Save() error {
 func (s *Scheduler) Start(ctx context.Context) error {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	defer s.Stop()
 
 	s.logger.Info("scheduler iniciado", "tasks", len(s.tasks))
 	s.tick(time.Now())
@@ -381,6 +379,10 @@ func (s *Scheduler) Start(ctx context.Context) error {
 }
 
 func (s *Scheduler) tick(now time.Time) {
+	if err := s.refresh(); err != nil {
+		s.logger.Error("falha ao sincronizar rotinas entre processos", "error", err)
+		return
+	}
 	s.mu.RLock()
 	due := make([]*Task, 0)
 	notices := make([]string, 0)
@@ -392,7 +394,7 @@ func (s *Scheduler) tick(now time.Time) {
 			continue
 		}
 		if task.CurrentRunID != "" {
-			if !task.NextRetryAt.IsZero() && !task.NextRetryAt.After(now) {
+			if task.LastStatus == "running" || (task.LastStatus == "retrying" && !task.NextRetryAt.After(now)) {
 				due = append(due, task)
 			}
 			continue
@@ -415,16 +417,56 @@ func (s *Scheduler) runTask(task *Task) {
 }
 
 func (s *Scheduler) runTaskAt(task *Task, now time.Time, manual bool) {
+	lease, acquired, err := s.taskLease(task.ID)
+	if err != nil {
+		s.logger.Error("falha ao adquirir dono da rotina", "id", task.ID, "error", err)
+		return
+	}
+	if !acquired {
+		return
+	}
+	defer func() {
+		if err := lease.Close(); err != nil {
+			s.logger.Warn("falha ao soltar dono da rotina", "id", task.ID, "error", err)
+		}
+	}()
+	s.runTaskAtOwned(task, now, manual)
+}
+
+// runTaskAtOwned executes only while this process holds the per-task file
+// lease. It refreshes the shared snapshot before checking whether the run is
+// still due; a stale tick can therefore never claim an already completed run.
+func (s *Scheduler) runTaskAtOwned(task *Task, now time.Time, manual bool) {
+	select {
+	case <-s.quit:
+		return
+	default:
+	}
+	if err := s.refresh(); err != nil {
+		s.logger.Error("falha ao carregar rotina antes da execucao", "id", task.ID, "error", err)
+		return
+	}
+	if err := s.recoverOrphanedRun(task.ID, now); err != nil {
+		s.logger.Error("falha ao reconciliar execucao interrompida", "id", task.ID, "error", err)
+		return
+	}
 	s.mu.Lock()
-	// A tick may have queued this pointer before the task was removed or
-	// replaced. Only the task still owned by the scheduler may start.
-	if current, ok := s.tasks[task.ID]; !ok || current != task {
+	// A queued tick must not execute a replacement definition from another
+	// process. The next tick will pick up the new pointer and schedule it.
+	current, ok := s.tasks[task.ID]
+	if !ok || current != task {
 		s.mu.Unlock()
 		return
 	}
 	if s.running[task.ID] {
 		s.mu.Unlock()
 		return
+	}
+	select {
+	case <-s.quit:
+		s.mu.Unlock()
+		return
+	default:
 	}
 	if task.CurrentRunID != "" {
 		if task.LastStatus != "retrying" || task.NextRetryAt.After(now) {
@@ -501,6 +543,11 @@ func (s *Scheduler) runTaskAt(task *Task, now time.Time, manual bool) {
 		maxAttempts = 1
 	}
 	for attempt := task.CurrentAttempt + 1; attempt <= maxAttempts; attempt++ {
+		select {
+		case <-s.quit:
+			return
+		default:
+		}
 		attemptStart := time.Now()
 		s.mu.Lock()
 		task.CurrentAttempt = attempt
@@ -602,11 +649,33 @@ func (s *Scheduler) runTaskAt(task *Task, now time.Time, manual bool) {
 		callback(&completed, result)
 	}
 	if durableCallback != nil {
-		s.deliverNotices(task.ID)
+		s.deliverNoticesOwned(task.ID)
 	}
 }
 
 func (s *Scheduler) deliverNotices(id string) {
+	select {
+	case <-s.quit:
+		return
+	default:
+	}
+	lease, acquired, err := s.taskLease(id)
+	if err != nil {
+		s.logger.Error("falha ao adquirir entrega de notificacao", "id", id, "error", err)
+		return
+	}
+	if !acquired {
+		return
+	}
+	defer lease.Close()
+	if err := s.refresh(); err != nil {
+		s.logger.Error("falha ao carregar notificacoes", "id", id, "error", err)
+		return
+	}
+	s.deliverNoticesOwned(id)
+}
+
+func (s *Scheduler) deliverNoticesOwned(id string) {
 	s.mu.Lock()
 	if s.notifying[id] || s.onRunDurable == nil {
 		s.mu.Unlock()
@@ -780,6 +849,11 @@ func (s *Scheduler) AddTask(task *Task) error {
 	}
 	task.NextRunAt = next
 	task.Enabled = true
+	lease, err := s.editLease(task.ID)
+	if err != nil {
+		return err
+	}
+	defer lease.Close()
 
 	s.mu.Lock()
 	if _, exists := s.tasks[task.ID]; exists {
@@ -797,6 +871,9 @@ func (s *Scheduler) AddTask(task *Task) error {
 			delete(s.tasks, task.ID)
 		}
 		s.mu.Unlock()
+		if refreshErr := s.refresh(); refreshErr != nil {
+			s.logger.Warn("falha ao recarregar rotina apos criacao recusada", "error", refreshErr)
+		}
 		return err
 	}
 	return nil
@@ -809,14 +886,36 @@ func validCron(expr string) bool {
 
 // RemoveTask removes a task.
 func (s *Scheduler) RemoveTask(id string) error {
+	lease, err := s.editLease(id)
+	if err != nil {
+		return err
+	}
+	defer lease.Close()
 	s.mu.Lock()
+	prior, exists := s.tasks[id]
+	if !exists {
+		s.mu.Unlock()
+		return nil
+	}
 	delete(s.tasks, id)
 	s.mu.Unlock()
-	return s.Save()
+	if err := s.Save(); err != nil {
+		s.mu.Lock()
+		s.tasks[id] = prior
+		s.mu.Unlock()
+		if refreshErr := s.refresh(); refreshErr != nil {
+			s.logger.Warn("falha ao recarregar rotina apos remocao recusada", "id", id, "error", refreshErr)
+		}
+		return err
+	}
+	return nil
 }
 
 // ListTasks returns all tasks.
 func (s *Scheduler) ListTasks() []*Task {
+	if err := s.refresh(); err != nil {
+		s.logger.Warn("lista de rotinas pode estar desatualizada", "error", err)
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	result := make([]*Task, 0, len(s.tasks))
@@ -831,6 +930,9 @@ func (s *Scheduler) ListTasks() []*Task {
 
 // GetTask returns a task by ID.
 func (s *Scheduler) GetTask(id string) (*Task, bool) {
+	if err := s.refresh(); err != nil {
+		s.logger.Warn("rotina pode estar desatualizada", "id", id, "error", err)
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	task, ok := s.tasks[id]
@@ -845,6 +947,25 @@ func (s *Scheduler) GetTask(id string) (*Task, bool) {
 
 // RunNow executes a routine without changing its next scheduled occurrence.
 func (s *Scheduler) RunNow(id string) (*Task, error) {
+	select {
+	case <-s.quit:
+		return nil, fmt.Errorf("agendador encerrado")
+	default:
+	}
+	lease, acquired, err := s.taskLease(id)
+	if err != nil {
+		return nil, err
+	}
+	if !acquired {
+		return nil, fmt.Errorf("tarefa %s ja esta em execucao", id)
+	}
+	defer lease.Close()
+	if err := s.refresh(); err != nil {
+		return nil, err
+	}
+	if err := s.recoverOrphanedRun(id, time.Now()); err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	task, ok := s.tasks[id]
 	running := s.running[id]
@@ -856,7 +977,7 @@ func (s *Scheduler) RunNow(id string) (*Task, error) {
 	if running || active {
 		return nil, fmt.Errorf("tarefa %s ja esta em execucao", id)
 	}
-	s.runTask(task)
+	s.runTaskAtOwned(task, time.Now(), true)
 	result, ok := s.GetTask(id)
 	if !ok {
 		return nil, fmt.Errorf("tarefa %s removida durante execucao", id)
@@ -866,9 +987,16 @@ func (s *Scheduler) RunNow(id string) (*Task, error) {
 
 // SetEnabled enables or pauses a task and persists the change.
 func (s *Scheduler) SetEnabled(id string, enabled bool) error {
+	lease, err := s.editLease(id)
+	if err != nil {
+		return err
+	}
+	defer lease.Close()
 	s.mu.Lock()
 	task, ok := s.tasks[id]
+	var prior *Task
 	if ok {
+		prior = cloneTask(task)
 		if enabled && task.NextRunAt.IsZero() && task.CurrentRunID == "" {
 			next, err := nextOccurrence(task.Schedule, time.Now(), task.TimeZone)
 			if err != nil || next.IsZero() {
@@ -883,12 +1011,26 @@ func (s *Scheduler) SetEnabled(id string, enabled bool) error {
 	if !ok {
 		return fmt.Errorf("tarefa %s nao encontrada", id)
 	}
-	return s.Save()
+	if err := s.Save(); err != nil {
+		s.mu.Lock()
+		*task = *prior
+		s.mu.Unlock()
+		if refreshErr := s.refresh(); refreshErr != nil {
+			s.logger.Warn("falha ao recarregar rotina apos pausa recusada", "id", id, "error", refreshErr)
+		}
+		return err
+	}
+	return nil
 }
 
 // UpdateTask changes the editable definition of a routine. A running routine
 // keeps its original definition until that execution finishes.
 func (s *Scheduler) UpdateTask(id string, args map[string]string) error {
+	lease, err := s.editLease(id)
+	if err != nil {
+		return err
+	}
+	defer lease.Close()
 	s.mu.Lock()
 	task, ok := s.tasks[id]
 	if !ok {
@@ -899,6 +1041,7 @@ func (s *Scheduler) UpdateTask(id string, args map[string]string) error {
 		s.mu.Unlock()
 		return fmt.Errorf("tarefa %s esta em execucao; tente novamente depois", id)
 	}
+	prior := cloneTask(task)
 	updated := *task
 	if v, exists := args["name"]; exists {
 		updated.Name = strings.TrimSpace(v)
@@ -946,7 +1089,16 @@ func (s *Scheduler) UpdateTask(id string, args map[string]string) error {
 	updated.NextRunAt = next
 	*task = updated
 	s.mu.Unlock()
-	return s.Save()
+	if err := s.Save(); err != nil {
+		s.mu.Lock()
+		*task = *prior
+		s.mu.Unlock()
+		if refreshErr := s.refresh(); refreshErr != nil {
+			s.logger.Warn("falha ao recarregar rotina apos edicao recusada", "id", id, "error", refreshErr)
+		}
+		return err
+	}
+	return nil
 }
 
 // matchCron checks if a five-field cron expression matches the given time.
@@ -1194,7 +1346,7 @@ func RegisterSkills(reg *skill.Registry, sched *Scheduler, verificationStores ..
 
 	reg.Register(&skill.Skill{
 		Name:        "scheduler_run",
-		Description: "Executar uma tarefa imediatamente",
+		Description: "Solicitar a execução imediata de uma rotina; consulte scheduler_history para acompanhar o resultado",
 		Parameters: jsonschema.Definition{
 			Type: jsonschema.Object,
 			Properties: map[string]jsonschema.Definition{
@@ -1203,11 +1355,20 @@ func RegisterSkills(reg *skill.Registry, sched *Scheduler, verificationStores ..
 			Required: []string{"id"},
 		},
 		Execute: func(args map[string]string) (string, error) {
-			task, err := sched.RunNow(args["id"])
-			if err != nil {
-				return "", err
+			id := strings.TrimSpace(args["id"])
+			task, ok := sched.GetTask(id)
+			if !ok {
+				return "", fmt.Errorf("tarefa %s nao encontrada", id)
 			}
-			return fmt.Sprintf("Tarefa '%s' executada. Resultado: %s", task.Name, task.LastResult), nil
+			// A scheduled agent may call this skill while its own turn holds the
+			// background agent gate. RunNow is synchronous, so running it here
+			// would deadlock when the target routine also wakes an agent.
+			go func() {
+				if _, err := sched.RunNow(id); err != nil {
+					sched.logger.Warn("execucao imediata da rotina falhou", "id", id, "error", err)
+				}
+			}()
+			return fmt.Sprintf("Execucao da rotina '%s' solicitada. Consulte scheduler_history para o resultado.", task.Name), nil
 		},
 	})
 }

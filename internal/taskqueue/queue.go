@@ -27,7 +27,15 @@ const (
 	Canceled  Status = "canceled"
 )
 
-var ErrNotFound = errors.New("tarefa nao encontrada")
+var (
+	ErrNotFound  = errors.New("tarefa nao encontrada")
+	ErrLeaseLost = errors.New("posse da tarefa perdida")
+)
+
+const (
+	leaseDuration = 90 * time.Second
+	leaseRenewal  = leaseDuration / 3
+)
 
 type Task struct {
 	ID          string `json:"id"`
@@ -44,6 +52,7 @@ type Task struct {
 	CreatedAt   int64  `json:"created_at"`
 	UpdatedAt   int64  `json:"updated_at"`
 	NextRunAt   int64  `json:"next_run_at"`
+	claimToken  string
 }
 
 type Attempt struct {
@@ -107,6 +116,7 @@ type Notice struct {
 	Attempts          int    `json:"delivery_attempts"`
 	NextRunAt         int64  `json:"next_delivery_at"`
 	LastDeliveryError string `json:"last_delivery_error,omitempty"`
+	claimToken        string
 }
 
 type CreateInput struct {
@@ -130,10 +140,12 @@ type Handler func(ctx context.Context, task Task) (string, error)
 
 type Notifier func(ctx context.Context, notice Notice) error
 
-// Queue processes one task at a time so priority ordering is deterministic.
-// SQLite owns state; the mutex only guards the worker lifecycle and handler.
+// Queue processes one task at a time per worker. Multiple processes may claim
+// different tasks from the same SQLite database. The mutex only guards the
+// local worker lifecycle and callbacks.
 type Queue struct {
 	db          *sql.DB
+	workerID    string
 	mu          sync.Mutex
 	handler     Handler
 	notifier    Notifier
@@ -153,7 +165,8 @@ CREATE TABLE IF NOT EXISTS tasks (
  id TEXT PRIMARY KEY, title TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL,
  priority INTEGER NOT NULL, attempts INTEGER NOT NULL, max_attempts INTEGER NOT NULL,
  channel TEXT NOT NULL, owner TEXT NOT NULL, result TEXT NOT NULL, last_error TEXT NOT NULL,
- created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, next_run_at INTEGER NOT NULL
+ created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, next_run_at INTEGER NOT NULL,
+ claim_token TEXT NOT NULL DEFAULT '', lease_until INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS tasks_ready_idx ON tasks(status,next_run_at,priority,created_at);
 CREATE TABLE IF NOT EXISTS task_attempts (
@@ -167,14 +180,15 @@ CREATE TABLE IF NOT EXISTS task_notices (
  status TEXT NOT NULL, result TEXT NOT NULL, error TEXT NOT NULL, channel TEXT NOT NULL,
  owner TEXT NOT NULL, created_at INTEGER NOT NULL, delivery_state TEXT NOT NULL,
  delivery_attempts INTEGER NOT NULL, next_delivery_at INTEGER NOT NULL,
- delivered_at INTEGER NOT NULL, last_delivery_error TEXT NOT NULL
+ delivered_at INTEGER NOT NULL, last_delivery_error TEXT NOT NULL,
+ claim_token TEXT NOT NULL DEFAULT '', lease_until INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS task_notices_ready_idx ON task_notices(delivery_state,next_delivery_at,created_at);
 `
 
-// Open initializes the private database and recovers a task interrupted by a
-// process crash. A repeated external effect remains possible; the handler is
-// given a stable task ID and attempt number to reconcile it.
+// Open initializes the private database and recovers expired leases. A
+// repeated external effect remains possible after a process crash; the handler
+// receives a stable task ID and attempt number for reconciliation.
 func Open(path string) (*Queue, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("caminho da fila obrigatorio")
@@ -202,13 +216,34 @@ func Open(path string) (*Queue, error) {
 		db.Close()
 		return nil, fmt.Errorf("criando fila: %w", err)
 	}
-	q := &Queue{db: db, wake: make(chan struct{}, 1), poll: time.Second,
+	if err := migrateLeaseColumns(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrando fila: %w", err)
+	}
+	q := &Queue{db: db, workerID: uuid.NewString(), wake: make(chan struct{}, 1), poll: time.Second,
 		taskTimeout: 30 * time.Minute, logger: slog.Default()}
 	if err := q.recoverInterrupted(context.Background()); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("recuperando tarefas: %w", err)
 	}
 	return q, nil
+}
+
+// ALTER TABLE is intentionally idempotent across processes opening an older
+// database at the same time. One process may add a column before another does.
+func migrateLeaseColumns(db *sql.DB) error {
+	for _, column := range []struct{ table, name, spec string }{
+		{"tasks", "claim_token", "TEXT NOT NULL DEFAULT ''"},
+		{"tasks", "lease_until", "INTEGER NOT NULL DEFAULT 0"},
+		{"task_notices", "claim_token", "TEXT NOT NULL DEFAULT ''"},
+		{"task_notices", "lease_until", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		_, err := db.Exec("ALTER TABLE " + column.table + " ADD COLUMN " + column.name + " " + column.spec)
+		if err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+			return err
+		}
+	}
+	return nil
 }
 
 func (q *Queue) SetHandler(handler Handler) {
@@ -271,7 +306,8 @@ func (q *Queue) Stop() {
 
 func (q *Queue) Close() error {
 	q.Stop()
-	return q.db.Close()
+	err := q.releaseOwned(context.Background())
+	return errors.Join(err, q.db.Close())
 }
 
 func (q *Queue) Wake() {
@@ -363,6 +399,31 @@ func (q *Queue) List(ctx context.Context, status Status, limit int) ([]Task, err
 	return out, rows.Err()
 }
 
+// ListByChannel applies the channel filter in SQLite before limiting results,
+// so tasks from other channels cannot hide the requested channel's newest work.
+func (q *Queue) ListByChannel(ctx context.Context, channel string, limit int) ([]Task, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	rows, err := q.db.QueryContext(ctx, `SELECT id,title,prompt,status,priority,attempts,max_attempts,channel,owner,result,last_error,created_at,updated_at,next_run_at FROM tasks WHERE channel=? ORDER BY created_at DESC,id DESC LIMIT ?`, channel, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]Task, 0)
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 func (q *Queue) History(ctx context.Context, id string) ([]Attempt, error) {
 	if _, err := q.Get(ctx, id); err != nil {
 		return nil, err
@@ -384,7 +445,7 @@ func (q *Queue) History(ctx context.Context, id string) ([]Attempt, error) {
 }
 
 func (q *Queue) Cancel(ctx context.Context, id string) error {
-	result, err := q.db.ExecContext(ctx, `UPDATE tasks SET status='canceled',updated_at=? WHERE id=? AND status IN ('pending','failed')`, time.Now().UnixMilli(), id)
+	result, err := q.db.ExecContext(ctx, `UPDATE tasks SET status='canceled',updated_at=MAX(?,updated_at+1) WHERE id=? AND status IN ('pending','failed')`, time.Now().UnixMilli(), id)
 	if err != nil {
 		return err
 	}
@@ -405,7 +466,7 @@ func (q *Queue) Retry(ctx context.Context, id string, additionalAttempts int) er
 		return errors.New("additional_attempts deve estar entre 1 e 20")
 	}
 	now := time.Now().UnixMilli()
-	result, err := q.db.ExecContext(ctx, `UPDATE tasks SET status='pending',max_attempts=attempts+?,last_error='',updated_at=?,next_run_at=? WHERE id=? AND status IN ('failed','canceled')`, additionalAttempts, now, now, id)
+	result, err := q.db.ExecContext(ctx, `UPDATE tasks SET status='pending',max_attempts=attempts+?,last_error='',updated_at=MAX(?,updated_at+1),next_run_at=? WHERE id=? AND status IN ('failed','canceled')`, additionalAttempts, now, now, id)
 	if err != nil {
 		return err
 	}
@@ -424,8 +485,16 @@ func (q *Queue) loop(ctx context.Context) {
 	defer q.wg.Done()
 	ticker := time.NewTicker(q.poll)
 	defer ticker.Stop()
+	var lastRecovery time.Time
 	for {
 		for {
+			if time.Since(lastRecovery) >= 10*time.Second {
+				if err := q.recoverInterrupted(ctx); err != nil {
+					q.logCycleError(ctx, err)
+					break
+				}
+				lastRecovery = time.Now()
+			}
 			notified, err := q.ProcessNextNotice(ctx)
 			if err != nil {
 				q.logCycleError(ctx, err)
@@ -476,11 +545,16 @@ func (q *Queue) ProcessNext(ctx context.Context) (bool, error) {
 	var result string
 	var runErr error
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	leaseDone := make(chan error, 1)
+	go func() { leaseDone <- q.keepTaskLease(runCtx, t, cancel) }()
 	result, runErr = handler(runCtx, t)
 	if runCtx.Err() != nil && runErr == nil {
 		runErr = runCtx.Err()
 	}
 	cancel()
+	if err := <-leaseDone; err != nil {
+		return true, err
+	}
 	if err := q.finish(t, result, runErr); err != nil {
 		return true, err
 	}
@@ -493,22 +567,20 @@ func (q *Queue) claim(ctx context.Context) (Task, bool, error) {
 		return Task{}, false, err
 	}
 	defer tx.Rollback()
-	row := tx.QueryRowContext(ctx, `SELECT id,title,prompt,status,priority,attempts,max_attempts,channel,owner,result,last_error,created_at,updated_at,next_run_at FROM tasks WHERE status='pending' AND next_run_at<=? ORDER BY priority DESC,next_run_at ASC,created_at ASC,id ASC LIMIT 1`, time.Now().UnixMilli())
+	now := time.Now().UnixMilli()
+	token := q.workerID + ":" + uuid.NewString()
+	row := tx.QueryRowContext(ctx, `UPDATE tasks SET status='running',attempts=attempts+1,
+	 updated_at=MAX(?,updated_at+1),claim_token=?,lease_until=?
+	 WHERE id=(SELECT id FROM tasks WHERE status='pending' AND next_run_at<=?
+	 ORDER BY priority DESC,next_run_at ASC,created_at ASC,id ASC LIMIT 1)
+	 AND status='pending'
+	 RETURNING id,title,prompt,status,priority,attempts,max_attempts,channel,owner,result,last_error,created_at,updated_at,next_run_at`,
+		now, token, now+leaseDuration.Milliseconds(), now)
 	t, err := scanTask(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Task{}, false, nil
 	}
 	if err != nil {
-		return Task{}, false, err
-	}
-	t.Attempts++
-	now := time.Now().UnixMilli()
-	res, err := tx.ExecContext(ctx, `UPDATE tasks SET status='running',attempts=?,updated_at=? WHERE id=? AND status='pending'`, t.Attempts, now, t.ID)
-	if err != nil {
-		return Task{}, false, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil || n != 1 {
 		return Task{}, false, err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO task_attempts(task_id,number,started_at,finished_at,status,result,error) VALUES(?,?,?,?,?,?,?)`, t.ID, t.Attempts, now, 0, "running", "", ""); err != nil {
@@ -517,8 +589,40 @@ func (q *Queue) claim(ctx context.Context) (Task, bool, error) {
 	if err := tx.Commit(); err != nil {
 		return Task{}, false, err
 	}
-	t.Status, t.UpdatedAt = Running, now
+	t.claimToken = token
 	return t, true, nil
+}
+
+func (q *Queue) keepTaskLease(ctx context.Context, t Task, cancel context.CancelFunc) error {
+	ticker := time.NewTicker(leaseRenewal)
+	defer ticker.Stop()
+	leaseUntil := time.Now().Add(leaseDuration)
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+		now := time.Now().UnixMilli()
+		res, err := q.db.ExecContext(ctx, `UPDATE tasks SET lease_until=? WHERE id=? AND status='running' AND attempts=? AND claim_token=?`,
+			now+leaseDuration.Milliseconds(), t.ID, t.Attempts, t.claimToken)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if time.Now().After(leaseUntil) {
+				cancel()
+				return fmt.Errorf("renovando posse da tarefa %s: %w", t.ID, err)
+			}
+			continue
+		}
+		n, err := res.RowsAffected()
+		if err != nil || n != 1 {
+			cancel()
+			return ErrLeaseLost
+		}
+		leaseUntil = time.UnixMilli(now).Add(leaseDuration)
+	}
 }
 
 func (q *Queue) finish(t Task, result string, runErr error) error {
@@ -547,7 +651,17 @@ func (q *Queue) finish(t Task, result string, runErr error) error {
 			status = Failed
 		}
 	}
-	res, err := tx.ExecContext(ctx, `UPDATE task_attempts SET finished_at=?,status=?,result=?,error=? WHERE task_id=? AND number=?`, now, statusForAttempt(runErr), result, lastError, t.ID, t.Attempts)
+	res, err := tx.ExecContext(ctx, `UPDATE tasks SET status=?,result=?,last_error=?,updated_at=MAX(?,updated_at+1),next_run_at=?,claim_token='',lease_until=0 WHERE id=? AND status='running' AND attempts=? AND claim_token=?`,
+		status, result, lastError, now, next, t.ID, t.Attempts, t.claimToken)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n != 1 {
+		return ErrLeaseLost
+	}
+	res, err = tx.ExecContext(ctx, `UPDATE task_attempts SET finished_at=?,status=?,result=?,error=? WHERE task_id=? AND number=? AND status='running'`, now, statusForAttempt(runErr), result, lastError, t.ID, t.Attempts)
 	if err != nil {
 		return err
 	}
@@ -555,15 +669,6 @@ func (q *Queue) finish(t Task, result string, runErr error) error {
 		return err
 	} else if n != 1 {
 		return errors.New("tentativa nao encontrada para concluir")
-	}
-	res, err = tx.ExecContext(ctx, `UPDATE tasks SET status=?,result=?,last_error=?,updated_at=?,next_run_at=? WHERE id=? AND status='running' AND attempts=?`, status, result, lastError, now, next, t.ID, t.Attempts)
-	if err != nil {
-		return err
-	}
-	if n, err := res.RowsAffected(); err != nil {
-		return err
-	} else if n != 1 {
-		return errors.New("tarefa nao encontrada para concluir")
 	}
 	if status == Succeeded || status == Failed {
 		key := fmt.Sprintf("%s:terminal:%d", t.ID, t.Attempts)
@@ -580,25 +685,54 @@ func (q *Queue) finish(t Task, result string, runErr error) error {
 }
 
 func (q *Queue) recoverInterrupted(ctx context.Context) error {
+	return q.recoverClaims(ctx, false)
+}
+
+func (q *Queue) releaseOwned(parent context.Context) error {
+	ctx, cancel := context.WithTimeout(parent, 15*time.Second)
+	defer cancel()
+	return q.recoverClaims(ctx, true)
+}
+
+// recoverClaims holds the SQLite writer lock while checking the lease, so a
+// concurrent renewal and recovery cannot both retain ownership. Close can
+// release this instance's own claims immediately; periodic recovery handles
+// claims left by a crashed process after their leases expire.
+func (q *Queue) recoverClaims(ctx context.Context, own bool) error {
 	tx, err := q.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	now := time.Now().UnixMilli()
-	if _, err := tx.ExecContext(ctx, `UPDATE task_attempts SET finished_at=?,status='interrupted',error='processo interrompido; efeito externo desconhecido' WHERE status='running'`, now); err != nil {
+	taskCondition := "lease_until<=?"
+	qualifiedTaskCondition := "t.lease_until<=?"
+	noticeCondition := "lease_until<=?"
+	conditionArg := any(now)
+	if own {
+		taskCondition = "claim_token LIKE ?"
+		qualifiedTaskCondition = "t.claim_token LIKE ?"
+		noticeCondition = "claim_token LIKE ?"
+		conditionArg = q.workerID + ":%"
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE task_attempts SET finished_at=?,status='interrupted',error='processo interrompido; efeito externo desconhecido'
+	 WHERE status='running' AND EXISTS (SELECT 1 FROM tasks t WHERE t.id=task_attempts.task_id
+	 AND t.attempts=task_attempts.number AND t.status='running' AND `+qualifiedTaskCondition+`)`, now, conditionArg); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO task_notices(key,task_id,attempt,status,result,error,channel,owner,created_at,delivery_state,delivery_attempts,next_delivery_at,delivered_at,last_delivery_error)
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO task_notices(key,task_id,attempt,status,result,error,channel,owner,created_at,delivery_state,delivery_attempts,next_delivery_at,delivered_at,last_delivery_error)
 	 SELECT id || ':terminal:' || attempts,id,attempts,'failed','',
 	 'processo interrompido; efeito externo desconhecido',channel,owner,?,'pending',0,?,0,''
-	 FROM tasks WHERE status='running' AND attempts>=max_attempts`, now, now); err != nil {
+	 FROM tasks WHERE status='running' AND attempts>=max_attempts AND `+taskCondition, now, now, conditionArg); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE tasks SET status=CASE WHEN attempts<max_attempts THEN 'pending' ELSE 'failed' END,last_error='processo interrompido; efeito externo desconhecido',updated_at=?,next_run_at=? WHERE status='running'`, now, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE tasks SET status=CASE WHEN attempts<max_attempts THEN 'pending' ELSE 'failed' END,
+	 last_error='processo interrompido; efeito externo desconhecido',updated_at=MAX(?,updated_at+1),
+	 next_run_at=?,claim_token='',lease_until=0 WHERE status='running' AND `+taskCondition, now, now, conditionArg); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE task_notices SET delivery_state='pending',next_delivery_at=? WHERE delivery_state='delivering'`, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE task_notices SET delivery_state='pending',next_delivery_at=?,claim_token='',lease_until=0
+	 WHERE delivery_state='delivering' AND `+noticeCondition, now, conditionArg); err != nil {
 		return err
 	}
 	return tx.Commit()

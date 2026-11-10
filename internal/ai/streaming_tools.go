@@ -35,6 +35,9 @@ type ToolCallInfo struct {
 	ID        string
 	Name      string
 	Arguments string // raw JSON
+	// Prepared while Chat Completions was still streaming. It is used only
+	// after EOF confirms that the final arguments match this JSON object.
+	preparedArgs map[string]any
 }
 
 // ToolCallResult holds the outcome of executing a single tool call.
@@ -117,7 +120,7 @@ func NewStreamingToolManager(
 // original call order by treating serial calls as barriers.
 func (m *StreamingToolManager) PartitionCalls(calls []ToolCallInfo) (concurrent []ToolCallInfo, serial []ToolCallInfo) {
 	for _, call := range calls {
-		args := m.parseArgs(call.Arguments)
+		args := m.argsFor(call)
 		t, ok := m.registry.Get(call.Name)
 		if !ok {
 			// Unknown tools are treated as serial for safety.
@@ -164,7 +167,7 @@ func (m *StreamingToolManager) ExecuteToolCalls(ctx context.Context, calls []Too
 	canRunConcurrent := make([]bool, len(calls))
 	concurrentCount := 0
 	for i, call := range calls {
-		args := m.parseArgs(call.Arguments)
+		args := m.argsFor(call)
 		if t, ok := m.registry.Get(call.Name); ok && m.checkSafe(t, args, call.Name) && m.checkReadOnly(t, args, call.Name) {
 			canRunConcurrent[i] = true
 			concurrentCount++
@@ -263,7 +266,7 @@ func (m *StreamingToolManager) executeSerial(ctx context.Context, calls []ToolCa
 func (m *StreamingToolManager) executeSingle(ctx context.Context, call ToolCallInfo) ToolCallResult {
 	m.setProgress(call.ID, CallStatusRunning)
 
-	args := m.parseArgs(call.Arguments)
+	args := m.argsFor(call)
 
 	var (
 		result types.ToolResult
@@ -361,6 +364,13 @@ func (m *StreamingToolManager) parseArgs(argsJSON string) map[string]any {
 		return make(map[string]any)
 	}
 	return args
+}
+
+func (m *StreamingToolManager) argsFor(call ToolCallInfo) map[string]any {
+	if call.preparedArgs == nil {
+		return m.parseArgs(call.Arguments)
+	}
+	return clonePreparedArgs(call.preparedArgs)
 }
 
 // checkSafe wraps IsConcurrencySafe with panic recovery.

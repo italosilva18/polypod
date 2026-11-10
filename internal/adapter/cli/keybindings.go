@@ -27,6 +27,12 @@ func DefaultKeyBindings() []KeyBinding {
 			Handler:     handleKeyCtrlC,
 		},
 		{
+			Key:         tea.KeyCtrlB,
+			Label:       "Ctrl+B",
+			Description: "minimizar/expandir saída do turno ativo",
+			Handler:     handleKeyCtrlB,
+		},
+		{
 			Key:         tea.KeyCtrlD,
 			Label:       "Ctrl+D",
 			Description: "sair do CLI",
@@ -99,6 +105,14 @@ func DefaultKeyBindings() []KeyBinding {
 			Handler:     handleKeyPgDown,
 		},
 	}
+}
+
+func handleKeyCtrlB(m *model) (model, tea.Cmd) {
+	if m.state == stateStreaming && !m.waitingForUserAnswer {
+		m.streamHidden = !m.streamHidden
+		m.updateViewport()
+	}
+	return *m, nil
 }
 
 // keybindingMap builds a lookup table from key type to handler for O(1) dispatch.

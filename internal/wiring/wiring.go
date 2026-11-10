@@ -292,6 +292,7 @@ func WireAIClient(sys *Systems, aiClient *ai.Client, logger *slog.Logger) {
 	sys.ToolRegistry.Remove("agent_run")
 	agentTool := subagent.NewAgentTool(sys.AgentRunner, executor)
 	sys.ToolRegistry.Register(agentTool)
+	registerSwarmTools(sys.ToolRegistry, sys.Swarm, sys.Agents, executor)
 
 	// Re-bridge the skill registry now that all skills (plugins, MCP, git,
 	// vision, voice, dbquery, etc.) have been loaded by main.go. The first

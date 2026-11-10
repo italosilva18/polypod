@@ -193,18 +193,21 @@ func (sm *SwarmManager) GetTeam(name string) (*Team, bool) {
 // DeleteTeam stops a team and removes it from the manager.
 // All teammates are shut down gracefully with the given timeout.
 func (sm *SwarmManager) DeleteTeam(name string, timeout time.Duration) error {
-	sm.mu.Lock()
+	sm.mu.RLock()
 	team, ok := sm.teams[name]
+	sm.mu.RUnlock()
 	if !ok {
-		sm.mu.Unlock()
 		return fmt.Errorf("%w: %s", ErrTeamNotFound, name)
 	}
-	delete(sm.teams, name)
-	sm.mu.Unlock()
 
 	if err := team.Stop(timeout); err != nil {
-		sm.logger.Warn("team stop had errors", "team", name, "error", err)
+		return err
 	}
+	sm.mu.Lock()
+	if sm.teams[name] == team {
+		delete(sm.teams, name)
+	}
+	sm.mu.Unlock()
 	sm.logger.Info("team deleted", "team", name)
 	return nil
 }
@@ -322,6 +325,9 @@ func (t *Team) Stop(timeout time.Duration) error {
 	case <-time.After(timeout):
 		err = fmt.Errorf("timeout waiting for %d runners to stop", len(runners))
 		t.logger.Warn("team stop timeout", "team", t.Name, "runners", len(runners))
+	}
+	if err != nil {
+		return err
 	}
 
 	t.router.CloseAll()
@@ -466,6 +472,7 @@ func (t *Team) StartTeammate(name string, executor TeammateExecutor) error {
 			PlanModeRequired: info.PlanModeRequired,
 		},
 		Mailbox:     mb,
+		Router:      t.router,
 		Executor:    executor,
 		TokenBudget: t.Config.DefaultTokenBudget,
 		TurnTimeout: t.Config.DefaultTimeout,
@@ -501,6 +508,11 @@ func (t *Team) ListMembers() []MemberInfo {
 	defer t.mu.RUnlock()
 	out := make([]MemberInfo, len(t.Members))
 	copy(out, t.Members)
+	for i := range out {
+		if runner, ok := t.runners[out[i].Name]; ok {
+			out[i].IsIdle = runner.State() == RunnerStateIdle
+		}
+	}
 	return out
 }
 
@@ -538,10 +550,24 @@ func (t *Team) RunningTeammates() []string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	var names []string
-	for name := range t.runners {
-		names = append(names, name)
+	for name, runner := range t.runners {
+		if runner.State() == RunnerStateWorking {
+			names = append(names, name)
+		}
 	}
 	return names
+}
+
+// TeammateOutputs returns a snapshot of the worker's recent completed turns.
+// The runner keeps a bounded history in memory for explicit result inspection.
+func (t *Team) TeammateOutputs(name string) ([]TeammateOutput, bool) {
+	t.mu.RLock()
+	runner, ok := t.runners[name]
+	t.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	return runner.Outputs(), true
 }
 
 // IdleTeammates returns the names of idle teammates.
@@ -550,7 +576,7 @@ func (t *Team) IdleTeammates() []string {
 	defer t.mu.RUnlock()
 	var idle []string
 	for _, m := range t.Members {
-		if m.IsIdle && m.Name != TeamLeaderName {
+		if runner, ok := t.runners[m.Name]; ok && runner.State() == RunnerStateIdle {
 			idle = append(idle, m.Name)
 		}
 	}

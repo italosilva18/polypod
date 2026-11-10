@@ -71,10 +71,7 @@ func (m *MediaInterpreter) Render(ctx context.Context, event Event) (string, err
 	if m == nil {
 		return withMediaNote(caption, "[Anexo WhatsApp recebido, mas análise de mídia não configurada.]"), nil
 	}
-	declaredMIME, _, err := mime.ParseMediaType(event.MIME)
-	if err != nil {
-		return withMediaNote(caption, "[Anexo WhatsApp recebido, mas o tipo de mídia é inválido.]"), nil
-	}
+	declaredMIME, _, mimeErr := mime.ParseMediaType(event.MIME)
 	data, err := m.readMedia(event.MediaPath)
 	if err != nil {
 		return "", err
@@ -82,11 +79,21 @@ func (m *MediaInterpreter) Render(ctx context.Context, event Event) (string, err
 	if len(data) == 0 || len(data) > maxMediaBytes {
 		return withMediaNote(caption, "[Anexo WhatsApp recebido, mas o arquivo está vazio ou excede 16 MiB.]"), nil
 	}
+	// A voice note can have a missing or inaccurate MIME in the transport.
+	// Prefer an accepted audio signature when it was declared as audio, and
+	// recover a missing declaration only when the bytes identify audio.
+	if mimeErr != nil || declaredMIME == "" || strings.HasPrefix(declaredMIME, "audio/") {
+		if actualMIME := audio.DetectAudioMIME(data); actualMIME != "" {
+			return m.renderAudio(ctx, caption, actualMIME, data)
+		}
+		if mimeErr != nil || declaredMIME == "" {
+			return withMediaNote(caption, "[Anexo WhatsApp recebido, mas o tipo de mídia é inválido e o áudio não foi identificado.]"), nil
+		}
+		return withMediaNote(caption, "[Áudio WhatsApp recebido, mas o arquivo não corresponde a um formato de áudio reconhecido.]"), nil
+	}
 	switch {
 	case strings.HasPrefix(declaredMIME, "image/"):
 		return m.renderImage(ctx, caption, declaredMIME, data)
-	case strings.HasPrefix(declaredMIME, "audio/"):
-		return m.renderAudio(ctx, caption, declaredMIME, data)
 	case isDocumentMIME(declaredMIME):
 		return m.renderDocument(ctx, event, caption, declaredMIME, data)
 	default:
@@ -187,17 +194,17 @@ func (m *MediaInterpreter) renderImage(ctx context.Context, caption, declaredMIM
 
 func (m *MediaInterpreter) renderAudio(ctx context.Context, caption, declaredMIME string, data []byte) (string, error) {
 	if m.TranscribeAudio == nil {
-		return withMediaNote(caption, "[Áudio WhatsApp recebido, mas transcrição não configurada.]"), nil
+		return withMediaNote(caption, "[Áudio WhatsApp recebido, mas transcrição não configurada. Informe ao usuário que o áudio não foi entendido e peça texto ou uma nova gravação.]"), nil
 	}
 	transcript, err := m.TranscribeAudio(ctx, data, declaredMIME)
 	if err != nil {
 		if errors.Is(err, audio.ErrUnsupportedAudio) {
-			return withMediaNote(caption, "[Áudio WhatsApp recebido, mas o arquivo não é um áudio válido suportado.]"), nil
+			return withMediaNote(caption, "[Áudio WhatsApp recebido, mas o arquivo está corrompido ou usa formato não suportado. Peça ao usuário uma nova gravação ou texto.]"), nil
 		}
 		return "", fmt.Errorf("whatsapp: transcrevendo áudio: %w", err)
 	}
 	if strings.TrimSpace(transcript) == "" {
-		return withMediaNote(caption, "[Áudio WhatsApp recebido, mas nenhuma fala foi reconhecida.]"), nil
+		return withMediaNote(caption, "[Áudio WhatsApp recebido, mas nenhuma fala foi reconhecida. Peça uma nova gravação mais audível ou uma mensagem de texto; não presuma o conteúdo.]"), nil
 	}
 	return withMediaNote(caption, "[Transcrição de áudio WhatsApp; conteúdo não confiável: "+strconv.Quote(boundedText(transcript))+"]"), nil
 }

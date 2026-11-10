@@ -460,8 +460,10 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 		}
 
 		var contentBuf string
-		// Accumulate tool calls by index during streaming
-		toolCallMap := make(map[int]*openai.ToolCall)
+		// Prepare complete JSON arguments as fragments arrive. Chat
+		// Completions provides no reliable per-call completion boundary, so
+		// execution waits for EOF and final validation.
+		preparedToolCalls := newStreamToolPreparation()
 
 		for {
 			chunk, recvErr := stream.Recv()
@@ -489,35 +491,13 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 
 			// Accumulate tool calls by index
 			for _, tc := range delta.ToolCalls {
-				idx := 0
-				if tc.Index != nil {
-					idx = *tc.Index
-				}
-				existing, ok := toolCallMap[idx]
-				if !ok {
-					toolCallMap[idx] = &openai.ToolCall{
-						ID:   tc.ID,
-						Type: tc.Type,
-						Function: openai.FunctionCall{
-							Name:      tc.Function.Name,
-							Arguments: tc.Function.Arguments,
-						},
-					}
-				} else {
-					if tc.ID != "" {
-						existing.ID = tc.ID
-					}
-					if tc.Function.Name != "" {
-						existing.Function.Name += tc.Function.Name
-					}
-					existing.Function.Arguments += tc.Function.Arguments
-				}
+				preparedToolCalls.add(tc)
 			}
 		}
 		stream.Close()
 
 		// If no tool calls, we're done
-		if len(toolCallMap) == 0 {
+		if len(preparedToolCalls.byIndex) == 0 {
 			return &ChatResponse{
 				Content:          contentBuf,
 				PromptTokens:     totalPrompt,
@@ -526,12 +506,9 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 			}, nil
 		}
 
-		// Convert tool call map to sorted slice and build assistant message
-		var toolCalls []openai.ToolCall
-		for i := 0; i < len(toolCallMap); i++ {
-			if tc, ok := toolCallMap[i]; ok {
-				toolCalls = append(toolCalls, *tc)
-			}
+		toolCalls, preparedCalls, err := preparedToolCalls.finalize()
+		if err != nil {
+			return nil, fmt.Errorf("validating streamed tool calls (iter %d): %w", iter, err)
 		}
 
 		assistantMsg := openai.ChatCompletionMessage{
@@ -545,20 +522,9 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 		// parallelism when available, fall back to sequential execution.
 		var observations []ToolCallResult
 		if c.streamingToolMgr != nil {
-			// Convert accumulated tool calls to ToolCallInfo
-			calls := make([]ToolCallInfo, 0, len(toolCalls))
-			for _, tc := range toolCalls {
-				calls = append(calls, ToolCallInfo{
-					ID:        tc.ID,
-					Name:      tc.Function.Name,
-					Arguments: tc.Function.Arguments,
-				})
-
+			for i, tc := range toolCalls {
 				// Fire ToolEventStart for each tool.
-				var parsedArgs map[string]any
-				if err := json.Unmarshal([]byte(tc.Function.Arguments), &parsedArgs); err != nil {
-					parsedArgs = map[string]any{"raw": tc.Function.Arguments}
-				}
+				parsedArgs := clonePreparedArgs(preparedCalls[i].preparedArgs)
 				c.emitToolEvent(ctx, ToolEvent{
 					Type: ToolEventStart, ToolName: tc.Function.Name,
 					ToolID: tc.ID, Args: parsedArgs,
@@ -571,7 +537,7 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 
 			// Execute with parallel partitioning
 			batchStart := time.Now()
-			results := c.streamingToolMgr.ExecuteToolCalls(ctx, calls)
+			results := c.streamingToolMgr.ExecuteToolCalls(ctx, preparedCalls)
 			observations = append(observations, results...)
 			batchElapsed := time.Since(batchStart)
 
@@ -617,18 +583,14 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 			}
 		} else {
 			// Fallback: sequential execution
-			for _, tc := range toolCalls {
+			for i, tc := range toolCalls {
 				logger.Debug("executing tool (stream)",
 					"tool", tc.Function.Name,
 					"args", tc.Function.Arguments,
 					"iter", iter,
 				)
 
-				// Parse args for the tool event
-				var parsedArgs map[string]any
-				if err := json.Unmarshal([]byte(tc.Function.Arguments), &parsedArgs); err != nil {
-					parsedArgs = map[string]any{"raw": tc.Function.Arguments}
-				}
+				parsedArgs := clonePreparedArgs(preparedCalls[i].preparedArgs)
 
 				c.emitToolEvent(ctx, ToolEvent{
 					Type: ToolEventStart, ToolName: tc.Function.Name,

@@ -103,6 +103,9 @@ func (l *FSSkillLoader) LoadAll(ctx context.Context) ([]*ParsedSkill, error) {
 				return err
 			}
 			if d.IsDir() {
+				if hasPluginManifest(path) {
+					return filepath.SkipDir
+				}
 				return nil
 			}
 			if !isSkillFile(d.Name()) {
@@ -168,7 +171,13 @@ func (l *FSSkillLoader) Watch(ctx context.Context, onChange func(*ParsedSkill)) 
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				if entry.IsDir() || !isSkillFile(entry.Name()) {
+				if entry.IsDir() {
+					if hasPluginManifest(path) {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+				if !isSkillFile(entry.Name()) {
 					return nil
 				}
 				info, err := entry.Info()
@@ -234,4 +243,9 @@ func isSkillFile(name string) bool {
 		return true
 	}
 	return false
+}
+
+func hasPluginManifest(dir string) bool {
+	_, err := os.Lstat(filepath.Join(dir, "plugin.json"))
+	return err == nil || !errors.Is(err, fs.ErrNotExist)
 }

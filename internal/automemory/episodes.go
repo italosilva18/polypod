@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -150,6 +149,16 @@ func (e *EpisodeService) RunNow(ctx context.Context) error {
 	if e.config.SessionStore == nil || e.config.Memory == nil || e.config.StateFile == "" {
 		return errors.New("episodes: SessionStore, Memory and StateFile are required")
 	}
+	// The root service and an interactive CLI may use the same state file.
+	// Hold the cross-process lease from cursor reload through every memory
+	// write and cursor publication, so neither process can replay or overwrite
+	// a batch that another process is still consolidating.
+	return withDreamStateLease(ctx, e.config.StateFile, func() error {
+		return e.runNowOwned(ctx)
+	})
+}
+
+func (e *EpisodeService) runNowOwned(ctx context.Context) error {
 	if err := e.loadState(); err != nil {
 		return fmt.Errorf("episodes: loading state: %w", err)
 	}
@@ -335,14 +344,7 @@ func (e *EpisodeService) persistState(state episodeState) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(e.config.StateFile), 0o700); err != nil {
-		return err
-	}
-	tmp := e.config.StateFile + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, e.config.StateFile)
+	return writePrivateAtomic(e.config.StateFile, raw)
 }
 
 func (e *EpisodeService) recordError(err error) error {

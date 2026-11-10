@@ -3,16 +3,22 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/costa/polypod/internal/taskplan"
+	"github.com/costa/polypod/internal/taskqueue"
 	"github.com/costa/polypod/internal/types"
 )
 
-// RegisterPlanTaskTools exposes durable planned work. These tools never start
-// background shell commands or agents; task_create retains that behavior.
-func RegisterPlanTaskTools(reg *Registry, store *taskplan.Store) {
+// RegisterPlanTaskTools exposes durable planned work. The optional queue
+// connects plan_run to the full background agent runtime when wired.
+func RegisterPlanTaskTools(reg *Registry, store *taskplan.Store, queues ...*taskqueue.Queue) {
+	var queue *taskqueue.Queue
+	if len(queues) != 0 {
+		queue = queues[0]
+	}
 	reg.RegisterDef(types.ToolDef{
 		NameFn:        func() string { return "plan_create" },
 		DescriptionFn: func() string { return "Criar tarefa planejada persistente. Não inicia execução." },
@@ -20,7 +26,7 @@ func RegisterPlanTaskTools(reg *Registry, store *taskplan.Store) {
 			return map[string]any{"type": "object", "properties": map[string]any{
 				"subject":     map[string]any{"type": "string", "description": "Título curto da tarefa"},
 				"description": map[string]any{"type": "string", "description": "Objetivo e critérios de conclusão"},
-				"owner":       map[string]any{"type": "string", "description": "Agente inicialmente responsável, opcional"},
+				"owner":       map[string]any{"type": "string", "description": "Identificador do responsável pelo plano, opcional"},
 				"blocked_by":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "IDs de tarefas que precisam terminar antes desta"},
 			}, "required": []string{"subject"}}
 		},
@@ -51,7 +57,7 @@ func RegisterPlanTaskTools(reg *Registry, store *taskplan.Store) {
 	reg.RegisterDef(types.ToolDef{
 		NameFn: func() string { return "plan_update" },
 		DescriptionFn: func() string {
-			return "Atualizar título, descrição, dono, estado ou dependências de uma tarefa planejada existente."
+			return "Atualizar título, descrição, dono, estado ou dependências antes de iniciar a execução de uma tarefa planejada."
 		},
 		InputSchemaFn: func() map[string]any {
 			return map[string]any{"type": "object", "properties": map[string]any{
@@ -106,13 +112,17 @@ func RegisterPlanTaskTools(reg *Registry, store *taskplan.Store) {
 				"id": map[string]any{"type": "string", "description": "ID da tarefa planejada"},
 			}, "required": []string{"id"}}
 		},
-		IsReadOnlyFn: func(map[string]any) bool { return true },
+		// With a queue, a read may persist a newly observed execution status.
+		IsReadOnlyFn: func(map[string]any) bool { return queue == nil },
 		ExecuteFn: func(tc types.ToolContext, args map[string]any) (types.ToolResult, error) {
 			id, err := planString(args, "id", true)
 			if err != nil {
 				return planError(err), nil
 			}
 			task, err := store.Get(planContext(tc), id)
+			if err == nil {
+				task, err = syncPlanTask(planContext(tc), store, queue, task)
+			}
 			return planResult(task, err), nil
 		},
 	})
@@ -127,7 +137,7 @@ func RegisterPlanTaskTools(reg *Registry, store *taskplan.Store) {
 				"offset": map[string]any{"type": "integer", "minimum": 0, "description": "Número de tarefas anteriores a pular"},
 			}}
 		},
-		IsReadOnlyFn: func(map[string]any) bool { return true },
+		IsReadOnlyFn: func(map[string]any) bool { return queue == nil },
 		ExecuteFn: func(tc types.ToolContext, args map[string]any) (types.ToolResult, error) {
 			status, err := planString(args, "status", false)
 			if err != nil {
@@ -150,6 +160,14 @@ func RegisterPlanTaskTools(reg *Registry, store *taskplan.Store) {
 				}
 			}
 			tasks, err := store.List(planContext(tc), taskplan.Status(status), limit, offset)
+			if err == nil {
+				for i := range tasks {
+					tasks[i], err = syncPlanTask(planContext(tc), store, queue, tasks[i])
+					if err != nil {
+						break
+					}
+				}
+			}
 			return planResult(tasks, err), nil
 		},
 	})
@@ -162,7 +180,7 @@ func RegisterPlanTaskTools(reg *Registry, store *taskplan.Store) {
 		InputSchemaFn: func() map[string]any {
 			return map[string]any{"type": "object", "properties": map[string]any{
 				"id":    map[string]any{"type": "string", "description": "ID da tarefa planejada"},
-				"owner": map[string]any{"type": "string", "description": "Agente que assume a tarefa; padrão: agente atual"},
+				"owner": map[string]any{"type": "string", "description": "Responsável que assume a tarefa; padrão: agente atual"},
 			}, "required": []string{"id"}}
 		},
 		ExecuteFn: func(tc types.ToolContext, args map[string]any) (types.ToolResult, error) {
@@ -181,6 +199,128 @@ func RegisterPlanTaskTools(reg *Registry, store *taskplan.Store) {
 			return planResult(task, err), nil
 		},
 	})
+
+	if queue != nil {
+		registerPlanRunTool(reg, store, queue)
+	}
+}
+
+func registerPlanRunTool(reg *Registry, store *taskplan.Store, queue *taskqueue.Queue) {
+	reg.RegisterDef(types.ToolDef{
+		NameFn: func() string { return "plan_run" },
+		DescriptionFn: func() string {
+			return "Iniciar uma vez a execução durável de um plano pelo ciclo completo do agente padrão, respeitando responsável e dependências. Retorna o estado existente se repetido; para falha use plan_retry."
+		},
+		InputSchemaFn: func() map[string]any {
+			return map[string]any{"type": "object", "properties": map[string]any{
+				"id":    map[string]any{"type": "string", "description": "ID da tarefa planejada"},
+				"owner": map[string]any{"type": "string", "description": "Responsável pelo plano, não seleciona o agente de execução; padrão: agente atual"},
+			}, "required": []string{"id"}}
+		},
+		ExecuteFn: func(tc types.ToolContext, args map[string]any) (types.ToolResult, error) {
+			id, err := planString(args, "id", true)
+			if err != nil {
+				return planError(err), nil
+			}
+			owner, err := planString(args, "owner", false)
+			if err != nil {
+				return planError(err), nil
+			}
+			if owner == "" {
+				owner = string(tc.AgentID)
+			}
+			ctx := planContext(tc)
+			planned, err := store.Get(ctx, id)
+			if err != nil {
+				return planError(err), nil
+			}
+			// Reconcile terminal prerequisites before the transactional blocker
+			// check. The queue may have finished while this process was offline.
+			for _, dependencyID := range planned.BlockedBy {
+				dependency, getErr := store.Get(ctx, dependencyID)
+				if getErr != nil {
+					return planError(getErr), nil
+				}
+				if _, getErr = syncPlanTask(ctx, store, queue, dependency); getErr != nil {
+					return planError(getErr), nil
+				}
+			}
+			planned, err = store.ReserveExecution(ctx, id, owner)
+			if err != nil {
+				return planError(err), nil
+			}
+			if planned.Execution == nil {
+				return planError(taskplan.ErrExecutionConflict), nil
+			}
+			planned, err = store.PublishExecution(ctx, queue, planned)
+			return planResult(planned, err), nil
+		},
+	})
+
+	reg.RegisterDef(types.ToolDef{
+		NameFn: func() string { return "plan_retry" },
+		DescriptionFn: func() string {
+			return "Retomar explicitamente a execução de um plano com falha ou cancelado, preservando o histórico de tentativas."
+		},
+		InputSchemaFn: func() map[string]any {
+			return map[string]any{"type": "object", "properties": map[string]any{
+				"id":                  map[string]any{"type": "string", "description": "ID da tarefa planejada"},
+				"additional_attempts": map[string]any{"type": "integer", "minimum": 1, "maximum": 20},
+			}, "required": []string{"id"}}
+		},
+		ExecuteFn: func(tc types.ToolContext, args map[string]any) (types.ToolResult, error) {
+			id, err := planString(args, "id", true)
+			if err != nil {
+				return planError(err), nil
+			}
+			attempts := 3
+			if raw, present := args["additional_attempts"]; present {
+				var valid bool
+				attempts, valid = planInt(raw)
+				if !valid || attempts < 1 || attempts > 20 {
+					return planError(fmt.Errorf("additional_attempts precisa estar entre 1 e 20")), nil
+				}
+			}
+			ctx := planContext(tc)
+			planned, err := store.Get(ctx, id)
+			if err != nil {
+				return planError(err), nil
+			}
+			if planned.Execution == nil {
+				return planError(taskplan.ErrExecutionNotFound), nil
+			}
+			queued, err := queue.Get(ctx, planned.Execution.QueueID)
+			if err != nil {
+				return planError(err), nil
+			}
+			if _, err = store.SyncExecution(ctx, queued); err != nil {
+				return planError(err), nil
+			}
+			if err = queue.Retry(ctx, queued.ID, attempts); err != nil {
+				return planError(err), nil
+			}
+			queued, err = queue.Get(ctx, queued.ID)
+			if err != nil {
+				return planError(err), nil
+			}
+			planned, err = store.SyncExecution(ctx, queued)
+			return planResult(planned, err), nil
+		},
+	})
+}
+
+func syncPlanTask(ctx context.Context, store *taskplan.Store, queue *taskqueue.Queue, planned taskplan.Task) (taskplan.Task, error) {
+	if queue == nil || planned.Execution == nil {
+		return planned, nil
+	}
+	queued, err := queue.Get(ctx, planned.Execution.QueueID)
+	if errors.Is(err, taskqueue.ErrNotFound) {
+		return planned, nil // Reserved before publication; plan_run can retry.
+	}
+	if err != nil {
+		return taskplan.Task{}, err
+	}
+	return store.SyncExecution(ctx, queued)
 }
 
 func planContext(tc types.ToolContext) context.Context {

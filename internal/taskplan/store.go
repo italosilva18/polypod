@@ -33,15 +33,16 @@ var (
 
 // Task is a durable plan item. It does not start a process or an agent.
 type Task struct {
-	ID          string    `json:"id"`
-	Subject     string    `json:"subject"`
-	Description string    `json:"description"`
-	Status      Status    `json:"status"`
-	Owner       string    `json:"owner,omitempty"`
-	BlockedBy   []string  `json:"blocked_by"`
-	Blocks      []string  `json:"blocks"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID          string     `json:"id"`
+	Subject     string     `json:"subject"`
+	Description string     `json:"description"`
+	Status      Status     `json:"status"`
+	Owner       string     `json:"owner,omitempty"`
+	BlockedBy   []string   `json:"blocked_by"`
+	Blocks      []string   `json:"blocks"`
+	Execution   *Execution `json:"execution,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
 }
 
 type CreateInput struct {
@@ -82,6 +83,20 @@ CREATE TABLE IF NOT EXISTS plan_dependencies (
  CHECK(task_id <> depends_on)
 );
 CREATE INDEX IF NOT EXISTS plan_dependencies_reverse_idx ON plan_dependencies(depends_on,task_id);
+CREATE TABLE IF NOT EXISTS plan_runs (
+ plan_id TEXT PRIMARY KEY REFERENCES plan_tasks(id) ON DELETE CASCADE,
+ queue_id TEXT NOT NULL UNIQUE,
+ title TEXT NOT NULL,
+ prompt TEXT NOT NULL,
+ status TEXT NOT NULL CHECK (status IN ('dispatching','pending','running','succeeded','failed','canceled')),
+ attempts INTEGER NOT NULL DEFAULT 0,
+ queue_updated_at INTEGER NOT NULL DEFAULT 0,
+ result TEXT NOT NULL DEFAULT '',
+ error TEXT NOT NULL DEFAULT '',
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS plan_runs_queue_idx ON plan_runs(queue_id);
 CREATE TABLE IF NOT EXISTS plan_write_lock (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL);
 INSERT INTO plan_write_lock(id,version) VALUES(1,0) ON CONFLICT(id) DO NOTHING;
 `
@@ -179,6 +194,9 @@ func (s *Store) Update(ctx context.Context, id string, in UpdateInput) (Task, er
 	task, err := readTask(ctx, tx, id)
 	if err != nil {
 		return Task{}, err
+	}
+	if task.Execution != nil {
+		return Task{}, ErrExecutionReserved
 	}
 	previousStatus, previousOwner := task.Status, task.Owner
 	if in.Subject != nil {
@@ -381,6 +399,9 @@ func readTask(ctx context.Context, q taskReader, id string) (Task, error) {
 		return Task{}, err
 	}
 	if task.Blocks, err = relationIDs(ctx, q, `SELECT task_id FROM plan_dependencies WHERE depends_on=? ORDER BY task_id`, id); err != nil {
+		return Task{}, err
+	}
+	if task.Execution, err = readExecution(ctx, q, id); err != nil {
 		return Task{}, err
 	}
 	return task, nil

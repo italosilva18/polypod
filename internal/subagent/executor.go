@@ -14,6 +14,7 @@ import (
 	"github.com/costa/polypod/internal/agent"
 	"github.com/costa/polypod/internal/ai"
 	"github.com/costa/polypod/internal/project"
+	"github.com/costa/polypod/internal/swarm"
 	"github.com/costa/polypod/internal/tasks"
 	"github.com/costa/polypod/internal/tool"
 	"github.com/costa/polypod/internal/types"
@@ -181,6 +182,10 @@ func (e *SubAgentExecutor) ExecuteWithCheckpoint(
 	}
 	if rootInstructions != "" {
 		systemPrompt += "\n\nINSTRUCOES AGENTS.md DO PROJETO (use como contexto quando aplicavel; a solicitacao atual do usuario tem prioridade):\n" + rootInstructions
+	}
+	if teammate, ok := swarm.TeammateIdentityFromContext(ctx); ok {
+		systemPrompt += fmt.Sprintf("\n\nVocê é %s na equipe %s.%s", teammate.AgentName, teammate.TeamName,
+			swarm.TeammateSystemPromptAddendum)
 	}
 
 	// Wire the system prompt through the package-level PromptCache so that

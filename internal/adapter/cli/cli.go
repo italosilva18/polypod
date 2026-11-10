@@ -27,6 +27,7 @@ import (
 	"github.com/costa/polypod/internal/session"
 	"github.com/costa/polypod/internal/sessionmem"
 	"github.com/costa/polypod/internal/skill"
+	"github.com/costa/polypod/internal/taskqueue"
 	"github.com/costa/polypod/internal/tasks"
 	"github.com/costa/polypod/internal/tool"
 	"github.com/costa/polypod/internal/tracking"
@@ -67,6 +68,7 @@ type Adapter struct {
 	turnCheckpoint    *turncheckpoint.Manager
 	activeSessionID   string
 	taskRegistry      *tasks.TaskRegistry
+	taskQueue         *taskqueue.Queue
 	sessionMemory     *sessionmem.FileStore
 	toolTranscript    *session.ToolTranscriptStore
 }
@@ -74,6 +76,11 @@ type Adapter struct {
 // SetTaskRegistry connects live background-task notices to the CLI.
 func (a *Adapter) SetTaskRegistry(registry *tasks.TaskRegistry) {
 	a.taskRegistry = registry
+}
+
+// SetTaskQueue enables durable /bg work from the CLI.
+func (a *Adapter) SetTaskQueue(queue *taskqueue.Queue) {
+	a.taskQueue = queue
 }
 
 // SetSessionMemory retains concise facts across compaction for each session.
@@ -249,6 +256,7 @@ func (a *Adapter) Start(ctx context.Context, handler adapter.MessageHandler) err
 	}
 
 	m := newModel(runCtx, sh, deps, a.dataDir, a.userPromptHandler, a.approvalHandler, a.fileIndex)
+	m.taskQueue = a.taskQueue
 	if a.taskRegistry != nil {
 		taskCtx, cancelTasks := context.WithCancel(runCtx)
 		defer cancelTasks()

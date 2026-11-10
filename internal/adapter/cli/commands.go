@@ -297,6 +297,7 @@ func helpText() string {
 		{"/session", "info da sessao"},
 		{"/copy", "copia ultima resposta pro clipboard"},
 		{"/voice [segundos]", "grava e transcreve voz no campo de mensagem"},
+		{"/bg <objetivo>", "cria tarefa durável separada; list/status/retry/cancel para acompanhar"},
 		{"/run <cmd>  ou  !<cmd>", "executa comando shell inline"},
 		{"/file <path>", "mostra conteudo de arquivo"},
 		{"/search <pattern>", "busca texto no projeto (grep)"},

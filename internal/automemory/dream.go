@@ -194,8 +194,9 @@ func (d *DreamService) loop(ctx context.Context) {
 		firstRun := d.lastRun.IsZero()
 		d.mu.Unlock()
 
-		if idleFor < d.config.IdleThreshold && !firstRun && sinceLastRun < d.config.Interval {
-			// User is still active, keep waiting.
+		if idleFor < d.config.IdleThreshold {
+			// A long interval since the last run does not make an active
+			// conversation idle. Wait for a quiet window before extracting.
 			continue
 		}
 		if !firstRun && sinceLastRun < d.config.Interval {
@@ -223,6 +224,21 @@ func (d *DreamService) loop(ctx context.Context) {
 func (d *DreamService) extractMemories(ctx context.Context) error {
 	d.runMu.Lock()
 	defer d.runMu.Unlock()
+	if d.config.StateFile == "" {
+		return d.extractMemoriesOwned(ctx)
+	}
+	return withDreamStateLease(ctx, d.config.StateFile, func() error {
+		if err := d.reloadState(); err != nil {
+			return fmt.Errorf("reloading dream cursor: %w", err)
+		}
+		return d.extractMemoriesOwned(ctx)
+	})
+}
+
+// The shared state lease is held across extraction and cursor publication.
+// Otherwise a CLI and the background service can process the same journal
+// window and overwrite each other's cursor and run statistics.
+func (d *DreamService) extractMemoriesOwned(ctx context.Context) error {
 	logger := d.config.Logger
 
 	d.mu.Lock()
@@ -256,13 +272,17 @@ func (d *DreamService) extractMemories(ctx context.Context) error {
 		return d.finishSuccess(0, 0, 0, 0)
 	}
 
-	logger.Info("dream: extracting memories", "messages", msgCount)
-
 	memories, cached, err := d.loadPending(sequence)
 	if err != nil {
 		d.recordError(err)
 		return err
 	}
+	if !cached && msgCount == 0 {
+		// A scheduler-only journal page still advances the cursor, but it
+		// needs neither a model call nor a durable pending extraction file.
+		return d.finishSuccess(sequence, 0, 0, 0)
+	}
+	logger.Info("dream: extracting memories", "messages", msgCount)
 	if !cached && msgCount > 0 {
 		memories, err = d.config.ExtractFn(ctx, transcript)
 	}
@@ -335,18 +355,17 @@ func (d *DreamService) extractMemories(ctx context.Context) error {
 	return nil
 }
 
-// collectTranscript gathers recent messages from all sessions, capped at
-// MaxMessages, and renders them as a single transcript string.
+// collectTranscript scans a bounded number of journal entries to find up to
+// MaxMessages explicit user messages. Autonomous scheduler turns are common
+// and must not consume the entire evidence window or delay the next real user
+// message by another consolidation interval.
 func (d *DreamService) collectTranscript(ctx context.Context) (string, int, uint64, []string, error) {
 	d.mu.Lock()
 	cursor := d.lastSequence
 	d.mu.Unlock()
-	entries, err := d.config.SessionStore.JournalAfter(ctx, cursor, d.config.MaxMessages)
-	if err != nil {
-		return "", 0, 0, nil, err
-	}
 	// Keep an unacknowledged batch boundary stable if new turns arrived after
 	// an interrupted write. Its cached extraction must remain replayable.
+	var pendingThrough uint64
 	if d.config.StateFile != "" {
 		raw, readErr := os.ReadFile(d.config.StateFile + ".pending")
 		if readErr != nil && !os.IsNotExist(readErr) {
@@ -358,12 +377,10 @@ func (d *DreamService) collectTranscript(ctx context.Context) (string, int, uint
 				return "", 0, 0, nil, err
 			}
 			if pending.Cursor == cursor {
-				for i, e := range entries {
-					if e.Sequence > pending.Through {
-						entries = entries[:i]
-						break
-					}
+				if pending.Through <= cursor {
+					return "", 0, 0, nil, fmt.Errorf("dream: limite de lote pendente inválido")
 				}
+				pendingThrough = pending.Through
 			}
 		}
 	}
@@ -371,19 +388,49 @@ func (d *DreamService) collectTranscript(ctx context.Context) (string, int, uint
 	var sequence uint64
 	var provenance []string
 	count := 0
-	for _, e := range entries {
-		sequence = e.Sequence
-		if e.Channel == "scheduler" || e.Channel == "heartbeat" || e.Channel == "inbox" {
-			continue
+	const maxScannedEntries = 1000
+	userLimit := d.config.MaxMessages
+	if pendingThrough != 0 {
+		// A persisted extraction must replay through its original boundary
+		// even if MaxMessages changed after the interrupted run.
+		userLimit = maxScannedEntries
+	}
+	scanned := 0
+	for scanned < maxScannedEntries && count < userLimit {
+		pageSize := min(d.config.MaxMessages, maxScannedEntries-scanned)
+		entries, err := d.config.SessionStore.JournalAfter(ctx, cursor, pageSize)
+		if err != nil {
+			return "", 0, 0, nil, err
 		}
-		// Only explicit user statements are evidence. Secrets never leave the
-		// private journal through automatic extraction, including assistant echoes.
-		if e.Message.Role != conversation.RoleUser || looksSensitive(e.Message.Content) {
-			continue
+		if len(entries) == 0 {
+			break
 		}
-		fmt.Fprintf(&sb, "[%s message=%s] user: %s\n", e.SessionID, e.Message.ID, strings.TrimSpace(e.Message.Content))
-		provenance = append(provenance, "journal:"+e.Message.ID)
-		count++
+		for _, e := range entries {
+			if pendingThrough != 0 && e.Sequence > pendingThrough {
+				return sb.String(), count, sequence, provenance, nil
+			}
+			cursor = e.Sequence
+			sequence = e.Sequence
+			scanned++
+			if !episodeChannelAllowed(e.Channel) || e.Message.Role != conversation.RoleUser ||
+				strings.TrimSpace(e.Message.Content) == "" || looksSensitive(e.Message.Content) {
+				if scanned >= maxScannedEntries {
+					break
+				}
+				continue
+			}
+			// Only explicit user statements are evidence. Secrets never leave
+			// the private journal through extraction, including assistant echoes.
+			fmt.Fprintf(&sb, "[%s message=%s] user: %s\n", e.SessionID, e.Message.ID, strings.TrimSpace(e.Message.Content))
+			provenance = append(provenance, "journal:"+e.Message.ID)
+			count++
+			if count >= userLimit || scanned >= maxScannedEntries {
+				break
+			}
+		}
+		if len(entries) < pageSize || (pendingThrough != 0 && sequence >= pendingThrough) {
+			break
+		}
 	}
 	return sb.String(), count, sequence, provenance, nil
 }
@@ -451,20 +498,33 @@ type dreamState struct {
 }
 
 func (d *DreamService) loadState() {
+	if err := d.reloadState(); err != nil {
+		d.config.Logger.Warn("dream state unavailable at startup", "error", err)
+	}
+}
+
+func (d *DreamService) reloadState() error {
 	if d.config.StateFile == "" {
-		return
+		return nil
 	}
 	raw, err := os.ReadFile(d.config.StateFile)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
 	}
 	var state dreamState
-	if json.Unmarshal(raw, &state) == nil {
-		d.lastProcessed = state.LastProcessed
-		d.lastSequence = state.LastSequence
-		d.stats = state.Stats
-		d.lastRun = state.Stats.LastRunTime
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return err
 	}
+	d.mu.Lock()
+	d.lastProcessed = state.LastProcessed
+	d.lastSequence = state.LastSequence
+	d.stats = state.Stats
+	d.lastRun = state.Stats.LastRunTime
+	d.mu.Unlock()
+	return nil
 }
 
 func (d *DreamService) saveState() error {
@@ -478,14 +538,7 @@ func (d *DreamService) saveState() error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(d.config.StateFile), 0o700); err != nil {
-		return err
-	}
-	tmp := d.config.StateFile + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, d.config.StateFile)
+	return writePrivateAtomic(d.config.StateFile, raw)
 }
 
 func normalisePriority(importance int) int {
@@ -542,12 +595,41 @@ func (d *DreamService) savePending(through uint64, memories []ExtractedMemory) e
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(d.config.StateFile), 0700); err != nil {
-		return err
-	}
 	path := d.config.StateFile + ".pending"
-	if err := os.WriteFile(path+".tmp", raw, 0600); err != nil {
+	return writePrivateAtomic(path, raw)
+}
+
+// writePrivateAtomic gives each writer a distinct staging path. This avoids
+// truncating another process's in-progress state file during an atomic save.
+// Cross-process ownership of the consolidation cursor is a separate concern.
+func writePrivateAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return os.Rename(path+".tmp", path)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }

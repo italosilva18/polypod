@@ -96,6 +96,8 @@ documents the Piper-based OGG/Opus path for WhatsApp voice notes, and
 [WhatsApp outbound media](docs/integrations/whatsapp-outbound-media.md) covers file delivery.
 The [managed browser](docs/integrations/browser-managed.md) explains the
 isolated profile and desktop handoff.
+The [remote sessions guide](docs/integrations/remote-sessions.md) shows how to
+connect a second terminal to a persistent Polypod session.
 The [self-hosted model guide](docs/integrations/self-hosted-model.md) explains
 how to connect a private OpenAI-compatible inference server without changing
 the existing WhatsApp and scheduler configuration.

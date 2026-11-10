@@ -18,7 +18,7 @@ O inventário percorreu todos os arquivos de `src_extracted/src`. Há **3.804 ar
 
 Uma definição presente na árvore extraída pode estar condicionada a uma *feature flag* ou a um serviço privado. Uma definição no Polypod também pode não estar ligada ao executável principal. Por isso, os itens abaixo distinguem implementação de ligação ao runtime.
 
-## Diferenças confirmadas e prioridade
+## Diferenças confirmadas em 9 de novembro e prioridade original
 
 | Prioridade | Diferença | Evidência na referência | Evidência no Polypod |
 | --- | --- | --- | --- |
@@ -35,7 +35,20 @@ Uma definição presente na árvore extraída pode estar condicionada a uma *fea
 
 O `AdvancedQueryEngine` em `internal/query/advanced_engine.go` e os modos `coordinator` não são instanciados no caminho principal; o CLI usa `internal/ai/service.go`. A integração deve mirar esse runtime efetivo, evitando ampliar módulos paralelos inativos.
 
-**Atualização desta continuação:** plano persistente, recuperação manual de turnos e antecipação de buscas na Responses API foram ligados ao runtime; os detalhes estão na [leitura linha a linha](src-extracted-line-review.md). Revisei a ligação de equipes: `internal/tool/teamtools.go` usa um `globalTeamStore` em memória que não é `sys.Swarm`, e os resultados dos trabalhadores ainda não são entregues ao líder. Registrar essas ferramentas como estão anunciaria equipes sem execução observável. Faltam ponte do executor, mensagens, resultados consultáveis e encerramento antes de expô-las.
+## Situação após a implementação de 10 de novembro
+
+| Área | Implementação atual | Limite ainda conhecido |
+| --- | --- | --- |
+| Planos e tarefas | `plan_run`/`plan_retry` reservam uma execução durável por item, publicam na fila SQLite, recuperam a janela de falha entre bancos e sincronizam tentativas e resultados. `/bg` cria uma tarefa independente no CLI. | O turno que já está ativo no chat principal não vira uma tarefa destacada; `/bg` inicia um trabalho novo. Efeitos externos podem se repetir após uma falha entre executar e registrar o resultado. |
+| Equipes de agentes | `team_create`, `team_spawn`, `team_send`, `team_inbox`, `team_ack`, `team_status`, `team_results` e `team_stop` usam `sys.Swarm` e o executor de agentes. Resultados chegam à caixa do líder, com leitura e confirmação separadas. | A equipe vive apenas no processo atual; não retoma trabalhos após reinício. |
+| Sessões remotas | Servidor próprio em `internal/remote` com SQLite, token, ordem, cursor por participante, reconexão e encaminhamento durável ao `humanloop`; `polypod remote` oferece um cliente de terminal. O serviço root hospeda somente em loopback. | O acesso de outra máquina precisa de um transporte externo autenticado e com TLS, por exemplo túnel SSH; a sessão não expõe uma URL pública diretamente. O token é compartilhado entre participantes. |
+| Agendador e fila | Locks e leases coordenam o serviço root e o CLI, com retomada e histórico. | Como em qualquer executor com efeitos externos, exatamente uma execução após falha depende de idempotência da ferramenta usada. |
+| Memória automática | O serviço de consolidação já estava ligado ao runtime; agora filtra tarefas automáticas, percorre a janela de mensagens do usuário e coordena processos pelo cursor compartilhado. | A qualidade do fato extraído depende do modelo; a memória não equivale a aprendizado de pesos. |
+| Plugins e skills | Gerente local de plugins com listagem, ativação, desativação, recarga e detecção de mudanças em disco. | Instalação e atualização de um catálogo remoto ainda não são implementadas. |
+| Streaming e CLI | Chamadas de ferramenta são analisadas e validadas durante o stream, com execução após o fim confirmado; o CLI reutiliza a renderização de mensagens e evita redesenhos desnecessários. | O protocolo Chat Completions não confirma o fim isolado de cada chamada de ferramenta; executar antes do EOF pode aplicar uma ação com argumentos incompletos. O CLI ainda não virtualiza todo o histórico. |
+| Voz | Áudio recebido no WhatsApp é identificado pelo conteúdo e a transcrição local serializa acesso ao modelo entre processos. | Ditado no CLI ainda usa captura por duração fixa e não apresenta texto parcial. |
+
+Os itens sem implementação nesta rodada continuam sendo registro visual de sessões simultâneas, sugestões contextuais e busca semântica de sessões. Esta tabela descreve o código integrado; **os testes de comportamento foram adiados pelo usuário**, portanto não há prova de equivalência ou de operação completa em produção.
 
 ## Capacidades presentes no runtime
 
