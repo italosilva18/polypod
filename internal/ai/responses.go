@@ -11,7 +11,8 @@ import (
 )
 
 func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatMessage, callback StreamCallback, logger *slog.Logger) (*ChatResponse, error) {
-	req := providerapi.ChatRequest{Model: c.model, MaxTokens: c.maxTok, Temperature: c.temp}
+	model := c.modelFor(ctx)
+	req := providerapi.ChatRequest{Model: model, MaxTokens: c.maxTok, Temperature: c.temp}
 	for _, msg := range messages {
 		req.Messages = append(req.Messages, providerapi.Message{Role: msg.Role, Content: msg.Content, Parts: msg.Parts})
 	}
@@ -53,7 +54,7 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 		}
 		totalPrompt += resp.PromptTokens
 		totalCompletion += resp.CompletionTokens
-		c.recordProviderUsage(resp)
+		c.recordProviderUsage(resp, model)
 		if len(resp.ToolCalls) == 0 {
 			return &ChatResponse{Content: resp.Content, PromptTokens: totalPrompt, CompletionTokens: totalCompletion, TotalTokens: totalPrompt + totalCompletion}, nil
 		}

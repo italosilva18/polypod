@@ -14,6 +14,7 @@ import (
 	"github.com/costa/polypod/internal/memory"
 	"github.com/costa/polypod/internal/project"
 	"github.com/costa/polypod/internal/sessionmem"
+	"github.com/costa/polypod/internal/smartroute"
 	"github.com/costa/polypod/internal/workdir"
 )
 
@@ -26,6 +27,7 @@ type KnowledgeSearcher interface {
 type AnswerRequest struct {
 	Channel               string
 	UserID                string
+	RoutingCategory       string // Trusted internal evaluation category; empty uses known channel mapping.
 	Query                 string
 	History               []conversation.Message
 	HistoryPrepared       bool   // The caller already checked and persisted auto-compaction.
@@ -43,16 +45,19 @@ type AnswerResponse struct {
 
 // Service orchestrates prompt building, knowledge retrieval, and AI completion.
 type Service struct {
-	client      *Client
-	knowledge   KnowledgeSearcher
-	agentReg    *agent.Registry
-	agentName   string
-	memStore    memory.Store
-	sessionMem  *sessionmem.FileStore
-	logger      *slog.Logger
-	autoCompact *compact.AutoCompactService
-	onActivity  func()
-	workdirs    *workdir.Store
+	client        *Client
+	knowledge     KnowledgeSearcher
+	agentReg      *agent.Registry
+	agentName     string
+	memStore      memory.Store
+	sessionMem    *sessionmem.FileStore
+	logger        *slog.Logger
+	autoCompact   *compact.AutoCompactService
+	onActivity    func()
+	workdirs      *workdir.Store
+	routingMu     sync.RWMutex // protects routingPolicy and manualModel
+	routingPolicy *smartroute.CalibratedPolicy
+	manualModel   bool
 	// Budget-triggered compaction is retried after a short delay when the
 	// summarizer is unavailable. Each session has its own delay so one failed
 	// summary does not hold back another session. Capacity-triggered compaction
@@ -109,6 +114,12 @@ func (s *Service) ActiveAgent() string {
 // interactive model picker so users can swap models mid-session
 // without restarting polypod.
 func (s *Service) SetModel(model string) {
+	if model == "" {
+		return
+	}
+	s.routingMu.Lock()
+	s.manualModel = true
+	s.routingMu.Unlock()
 	if s.client != nil {
 		s.client.SetModel(model)
 	}
@@ -342,6 +353,7 @@ func (s *Service) Answer(ctx context.Context, req AnswerRequest) (*AnswerRespons
 		s.onActivity()
 	}
 	ctx = workdir.WithScope(ctx, s.workdirs, req.Channel, req.UserID, req.SessionMemoryScope)
+	ctx = s.withRoutedModel(ctx, req)
 	ctx = s.withProjectInstructions(ctx)
 	messages, names := s.buildMessages(ctx, req)
 
@@ -373,6 +385,7 @@ func (s *Service) AnswerStream(ctx context.Context, req AnswerRequest, callback 
 		s.onActivity()
 	}
 	ctx = workdir.WithScope(ctx, s.workdirs, req.Channel, req.UserID, req.SessionMemoryScope)
+	ctx = s.withRoutedModel(ctx, req)
 	ctx = s.withProjectInstructions(ctx)
 	messages, names := s.buildMessages(ctx, req)
 

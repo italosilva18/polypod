@@ -22,6 +22,7 @@ type Client struct {
 	client           *openai.Client
 	responseProvider providerapi.Provider
 	textOnly         bool
+	modelMu          sync.RWMutex // protects the manually selected default model
 	model            string
 	maxTok           int
 	maxToolIter      int
@@ -44,13 +45,13 @@ func (c *Client) SetCostEngine(ce *tracking.CostEngine) {
 	c.costEngine = ce
 }
 
-func (c *Client) recordProviderUsage(resp *providerapi.ChatResponse) {
+func (c *Client) recordProviderUsage(resp *providerapi.ChatResponse, requestedModel string) {
 	if c.costEngine == nil || resp == nil {
 		return
 	}
 	model := resp.Model
 	if model == "" {
-		model = c.model
+		model = requestedModel
 	}
 	c.costEngine.RecordCompletion(model, resp.PromptTokens, resp.CompletionTokens, resp.CacheReadTokens, resp.CacheWriteTokens)
 }
@@ -158,6 +159,8 @@ func (c *Client) skillNamesFor(ctx context.Context) []string {
 
 // Model returns the configured model name.
 func (c *Client) Model() string {
+	c.modelMu.RLock()
+	defer c.modelMu.RUnlock()
 	return c.model
 }
 
@@ -166,7 +169,27 @@ func (c *Client) SetModel(model string) {
 	if model == "" {
 		return
 	}
+	c.modelMu.Lock()
 	c.model = model
+	c.modelMu.Unlock()
+}
+
+type requestModelKey struct{}
+
+// withRequestModel pins a routed model to a single turn. Tool iterations keep
+// that same model even if another session changes its manual default.
+func withRequestModel(ctx context.Context, model string) context.Context {
+	if model == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, requestModelKey{}, model)
+}
+
+func (c *Client) modelFor(ctx context.Context) string {
+	if model, ok := ctx.Value(requestModelKey{}).(string); ok && model != "" {
+		return model
+	}
+	return c.Model()
 }
 
 // MaxTokens returns the configured max tokens limit.
@@ -218,7 +241,7 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req openai.ChatComple
 		if err != nil {
 			return openai.ChatCompletionResponse{}, err
 		}
-		c.recordProviderUsage(resp)
+		c.recordProviderUsage(resp, req.Model)
 		message := openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, Content: resp.Content}
 		for _, tc := range resp.ToolCalls {
 			message.ToolCalls = append(message.ToolCalls, openai.ToolCall{ID: tc.ID, Type: openai.ToolTypeFunction, Function: openai.FunctionCall{Name: tc.Name, Arguments: tc.Arguments}})
@@ -257,8 +280,9 @@ type StreamCallback func(delta string)
 
 // Complete sends a chat completion request with retry.
 func (c *Client) Complete(ctx context.Context, messages []ChatMessage) (*ChatResponse, error) {
+	model := c.modelFor(ctx)
 	if c.responseProvider != nil {
-		req := providerapi.ChatRequest{Model: c.model, MaxTokens: c.maxTok, Temperature: c.temp}
+		req := providerapi.ChatRequest{Model: model, MaxTokens: c.maxTok, Temperature: c.temp}
 		for _, msg := range messages {
 			req.Messages = append(req.Messages, providerapi.Message{Role: msg.Role, Content: msg.Content, Parts: msg.Parts})
 		}
@@ -266,7 +290,7 @@ func (c *Client) Complete(ctx context.Context, messages []ChatMessage) (*ChatRes
 		if err != nil {
 			return nil, err
 		}
-		c.recordProviderUsage(resp)
+		c.recordProviderUsage(resp, model)
 		return &ChatResponse{Content: resp.Content, PromptTokens: resp.PromptTokens, CompletionTokens: resp.CompletionTokens, TotalTokens: resp.TotalTokens}, nil
 	}
 	msgs := make([]openai.ChatCompletionMessage, len(messages))
@@ -276,7 +300,7 @@ func (c *Client) Complete(ctx context.Context, messages []ChatMessage) (*ChatRes
 
 	resp, err := retry(ctx, func() (openai.ChatCompletionResponse, error) {
 		return c.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-			Model:       c.model,
+			Model:       model,
 			Messages:    msgs,
 			MaxTokens:   c.maxTok,
 			Temperature: c.temp,
@@ -291,7 +315,7 @@ func (c *Client) Complete(ctx context.Context, messages []ChatMessage) (*ChatRes
 	}
 
 	if c.costEngine != nil {
-		c.costEngine.RecordCompletion(c.model, resp.Usage.PromptTokens, resp.Usage.CompletionTokens, 0, 0)
+		c.costEngine.RecordCompletion(model, resp.Usage.PromptTokens, resp.Usage.CompletionTokens, 0, 0)
 	}
 
 	return &ChatResponse{
@@ -313,6 +337,7 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 	if !c.toolsOn || len(tools) == 0 {
 		return c.Complete(ctx, messages)
 	}
+	model := c.modelFor(ctx)
 
 	msgs := make([]openai.ChatCompletionMessage, len(messages))
 	for i, m := range messages {
@@ -325,7 +350,7 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 	for iter := 0; maxIterations < 0 || iter < maxIterations; iter++ {
 		resp, err := retry(ctx, func() (openai.ChatCompletionResponse, error) {
 			return c.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-				Model:       c.model,
+				Model:       model,
 				Messages:    msgs,
 				MaxTokens:   c.maxTok,
 				Temperature: c.temp,
@@ -343,7 +368,7 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 		totalCompletion += resp.Usage.CompletionTokens
 
 		if c.costEngine != nil {
-			c.costEngine.RecordCompletion(c.model, resp.Usage.PromptTokens, resp.Usage.CompletionTokens, 0, 0)
+			c.costEngine.RecordCompletion(model, resp.Usage.PromptTokens, resp.Usage.CompletionTokens, 0, 0)
 		}
 
 		choice := resp.Choices[0]
@@ -438,11 +463,12 @@ func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMes
 	}
 
 	var totalPrompt, totalCompletion int
+	model := c.modelFor(ctx)
 
 	maxIterations := c.toolIterationLimit()
 	for iter := 0; maxIterations < 0 || iter < maxIterations; iter++ {
 		req := openai.ChatCompletionRequest{
-			Model:       c.model,
+			Model:       model,
 			Messages:    msgs,
 			MaxTokens:   c.maxTok,
 			Temperature: c.temp,

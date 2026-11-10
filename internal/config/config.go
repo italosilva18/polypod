@@ -141,6 +141,19 @@ type AIConfig struct {
 	FallbackBaseURL   string  `yaml:"fallback_base_url,omitempty"`
 	FallbackAPIKey    string  `yaml:"fallback_api_key,omitempty"`
 	FallbackModel     string  `yaml:"fallback_model,omitempty"`
+	RoutingPolicyFile string  `yaml:"routing_policy_file,omitempty"`
+	RoutingModels     string  `yaml:"routing_models,omitempty"` // comma-separated IDs on the primary provider only
+}
+
+// RoutingModelIDs returns explicitly permitted same-provider candidate IDs.
+func (c AIConfig) RoutingModelIDs() []string {
+	var models []string
+	for _, model := range strings.Split(c.RoutingModels, ",") {
+		if trimmed := strings.TrimSpace(model); trimmed != "" {
+			models = append(models, trimmed)
+		}
+	}
+	return models
 }
 
 const (
