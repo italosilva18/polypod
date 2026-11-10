@@ -10,9 +10,9 @@ As afirmações históricas nas linhas de **Mídia e áudio**, **Documentos e OC
 
 O corpo da prévia tem limite de 4.000 caracteres; o agente pode ler os demais trechos pelo `source_id`. A entrada WhatsApp tem limite de 16 MiB, a extração limita texto a 4 MiB e PDF a 100 páginas por chamada, com até 20 páginas de OCR e timeout de dois minutos (`P:internal/whatsappgateway/media.go`, `P:internal/document/extract.go`). A ligação do código está verificada por inspeção nesta atualização; recebimento, extração, indexação e resposta com um documento real pelo telefone ainda aguardam ensaio de ponta a ponta.
 
-## Atualização técnica de 10 de novembro de 2026 (código `414b125`)
+## Atualização técnica de 10 de novembro de 2026 (código `4e11221`)
 
-Este corte descreve o código da branch `feat/continuous-agent-runtime-2026-11-07`, não uma comparação medida de qualidade com PolyClaw. O serviço havia passado pelo gate de implantação com processo estável e WhatsApp conectado no commit `a963f92`, binário SHA-256 `a827bc094055c4f11aaaab2f8ac6dcfe0cb6203c4b483b469de023c1d7693a99`. As mudanças de CLI, memória e MIME genérico posteriores a esse commit ainda não estavam no binário instalado neste corte. Testes de comportamento e novos ensaios ao vivo foram adiados pelo usuário.
+Este corte descreve o código da branch `feat/continuous-agent-runtime-2026-11-07`, não uma comparação medida de qualidade com PolyClaw. O serviço passou pelo gate de implantação no commit `4e11221`, com processo estável, WhatsApp conectado e binário SHA-256 `0232a689d3eb8faa41478b8ab8931afda02bd63c8f8c419f849e84b9324997d1`. Testes de comportamento e novos ensaios ao vivo foram adiados pelo usuário.
 
 | Área | Código neste corte | Limite verificável |
 | --- | --- | --- |
