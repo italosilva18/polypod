@@ -45,6 +45,8 @@ func (s *Store) SearchVerified(ctx context.Context, query string, limit int) ([]
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT pattern_key,SUM(success),COUNT(*) FROM outcomes
+	 WHERE source_kind IN ('task','routine') AND verified_by IN
+	 ('file_sha256_v1','http_status_v1','http_json_v1','sqlite_scalar_v1')
 	 GROUP BY pattern_key HAVING SUM(success)>=? AND SUM(success)*4>=COUNT(*)*3
 	 ORDER BY COUNT(*) DESC,pattern_key LIMIT ?`, minSuccesses, maxExperienceCandidates)
 	if err != nil {
@@ -95,12 +97,18 @@ func (s *Store) SearchVerified(ctx context.Context, query string, limit int) ([]
 		if err != nil {
 			return nil, err
 		}
-		sequence, repeated := mostFrequentSequence(outcomes)
+		verified := make([]Outcome, 0, len(outcomes))
+		for _, outcome := range outcomes {
+			if (outcome.SourceKind == "task" || outcome.SourceKind == "routine") && internalVerifier(outcome.VerifiedBy) {
+				verified = append(verified, outcome)
+			}
+		}
+		sequence, repeated := mostFrequentSequence(verified)
 		if len(sequence) == 0 || repeated < 2 {
 			continue
 		}
 		verifiers := make(map[string]bool)
-		for _, outcome := range outcomes {
+		for _, outcome := range verified {
 			if outcome.Success {
 				verifiers[outcome.VerifiedBy] = true
 			}
