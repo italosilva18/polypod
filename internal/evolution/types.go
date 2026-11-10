@@ -19,16 +19,19 @@ type OutcomeInput struct {
 	ToolNames   []string `json:"tool_names"`
 }
 
-// VerificationPlanInput describes an independent file-state check for a queued
-// task or routine. SubjectID is the stable task ID; each completed run uses its
-// own RunID when the verified outcome is recorded.
+// VerificationPlanInput describes an independent state check for a queued task
+// or routine. SubjectID is stable; each completed run has its own RunID.
+// ExpectedJSON is accepted only while registering a plan and is never stored.
 type VerificationPlanInput struct {
 	SourceKind     string `json:"source_kind"`
 	SubjectID      string `json:"subject_id"`
 	PatternKey     string `json:"pattern_key"`
-	Kind           string `json:"kind"` // currently file_sha256
-	Path           string `json:"path"`
-	ExpectedSHA256 string `json:"expected_sha256"`
+	Kind           string `json:"kind"`               // file_sha256, http_status, http_json, sqlite_scalar
+	Path           string `json:"path"`               // absolute file/DB path or URL
+	Selector       string `json:"selector,omitempty"` // JSON pointer or read-only SQL query
+	ExpectedSHA256 string `json:"expected_sha256"`    // derived from ExpectedJSON/status for non-file kinds
+	ExpectedJSON   string `json:"-"`
+	ExpectedStatus int    `json:"expected_status,omitempty"`
 }
 
 type VerificationPlan struct {

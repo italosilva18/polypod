@@ -16,18 +16,21 @@ import (
 
 const (
 	FileSHA256Check      = "file_sha256"
+	HTTPStatusCheck      = "http_status"
+	HTTPJSONCheck        = "http_json"
+	SQLiteScalarCheck    = "sqlite_scalar"
 	missingVerifiedFile  = "missing"
 	maxVerifiedFileBytes = 1 << 30
 	verificationSettle   = 150 * time.Millisecond
 )
 
-var ErrVerificationUnstable = errors.New("estado do arquivo mudou durante a verificação")
+var ErrVerificationUnstable = errors.New("alvo mudou durante a verificação")
 var ErrVerificationStartUnknown = errors.New("verificação exige início durável da execução")
 
 // RegisterVerificationPlan stores an immutable check for a task or routine.
 // The plan is registered when work is created, before the work can satisfy it.
-// No agent narrative or exit status can satisfy a plan; only a later file read
-// can do so. A matching preexisting file is rejected to avoid learning from a
+// No agent narrative or exit status can satisfy a plan; only a later state read
+// can do so. A matching preexisting state is rejected to avoid learning from a
 // task that did not produce the expected state transition.
 func (s *Store) RegisterVerificationPlan(ctx context.Context, input VerificationPlanInput) (VerificationPlan, error) {
 	input, err := normalizeVerificationPlan(input)
@@ -39,17 +42,17 @@ func (s *Store) RegisterVerificationPlan(ctx context.Context, input Verification
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return VerificationPlan{}, err
 	}
-	baseline, err := fileStateSHA256(ctx, input.Path)
+	baseline, err := verificationState(ctx, input)
 	if err != nil {
 		return VerificationPlan{}, fmt.Errorf("ler estado inicial da verificação: %w", err)
 	}
 	if baseline == input.ExpectedSHA256 {
-		return VerificationPlan{}, errors.New("arquivo já possui o hash esperado antes da tarefa")
+		return VerificationPlan{}, errors.New("alvo já possui o estado esperado antes da tarefa")
 	}
 	_, err = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO verification_plans
-	 (source_kind,subject_id,pattern_key,kind,path,expected_sha256,baseline_sha256,created_at)
-	 VALUES(?,?,?,?,?,?,?,?)`, input.SourceKind, input.SubjectID, input.PatternKey,
-		input.Kind, input.Path, input.ExpectedSHA256, baseline, time.Now().UnixMilli())
+	 (source_kind,subject_id,pattern_key,kind,path,selector,expected_status,expected_sha256,baseline_sha256,created_at)
+	 VALUES(?,?,?,?,?,?,?,?,?,?)`, input.SourceKind, input.SubjectID, input.PatternKey,
+		input.Kind, input.Path, input.Selector, input.ExpectedStatus, input.ExpectedSHA256, baseline, time.Now().UnixMilli())
 	if err != nil {
 		return VerificationPlan{}, fmt.Errorf("registrar verificação: %w", err)
 	}
@@ -68,7 +71,8 @@ func normalizeVerificationPlan(input VerificationPlanInput) (VerificationPlanInp
 	if input.Kind == "" {
 		input.Kind = FileSHA256Check
 	}
-	input.Path = filepath.Clean(strings.TrimSpace(input.Path))
+	input.Path = strings.TrimSpace(input.Path)
+	input.Selector = strings.TrimSpace(input.Selector)
 	input.ExpectedSHA256 = strings.ToLower(strings.TrimSpace(input.ExpectedSHA256))
 	if input.SourceKind != "task" && input.SourceKind != "routine" {
 		return input, errors.New("verificação exige fonte task ou routine")
@@ -77,17 +81,66 @@ func normalizeVerificationPlan(input VerificationPlanInput) (VerificationPlanInp
 		input.PatternKey == "" || len(input.PatternKey) > 160 {
 		return input, errors.New("identificador e padrão de verificação inválidos")
 	}
-	if input.Kind != FileSHA256Check {
+	switch input.Kind {
+	case FileSHA256Check:
+		input.Path = filepath.Clean(input.Path)
+		if !validVerificationPath(input.Path) || input.Selector != "" || input.ExpectedStatus != 0 || input.ExpectedJSON != "" {
+			return input, errors.New("file_sha256 exige caminho absoluto, sem seletor ou valor JSON")
+		}
+		decoded, err := hex.DecodeString(input.ExpectedSHA256)
+		if err != nil || len(decoded) != sha256.Size {
+			return input, errors.New("hash SHA-256 esperado inválido")
+		}
+	case HTTPStatusCheck, HTTPJSONCheck:
+		url, err := validateVerificationURL(input.Path)
+		if err != nil {
+			return input, err
+		}
+		input.Path = url
+		if input.ExpectedStatus < 100 || input.ExpectedStatus > 599 || input.ExpectedSHA256 != "" {
+			return input, errors.New("HTTP exige expected_status entre 100 e 599, sem expected_sha256")
+		}
+		if input.Kind == HTTPStatusCheck {
+			if input.Selector != "" || input.ExpectedJSON != "" {
+				return input, errors.New("http_status não aceita seletor ou valor JSON")
+			}
+			input.ExpectedSHA256 = stateDigest(HTTPStatusCheck, input.ExpectedStatus, nil)
+		} else {
+			if err := validateJSONPointer(input.Selector); err != nil {
+				return input, err
+			}
+			value, err := canonicalExpectedJSON(input.ExpectedJSON)
+			if err != nil {
+				return input, err
+			}
+			input.ExpectedSHA256 = stateDigest(HTTPJSONCheck, input.ExpectedStatus, value)
+			input.ExpectedJSON = ""
+		}
+	case SQLiteScalarCheck:
+		input.Path = filepath.Clean(input.Path)
+		if !validVerificationPath(input.Path) || input.ExpectedStatus != 0 || input.ExpectedSHA256 != "" {
+			return input, errors.New("sqlite_scalar exige caminho absoluto, sem status ou expected_sha256")
+		}
+		if err := validateScalarQuery(input.Selector); err != nil {
+			return input, err
+		}
+		value, err := canonicalExpectedJSON(input.ExpectedJSON)
+		if err != nil {
+			return input, err
+		}
+		if !isJSONScalar(value) {
+			return input, errors.New("sqlite_scalar exige expected_json escalar")
+		}
+		input.ExpectedSHA256 = stateDigest(SQLiteScalarCheck, 0, value)
+		input.ExpectedJSON = ""
+	default:
 		return input, errors.New("tipo de verificação desconhecido")
 	}
-	if !filepath.IsAbs(input.Path) || len(input.Path) > 4096 || strings.ContainsRune(input.Path, '\x00') {
-		return input, errors.New("verificação exige caminho absoluto de arquivo")
-	}
-	decoded, err := hex.DecodeString(input.ExpectedSHA256)
-	if err != nil || len(decoded) != sha256.Size {
-		return input, errors.New("hash SHA-256 esperado inválido")
-	}
 	return input, nil
+}
+
+func validVerificationPath(path string) bool {
+	return filepath.IsAbs(path) && len(path) <= 4096 && !strings.ContainsRune(path, '\x00')
 }
 
 func sameVerificationPlan(stored VerificationPlan, input VerificationPlanInput) (VerificationPlan, error) {
@@ -100,11 +153,11 @@ func sameVerificationPlan(stored VerificationPlan, input VerificationPlanInput) 
 
 func (s *Store) verificationPlan(ctx context.Context, kind, subjectID string) (VerificationPlan, error) {
 	var plan VerificationPlan
-	err := s.db.QueryRowContext(ctx, `SELECT source_kind,subject_id,pattern_key,kind,path,
-	 expected_sha256,baseline_sha256,created_at FROM verification_plans
+	err := s.db.QueryRowContext(ctx, `SELECT source_kind,subject_id,pattern_key,kind,path,selector,
+	 expected_status,expected_sha256,baseline_sha256,created_at FROM verification_plans
 	 WHERE source_kind=? AND subject_id=?`, kind, subjectID).Scan(
-		&plan.SourceKind, &plan.SubjectID, &plan.PatternKey, &plan.Kind, &plan.Path,
-		&plan.ExpectedSHA256, &plan.BaselineSHA256, &plan.CreatedAt)
+		&plan.SourceKind, &plan.SubjectID, &plan.PatternKey, &plan.Kind, &plan.Path, &plan.Selector,
+		&plan.ExpectedStatus, &plan.ExpectedSHA256, &plan.BaselineSHA256, &plan.CreatedAt)
 	return plan, err
 }
 
@@ -160,7 +213,7 @@ func (s *Store) BeginVerificationRun(ctx context.Context, sourceKind, subjectID,
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
-	baseline, err := fileStateSHA256(ctx, plan.Path)
+	baseline, err := verificationState(ctx, plan.VerificationPlanInput)
 	if err != nil {
 		return false, fmt.Errorf("ler estado inicial da execução: %w", err)
 	}
@@ -190,8 +243,8 @@ func (s *Store) verificationRun(ctx context.Context, sourceKind, runID string) (
 
 // FinishVerificationRun captures the postcondition immediately after the
 // terminal handler returns. The delayed notice callback uses only this durable
-// snapshot. Repeated finish calls with a different state make the run
-// inconclusive instead of replacing or falsely crediting either state.
+// snapshot. Before an outcome is recorded, conflicting final reads make the
+// run inconclusive. After an outcome exists, repeated calls preserve it.
 func (s *Store) FinishVerificationRun(ctx context.Context, sourceKind, subjectID, runID string) (bool, error) {
 	s.verifyMu.Lock()
 	defer s.verifyMu.Unlock()
@@ -218,15 +271,24 @@ func (s *Store) FinishVerificationRun(ctx context.Context, sourceKind, subjectID
 	if run.subjectID != subjectID {
 		return false, fmt.Errorf("execução %s/%s pertence a outra tarefa: %w", sourceKind, runID, ErrStateConflict)
 	}
+	// Once an outcome exists, delivery retries cannot change its recorded proof.
+	if existing, err := s.outcomeBySource(ctx, sourceKind, runID); err == nil {
+		if existing.VerifiedBy != verifierName(plan.Kind) || existing.PatternKey != plan.PatternKey {
+			return false, ErrStateConflict
+		}
+		return true, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
 	if run.finishedAt > 0 && !run.finalSHA256.Valid {
 		return false, nil
 	}
-	actual, err := fileStateSHA256(ctx, plan.Path)
+	actual, err := verificationState(ctx, plan.VerificationPlanInput)
 	if err != nil {
 		return false, fmt.Errorf("capturar estado final da execução: %w", err)
 	}
 	if actual != plan.ExpectedSHA256 {
-		// A missing or mismatched artifact is evidence of failure only if the
+		// A missing or mismatched target is evidence of failure only if the
 		// state remains the same after a short settling window.
 		timer := time.NewTimer(verificationSettle)
 		defer timer.Stop()
@@ -235,7 +297,7 @@ func (s *Store) FinishVerificationRun(ctx context.Context, sourceKind, subjectID
 			return false, ctx.Err()
 		case <-timer.C:
 		}
-		confirmed, err := fileStateSHA256(ctx, plan.Path)
+		confirmed, err := verificationState(ctx, plan.VerificationPlanInput)
 		if err != nil {
 			return false, fmt.Errorf("confirmar estado final da execução: %w", err)
 		}
@@ -278,7 +340,7 @@ func (s *Store) VerifyAndRecord(ctx context.Context, sourceKind, subjectID, runI
 // VerifyAndRecordAt checks an immutable plan after one durable run. The caller
 // supplies tool names only if they were observed by the tool execution path;
 // an empty trace is recorded for outcome metrics but cannot generate a skill
-// draft. Repeated notices return the original outcome even if the file later
+// draft. Repeated notices return the original outcome even if the target later
 // changes, so delivery retries never rewrite learning history.
 // startedAt must come from the task/routine's persisted attempt history, never
 // the callback time or a timestamp supplied by the agent.
@@ -313,20 +375,20 @@ func (s *Store) VerifyAndRecordAt(ctx context.Context, sourceKind, subjectID, ru
 	if run.subjectID != subjectID {
 		return Outcome{}, false, fmt.Errorf("execução %s/%s pertence a outra tarefa: %w", sourceKind, runID, ErrStateConflict)
 	}
-	if run.baselineSHA256 == plan.ExpectedSHA256 {
-		return Outcome{}, false, nil
-	}
-	if !run.finalSHA256.Valid || run.finishedAt == 0 {
-		return Outcome{}, false, nil
-	}
 	if existing, err := s.outcomeBySource(ctx, sourceKind, runID); err == nil {
-		if existing.VerifiedBy != "file_sha256_v1" || existing.PatternKey != plan.PatternKey {
+		if existing.VerifiedBy != verifierName(plan.Kind) || existing.PatternKey != plan.PatternKey {
 			return Outcome{}, false, fmt.Errorf("execução %s/%s já tem resultado de outra origem: %w",
 				sourceKind, runID, ErrStateConflict)
 		}
 		return existing, true, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return Outcome{}, false, err
+	}
+	if run.baselineSHA256 == plan.ExpectedSHA256 {
+		return Outcome{}, false, nil
+	}
+	if !run.finalSHA256.Valid || run.finishedAt == 0 {
+		return Outcome{}, false, nil
 	}
 	actual := run.finalSHA256.String
 	success := actual == plan.ExpectedSHA256
@@ -343,7 +405,7 @@ func (s *Store) VerifyAndRecordAt(ctx context.Context, sourceKind, subjectID, ru
 	}
 	out, err := s.recordOutcome(ctx, OutcomeInput{
 		SourceKind: sourceKind, SourceID: runID, PatternKey: plan.PatternKey,
-		Success: success, VerifiedBy: "file_sha256_v1", EvidenceRef: FileSHA256Check + ":" + actual,
+		Success: success, VerifiedBy: verifierName(plan.Kind), EvidenceRef: plan.Kind + ":" + actual,
 		ToolNames: tools,
 	})
 	if err != nil {

@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS outcomes (
 CREATE INDEX IF NOT EXISTS outcomes_pattern_idx ON outcomes(pattern_key,created_at);
 CREATE TABLE IF NOT EXISTS verification_plans (
  source_kind TEXT NOT NULL, subject_id TEXT NOT NULL, pattern_key TEXT NOT NULL,
- kind TEXT NOT NULL, path TEXT NOT NULL, expected_sha256 TEXT NOT NULL,
+ kind TEXT NOT NULL, path TEXT NOT NULL, selector TEXT NOT NULL DEFAULT '',
+ expected_status INTEGER NOT NULL DEFAULT 0, expected_sha256 TEXT NOT NULL,
  baseline_sha256 TEXT NOT NULL, created_at INTEGER NOT NULL,
  PRIMARY KEY(source_kind,subject_id)
 );
@@ -108,12 +109,52 @@ func Open(dbPath, skillsDir string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("atualizando execuções verificadas: %w", err)
 	}
+	if err := ensureVerificationPlanColumns(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("atualizando planos verificados: %w", err)
+	}
 	s := &Store{db: db, skillsDir: absSkills}
 	if err := s.recoverApplying(context.Background()); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("recuperando skills aplicadas: %w", err)
 	}
 	return s, nil
+}
+
+func ensureVerificationPlanColumns(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(verification_plans)`)
+	if err != nil {
+		return err
+	}
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var position, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&position, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"selector", "selector TEXT NOT NULL DEFAULT ''"},
+		{"expected_status", "expected_status INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if !columns[column.name] {
+			if _, err := db.Exec(`ALTER TABLE verification_plans ADD COLUMN ` + column.definition); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func ensureVerificationRunColumns(db *sql.DB) error {
@@ -160,8 +201,8 @@ func (s *Store) Close() error { return s.db.Close() }
 // supplied by the caller; this package never treats external page or model text
 // as verification. The source pair is idempotent and immutable.
 func (s *Store) RecordOutcome(ctx context.Context, in OutcomeInput) (Outcome, error) {
-	if strings.TrimSpace(in.VerifiedBy) == "file_sha256_v1" {
-		return Outcome{}, errors.New("file_sha256_v1 é reservado ao verificador interno")
+	if internalVerifier(in.VerifiedBy) {
+		return Outcome{}, errors.New("identificador reservado ao verificador interno")
 	}
 	return s.recordOutcome(ctx, in)
 }
@@ -219,8 +260,8 @@ func validateOutcome(in OutcomeInput) (OutcomeInput, error) {
 		!evidenceTokenPattern.MatchString(in.EvidenceRef) {
 		return in, errors.New("source_id, verified_by e evidence_ref devem ser identificadores, não texto externo")
 	}
-	verifiedWithoutTrace := in.VerifiedBy == "file_sha256_v1" &&
-		strings.HasPrefix(in.EvidenceRef, "file_sha256:") &&
+	verifiedWithoutTrace := internalVerifier(in.VerifiedBy) &&
+		strings.HasPrefix(in.EvidenceRef, verifierKind(in.VerifiedBy)+":") &&
 		(in.SourceKind == "task" || in.SourceKind == "routine")
 	if len(in.ToolNames) > 24 || (in.Success && len(in.ToolNames) == 0 && !verifiedWithoutTrace) {
 		return in, errors.New("sucesso exige de 1 a 24 ferramentas observadas")

@@ -19,7 +19,7 @@ func RegisterEvolutionTool(reg *Registry, store *evolution.Store, onApply func(n
 	reg.RegisterDef(types.ToolDef{
 		NameFn: func() string { return "skill_evolution" },
 		DescriptionFn: func() string {
-			return "Planejar verificação SHA-256 independente para tarefa/rotina, consultar resultados " +
+			return "Planejar verificação independente de arquivo, HTTP ou SQLite para tarefa/rotina; consultar resultados " +
 				"verificados, agrupar padrões repetidos, revisar rascunhos " +
 				"SKILL.md e aplicar ou descartar explicitamente. O agente não certifica o próprio sucesso."
 		},
@@ -30,9 +30,12 @@ func RegisterEvolutionTool(reg *Registry, store *evolution.Store, onApply func(n
 					"action":          map[string]any{"type": "string", "enum": []string{"plan", "patterns", "propose", "get", "list", "review", "apply"}},
 					"source_kind":     map[string]any{"type": "string", "enum": []string{"task", "routine"}},
 					"subject_id":      map[string]any{"type": "string", "description": "ID estável da tarefa ou rotina a verificar"},
-					"kind":            map[string]any{"type": "string", "enum": []string{"file_sha256"}},
-					"path":            map[string]any{"type": "string", "description": "Caminho absoluto do arquivo a verificar"},
-					"expected_sha256": map[string]any{"type": "string", "description": "SHA-256 exato do estado esperado após execução"},
+					"kind":            map[string]any{"type": "string", "enum": []string{"file_sha256", "http_status", "http_json", "sqlite_scalar"}},
+					"path":            map[string]any{"type": "string", "description": "Arquivo/SQLite absoluto ou URL HTTP(S) a verificar"},
+					"selector":        map[string]any{"type": "string", "description": "Ponteiro JSON RFC 6901 ou consulta SQLite SELECT escalar"},
+					"expected_sha256": map[string]any{"type": "string", "description": "SHA-256 exato para file_sha256"},
+					"expected_json":   map[string]any{"type": "string", "description": "Valor JSON esperado para http_json/sqlite_scalar; só o hash é persistido"},
+					"expected_status": map[string]any{"type": "integer", "minimum": 100, "maximum": 599},
 					"pattern_key":     map[string]any{"type": "string"},
 					"draft_id":        map[string]any{"type": "string"},
 					"decision":        map[string]any{"type": "string", "enum": []string{"approve", "discard"}},
@@ -76,10 +79,13 @@ func RegisterEvolutionTool(reg *Registry, store *evolution.Store, onApply func(n
 			var err error
 			switch args["action"] {
 			case "plan":
+				status, _ := integerArg(args, "expected_status", 0, 599)
 				value, err = store.RegisterVerificationPlan(ctx, evolution.VerificationPlanInput{
 					SourceKind: args["source_kind"].(string), SubjectID: args["subject_id"].(string),
 					PatternKey: args["pattern_key"].(string), Kind: stringArg(args, "kind"),
-					Path: args["path"].(string), ExpectedSHA256: args["expected_sha256"].(string),
+					Path: args["path"].(string), Selector: stringArg(args, "selector"),
+					ExpectedSHA256: stringArg(args, "expected_sha256"), ExpectedJSON: stringArg(args, "expected_json"),
+					ExpectedStatus: status,
 				})
 			case "patterns":
 				value, err = store.Patterns(ctx)
@@ -121,15 +127,36 @@ func validateEvolutionArgs(args map[string]any) error {
 	}
 	switch action {
 	case "plan":
-		for _, key := range []string{"source_kind", "subject_id", "pattern_key", "path", "expected_sha256"} {
+		for _, key := range []string{"source_kind", "subject_id", "pattern_key", "path"} {
 			if err := requiredStringArg(args, key); err != nil {
 				return err
 			}
 		}
-		if kind, exists := args["kind"]; exists {
-			if kind != evolution.FileSHA256Check {
-				return errors.New("kind deve ser file_sha256")
+		kind := stringArg(args, "kind")
+		if kind == "" {
+			kind = evolution.FileSHA256Check
+		}
+		switch kind {
+		case evolution.FileSHA256Check:
+			return requiredStringArg(args, "expected_sha256")
+		case evolution.HTTPStatusCheck:
+			status, err := integerArg(args, "expected_status", 0, 599)
+			if err != nil || status < 100 {
+				return errors.New("expected_status deve estar entre 100 e 599")
 			}
+		case evolution.HTTPJSONCheck:
+			status, err := integerArg(args, "expected_status", 0, 599)
+			if err != nil || status < 100 {
+				return errors.New("expected_status deve estar entre 100 e 599")
+			}
+			return requiredStringArg(args, "expected_json")
+		case evolution.SQLiteScalarCheck:
+			if err := requiredStringArg(args, "selector"); err != nil {
+				return err
+			}
+			return requiredStringArg(args, "expected_json")
+		default:
+			return errors.New("kind de verificação desconhecido")
 		}
 	case "propose":
 		return requiredStringArg(args, "pattern_key")

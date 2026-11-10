@@ -1154,22 +1154,26 @@ func RegisterSkills(reg *skill.Registry, sched *Scheduler, verificationStores ..
 
 	reg.Register(&skill.Skill{
 		Name:        "scheduler_add",
-		Description: "Adicionar rotina agendada; verificação SHA-256 opcional exige prompt e e registrada antes da primeira execução",
+		Description: "Adicionar rotina agendada; verificação opcional de arquivo, HTTP ou SQLite exige prompt e é registrada antes da primeira execução",
 		Parameters: jsonschema.Definition{
 			Type: jsonschema.Object,
 			Properties: map[string]jsonschema.Definition{
-				"name":                 {Type: jsonschema.String, Description: "Nome humano e curto da rotina"},
-				"schedule":             {Type: jsonschema.String, Description: "Cron de cinco campos com listas/intervalos/passos, @every 30m ou @at 2026-11-06T09:00:00-03:00"},
-				"time_zone":            {Type: jsonschema.String, Description: "Fuso IANA para cron, por exemplo America/Sao_Paulo; vazio usa o fuso da maquina"},
-				"misfire_policy":       {Type: jsonschema.String, Description: "run_once executa uma vez apos parada; skip ignora horarios perdidos"},
-				"prompt":               {Type: jsonschema.String, Description: "Objetivo completo para despertar o agente, incluindo contexto, verificacao de sucesso e o que fazer em caso de erro"},
-				"command":              {Type: jsonschema.String, Description: "Comando shell exato; use somente para automacoes mecanicas que nao exigem raciocinio"},
-				"max_retries":          {Type: jsonschema.Integer, Description: "Numero de novas tentativas em caso de falha (padrao 3, maximo 5)"},
-				"channel":              {Type: jsonschema.String, Description: "Canal de origem da rotina"},
-				"user_id":              {Type: jsonschema.String, Description: "Identidade dona da rotina"},
-				"verification_path":    {Type: jsonschema.String, Description: "Arquivo absoluto cujo SHA-256 deve provar o resultado; opcional com os dois campos abaixo"},
-				"verification_sha256":  {Type: jsonschema.String, Description: "SHA-256 esperado do arquivo ao concluir a rotina"},
-				"verification_pattern": {Type: jsonschema.String, Description: "Categoria estavel para aprender com resultados verificados"},
+				"name":                         {Type: jsonschema.String, Description: "Nome humano e curto da rotina"},
+				"schedule":                     {Type: jsonschema.String, Description: "Cron de cinco campos com listas/intervalos/passos, @every 30m ou @at 2026-11-06T09:00:00-03:00"},
+				"time_zone":                    {Type: jsonschema.String, Description: "Fuso IANA para cron, por exemplo America/Sao_Paulo; vazio usa o fuso da maquina"},
+				"misfire_policy":               {Type: jsonschema.String, Description: "run_once executa uma vez apos parada; skip ignora horarios perdidos"},
+				"prompt":                       {Type: jsonschema.String, Description: "Objetivo completo para despertar o agente, incluindo contexto, verificacao de sucesso e o que fazer em caso de erro"},
+				"command":                      {Type: jsonschema.String, Description: "Comando shell exato; use somente para automacoes mecanicas que nao exigem raciocinio"},
+				"max_retries":                  {Type: jsonschema.Integer, Description: "Numero de novas tentativas em caso de falha (padrao 3, maximo 5)"},
+				"channel":                      {Type: jsonschema.String, Description: "Canal de origem da rotina"},
+				"user_id":                      {Type: jsonschema.String, Description: "Identidade dona da rotina"},
+				"verification_kind":            {Type: jsonschema.String, Description: "file_sha256 (padrão), http_status, http_json ou sqlite_scalar"},
+				"verification_path":            {Type: jsonschema.String, Description: "Arquivo/SQLite absoluto ou URL HTTP(S) a verificar"},
+				"verification_selector":        {Type: jsonschema.String, Description: "Ponteiro JSON RFC 6901 ou SELECT escalar"},
+				"verification_sha256":          {Type: jsonschema.String, Description: "SHA-256 esperado do arquivo ao concluir a rotina"},
+				"verification_expected_json":   {Type: jsonschema.String, Description: "Valor JSON esperado; só o hash é persistido"},
+				"verification_expected_status": {Type: jsonschema.Integer, Description: "Código HTTP esperado entre 100 e 599"},
+				"verification_pattern":         {Type: jsonschema.String, Description: "Categoria estavel para aprender com resultados verificados"},
 			},
 			Required: []string{"name", "schedule"},
 		},
@@ -1196,10 +1200,27 @@ func RegisterSkills(reg *skill.Registry, sched *Scheduler, verificationStores ..
 			verificationPath := strings.TrimSpace(args["verification_path"])
 			verificationSHA := strings.TrimSpace(args["verification_sha256"])
 			verificationPattern := strings.TrimSpace(args["verification_pattern"])
-			planned := verificationPath != "" || verificationSHA != "" || verificationPattern != ""
+			verificationKind := strings.TrimSpace(args["verification_kind"])
+			if verificationKind == "" {
+				verificationKind = evolution.FileSHA256Check
+			}
+			planned := verificationPath != "" || verificationSHA != "" || verificationPattern != "" ||
+				strings.TrimSpace(args["verification_kind"]) != "" || strings.TrimSpace(args["verification_selector"]) != "" ||
+				strings.TrimSpace(args["verification_expected_json"]) != "" || strings.TrimSpace(args["verification_expected_status"]) != ""
 			if planned {
-				if verificationPath == "" || verificationSHA == "" || verificationPattern == "" {
-					return "", fmt.Errorf("verification_path, verification_sha256 e verification_pattern devem ser fornecidos juntos")
+				if verificationPath == "" || verificationPattern == "" {
+					return "", fmt.Errorf("verification_path e verification_pattern devem ser fornecidos juntos")
+				}
+				if verificationKind == evolution.FileSHA256Check && verificationSHA == "" {
+					return "", fmt.Errorf("file_sha256 exige verification_sha256")
+				}
+				verificationStatus := 0
+				if statusText := strings.TrimSpace(args["verification_expected_status"]); statusText != "" {
+					var err error
+					verificationStatus, err = strconv.Atoi(statusText)
+					if err != nil {
+						return "", fmt.Errorf("verification_expected_status deve ser inteiro")
+					}
 				}
 				if strings.TrimSpace(task.Prompt) == "" {
 					return "", fmt.Errorf("verificacao planejada exige rotina com prompt; command isolado ainda nao tem captura de estado antes da execucao")
@@ -1228,7 +1249,9 @@ func RegisterSkills(reg *skill.Registry, sched *Scheduler, verificationStores ..
 				}
 				_, err := verificationStore.RegisterVerificationPlan(context.Background(), evolution.VerificationPlanInput{
 					SourceKind: "routine", SubjectID: task.ID, PatternKey: verificationPattern,
-					Kind: evolution.FileSHA256Check, Path: verificationPath, ExpectedSHA256: verificationSHA,
+					Kind: verificationKind, Path: verificationPath, Selector: args["verification_selector"],
+					ExpectedSHA256: verificationSHA, ExpectedJSON: args["verification_expected_json"],
+					ExpectedStatus: verificationStatus,
 				})
 				if err != nil {
 					return "", fmt.Errorf("registrando verificacao da rotina: %w", err)

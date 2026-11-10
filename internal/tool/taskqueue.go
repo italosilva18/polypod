@@ -27,25 +27,29 @@ func RegisterTaskQueueTool(reg *Registry, queue *taskqueue.Queue, evolutionStore
 	reg.RegisterDef(types.ToolDef{
 		NameFn: func() string { return "task_queue" },
 		DescriptionFn: func() string {
-			return "Criar e acompanhar tarefas pontuais persistentes. Opcionalmente, registre antes do despacho uma prova SHA-256 do arquivo esperado para aprender com o resultado real."
+			return "Criar e acompanhar tarefas pontuais persistentes. Opcionalmente, registre antes do despacho uma verificação de arquivo, HTTP ou SQLite para aprender com o resultado real."
 		},
 		InputSchemaFn: func() map[string]any {
 			return map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"action":               map[string]any{"type": "string", "enum": []string{"create", "list", "get", "history", "cancel", "retry", "status"}},
-					"id":                   map[string]any{"type": "string", "description": "ID da tarefa para get, history, cancel ou retry"},
-					"title":                map[string]any{"type": "string", "description": "Nome curto da tarefa"},
-					"prompt":               map[string]any{"type": "string", "description": "Objetivo completo para o agente, incluindo verificacao"},
-					"priority":             map[string]any{"type": "integer", "minimum": -100, "maximum": 100},
-					"max_attempts":         map[string]any{"type": "integer", "minimum": 1, "maximum": 20},
-					"next_run_at":          map[string]any{"type": "string", "description": "Horario RFC3339 opcional"},
-					"verification_path":    map[string]any{"type": "string", "description": "Arquivo absoluto cujo estado final será verificado"},
-					"verification_sha256":  map[string]any{"type": "string", "description": "SHA-256 exato esperado após a tarefa"},
-					"verification_pattern": map[string]any{"type": "string", "description": "Categoria estável para agrupar resultados verificados"},
-					"status":               map[string]any{"type": "string", "enum": []string{"pending", "running", "succeeded", "failed", "canceled"}},
-					"limit":                map[string]any{"type": "integer", "minimum": 1, "maximum": 200},
-					"additional_attempts":  map[string]any{"type": "integer", "minimum": 1, "maximum": 20},
+					"action":                       map[string]any{"type": "string", "enum": []string{"create", "list", "get", "history", "cancel", "retry", "status"}},
+					"id":                           map[string]any{"type": "string", "description": "ID da tarefa para get, history, cancel ou retry"},
+					"title":                        map[string]any{"type": "string", "description": "Nome curto da tarefa"},
+					"prompt":                       map[string]any{"type": "string", "description": "Objetivo completo para o agente, incluindo verificacao"},
+					"priority":                     map[string]any{"type": "integer", "minimum": -100, "maximum": 100},
+					"max_attempts":                 map[string]any{"type": "integer", "minimum": 1, "maximum": 20},
+					"next_run_at":                  map[string]any{"type": "string", "description": "Horario RFC3339 opcional"},
+					"verification_kind":            map[string]any{"type": "string", "enum": []string{"file_sha256", "http_status", "http_json", "sqlite_scalar"}},
+					"verification_path":            map[string]any{"type": "string", "description": "Arquivo/SQLite absoluto ou URL HTTP(S) a verificar"},
+					"verification_selector":        map[string]any{"type": "string", "description": "Ponteiro JSON RFC 6901 ou SELECT escalar"},
+					"verification_sha256":          map[string]any{"type": "string", "description": "SHA-256 exato esperado após a tarefa"},
+					"verification_expected_json":   map[string]any{"type": "string", "description": "Valor JSON esperado; somente o hash é persistido"},
+					"verification_expected_status": map[string]any{"type": "integer", "minimum": 100, "maximum": 599},
+					"verification_pattern":         map[string]any{"type": "string", "description": "Categoria estável para agrupar resultados verificados"},
+					"status":                       map[string]any{"type": "string", "enum": []string{"pending", "running", "succeeded", "failed", "canceled"}},
+					"limit":                        map[string]any{"type": "integer", "minimum": 1, "maximum": 200},
+					"additional_attempts":          map[string]any{"type": "integer", "minimum": 1, "maximum": 20},
 				},
 				"required": []string{"action"},
 			}
@@ -95,10 +99,13 @@ func RegisterTaskQueueTool(reg *Registry, queue *taskqueue.Queue, evolutionStore
 						break
 					}
 					input.ID = taskqueue.NewTaskID()
+					status, _ := integerArg(args, "verification_expected_status", 0, 599)
 					plan, planErr := evolutionStore.RegisterVerificationPlan(ctx, evolution.VerificationPlanInput{
 						SourceKind: "task", SubjectID: input.ID,
-						PatternKey: args["verification_pattern"].(string), Kind: evolution.FileSHA256Check,
-						Path: args["verification_path"].(string), ExpectedSHA256: args["verification_sha256"].(string),
+						PatternKey: args["verification_pattern"].(string), Kind: stringArg(args, "verification_kind"),
+						Path: args["verification_path"].(string), Selector: stringArg(args, "verification_selector"),
+						ExpectedSHA256: stringArg(args, "verification_sha256"),
+						ExpectedJSON:   stringArg(args, "verification_expected_json"), ExpectedStatus: status,
 					})
 					err = planErr
 					if err != nil {
@@ -166,18 +173,46 @@ func validateTaskQueueArgs(args map[string]any) error {
 			}
 		}
 		if verificationRequested(args) {
-			for _, key := range []string{"verification_path", "verification_sha256", "verification_pattern"} {
+			for _, key := range []string{"verification_path", "verification_pattern"} {
 				if err := requiredStringArg(args, key); err != nil {
 					return err
 				}
 			}
-			path := strings.TrimSpace(args["verification_path"].(string))
-			if !filepath.IsAbs(path) || strings.ContainsRune(path, '\x00') {
-				return errors.New("verification_path deve ser caminho absoluto de arquivo")
+			kind := stringArg(args, "verification_kind")
+			if kind == "" {
+				kind = evolution.FileSHA256Check
 			}
-			digest, err := hex.DecodeString(strings.TrimSpace(args["verification_sha256"].(string)))
-			if err != nil || len(digest) != sha256.Size {
-				return errors.New("verification_sha256 deve ser SHA-256 hexadecimal completo")
+			switch kind {
+			case evolution.FileSHA256Check:
+				if err := requiredStringArg(args, "verification_sha256"); err != nil {
+					return err
+				}
+				path := strings.TrimSpace(args["verification_path"].(string))
+				if !filepath.IsAbs(path) || strings.ContainsRune(path, '\x00') {
+					return errors.New("verification_path deve ser caminho absoluto de arquivo")
+				}
+				digest, err := hex.DecodeString(strings.TrimSpace(args["verification_sha256"].(string)))
+				if err != nil || len(digest) != sha256.Size {
+					return errors.New("verification_sha256 deve ser SHA-256 hexadecimal completo")
+				}
+			case evolution.HTTPStatusCheck, evolution.HTTPJSONCheck:
+				status, err := integerArg(args, "verification_expected_status", 0, 599)
+				if err != nil || status < 100 {
+					return errors.New("verification_expected_status deve estar entre 100 e 599")
+				}
+				if kind == evolution.HTTPJSONCheck {
+					if err := requiredStringArg(args, "verification_expected_json"); err != nil {
+						return err
+					}
+				}
+			case evolution.SQLiteScalarCheck:
+				for _, key := range []string{"verification_selector", "verification_expected_json"} {
+					if err := requiredStringArg(args, key); err != nil {
+						return err
+					}
+				}
+			default:
+				return errors.New("verification_kind desconhecido")
 			}
 		}
 	case "status":
@@ -216,7 +251,7 @@ func validateTaskQueueArgs(args map[string]any) error {
 }
 
 func verificationRequested(args map[string]any) bool {
-	for _, key := range []string{"verification_path", "verification_sha256", "verification_pattern"} {
+	for _, key := range []string{"verification_kind", "verification_path", "verification_selector", "verification_sha256", "verification_expected_json", "verification_expected_status", "verification_pattern"} {
 		if _, exists := args[key]; exists {
 			return true
 		}
