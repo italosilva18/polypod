@@ -65,6 +65,7 @@ type Systems struct {
 	UserPromptHandler  *tool.UserPromptHandler
 	AskQuestionChannel *tool.AskQuestionChannel
 	PromptCommands     *command.PromptRegistry
+	teamRecovery       *teamRecovery
 }
 
 // WireAll creates and connects all subsystems. It returns a fully-wired
@@ -302,6 +303,7 @@ func WireAIClient(sys *Systems, aiClient *ai.Client, logger *slog.Logger) {
 	agentTool := subagent.NewAgentTool(sys.AgentRunner, executor)
 	sys.ToolRegistry.Register(agentTool)
 	registerSwarmTools(sys.ToolRegistry, sys.Swarm, sys.Agents, executor)
+	sys.teamRecovery = &teamRecovery{manager: sys.Swarm, agents: sys.Agents, executor: executor, logger: logger}
 
 	// Re-bridge the skill registry now that all skills (plugins, MCP, git,
 	// vision, voice, dbquery, etc.) have been loaded by main.go. The first

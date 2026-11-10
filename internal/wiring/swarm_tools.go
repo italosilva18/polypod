@@ -394,16 +394,7 @@ func registerSwarmTools(reg *tool.Registry, manager *swarm.SwarmManager, agents 
 				if swarmArg(args, "name") != "" {
 					return swarmError("apply restaura a equipe inteira; omita name"), nil
 				}
-				report, err = manager.ApplyResumeInterrupted(name, func(info swarm.MemberInfo) (swarm.TeammateExecutor, error) {
-					if info.AgentType == "" || !agents.Has(info.AgentType) {
-						return nil, fmt.Errorf("agente %s indisponível", info.AgentType)
-					}
-					ag := agents.Get(info.AgentType)
-					if ag == nil || ag.Name != info.AgentType {
-						return nil, fmt.Errorf("agente %s não corresponde ao tipo salvo", info.AgentType)
-					}
-					return checkpointTeammateExecutor(executor, ag.Name), nil
-				})
+				report, err = manager.ApplyResumeInterrupted(name, resumeExecutorFactory(agents, executor))
 			} else {
 				report, err = manager.ResumeInterrupted(name, swarmArg(args, "name"))
 			}

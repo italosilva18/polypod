@@ -2154,6 +2154,12 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		}()
 		defer sched.Stop()
 	}
+	if headlessPrompt == "" {
+		// All tools, channels, and routine handlers are ready before workers
+		// from an eligible crashed team can receive restored messages.
+		sys.StartTeamRecovery(ctx)
+		defer sys.StopTeamRecovery()
+	}
 
 	// Headless mode
 	if headlessPrompt != "" {

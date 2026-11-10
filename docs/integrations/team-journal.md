@@ -29,6 +29,15 @@ retomada exige inspeção manual; o mesmo run não é retomado duas vezes. A
 criação grava o marcador de posse antes do evento `created`; se essa gravação
 falhar, uma execução anterior também fica bloqueada por precaução.
 
+Na inicialização normal, depois de ligar ferramentas, canais e agendador, o
+Polypod tenta a mesma retomada em segundo plano para até 32 equipes registradas
+como interrompidas e em execução. A tentativa usa os mesmos locks e recusas de
+`team_resume apply=true`; não roda em uma chamada headless. O log informa cada
+equipe restaurada ou recusada e quantas ficaram para inspeção manual por causa
+do limite. O desligamento espera a passagem terminar antes de parar as equipes;
+uma leitura lenta do diário pode atrasar esse desligamento. Uma pergunta feita
+imediatamente por um integrante restaurado pode aguardar a interface CLI abrir.
+
 Processos com UIDs diferentes, como um serviço root e uma CLI de usuário,
 têm diários separados para manter permissões privadas. O envio de mensagens
 e o início dos turnos do protocolo novo falham fechados quando o diário não
