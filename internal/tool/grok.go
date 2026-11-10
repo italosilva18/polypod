@@ -58,7 +58,9 @@ func executeGrok(tc types.ToolContext, args map[string]any) (types.ToolResult, e
 	if parent == nil {
 		parent = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
+	// Repository work often takes longer than a short chat delegation. Keep a
+	// finite ceiling while allowing the parent task or abort signal to cancel.
+	ctx, cancel := context.WithTimeout(parent, time.Hour)
 	defer cancel()
 	if tc.AbortChan != nil {
 		go func() {
@@ -102,7 +104,7 @@ func executeGrok(tc types.ToolContext, args map[string]any) (types.ToolResult, e
 	cmd.Stderr = io.Discard // CLI diagnostics can contain authentication material.
 	err = cmd.Run()
 	if ctx.Err() != nil {
-		return types.ToolResult{IsError: true, Content: "Delegação ao Grok cancelada ou excedeu o limite de 5 minutos."}, nil
+		return types.ToolResult{IsError: true, Content: "Delegação ao Grok cancelada ou excedeu o limite de 1 hora."}, nil
 	}
 	if err != nil {
 		// Do not return raw subprocess errors/output from failed auth flows.

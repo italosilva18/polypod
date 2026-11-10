@@ -28,7 +28,8 @@ Por padrão `--permission-mode dontAsk` nega ações sem permissão preexistente
 adiciona a opção oficial `--always-approve`, permitindo uma tarefa previamente
 autorizada sem prompts locais. A entrada padrão fica fechada; login ou aprovações
 interativas devem ser realizados no CLI oficial. Não há tentativa de login automático.
-Há limite de cinco minutos, cancelamento com a sessão e saída limitada a 64 KiB.
+Há limite de uma hora para tarefas de implementação, cancelamento com a sessão
+e saída limitada a 64 KiB.
 Diagnósticos de erro não são devolvidos ao modelo, para não expor material de login.
 
 Essa integração funciona como delegação, não como substituto do provider principal

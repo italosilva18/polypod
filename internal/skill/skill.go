@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -218,6 +219,71 @@ func (r *Registry) register(s *Skill, trusted bool) error {
 	r.mu.Unlock()
 	if onChange != nil {
 		onChange(s.Name, true)
+	}
+	return nil
+}
+
+// ReplacePluginSkills applies a plugin's complete desired skill set under one
+// registry lock. current contains the exact origins last owned by that plugin.
+// Name and registration-guard conflicts are checked before any change.
+func (r *Registry) ReplacePluginSkills(current map[string]string, desired map[string]*Skill) error {
+	r.mu.Lock()
+	for name, s := range desired {
+		if s == nil || s.Name != name || !strings.HasPrefix(s.Origin, "plugin:") {
+			r.mu.Unlock()
+			return fmt.Errorf("skill de plugin %q invalida", name)
+		}
+		if r.registrationGuard != nil {
+			if err := r.registrationGuard(name); err != nil {
+				r.mu.Unlock()
+				return err
+			}
+		}
+		if existing, ok := r.skills[name]; ok && existing.Origin != s.Origin {
+			ownedOrigin, owned := current[name]
+			if !owned || ownedOrigin != existing.Origin {
+				r.mu.Unlock()
+				return fmt.Errorf("skill %q pertence a outra origem", name)
+			}
+		}
+	}
+	for name, origin := range current {
+		existing, ok := r.skills[name]
+		if !ok || existing.Origin != origin {
+			continue
+		}
+		if wanted, keep := desired[name]; keep && wanted.Origin == origin {
+			continue
+		}
+		if r.registrationGuard != nil {
+			if err := r.registrationGuard(name); err != nil {
+				r.mu.Unlock()
+				return err
+			}
+		}
+	}
+	changed := make(map[string]bool, len(current)+len(desired))
+	for name, origin := range current {
+		if existing, ok := r.skills[name]; ok && existing.Origin == origin {
+			delete(r.skills, name)
+			changed[name] = false
+		}
+	}
+	for name, s := range desired {
+		r.skills[name] = s
+		changed[name] = true
+	}
+	onChange := r.onChange
+	r.mu.Unlock()
+	if onChange != nil {
+		names := make([]string, 0, len(changed))
+		for name := range changed {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			onChange(name, changed[name])
+		}
 	}
 	return nil
 }

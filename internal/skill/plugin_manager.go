@@ -116,7 +116,7 @@ func (pm *PluginManager) fingerprint() [32]byte {
 			continue
 		}
 		for _, entry := range entries {
-			if !entry.IsDir() {
+			if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 				continue
 			}
 			dir := filepath.Join(root, entry.Name())
@@ -162,6 +162,18 @@ func (pm *PluginManager) Reconcile(ctx context.Context) (int, error) {
 	}
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+	return pm.reconcileLocked(ctx)
+}
+
+func (pm *PluginManager) reconcileLocked(ctx context.Context) (int, error) {
+	release, err := pm.lockScanRoots(ctx)
+	if err != nil {
+		return pm.loadedCountLocked(), err
+	}
+	defer release()
+	if err := pm.recoverMissingPluginBackupsLocked(ctx); err != nil {
+		return pm.loadedCountLocked(), err
+	}
 	manifests, scanErr := pm.loader.DiscoverAll()
 	pm.adoptExistingLocked(manifests)
 	seen := make(map[string]struct{}, len(manifests))
@@ -197,6 +209,11 @@ func (pm *PluginManager) List(ctx context.Context) ([]PluginInfo, error) {
 	}
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+	release, err := pm.lockScanRoots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	manifests, err := pm.loader.DiscoverAll()
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
@@ -218,14 +235,24 @@ func (pm *PluginManager) SetEnabled(ctx context.Context, id string, enabled bool
 	}
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+	release, err := pm.lockScanRoots(ctx)
+	if err != nil {
+		return PluginInfo{}, err
+	}
+	defer release()
 	manifest, err := pm.findLocked(ctx, id)
 	if err != nil {
 		return PluginInfo{}, err
 	}
 	pm.adoptExistingLocked([]PluginManifest{manifest})
 	if manifest.Enabled != enabled {
-		if err := writePluginEnabled(filepath.Join(manifest.dir, "plugin.json"), enabled); err != nil {
-			return pm.infoLocked(manifest), err
+		if writeErr := writePluginEnabled(filepath.Join(manifest.dir, "plugin.json"), enabled); writeErr != nil {
+			refreshed, readErr := pm.findLocked(context.WithoutCancel(ctx), id)
+			if readErr == nil && refreshed.Enabled == enabled {
+				reconcileErr := pm.reconcileOneLocked(refreshed)
+				return pm.infoLocked(refreshed), errors.Join(writeErr, reconcileErr)
+			}
+			return pm.infoLocked(manifest), errors.Join(writeErr, readErr)
 		}
 		manifest.Enabled = enabled
 	}
@@ -244,6 +271,11 @@ func (pm *PluginManager) Reload(ctx context.Context, id string) (int, error) {
 	}
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+	release, err := pm.lockScanRoots(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 	manifest, err := pm.findLocked(ctx, id)
 	if err != nil {
 		return 0, err
@@ -290,63 +322,28 @@ func (pm *PluginManager) reconcileOneLocked(manifest PluginManifest) error {
 		}
 		desired[s.Name] = s
 	}
-	// Check every origin before changing any entry. A plugin can update its own
-	// file, but cannot replace a builtin, an MCP skill, or another plugin.
-	for name, s := range desired {
-		if existing, ok := pm.reg.Get(name); ok && existing.Origin != s.Origin {
-			return fmt.Errorf("skill %q pertence a outra origem", name)
-		}
-	}
 	current := pm.loaded[manifest.dir]
-	if current == nil {
-		current = make(map[string]string)
-		pm.loaded[manifest.dir] = current
+	if err := pm.reg.ReplacePluginSkills(current, desired); err != nil {
+		return err
 	}
-	names := make([]string, 0, len(desired))
-	for name := range desired {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	var errs []error
-	for _, name := range names {
-		if err := pm.reg.TryRegister(desired[name]); err != nil {
-			errs = append(errs, fmt.Errorf("registrando skill %q: %w", name, err))
-			continue
-		}
-		current[name] = desired[name].Origin
-	}
-	if len(errs) > 0 {
-		return errors.Join(errs...)
-	}
-	for name, origin := range current {
-		if _, stillDeclared := desired[name]; stillDeclared {
-			continue
-		}
-		if err := pm.removeOwnedSkillLocked(name, origin); err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		delete(current, name)
-	}
-	if len(current) == 0 {
+	if len(desired) == 0 {
 		delete(pm.loaded, manifest.dir)
+		return nil
 	}
-	return errors.Join(errs...)
+	updated := make(map[string]string, len(desired))
+	for name, s := range desired {
+		updated[name] = s.Origin
+	}
+	pm.loaded[manifest.dir] = updated
+	return nil
 }
 
 func (pm *PluginManager) unloadLocked(dir string) error {
-	var errs []error
-	for name, origin := range pm.loaded[dir] {
-		if err := pm.removeOwnedSkillLocked(name, origin); err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		delete(pm.loaded[dir], name)
+	if err := pm.reg.ReplacePluginSkills(pm.loaded[dir], nil); err != nil {
+		return err
 	}
-	if len(pm.loaded[dir]) == 0 {
-		delete(pm.loaded, dir)
-	}
-	return errors.Join(errs...)
+	delete(pm.loaded, dir)
+	return nil
 }
 
 func (pm *PluginManager) removeOwnedSkillLocked(name, origin string) error {
@@ -432,7 +429,7 @@ func writePluginEnabled(path string, enabled bool) error {
 		return err
 	}
 	updated = append(updated, '\n')
-	info, err := os.Stat(path)
+	gid, err := pluginSharedGID()
 	if err != nil {
 		return err
 	}
@@ -442,7 +439,7 @@ func writePluginEnabled(path string, enabled bool) error {
 	}
 	tmp := f.Name()
 	defer os.Remove(tmp)
-	if err := f.Chmod(info.Mode().Perm()); err != nil {
+	if err := setPluginFileAccess(f, 0o660, gid); err != nil {
 		f.Close()
 		return err
 	}
@@ -460,9 +457,14 @@ func writePluginEnabled(path string, enabled bool) error {
 	if err := os.Rename(tmp, path); err != nil {
 		return err
 	}
-	if dir, err := os.Open(filepath.Dir(path)); err == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("manifesto salvo, mas nao foi possivel abrir diretorio para sync: %w", err)
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	if syncErr != nil || closeErr != nil {
+		return fmt.Errorf("manifesto salvo, mas sincronizacao falhou: %w", errors.Join(syncErr, closeErr))
 	}
 	return nil
 }

@@ -26,13 +26,13 @@ type Commit struct {
 }
 
 // GetCurrentBranch returns the name of the current git branch.
-func GetCurrentBranch() (string, error) {
-	return runGit("rev-parse", "--abbrev-ref", "HEAD")
+func GetCurrentBranch(dir ...string) (string, error) {
+	return runGitFor(dir, "rev-parse", "--abbrev-ref", "HEAD")
 }
 
 // GetStatus returns parsed git status output for all files.
-func GetStatus() ([]FileStatus, error) {
-	out, err := runGit("status", "--porcelain", "-uall")
+func GetStatus(dir ...string) ([]FileStatus, error) {
+	out, err := runGitFor(dir, "status", "--porcelain", "-uall")
 	if err != nil {
 		return nil, err
 	}
@@ -90,23 +90,23 @@ func GetStatus() ([]FileStatus, error) {
 }
 
 // GetDiff returns the diff output. If staged is true, returns only staged changes.
-func GetDiff(staged bool) (string, error) {
+func GetDiff(staged bool, dir ...string) (string, error) {
 	if staged {
-		return runGit("diff", "--cached")
+		return runGitFor(dir, "diff", "--cached")
 	}
-	return runGit("diff")
+	return runGitFor(dir, "diff")
 }
 
 // GetDiffStat returns a short stat summary of the diff.
-func GetDiffStat(staged bool) (string, error) {
+func GetDiffStat(staged bool, dir ...string) (string, error) {
 	if staged {
-		return runGit("diff", "--cached", "--stat")
+		return runGitFor(dir, "diff", "--cached", "--stat")
 	}
-	return runGit("diff", "--stat")
+	return runGitFor(dir, "diff", "--stat")
 }
 
 // GetRecentCommits returns the n most recent commits with structured data.
-func GetRecentCommits(n int) ([]Commit, error) {
+func GetRecentCommits(n int, dir ...string) ([]Commit, error) {
 	if n <= 0 {
 		n = 10
 	}
@@ -114,7 +114,7 @@ func GetRecentCommits(n int) ([]Commit, error) {
 	// Use a unique separator to parse fields reliably
 	const sep = "<<|>>"
 	format := fmt.Sprintf("%%H%s%%s%s%%an%s%%aI", sep, sep, sep)
-	out, err := runGit("log", fmt.Sprintf("-%d", n), fmt.Sprintf("--format=%s", format))
+	out, err := runGitFor(dir, "log", fmt.Sprintf("-%d", n), fmt.Sprintf("--format=%s", format))
 	if err != nil {
 		return nil, err
 	}
@@ -175,28 +175,28 @@ func GetRemoteURL() (string, error) {
 }
 
 // StageFiles adds the specified file paths to the git staging area.
-func StageFiles(paths []string) error {
+func StageFiles(paths []string, dir ...string) error {
 	if len(paths) == 0 {
 		return fmt.Errorf("no files specified to stage")
 	}
 	args := append([]string{"add", "--"}, paths...)
-	_, err := runGit(args...)
+	_, err := runGitFor(dir, args...)
 	return err
 }
 
 // StageAll stages all changes (tracked and untracked).
-func StageAll() error {
-	_, err := runGit("add", "-A")
+func StageAll(dir ...string) error {
+	_, err := runGitFor(dir, "add", "-A")
 	return err
 }
 
 // CreateCommit creates a new commit with the given message.
 // Files must be staged before calling this.
-func CreateCommit(message string) error {
+func CreateCommit(message string, dir ...string) error {
 	if strings.TrimSpace(message) == "" {
 		return fmt.Errorf("commit message cannot be empty")
 	}
-	_, err := runGit("commit", "-m", message)
+	_, err := runGitFor(dir, "commit", "-m", message)
 	return err
 }
 
@@ -211,8 +211,8 @@ func HasUncommittedChanges() bool {
 }
 
 // HasStagedChanges returns true if there are staged changes ready to commit.
-func HasStagedChanges() bool {
-	_, err := runGit("diff", "--cached", "--quiet")
+func HasStagedChanges(dir ...string) bool {
+	_, err := runGitFor(dir, "diff", "--cached", "--quiet")
 	return err != nil // non-zero exit = there are staged changes
 }
 
@@ -237,12 +237,12 @@ func GetBranches() ([]string, error) {
 }
 
 // GetFilesDiff returns the list of files changed between HEAD and working tree.
-func GetFilesDiff(staged bool) ([]string, error) {
+func GetFilesDiff(staged bool, dir ...string) ([]string, error) {
 	args := []string{"diff", "--name-only"}
 	if staged {
 		args = append(args, "--cached")
 	}
-	out, err := runGit(args...)
+	out, err := runGitFor(dir, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -398,4 +398,13 @@ func runGitAt(dir string, args ...string) (string, error) {
 		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
 	return result, nil
+}
+
+// runGitFor preserves the process-cwd behavior for legacy callers while
+// allowing a conversation to target its own Git worktree explicitly.
+func runGitFor(dir []string, args ...string) (string, error) {
+	if len(dir) > 0 && dir[0] != "" {
+		return runGitAt(dir[0], args...)
+	}
+	return runGit(args...)
 }

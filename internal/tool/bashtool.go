@@ -223,7 +223,7 @@ func RegisterBashTool(reg *Registry, workingDir string) {
 						"category", cat.String(),
 					)
 
-					output, exitCode, err := sbx.Execute(ctx.Context, cmd)
+					output, exitCode, err := sbx.ExecuteAt(ctx.Context, cmd, wd)
 					if err != nil {
 						return types.ToolResult{
 							Content: fmt.Sprintf("Sandbox error: %v", err),

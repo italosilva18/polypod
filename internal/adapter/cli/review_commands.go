@@ -1,10 +1,13 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	pgit "github.com/costa/polypod/internal/git"
 )
@@ -24,13 +27,14 @@ import (
 //	/review main..feature    → branch-to-branch diff
 //	/review path/to/file.go  → diff for a single file (working tree)
 func handleReview(parts []string, deps commandDeps) commandResult {
+	dir := commandWorkingDir(deps)
 	if deps.generateText == nil {
 		return commandResult{
 			output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render("servico AI nao disponivel"),
 			handled: true,
 		}
 	}
-	if !pgit.IsInsideRepo() {
+	if !pgit.IsInsideRepoAt(dir) {
 		return commandResult{
 			output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render("nao esta em um repositorio git"),
 			handled: true,
@@ -42,7 +46,7 @@ func handleReview(parts []string, deps commandDeps) commandResult {
 		target = strings.Join(parts[1:], " ")
 	}
 
-	diff, label, files, err := resolveReviewTarget(target)
+	diff, label, files, err := resolveReviewTarget(target, dir)
 	if err != nil {
 		return commandResult{
 			output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()),
@@ -83,57 +87,61 @@ func handleReview(parts []string, deps commandDeps) commandResult {
 
 // resolveReviewTarget interprets the user-provided target argument and
 // returns (diff, human-readable label, file count, error).
-func resolveReviewTarget(target string) (string, string, int, error) {
+func resolveReviewTarget(target, dir string) (string, string, int, error) {
 	target = strings.TrimSpace(target)
 
 	switch {
 	case target == "":
-		diff, err := pgit.GetDiff(false)
+		diff, err := pgit.GetDiff(false, dir)
 		if err != nil {
 			return "", "", 0, err
 		}
-		files, _ := pgit.GetFilesDiff(false)
+		files, _ := pgit.GetFilesDiff(false, dir)
 		return diff, "working tree (unstaged)", len(files), nil
 
 	case target == "--staged" || target == "--cached":
-		diff, err := pgit.GetDiff(true)
+		diff, err := pgit.GetDiff(true, dir)
 		if err != nil {
 			return "", "", 0, err
 		}
-		files, _ := pgit.GetFilesDiff(true)
+		files, _ := pgit.GetFilesDiff(true, dir)
 		return diff, "staged", len(files), nil
 
 	case target == "--pr":
-		base, err := detectDefaultBranch()
+		base, err := detectDefaultBranch(dir)
 		if err != nil {
 			return "", "", 0, err
 		}
-		head, err := pgit.GetCurrentBranch()
+		head, err := pgit.GetCurrentBranch(dir)
 		if err != nil {
 			return "", "", 0, err
 		}
 		rng := base + "..." + head
-		diff, err := runGitCapture("diff", rng)
+		diff, err := runGitCapture(dir, "diff", rng)
 		if err != nil {
 			return "", "", 0, err
 		}
-		files := countGitFiles("diff", "--name-only", rng)
+		files := countGitFiles(dir, "diff", "--name-only", rng)
 		return diff, fmt.Sprintf("PR: %s", rng), files, nil
 	}
 
 	// Range syntax (a..b or a...b)
 	if strings.Contains(target, "..") {
-		diff, err := runGitCapture("diff", target)
+		diff, err := runGitCapture(dir, "diff", target)
 		if err != nil {
 			return "", "", 0, err
 		}
-		files := countGitFiles("diff", "--name-only", target)
+		files := countGitFiles(dir, "diff", "--name-only", target)
 		return diff, target, files, nil
 	}
 
 	// File path
-	if _, err := os.Stat(target); err == nil {
-		diff, derr := runGitCapture("diff", "--", target)
+	filePath := target
+	if !filepath.IsAbs(filePath) {
+		filePath = filepath.Join(dir, filePath)
+	}
+	if _, err := os.Stat(filePath); err == nil {
+		diff, derr := runGitCapture(dir, "diff", "--", target)
 		if derr != nil {
 			return "", "", 0, derr
 		}
@@ -141,7 +149,7 @@ func resolveReviewTarget(target string) (string, string, int, error) {
 	}
 
 	// Treat as an arbitrary git ref/file the user knows about.
-	diff, derr := runGitCapture("diff", "--", target)
+	diff, derr := runGitCapture(dir, "diff", "--", target)
 	if derr != nil {
 		return "", "", 0, fmt.Errorf("alvo nao reconhecido: %s", target)
 	}
@@ -199,7 +207,7 @@ func handleSecurityReview(parts []string, deps commandDeps) commandResult {
 		target = strings.Join(parts[1:], " ")
 	}
 
-	source, label, fileCount, err := resolveSecurityTarget(target)
+	source, label, fileCount, err := resolveSecurityTarget(target, commandWorkingDir(deps))
 	if err != nil {
 		return commandResult{
 			output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()),
@@ -239,34 +247,34 @@ func handleSecurityReview(parts []string, deps commandDeps) commandResult {
 // based on the target argument. The content can be either a unified diff
 // (for change-based scopes) or concatenated file bodies (for --full and
 // single-file targets).
-func resolveSecurityTarget(target string) (string, string, int, error) {
+func resolveSecurityTarget(target, dir string) (string, string, int, error) {
 	target = strings.TrimSpace(target)
 
 	switch {
 	case target == "":
-		if !pgit.IsInsideRepo() {
+		if !pgit.IsInsideRepoAt(dir) {
 			return "", "", 0, fmt.Errorf("nao esta em um repositorio git (use /security-review <file> ou --full)")
 		}
-		diff, err := pgit.GetDiff(false)
+		diff, err := pgit.GetDiff(false, dir)
 		if err != nil {
 			return "", "", 0, err
 		}
-		files, _ := pgit.GetFilesDiff(false)
+		files, _ := pgit.GetFilesDiff(false, dir)
 		return diff, "working tree (unstaged)", len(files), nil
 
 	case target == "--staged" || target == "--cached":
-		if !pgit.IsInsideRepo() {
+		if !pgit.IsInsideRepoAt(dir) {
 			return "", "", 0, fmt.Errorf("nao esta em um repositorio git")
 		}
-		diff, err := pgit.GetDiff(true)
+		diff, err := pgit.GetDiff(true, dir)
 		if err != nil {
 			return "", "", 0, err
 		}
-		files, _ := pgit.GetFilesDiff(true)
+		files, _ := pgit.GetFilesDiff(true, dir)
 		return diff, "staged", len(files), nil
 
 	case target == "--full":
-		body, count, err := collectRepoSources()
+		body, count, err := collectRepoSources(dir)
 		if err != nil {
 			return "", "", 0, err
 		}
@@ -274,8 +282,12 @@ func resolveSecurityTarget(target string) (string, string, int, error) {
 	}
 
 	// Single file target.
-	if info, err := os.Stat(target); err == nil && !info.IsDir() {
-		data, rerr := os.ReadFile(target)
+	filePath := target
+	if !filepath.IsAbs(filePath) {
+		filePath = filepath.Join(dir, filePath)
+	}
+	if info, err := os.Stat(filePath); err == nil && !info.IsDir() {
+		data, rerr := os.ReadFile(filePath)
 		if rerr != nil {
 			return "", "", 0, rerr
 		}
@@ -404,22 +416,27 @@ func countDiffLines(diff string) (added, removed int) {
 	return
 }
 
-// runGitCapture is a thin wrapper for invoking git via the shell helper
-// already used by other commands. It mirrors how /diff invokes git when
-// the internal git package does not expose the exact subcommand needed.
-func runGitCapture(args ...string) (string, error) {
-	cmd := "git " + strings.Join(args, " ")
-	out, err := runShellCmd(cmd)
-	if err != nil && out == "" {
-		return "", err
+// runGitCapture invokes Git with separate arguments so a file or ref never
+// becomes shell syntax, and keeps it in the active conversation worktree.
+func runGitCapture(dir string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), ctx.Err())
 	}
-	return out, nil
+	if err != nil {
+		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // countGitFiles runs `git <args...>` and returns the number of non-empty
 // lines in its output. Returns 0 on error.
-func countGitFiles(args ...string) int {
-	out, err := runGitCapture(args...)
+func countGitFiles(dir string, args ...string) int {
+	out, err := runGitCapture(dir, args...)
 	if err != nil {
 		return 0
 	}
@@ -435,9 +452,9 @@ func countGitFiles(args ...string) int {
 // detectDefaultBranch tries a few heuristics to find the repository's
 // default branch (the base for /review --pr). Falls back to "main" if it
 // cannot determine one with confidence.
-func detectDefaultBranch() (string, error) {
+func detectDefaultBranch(dir string) (string, error) {
 	// Most reliable: ask the origin remote.
-	if out, err := runGitCapture("symbolic-ref", "refs/remotes/origin/HEAD"); err == nil && out != "" {
+	if out, err := runGitCapture(dir, "symbolic-ref", "refs/remotes/origin/HEAD"); err == nil && out != "" {
 		// "refs/remotes/origin/main" → "origin/main"
 		out = strings.TrimSpace(out)
 		out = strings.TrimPrefix(out, "refs/remotes/")
@@ -445,7 +462,7 @@ func detectDefaultBranch() (string, error) {
 	}
 	// Fallbacks: common defaults.
 	for _, candidate := range []string{"origin/main", "origin/master", "main", "master"} {
-		if _, err := runGitCapture("rev-parse", "--verify", candidate); err == nil {
+		if _, err := runGitCapture(dir, "rev-parse", "--verify", candidate); err == nil {
 			return candidate, nil
 		}
 	}
@@ -455,11 +472,7 @@ func detectDefaultBranch() (string, error) {
 // collectRepoSources walks the working directory and concatenates source
 // files for the /security-review --full target. It skips binaries,
 // vendored code, build outputs and large files.
-func collectRepoSources() (string, int, error) {
-	wd, err := os.Getwd()
-	if err != nil {
-		return "", 0, err
-	}
+func collectRepoSources(wd string) (string, int, error) {
 
 	skipDirs := map[string]bool{
 		".git": true, "node_modules": true, "vendor": true,
@@ -481,7 +494,7 @@ func collectRepoSources() (string, int, error) {
 	const maxFileBytes = 64 * 1024
 	const maxTotalBytes = 600 * 1024
 
-	err = filepath.Walk(wd, func(p string, info os.FileInfo, werr error) error {
+	err := filepath.Walk(wd, func(p string, info os.FileInfo, werr error) error {
 		if werr != nil {
 			return nil
 		}

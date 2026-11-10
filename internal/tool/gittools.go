@@ -33,14 +33,15 @@ func newGitStatusTool(wd string) types.ToolDef {
 		IsReadOnlyFn:    func(map[string]any) bool { return true },
 		IsConcurrencyFn: func(map[string]any) bool { return true },
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
-			if !git.IsInsideRepo() {
+			dir := effectiveWorkingDir(ctx, wd)
+			if !git.IsInsideRepoAt(dir) {
 				return types.ToolResult{
 					Content: "Not inside a git repository.",
 					IsError: true,
 				}, nil
 			}
 
-			statuses, err := git.GetStatus()
+			statuses, err := git.GetStatus(dir)
 			if err != nil {
 				return types.ToolResult{
 					Content: fmt.Sprintf("Error getting git status: %v", err),
@@ -51,7 +52,7 @@ func newGitStatusTool(wd string) types.ToolDef {
 			var sb strings.Builder
 
 			// Header with branch info
-			branch, err := git.GetCurrentBranch()
+			branch, err := git.GetCurrentBranch(dir)
 			if err == nil {
 				sb.WriteString(fmt.Sprintf("Branch: %s\n\n", branch))
 			}
@@ -102,7 +103,8 @@ func newGitDiffTool(wd string) types.ToolDef {
 		IsReadOnlyFn:    func(map[string]any) bool { return true },
 		IsConcurrencyFn: func(map[string]any) bool { return true },
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
-			if !git.IsInsideRepo() {
+			dir := effectiveWorkingDir(ctx, wd)
+			if !git.IsInsideRepoAt(dir) {
 				return types.ToolResult{
 					Content: "Not inside a git repository.",
 					IsError: true,
@@ -116,7 +118,7 @@ func newGitDiffTool(wd string) types.ToolDef {
 				staged = true
 			}
 
-			diff, err := git.GetDiff(staged)
+			diff, err := git.GetDiff(staged, dir)
 			if err != nil {
 				return types.ToolResult{
 					Content: fmt.Sprintf("Error getting diff: %v", err),
@@ -135,7 +137,7 @@ func newGitDiffTool(wd string) types.ToolDef {
 			}
 
 			// Add stat header
-			stat, _ := git.GetDiffStat(staged)
+			stat, _ := git.GetDiffStat(staged, dir)
 			var sb strings.Builder
 			if stat != "" {
 				sb.WriteString(stat)
@@ -172,7 +174,8 @@ func newGitLogTool(wd string) types.ToolDef {
 		IsReadOnlyFn:    func(map[string]any) bool { return true },
 		IsConcurrencyFn: func(map[string]any) bool { return true },
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
-			if !git.IsInsideRepo() {
+			dir := effectiveWorkingDir(ctx, wd)
+			if !git.IsInsideRepoAt(dir) {
 				return types.ToolResult{
 					Content: "Not inside a git repository.",
 					IsError: true,
@@ -191,7 +194,7 @@ func newGitLogTool(wd string) types.ToolDef {
 				n = 50
 			}
 
-			commits, err := git.GetRecentCommits(n)
+			commits, err := git.GetRecentCommits(n, dir)
 			if err != nil {
 				return types.ToolResult{
 					Content: fmt.Sprintf("Error getting commits: %v", err),
@@ -247,7 +250,8 @@ func newGitCommitTool(wd string) types.ToolDef {
 			}
 		},
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
-			if !git.IsInsideRepo() {
+			dir := effectiveWorkingDir(ctx, wd)
+			if !git.IsInsideRepoAt(dir) {
 				return types.ToolResult{
 					Content: "Not inside a git repository.",
 					IsError: true,
@@ -263,14 +267,14 @@ func newGitCommitTool(wd string) types.ToolDef {
 				for i := range paths {
 					paths[i] = strings.TrimSpace(paths[i])
 				}
-				if err := git.StageFiles(paths); err != nil {
+				if err := git.StageFiles(paths, dir); err != nil {
 					return types.ToolResult{
 						Content: fmt.Sprintf("Error staging files: %v", err),
 						IsError: true,
 					}, nil
 				}
 			} else {
-				if err := git.StageAll(); err != nil {
+				if err := git.StageAll(dir); err != nil {
 					return types.ToolResult{
 						Content: fmt.Sprintf("Error staging all files: %v", err),
 						IsError: true,
@@ -279,7 +283,7 @@ func newGitCommitTool(wd string) types.ToolDef {
 			}
 
 			// Verify there are staged changes
-			if !git.HasStagedChanges() {
+			if !git.HasStagedChanges(dir) {
 				return types.ToolResult{
 					Content: "Nothing to commit. No staged changes after staging.",
 					IsError: true,
@@ -287,7 +291,7 @@ func newGitCommitTool(wd string) types.ToolDef {
 			}
 
 			// Create commit
-			if err := git.CreateCommit(message); err != nil {
+			if err := git.CreateCommit(message, dir); err != nil {
 				return types.ToolResult{
 					Content: fmt.Sprintf("Error creating commit: %v", err),
 					IsError: true,
@@ -299,7 +303,7 @@ func newGitCommitTool(wd string) types.ToolDef {
 			sb.WriteString(fmt.Sprintf("Committed: %s\n", message))
 
 			// Show the new commit hash
-			commits, err := git.GetRecentCommits(1)
+			commits, err := git.GetRecentCommits(1, dir)
 			if err == nil && len(commits) > 0 {
 				sb.WriteString(fmt.Sprintf("Hash: %s\n", commits[0].Hash[:7]))
 			}
@@ -330,9 +334,10 @@ func newProjectInfoTool(wd string) types.ToolDef {
 		IsReadOnlyFn:    func(map[string]any) bool { return true },
 		IsConcurrencyFn: func(map[string]any) bool { return true },
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
-			path := wd
+			dir := effectiveWorkingDir(ctx, wd)
+			path := dir
 			if p, ok := args["path"].(string); ok && p != "" {
-				path = resolvePath(wd, p)
+				path = resolvePath(dir, p)
 			}
 
 			idx, err := codemap.IndexProject(path)

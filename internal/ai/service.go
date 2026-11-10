@@ -56,6 +56,13 @@ type Service struct {
 // SetWorkdirStore enables conversation-scoped working directories for tools.
 func (s *Service) SetWorkdirStore(store *workdir.Store) { s.workdirs = store }
 
+// WorkingDir resolves the same conversation scope used by model tools. Local
+// CLI commands can use it without changing the process-wide working directory.
+func (s *Service) WorkingDir(channel, userID, sessionID, fallback string) string {
+	ctx := workdir.WithScope(context.Background(), s.workdirs, channel, userID, sessionID)
+	return workdir.Dir(ctx, fallback)
+}
+
 // SetActivityCallback registers a lightweight hook invoked whenever a user or
 // routine starts an AI turn. The dreaming service uses it to avoid learning
 // from a conversation while that conversation is still active.

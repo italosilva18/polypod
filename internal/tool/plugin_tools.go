@@ -71,6 +71,69 @@ func RegisterPluginTools(reg *Registry, manager *skill.PluginManager) {
 		},
 	})
 	reg.RegisterDef(types.ToolDef{
+		NameFn:          func() string { return "install_local_plugin" },
+		IsDestructiveFn: func(map[string]any) bool { return true },
+		DescriptionFn: func() string {
+			return "Instala um plugin de um diretorio local ou URL Git HTTPS/SSH explicita, valida o manifesto e as skills e ativa no processo atual."
+		},
+		InputSchemaFn: func() map[string]any {
+			return map[string]any{"type": "object", "properties": map[string]any{
+				"source": map[string]any{"type": "string", "description": "Diretorio local ou URL Git HTTPS/SSH sem credenciais embutidas"},
+			}, "required": []string{"source"}}
+		},
+		ValidateFn: func(args map[string]any) types.ValidationResult {
+			if source, ok := args["source"].(string); !ok || strings.TrimSpace(source) == "" {
+				return types.ValidationResult{Message: "source deve ser um diretorio ou URL Git"}
+			}
+			return types.ValidationResult{Valid: true}
+		},
+		ExecuteFn: func(tc types.ToolContext, args map[string]any) (types.ToolResult, error) {
+			if manager == nil {
+				return pluginToolError("Gerenciador de plugins indisponível"), nil
+			}
+			source, _ := args["source"].(string)
+			info, err := manager.Install(pluginToolContext(tc), source)
+			if err != nil {
+				return pluginToolError(fmt.Sprintf("Instalação do plugin falhou: %v", err)), nil
+			}
+			return pluginToolJSON(info), nil
+		},
+	})
+	reg.RegisterDef(types.ToolDef{
+		NameFn:          func() string { return "update_local_plugin" },
+		IsDestructiveFn: func(map[string]any) bool { return true },
+		DescriptionFn: func() string {
+			return "Atualiza um plugin pelo ID de list_local_plugins usando diretorio local ou URL Git HTTPS/SSH explicita."
+		},
+		InputSchemaFn: func() map[string]any {
+			return map[string]any{"type": "object", "properties": map[string]any{
+				"id":     map[string]any{"type": "string", "description": "ID retornado por list_local_plugins"},
+				"source": map[string]any{"type": "string", "description": "Diretorio local ou URL Git HTTPS/SSH sem credenciais embutidas"},
+			}, "required": []string{"id", "source"}}
+		},
+		ValidateFn: func(args map[string]any) types.ValidationResult {
+			if id, ok := args["id"].(string); !ok || strings.TrimSpace(id) == "" {
+				return types.ValidationResult{Message: "id do plugin é obrigatório"}
+			}
+			if source, ok := args["source"].(string); !ok || strings.TrimSpace(source) == "" {
+				return types.ValidationResult{Message: "source deve ser um diretorio ou URL Git"}
+			}
+			return types.ValidationResult{Valid: true}
+		},
+		ExecuteFn: func(tc types.ToolContext, args map[string]any) (types.ToolResult, error) {
+			if manager == nil {
+				return pluginToolError("Gerenciador de plugins indisponível"), nil
+			}
+			id, _ := args["id"].(string)
+			source, _ := args["source"].(string)
+			info, err := manager.Update(pluginToolContext(tc), id, source)
+			if err != nil {
+				return pluginToolError(fmt.Sprintf("Atualização do plugin falhou: %v", err)), nil
+			}
+			return pluginToolJSON(info), nil
+		},
+	})
+	reg.RegisterDef(types.ToolDef{
 		NameFn: func() string { return "reload_local_plugins" },
 		DescriptionFn: func() string {
 			return "Recarrega um plugin local pelo ID ou reconcilia todos, incluindo plugins adicionados e removidos."

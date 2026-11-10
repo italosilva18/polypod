@@ -64,7 +64,7 @@ func processCommand(input string, deps commandDeps, messages []chatEntry) comman
 		if cmd == "" {
 			return commandResult{output: cmdLabelStyle.Render("uso: ") + cmdValueStyle.Render("!<comando>"), handled: true}
 		}
-		return handleRun(cmd)
+		return handleRun(cmd, deps)
 	}
 
 	if !strings.HasPrefix(input, "/") {
@@ -136,30 +136,30 @@ func processCommand(input string, deps commandDeps, messages []chatEntry) comman
 			return commandResult{output: cmdLabelStyle.Render("uso: ") + cmdValueStyle.Render("/run <comando>"), handled: true}
 		}
 		shellCmd := strings.TrimSpace(strings.TrimPrefix(input, parts[0]))
-		return handleRun(shellCmd)
+		return handleRun(shellCmd, deps)
 
 	case "/file":
 		if len(parts) < 2 {
 			return commandResult{output: cmdLabelStyle.Render("uso: ") + cmdValueStyle.Render("/file <caminho>"), handled: true}
 		}
-		return handleFile(parts[1])
+		return handleFile(parts[1], deps)
 
 	case "/search":
 		if len(parts) < 2 {
 			return commandResult{output: cmdLabelStyle.Render("uso: ") + cmdValueStyle.Render("/search <pattern>"), handled: true}
 		}
 		pattern := strings.Join(parts[1:], " ")
-		return handleSearch(pattern)
+		return handleSearch(pattern, deps)
 
 	case "/git":
 		sub := ""
 		if len(parts) >= 2 {
 			sub = strings.ToLower(parts[1])
 		}
-		return handleGit(sub)
+		return handleGit(sub, deps)
 
 	case "/project":
-		return handleProject()
+		return handleProject(deps)
 
 	case "/export":
 		path := "chat_export.md"
@@ -181,7 +181,7 @@ func processCommand(input string, deps commandDeps, messages []chatEntry) comman
 		return handleSuggestions(deps)
 
 	case "/init":
-		return handleInit(parts)
+		return handleInit(parts, deps)
 
 	case "/commit":
 		// Preserve the rest of the original input (with original case) as the message
@@ -192,7 +192,13 @@ func processCommand(input string, deps commandDeps, messages []chatEntry) comman
 		return handleCommit(deps, userMsg)
 
 	case "/diff":
-		return handleDiff(parts)
+		return handleDiff(parts, deps)
+
+	case "/review":
+		return handleReview(parts, deps)
+
+	case "/security-review":
+		return handleSecurityReview(parts, deps)
 
 	case "/compact":
 		return handleCompact(deps, messages)
@@ -251,11 +257,7 @@ func processCommand(input string, deps commandDeps, messages []chatEntry) comman
 		if deps.commandRegistry != nil {
 			name := strings.TrimPrefix(cmd, "/")
 			if registered, ok := deps.commandRegistry.Get(name); ok {
-				workingDir, err := os.Getwd()
-				if err != nil {
-					workingDir = "."
-				}
-				ctx := command.CommandContext{WorkingDir: workingDir}
+				ctx := command.CommandContext{WorkingDir: commandWorkingDir(deps)}
 				args := parts[1:]
 				switch registered.Type {
 				case command.CommandPrompt:
@@ -661,13 +663,13 @@ func handleCopy(messages []chatEntry) commandResult {
 	return commandResult{output: cmdLabelStyle.Render("nenhuma resposta pra copiar"), handled: true}
 }
 
-func handleRun(command string) commandResult {
+func handleRun(command string, deps commandDeps) commandResult {
 	var b strings.Builder
 	b.WriteString(cmdLabelStyle.Render("$ "))
 	b.WriteString(cmdValueStyle.Render(command))
 	b.WriteString("\n\n")
 
-	output, err := runShellCmd(command)
+	output, err := runShellCmd(command, commandWorkingDir(deps))
 	if err != nil {
 		b.WriteString(errorStyle.Render("erro: "))
 		b.WriteString(cmdLabelStyle.Render(err.Error()))
@@ -684,11 +686,10 @@ func handleRun(command string) commandResult {
 	return commandResult{output: b.String(), handled: true}
 }
 
-func handleFile(path string) commandResult {
+func handleFile(path string, deps commandDeps) commandResult {
 	// Resolve relative paths
 	if !filepath.IsAbs(path) {
-		wd, _ := os.Getwd()
-		path = filepath.Join(wd, path)
+		path = filepath.Join(commandWorkingDir(deps), path)
 	}
 
 	info, err := os.Stat(path)
@@ -742,8 +743,8 @@ func handleFile(path string) commandResult {
 	return commandResult{output: b.String(), handled: true}
 }
 
-func handleSearch(pattern string) commandResult {
-	output, err := runShellCmd(fmt.Sprintf("grep -rn --include='*' --max-count=30 %q .", pattern))
+func handleSearch(pattern string, deps commandDeps) commandResult {
+	output, err := runShellCmd(fmt.Sprintf("grep -rn --include='*' --max-count=30 %q .", pattern), commandWorkingDir(deps))
 	if err != nil {
 		if output == "" {
 			return commandResult{
@@ -788,7 +789,7 @@ func handleSearch(pattern string) commandResult {
 	return commandResult{output: b.String(), handled: true}
 }
 
-func handleGit(sub string) commandResult {
+func handleGit(sub string, deps commandDeps) commandResult {
 	var shellCmd string
 
 	switch sub {
@@ -807,7 +808,7 @@ func handleGit(sub string) commandResult {
 		}
 	}
 
-	output, err := runShellCmd(shellCmd)
+	output, err := runShellCmd(shellCmd, commandWorkingDir(deps))
 
 	var b strings.Builder
 	b.WriteString(cmdLabelStyle.Render("$ "))
@@ -826,14 +827,8 @@ func handleGit(sub string) commandResult {
 	return commandResult{output: b.String(), handled: true}
 }
 
-func handleProject() commandResult {
-	wd, err := os.Getwd()
-	if err != nil {
-		return commandResult{
-			output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()),
-			handled: true,
-		}
-	}
+func handleProject(deps commandDeps) commandResult {
+	wd := commandWorkingDir(deps)
 
 	var b strings.Builder
 	b.WriteString(cmdTitleStyle.Render("Projeto"))
@@ -1069,6 +1064,7 @@ type rewindOutcome struct {
 
 // commandDeps holds function callbacks for slash commands.
 type commandDeps struct {
+	workingDir   func() string
 	captureVoice func(context.Context, context.Context, time.Duration) (string, error)
 	// bindBranches connects /branch to persisted transcripts and the active
 	// conversation. The CLI state binds lazily on the first /branch command.
@@ -1198,12 +1194,28 @@ type commandDeps struct {
 	configPath func() string
 }
 
+func commandWorkingDir(deps commandDeps) string {
+	if deps.workingDir != nil {
+		if dir := deps.workingDir(); dir != "" {
+			return dir
+		}
+	}
+	dir, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	return dir
+}
+
 // runShellCmd executes a shell command with a 15s timeout and returns its output.
-func runShellCmd(command string) (string, error) {
+func runShellCmd(command string, dir ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	if len(dir) > 0 {
+		cmd.Dir = dir[0]
+	}
 	out, err := cmd.CombinedOutput()
 
 	output := string(out)
@@ -1218,14 +1230,8 @@ func runShellCmd(command string) (string, error) {
 
 // handleInit bootstraps .polypod.md and the .polypod/ directory using the
 // initcmd package. Supports --force to re-run on already-inited projects.
-func handleInit(parts []string) commandResult {
-	wd, err := os.Getwd()
-	if err != nil {
-		return commandResult{
-			output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()),
-			handled: true,
-		}
-	}
+func handleInit(parts []string, deps commandDeps) commandResult {
+	wd := commandWorkingDir(deps)
 
 	force := false
 	for _, p := range parts[1:] {
@@ -1337,7 +1343,8 @@ func handleInit(parts []string) commandResult {
 // handleCommit creates a git commit, generating the message via AI when
 // no explicit message is provided by the user.
 func handleCommit(deps commandDeps, userMsg string) commandResult {
-	if !pgit.IsInsideRepo() {
+	dir := commandWorkingDir(deps)
+	if !pgit.IsInsideRepoAt(dir) {
 		return commandResult{
 			output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render("nao esta em um repositorio git"),
 			handled: true,
@@ -1346,15 +1353,15 @@ func handleCommit(deps commandDeps, userMsg string) commandResult {
 
 	// If nothing staged, auto-stage everything so we have something to commit.
 	autoStaged := false
-	if !pgit.HasStagedChanges() {
-		if err := pgit.StageAll(); err != nil {
+	if !pgit.HasStagedChanges(dir) {
+		if err := pgit.StageAll(dir); err != nil {
 			return commandResult{
 				output:  errorStyle.Render("erro ao stageing: ") + cmdLabelStyle.Render(err.Error()),
 				handled: true,
 			}
 		}
 		autoStaged = true
-		if !pgit.HasStagedChanges() {
+		if !pgit.HasStagedChanges(dir) {
 			return commandResult{
 				output:  cmdLabelStyle.Render("nenhuma mudanca para commitar (working tree limpo)"),
 				handled: true,
@@ -1362,7 +1369,7 @@ func handleCommit(deps commandDeps, userMsg string) commandResult {
 		}
 	}
 
-	diff, changes, err := commitai.GetStagedDiff()
+	diff, changes, err := commitai.GetStagedDiff(dir)
 	if err != nil {
 		return commandResult{
 			output:  errorStyle.Render("erro git diff: ") + cmdLabelStyle.Render(err.Error()),
@@ -1402,7 +1409,7 @@ func handleCommit(deps commandDeps, userMsg string) commandResult {
 	// Strip code fences/quotes that the model sometimes wraps around.
 	message = stripCommitMessageFences(message)
 
-	if err := pgit.CreateCommit(message); err != nil {
+	if err := pgit.CreateCommit(message, dir); err != nil {
 		return commandResult{
 			output:  errorStyle.Render("erro git commit: ") + cmdLabelStyle.Render(err.Error()),
 			handled: true,
@@ -1440,8 +1447,9 @@ func handleCommit(deps commandDeps, userMsg string) commandResult {
 }
 
 // handleDiff shows uncommitted diffs with ANSI color highlighting.
-func handleDiff(parts []string) commandResult {
-	if !pgit.IsInsideRepo() {
+func handleDiff(parts []string, deps commandDeps) commandResult {
+	dir := commandWorkingDir(deps)
+	if !pgit.IsInsideRepoAt(dir) {
 		return commandResult{
 			output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render("nao esta em um repositorio git"),
 			handled: true,
@@ -1471,7 +1479,7 @@ func handleDiff(parts []string) commandResult {
 	}
 
 	cmdStr := "git " + strings.Join(args, " ")
-	output, err := runShellCmd(cmdStr)
+	output, err := runGitCapture(dir, args...)
 	if err != nil && output == "" {
 		return commandResult{
 			output:  errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()),

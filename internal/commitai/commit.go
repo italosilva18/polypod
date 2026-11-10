@@ -15,12 +15,15 @@ type StagedChange struct {
 }
 
 // GetStagedDiff returns the staged diff and list of changed files.
-func GetStagedDiff() (diff string, changes []StagedChange, err error) {
+func GetStagedDiff(dir ...string) (diff string, changes []StagedChange, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	// Get file list
 	cmd := exec.CommandContext(ctx, "git", "diff", "--cached", "--name-status")
+	if len(dir) > 0 {
+		cmd.Dir = dir[0]
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", nil, fmt.Errorf("git diff --name-status: %w", err)
@@ -38,9 +41,15 @@ func GetStagedDiff() (diff string, changes []StagedChange, err error) {
 
 	// Get actual diff
 	cmd = exec.CommandContext(ctx, "git", "diff", "--cached", "--stat")
+	if len(dir) > 0 {
+		cmd.Dir = dir[0]
+	}
 	statOut, _ := cmd.CombinedOutput()
 
 	cmd = exec.CommandContext(ctx, "git", "diff", "--cached")
+	if len(dir) > 0 {
+		cmd.Dir = dir[0]
+	}
 	diffOut, _ := cmd.CombinedOutput()
 	diff = string(diffOut)
 

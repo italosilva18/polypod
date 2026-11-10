@@ -112,6 +112,8 @@ shell command output before it reaches the model.
 The [skill catalog](docs/integrations/skill-catalog.md) and
 [skill evolution cycle](docs/integrations/skill-evolution.md) cover discovery,
 import, evidence, review and application.
+The [local plugins guide](docs/integrations/local-plugins.md) covers plugin
+installation, updates and rollback from a folder or explicit Git URL.
 The [I2C/SPI guide](docs/integrations/hardware-i2c-spi.md) describes device
 parameters and the remaining physical verification.
 The [USB/serial/firmware guide](docs/integrations/serial-hardware.md) covers

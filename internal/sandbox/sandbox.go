@@ -183,6 +183,22 @@ func (se *SandboxExecutor) Execute(ctx context.Context, command string) (string,
 	}
 }
 
+// ExecuteAt runs one command with a conversation-specific workspace. Copying
+// the executor keeps concurrent channels from changing each other's mount or
+// local command directory.
+func (se *SandboxExecutor) ExecuteAt(ctx context.Context, command, dir string) (string, int, error) {
+	if dir == "" {
+		return se.Execute(ctx, command)
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", -1, fmt.Errorf("resolving sandbox workspace: %w", err)
+	}
+	scoped := *se
+	scoped.config.WorkspaceDir = abs
+	return scoped.Execute(ctx, command)
+}
+
 // ─── Execution strategies ──────────────────────────────────────────────
 
 // executeUnsandboxed runs the command with no isolation.

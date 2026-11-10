@@ -318,6 +318,15 @@ func (a *Adapter) Send(ctx context.Context, msg adapter.OutMessage) error {
 // buildCommandDeps creates the closure-based command deps from real implementations.
 func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 	deps := commandDeps{commandRegistry: a.commandRegistry, activeSessionID: a.ActiveSessionID}
+	if a.aiSvc != nil {
+		deps.workingDir = func() string {
+			fallback, err := os.Getwd()
+			if err != nil {
+				fallback = "."
+			}
+			return a.aiSvc.WorkingDir("cli", "local", a.ActiveSessionID(), fallback)
+		}
+	}
 	if a.cfg != nil && a.cfg.WhatsApp.AudioTranscription.Enabled {
 		deps.captureVoice = newVoiceCapture(a.cfg.WhatsApp.AudioTranscription)
 	}
@@ -405,9 +414,10 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 	if a.aiSvc != nil {
 		deps.generateCommitMsg = func(prompt string) (string, error) {
 			resp, err := a.aiSvc.Answer(context.Background(), ai.AnswerRequest{
-				Channel: "cli",
-				UserID:  "local",
-				Query:   prompt,
+				Channel:            "cli",
+				UserID:             "local",
+				Query:              prompt,
+				SessionMemoryScope: a.ActiveSessionID(),
 				// No history: this is a one-shot task, not part of the chat.
 				History: nil,
 			})
@@ -420,10 +430,11 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 		// /review and /security-review: generic one-shot text generation.
 		deps.generateText = func(prompt string) (string, error) {
 			resp, err := a.aiSvc.Answer(context.Background(), ai.AnswerRequest{
-				Channel: "cli",
-				UserID:  "local",
-				Query:   prompt,
-				History: nil,
+				Channel:            "cli",
+				UserID:             "local",
+				Query:              prompt,
+				SessionMemoryScope: a.ActiveSessionID(),
+				History:            nil,
 			})
 			if err != nil {
 				return "", err

@@ -106,7 +106,7 @@ func (pl *PluginLoader) discover(includeDisabled bool) ([]PluginManifest, error)
 		}
 
 		for _, entry := range entries {
-			if !entry.IsDir() {
+			if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 				continue
 			}
 			pluginDir := filepath.Join(dir, entry.Name())
