@@ -173,7 +173,13 @@ func (s *Service) PrepareHistory(ctx context.Context, history []conversation.Mes
 	}
 	if budgetTrigger {
 		s.historyBudgetMu.Lock()
-		s.historyBudgetRetryAt = time.Time{}
+		// A single oversized turn or summary may remain above the budget even
+		// after successful compaction. Avoid re-summarizing it every turn.
+		if compact.EstimateTokens(compacted) > budget {
+			s.historyBudgetRetryAt = time.Now().Add(time.Minute)
+		} else {
+			s.historyBudgetRetryAt = time.Time{}
+		}
 		s.historyBudgetMu.Unlock()
 	}
 	s.logger.Info("auto-compact prepared",
