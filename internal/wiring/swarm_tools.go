@@ -16,8 +16,9 @@ import (
 )
 
 // registerSwarmTools connects team operations to the live swarm manager and
-// the same full agent executor used by agent_run. Worker goroutines are
-// process-local; the team journal retains coordination evidence after restart.
+// the same full agent executor used by agent_run. Worker turns persist a
+// model/tool checkpoint when the team journal is enabled. team_resume only
+// diagnoses crash boundaries; a journal prompt is not a resume cursor.
 func registerSwarmTools(reg *tool.Registry, manager *swarm.SwarmManager, agents *agent.Registry, executor *subagent.SubAgentExecutor) {
 	reg.RegisterDef(types.ToolDef{
 		NameFn: func() string { return "team_create" },
@@ -78,13 +79,15 @@ func registerSwarmTools(reg *tool.Registry, manager *swarm.SwarmManager, agents 
 			if !agents.Has(agentName) {
 				return swarmError("agente desconhecido: " + agentName), nil
 			}
+			ag := agents.Get(agentName)
+			if ag == nil || ag.Name == "" || !agents.Has(agentName) {
+				return swarmError("agente desconhecido: " + agentName), nil
+			}
 			member, err := team.AddTeammate(swarm.TeammateConfig{Name: name, AgentType: agentName})
 			if err != nil {
 				return swarmError(err.Error()), nil
 			}
-			worker := func(ctx context.Context, prompt string, identity swarm.TeammateIdentity) (string, error) {
-				return executor.Execute(swarm.WithTeammateIdentity(ctx, identity), agentName, prompt)
-			}
+			worker := checkpointTeammateExecutor(executor, ag.Name)
 			if err := team.StartTeammate(member.Name, worker); err != nil {
 				_ = team.RemoveTeammate(member.Name)
 				return swarmError(err.Error()), nil
@@ -351,6 +354,49 @@ func registerSwarmTools(reg *tool.Registry, manager *swarm.SwarmManager, agents 
 			return types.ToolResult{Content: "Equipe encerrada: " + name}, nil
 		},
 	})
+
+	reg.RegisterDef(types.ToolDef{
+		NameFn: func() string { return "team_resume" },
+		DescriptionFn: func() string {
+			return "Diagnosticar checkpoints de uma equipe interrompida. Somente leitura: não restaura a equipe, não inicia integrantes e não executa ferramentas. Mostra turnos, chamadas pendentes e bloqueios da retomada."
+		},
+		IsReadOnlyFn: func(map[string]any) bool { return true },
+		InputSchemaFn: func() map[string]any {
+			return swarmSchema(map[string]any{
+				"team": map[string]any{"type": "string", "description": "Nome da equipe"},
+				"name": map[string]any{"type": "string", "description": "Integrante opcional; vazio avalia todos"},
+			}, "team")
+		},
+		ExecuteFn: func(tc types.ToolContext, args map[string]any) (types.ToolResult, error) {
+			if _, isWorker := swarm.TeammateIdentityFromContext(tc.Context); isWorker {
+				return swarmError("a retomada da equipe é feita pela sessão principal"), nil
+			}
+			name := swarmArg(args, "team")
+			if name == "" {
+				return swarmError("team é obrigatório"), nil
+			}
+			report, err := manager.ResumeInterrupted(name, swarmArg(args, "name"))
+			if err != nil && len(report.Members) == 0 {
+				return swarmError(err.Error()), nil
+			}
+			if err != nil {
+				report.Continued = false
+				report.Note = strings.TrimSpace(err.Error() + " " + report.Note)
+			}
+			return swarmJSON(report), nil
+		},
+	})
+}
+
+func checkpointTeammateExecutor(executor *subagent.SubAgentExecutor, agentName string) swarm.TeammateExecutor {
+	return func(ctx context.Context, prompt string, identity swarm.TeammateIdentity) (string, error) {
+		ctx = swarm.WithTeammateIdentity(ctx, identity)
+		binding, bound := swarm.CheckpointBindingFromContext(ctx)
+		if !bound {
+			return executor.ExecuteWithCheckpoint(ctx, agentName, prompt, nil, nil, nil)
+		}
+		return executor.ExecuteWithCheckpoint(ctx, agentName, prompt, binding.Initial, nil, binding.Save)
+	}
 }
 
 func swarmSchema(properties map[string]any, required ...string) map[string]any {

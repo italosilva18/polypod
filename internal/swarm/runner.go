@@ -2,13 +2,18 @@ package swarm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
+
+	"github.com/costa/polypod/internal/tasks"
 )
+
+var errWorkerCheckpointSave = errors.New("worker checkpoint persistence failed")
 
 // TeammateIdentity identifies a teammate within a team. Equivalent to
 // Claude Code's TeammateIdentity type in InProcessTeammateTask/types.ts.
@@ -53,6 +58,11 @@ type RunnerConfig struct {
 	Logger      *slog.Logger
 	Journal     *TeamJournal
 	RunID       string
+	AgentType   string
+	Checkpoints *workerCheckpointStore
+	// Resume continues one checkpointed turn before the mailbox loop.
+	// It is not derived from a journal prompt.
+	Resume *workerTurnResume
 }
 
 // RunnerState tracks the teammate runner's lifecycle.
@@ -108,6 +118,9 @@ type TeammateRunner struct {
 	// Callbacks notified on idle transition.
 	idleCbs   []func()
 	idleCbsMu sync.Mutex
+
+	// resumeTurn is set only while executeTurn continues a checkpoint.
+	resumeTurn *workerTurnResume
 }
 
 // NewTeammateRunner creates a runner but does not start it. Call Start().
@@ -205,6 +218,7 @@ func (r *TeammateRunner) loop() {
 		"agent_name", r.cfg.Identity.AgentName,
 		"team", r.cfg.Identity.TeamName,
 	)
+	r.resumeCheckpointTurn()
 
 	for {
 		atomic.StoreInt32(&r.state, int32(RunnerStateIdle))
@@ -251,6 +265,9 @@ func (r *TeammateRunner) loop() {
 
 		prompt := r.buildPrompt(msg)
 		r.executeTurn(prompt)
+		if r.ctx.Err() != nil {
+			return
+		}
 
 		// Transition to idle.
 		atomic.StoreInt32(&r.state, int32(RunnerStateIdle))
@@ -259,6 +276,58 @@ func (r *TeammateRunner) loop() {
 		// Send idle notification to leader.
 		r.sendIdleNotification()
 	}
+}
+
+// resumeCheckpointTurn runs a validated checkpoint once, before the mailbox
+// loop accepts new work. A missing or pending checkpoint stops the runner
+// instead of replaying a prompt.
+func (r *TeammateRunner) resumeCheckpointTurn() {
+	resume := r.cfg.Resume
+	r.cfg.Resume = nil
+	if resume == nil {
+		return
+	}
+	if r.cfg.Checkpoints == nil || resume.Turn < 1 || resume.Checkpoint == nil || resume.Checkpoint.ValidateResume() != nil {
+		r.logger.Error("teammate checkpoint resume refused", "agent_name", r.cfg.Identity.AgentName, "turn", resume.Turn)
+		r.Stop()
+		return
+	}
+	atomic.StoreInt32(&r.turnCount, int32(resume.Turn-1))
+	tokens := int64(resume.Checkpoint.PromptTokens) + int64(resume.Checkpoint.CompletionTokens)
+	if tokens > 0 {
+		atomic.StoreInt64(&r.tokensUsed, tokens)
+	}
+	r.resumeTurn = resume
+	atomic.StoreInt32(&r.state, int32(RunnerStateWorking))
+	r.logger.Info("teammate resuming from checkpoint", "agent_name", r.cfg.Identity.AgentName,
+		"turn", resume.Turn, "phase", resume.Checkpoint.Phase)
+	r.executeTurn(resume.Prompt)
+	r.resumeTurn = nil
+	if r.ctx.Err() != nil {
+		return
+	}
+	atomic.StoreInt32(&r.state, int32(RunnerStateIdle))
+	r.fireIdleCallbacks()
+	r.sendIdleNotification()
+}
+
+func (r *TeammateRunner) bindCheckpoint(ctx context.Context, turn int, initial *tasks.AgentCheckpoint) context.Context {
+	if r.cfg.Checkpoints == nil {
+		return ctx
+	}
+	store := r.cfg.Checkpoints
+	key := workerCheckpointKey{Team: r.cfg.Identity.TeamName, RunID: r.cfg.RunID, Agent: r.cfg.Identity.AgentName, Turn: turn}
+	identity := r.cfg.Identity
+	agentType := r.cfg.AgentType
+	return WithCheckpointBinding(ctx, CheckpointBinding{
+		Initial: initial,
+		Save: func(checkpoint *tasks.AgentCheckpoint) error {
+			if err := store.Save(key, identity, agentType, checkpoint); err != nil {
+				return fmt.Errorf("%w: %w", errWorkerCheckpointSave, err)
+			}
+			return nil
+		},
+	})
 }
 
 // executeTurn runs one turn of the executor with the given prompt.
@@ -274,7 +343,14 @@ func (r *TeammateRunner) executeTurn(prompt string) {
 	defer workCancel()
 
 	start := time.Now()
-	r.recordTurn(journalEvent{Kind: "turn_started", Prompt: prompt, Turn: turn})
+	resuming := r.resumeTurn != nil && r.resumeTurn.Turn == turn && r.resumeTurn.Checkpoint != nil
+	if resuming {
+		// turn_resumed does not carry the prompt. The checkpoint is the
+		// only authority for what executes.
+		r.recordTurn(journalEvent{Kind: "turn_resumed", Turn: turn, CheckpointPhase: r.resumeTurn.Checkpoint.Phase})
+	} else {
+		r.recordTurn(journalEvent{Kind: "turn_started", Prompt: prompt, Turn: turn})
+	}
 
 	r.logger.Debug("teammate turn starting",
 		"agent_name", r.cfg.Identity.AgentName,
@@ -282,7 +358,11 @@ func (r *TeammateRunner) executeTurn(prompt string) {
 		"prompt_len", len(prompt),
 	)
 
-	response, err := r.cfg.Executor(workCtx, prompt, r.cfg.Identity)
+	var initialCheckpoint *tasks.AgentCheckpoint
+	if resuming {
+		initialCheckpoint = r.resumeTurn.Checkpoint
+	}
+	response, err := r.cfg.Executor(r.bindCheckpoint(workCtx, turn, initialCheckpoint), prompt, r.cfg.Identity)
 
 	output := TeammateOutput{
 		Response:  response,
@@ -328,6 +408,13 @@ func (r *TeammateRunner) executeTurn(prompt string) {
 			"response_len", len(response),
 		)
 		r.sendTurnNotification("completed", response, turn)
+	}
+	if errors.Is(err, errWorkerCheckpointSave) {
+		// A failed save may leave a tool effect uncertain. Never advance to
+		// another mailbox message and hide that boundary behind a newer turn.
+		r.logger.Error("teammate quarantined after checkpoint failure",
+			"agent_name", r.cfg.Identity.AgentName, "turn", turn, "error", err)
+		r.Stop()
 	}
 
 	// Check token budget.

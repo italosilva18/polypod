@@ -20,6 +20,10 @@ func unlockTeamJournalFile(file *os.File) error {
 	return windows.UnlockFileEx(windows.Handle(file.Fd()), 0, 1, 0, &overlapped)
 }
 
+func teamJournalLockBusy(err error) bool {
+	return errors.Is(err, windows.ERROR_LOCK_VIOLATION)
+}
+
 func teamJournalOwnerLive(path string) (bool, error) {
 	file, err := os.OpenFile(path, os.O_RDWR, 0)
 	if errors.Is(err, os.ErrNotExist) {

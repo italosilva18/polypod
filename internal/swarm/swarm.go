@@ -12,8 +12,11 @@ package swarm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -111,24 +114,28 @@ type Team struct {
 	Members    []MemberInfo `json:"members"`
 
 	// Runtime
-	router  *MessageRouter
-	perms   *PermissionBridge
-	cancel  context.CancelFunc
-	ctx     context.Context
-	runners map[string]*TeammateRunner // agentName → runner
-	logger  *slog.Logger
-	journal *TeamJournal
-	runID   string
+	router      *MessageRouter
+	perms       *PermissionBridge
+	cancel      context.CancelFunc
+	ctx         context.Context
+	runners     map[string]*TeammateRunner // agentName → runner
+	logger      *slog.Logger
+	journal     *TeamJournal
+	checkpoints *workerCheckpointStore
+	runID       string
+	// resumeLock is held for a team rebuilt from a checkpoint until Stop.
+	resumeLock *os.File
 }
 
 // --- SwarmManager ---
 
 // SwarmManager manages all active teams in the process.
 type SwarmManager struct {
-	mu      sync.RWMutex
-	teams   map[string]*Team
-	logger  *slog.Logger
-	journal *TeamJournal
+	mu          sync.RWMutex
+	teams       map[string]*Team
+	logger      *slog.Logger
+	journal     *TeamJournal
+	checkpoints *workerCheckpointStore
 }
 
 // NewSwarmManager creates a new swarm manager.
@@ -145,8 +152,14 @@ func (sm *SwarmManager) EnableJournal(path string) error {
 	if err != nil {
 		return err
 	}
+	store, err := newWorkerCheckpointStore(filepath.Join(path, "worker-checkpoints"))
+	if err != nil {
+		_ = j.Close()
+		return err
+	}
 	sm.mu.Lock()
 	sm.journal = j
+	sm.checkpoints = store
 	sm.mu.Unlock()
 	return nil
 }
@@ -189,13 +202,14 @@ func (sm *SwarmManager) CreateTeam(name, description string, cfg TeamConfig) (*T
 				JoinedAt: time.Now(),
 			},
 		},
-		router:  router,
-		cancel:  cancel,
-		ctx:     ctx,
-		runners: make(map[string]*TeammateRunner),
-		logger:  sm.logger,
-		journal: sm.journal,
-		runID:   fmt.Sprintf("%d", time.Now().UnixNano()),
+		router:      router,
+		cancel:      cancel,
+		ctx:         ctx,
+		runners:     make(map[string]*TeammateRunner),
+		logger:      sm.logger,
+		journal:     sm.journal,
+		checkpoints: sm.checkpoints,
+		runID:       fmt.Sprintf("%d", time.Now().UnixNano()),
 	}
 	router.journal = sm.journal
 	router.runID = team.runID
@@ -403,8 +417,11 @@ func (t *Team) Stop(timeout time.Duration) error {
 	t.mu.Lock()
 	t.State = TeamStateStopped
 	t.runners = make(map[string]*TeammateRunner)
+	resumeLock := t.resumeLock
+	t.resumeLock = nil
 	t.recordStateLocked()
 	t.mu.Unlock()
+	releaseResumeLock(resumeLock)
 
 	t.logger.Info("team stopped", "team", t.Name)
 	return err
@@ -505,6 +522,19 @@ func (t *Team) RemoveTeammate(name string) error {
 // StartTeammate launches the execution loop for a teammate.
 // The teammate must already be registered via AddTeammate.
 func (t *Team) StartTeammate(name string, executor TeammateExecutor) error {
+	return t.startTeammate(name, executor, nil)
+}
+
+// StartTeammateFromCheckpoint continues one interrupted turn from a validated
+// checkpoint, then reads only new mailbox messages.
+func (t *Team) StartTeammateFromCheckpoint(name string, executor TeammateExecutor, resume *workerTurnResume) error {
+	if resume == nil || resume.Checkpoint == nil {
+		return errors.New("checkpoint de retomada ausente")
+	}
+	return t.startTeammate(name, executor, resume)
+}
+
+func (t *Team) startTeammate(name string, executor TeammateExecutor, resume *workerTurnResume) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -523,6 +553,18 @@ func (t *Team) StartTeammate(name string, executor TeammateExecutor) error {
 	if info == nil {
 		return fmt.Errorf("%w: %s", ErrAgentNotFound, name)
 	}
+	if resume != nil {
+		if t.checkpoints == nil {
+			return errors.New("retomada sem armazenamento de checkpoint")
+		}
+		if err := resume.Checkpoint.ValidateResume(); err != nil {
+			return err
+		}
+		if resume.Turn < 1 || resume.Identity.AgentID != info.AgentID || resume.Identity.AgentName != info.Name ||
+			resume.Identity.TeamName != t.Name || resume.Identity.PlanModeRequired != info.PlanModeRequired {
+			return fmt.Errorf("checkpoint não corresponde à identidade de %s", name)
+		}
+	}
 
 	// Don't double-start.
 	if _, running := t.runners[name]; running {
@@ -534,14 +576,23 @@ func (t *Team) StartTeammate(name string, executor TeammateExecutor) error {
 		return fmt.Errorf("no mailbox for teammate %s", name)
 	}
 
+	identity := TeammateIdentity{
+		AgentID:          info.AgentID,
+		AgentName:        info.Name,
+		TeamName:         t.Name,
+		Color:            info.Color,
+		PlanModeRequired: info.PlanModeRequired,
+	}
+	agentType := info.AgentType
+	if resume != nil {
+		identity.Color = resume.Identity.Color
+		identity.ParentSessionID = resume.Identity.ParentSessionID
+		if resume.AgentType != "" {
+			agentType = resume.AgentType
+		}
+	}
 	runnerCfg := RunnerConfig{
-		Identity: TeammateIdentity{
-			AgentID:          info.AgentID,
-			AgentName:        info.Name,
-			TeamName:         t.Name,
-			Color:            info.Color,
-			PlanModeRequired: info.PlanModeRequired,
-		},
+		Identity:    identity,
 		Mailbox:     mb,
 		Router:      t.router,
 		Executor:    executor,
@@ -550,6 +601,9 @@ func (t *Team) StartTeammate(name string, executor TeammateExecutor) error {
 		Logger:      t.logger,
 		Journal:     t.journal,
 		RunID:       t.runID,
+		AgentType:   agentType,
+		Checkpoints: t.checkpoints,
+		Resume:      resume,
 	}
 
 	runner := NewTeammateRunner(t.ctx, runnerCfg)

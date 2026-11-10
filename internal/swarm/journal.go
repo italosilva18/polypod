@@ -28,23 +28,25 @@ type TeamJournal struct {
 type journalRecord struct {
 	event     journalEvent
 	ownerLive bool
+	self      bool
 }
 
 type journalEvent struct {
-	Version int          `json:"version"`
-	Kind    string       `json:"kind"`
-	Team    string       `json:"team"`
-	RunID   string       `json:"run_id"`
-	At      time.Time    `json:"at"`
-	Summary *TeamSummary `json:"summary,omitempty"`
-	Member  *MemberInfo  `json:"member,omitempty"`
-	Message *Message     `json:"message,omitempty"`
-	Agent   string       `json:"agent,omitempty"`
-	Turn    int          `json:"turn,omitempty"`
-	Prompt  string       `json:"prompt,omitempty"`
-	Result  string       `json:"result,omitempty"`
-	Error   string       `json:"error,omitempty"`
-	IDs     []string     `json:"ids,omitempty"`
+	Version         int          `json:"version"`
+	Kind            string       `json:"kind"`
+	Team            string       `json:"team"`
+	RunID           string       `json:"run_id"`
+	At              time.Time    `json:"at"`
+	Summary         *TeamSummary `json:"summary,omitempty"`
+	Member          *MemberInfo  `json:"member,omitempty"`
+	Message         *Message     `json:"message,omitempty"`
+	Agent           string       `json:"agent,omitempty"`
+	Turn            int          `json:"turn,omitempty"`
+	CheckpointPhase string       `json:"checkpoint_phase,omitempty"`
+	Prompt          string       `json:"prompt,omitempty"`
+	Result          string       `json:"result,omitempty"`
+	Error           string       `json:"error,omitempty"`
+	IDs             []string     `json:"ids,omitempty"`
 }
 
 // ArchivedTurn is a completed or interrupted teammate turn from a past run.
@@ -62,10 +64,13 @@ type ArchivedTurn struct {
 type ArchivedTeam struct {
 	RunID     string
 	OwnerLive bool
-	Summary   TeamSummary
-	Members   []MemberInfo
-	Pending   []*Message
-	Results   map[string][]ArchivedTurn
+	// ExternalOwner is true when a different live process holds events for
+	// this run. The current process's own journal file does not set it.
+	ExternalOwner bool `json:"-"`
+	Summary       TeamSummary
+	Members       []MemberInfo
+	Pending       []*Message
+	Results       map[string][]ArchivedTurn
 }
 
 const maxJournalText = 256 << 10
@@ -202,8 +207,9 @@ func (j *TeamJournal) readLocked() ([]journalRecord, error) {
 	}
 	var records []journalRecord
 	for _, path := range paths {
-		live := path == j.path
-		if !live {
+		self := path == j.path
+		live := self
+		if !self {
 			live, err = teamJournalOwnerLive(strings.TrimSuffix(path, ".jsonl") + ".lock")
 			if err != nil {
 				return nil, fmt.Errorf("checking team journal owner: %w", err)
@@ -240,7 +246,7 @@ func (j *TeamJournal) readLocked() ([]journalRecord, error) {
 				_ = file.Close()
 				return nil, fmt.Errorf("unsupported team journal version %d", event.Version)
 			}
-			records = append(records, journalRecord{event: event, ownerLive: live})
+			records = append(records, journalRecord{event: event, ownerLive: live, self: self})
 		}
 		if err := file.Close(); err != nil {
 			return nil, fmt.Errorf("closing team journal: %w", err)
@@ -262,12 +268,24 @@ func (j *TeamJournal) Teams() ([]ArchivedTeam, error) {
 		return nil, err
 	}
 	latest := make(map[string]string)
-	liveOwner := make(map[string]bool)
 	for _, record := range records {
 		event := record.event
 		if event.Kind == "created" {
 			latest[event.Team] = event.RunID
-			liveOwner[event.Team] = record.ownerLive
+		}
+	}
+	liveOwner := make(map[string]bool)
+	externalOwner := make(map[string]bool)
+	for _, record := range records {
+		event := record.event
+		// Acknowledgements and other inspection events may be appended by a
+		// later process. Only creation establishes ownership of a worker run.
+		if event.Kind != "created" || latest[event.Team] != event.RunID || !record.ownerLive {
+			continue
+		}
+		liveOwner[event.Team] = true
+		if !record.self {
+			externalOwner[event.Team] = true
 		}
 	}
 	archive := make(map[string]*ArchivedTeam, len(latest))
@@ -343,11 +361,15 @@ func (j *TeamJournal) Teams() ([]ArchivedTeam, error) {
 				turns = turns[len(turns)-100:]
 			}
 			item.Results[event.Agent] = turns
+		case "resumed", "turn_resumed":
+			// Checkpoint resume evidence. These events never open a turn
+			// and never supply a prompt that can be replayed.
 		}
 	}
 	items := make([]ArchivedTeam, 0, len(archive))
 	for name, item := range archive {
 		item.OwnerLive = liveOwner[name]
+		item.ExternalOwner = externalOwner[name]
 		if !liveOwner[name] && item.Summary.State != TeamStateStopped.String() {
 			item.Summary.State = "interrupted"
 		}

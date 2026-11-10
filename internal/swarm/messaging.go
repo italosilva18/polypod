@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -117,6 +118,18 @@ func NewMessage(msgType MessageType, sender, target, content string) *Message {
 
 func generateMessageID() string {
 	return fmt.Sprintf("msg-%d-%d", time.Now().UnixNano(), atomic.AddUint64(&globalSeqNo, 1))
+}
+
+// cloneMessage copies a journaled message so a restored mailbox can deliver
+// it without sharing metadata or a heap index from a previous process.
+func cloneMessage(msg *Message) *Message {
+	if msg == nil {
+		return nil
+	}
+	copy := *msg
+	copy.Metadata = maps.Clone(msg.Metadata)
+	copy.index = -1
+	return &copy
 }
 
 // --- Priority Queue (min-heap: lower priority number = dequeue first) ---

@@ -2,8 +2,6 @@ package subagent
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -212,10 +210,9 @@ func (e *SubAgentExecutor) ExecuteWithCheckpoint(
 		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
 		{Role: openai.ChatMessageRoleUser, Content: query},
 	}
-	queryDigest := sha256.Sum256([]byte(query))
 	checkpoint := &tasks.AgentCheckpoint{
 		Version: tasks.AgentCheckpointVersion, AgentName: ag.Name,
-		QuerySHA256: hex.EncodeToString(queryDigest[:]), Phase: "model",
+		QuerySHA256: tasks.QueryDigest(query), Phase: tasks.AgentCheckpointPhaseModel,
 	}
 	if initial != nil {
 		if err := initial.ValidateResume(); err != nil {
@@ -254,7 +251,7 @@ func (e *SubAgentExecutor) ExecuteWithCheckpoint(
 	// 5. Agentic loop. A tool phase is completed before checking the model-call
 	// limit, matching the result of a model response that requested tools.
 	for {
-		if checkpoint.Phase == "tools" {
+		if checkpoint.Phase == tasks.AgentCheckpointPhaseTools {
 			if err := e.completeCheckpointTools(ctx, ag, allowedNames, &msgs, checkpoint, saveBoundary, report); err != nil {
 				return "", err
 			}
@@ -330,7 +327,7 @@ func (e *SubAgentExecutor) ExecuteWithCheckpoint(
 
 		// Check if the model is done (no tool calls).
 		if choice.FinishReason != openai.FinishReasonToolCalls || len(choice.Message.ToolCalls) == 0 {
-			checkpoint.Phase = "done"
+			checkpoint.Phase = tasks.AgentCheckpointPhaseDone
 			if err := saveBoundary(); err != nil {
 				return "", err
 			}
@@ -346,7 +343,7 @@ func (e *SubAgentExecutor) ExecuteWithCheckpoint(
 
 		// Append the assistant message with tool calls.
 		msgs = append(msgs, choice.Message)
-		checkpoint.Phase = "tools"
+		checkpoint.Phase = tasks.AgentCheckpointPhaseTools
 		checkpoint.NextToolIndex = 0
 		if err := saveBoundary(); err != nil {
 			return "", err
@@ -430,7 +427,7 @@ func (e *SubAgentExecutor) completeCheckpointTools(
 			return err
 		}
 	}
-	checkpoint.Phase = "model"
+	checkpoint.Phase = tasks.AgentCheckpointPhaseModel
 	checkpoint.NextToolIndex = 0
 	return saveBoundary()
 }

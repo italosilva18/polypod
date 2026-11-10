@@ -1,6 +1,8 @@
 package tasks
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,10 +10,23 @@ import (
 
 const AgentCheckpointVersion = 1
 
+const (
+	// AgentCheckpointPhaseModel is a boundary before a model call. No tool
+	// from this boundary has started.
+	AgentCheckpointPhaseModel = "model"
+	// AgentCheckpointPhaseTools is a boundary between completed tool results.
+	// The next tool has not started unless PendingToolCallID is set.
+	AgentCheckpointPhaseTools = "tools"
+	// AgentCheckpointPhaseDone means the executor finished this turn. It is
+	// not a reason to call the model or tools again.
+	AgentCheckpointPhaseDone = "done"
+)
+
 // AgentCheckpoint is a durable boundary between subagent model calls and tool
 // calls. Messages contains the serialized chat and tool transcript used by
 // the subagent executor. A pending tool call is ambiguous
-// after a crash and must never be run again automatically.
+// after a crash and must never be run again automatically. A prompt kept
+// outside Messages is not a resume token.
 type AgentCheckpoint struct {
 	Version           int             `json:"version"`
 	AgentName         string          `json:"agent_name"`
@@ -51,13 +66,42 @@ func (checkpoint *AgentCheckpoint) ValidateResume() error {
 	if checkpoint.PendingToolCallID != "" {
 		return fmt.Errorf("chamada de ferramenta %s estava em andamento; verifique o efeito no sistema antes de criar uma nova tarefa", checkpoint.PendingToolCallID)
 	}
-	if checkpoint.Phase != "model" && checkpoint.Phase != "tools" {
+	if checkpoint.Phase != AgentCheckpointPhaseModel && checkpoint.Phase != AgentCheckpointPhaseTools {
 		return fmt.Errorf("fase de checkpoint %q nao retomavel", checkpoint.Phase)
 	}
 	if checkpoint.Turn < 0 || checkpoint.NextToolIndex < 0 {
 		return errors.New("contadores de checkpoint invalidos")
 	}
 	return nil
+}
+
+// QueryDigest is the canonical hash of the user prompt stored in a checkpoint.
+func QueryDigest(query string) string {
+	sum := sha256.Sum256([]byte(query))
+	return hex.EncodeToString(sum[:])
+}
+
+// ResumeQuery returns the user prompt embedded in Messages. Callers must not
+// replace it with a journal or task prompt. ValidateResume is separate: a
+// done or pending checkpoint can still be decoded without becoming executable.
+func (checkpoint *AgentCheckpoint) ResumeQuery() (string, error) {
+	if checkpoint == nil {
+		return "", errors.New("checkpoint ausente")
+	}
+	var messages []struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(checkpoint.Messages, &messages); err != nil {
+		return "", fmt.Errorf("decodificando mensagens do checkpoint: %w", err)
+	}
+	if len(messages) < 2 || messages[0].Role != "system" || messages[1].Role != "user" {
+		return "", errors.New("checkpoint sem mensagem de usuario")
+	}
+	if checkpoint.QuerySHA256 == "" || QueryDigest(messages[1].Content) != checkpoint.QuerySHA256 {
+		return "", errors.New("hash do prompt nao corresponde ao checkpoint")
+	}
+	return messages[1].Content, nil
 }
 
 // SaveAgentCheckpoint persists the boundary before any tool side effect.
