@@ -82,6 +82,7 @@ skills:
   - task_queue
   - find_skills
   - install_skill
+  - search_plugin_catalog
   - list_local_plugins
   - install_local_plugin
   - update_local_plugin

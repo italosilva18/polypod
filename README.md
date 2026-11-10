@@ -118,6 +118,9 @@ The [skill catalog](docs/integrations/skill-catalog.md) and
 import, evidence, review and application.
 The [local plugins guide](docs/integrations/local-plugins.md) covers plugin
 installation, updates and rollback from a folder or explicit Git URL.
+The [remote plugin catalog](docs/integrations/plugin-catalog.md) is an optional
+HTTPS index for search only; it stays off unless `POLYPOD_PLUGIN_CATALOG_URL`
+is set and never installs a plugin by itself.
 The [I2C/SPI guide](docs/integrations/hardware-i2c-spi.md) describes device
 parameters and the remaining physical verification.
 The [USB/serial/firmware guide](docs/integrations/serial-hardware.md) covers

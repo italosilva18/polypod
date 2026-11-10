@@ -41,3 +41,9 @@ root e o CLI do usuário compartilham o diretório com acesso de grupo.
 Instalação e atualização não instalam dependências externas declaradas pela
 skill. Os testes de comportamento desse fluxo foram adiados nesta rodada;
 compilação, análise estática e inspeção do diff verificam a integração básica.
+
+Não há índice remoto embutido. Para publicar ou consultar uma lista HTTPS
+opcional de metadados e URLs `source`, sem instalar nada nessa consulta, veja
+[catálogo remoto de plugins](plugin-catalog.md). A instalação de um item
+encontrado continua sendo uma chamada explícita a `install_local_plugin`;
+nome, autor, descrição e URL do índice são alegações não verificadas.
