@@ -79,12 +79,17 @@ func (m *MediaInterpreter) Render(ctx context.Context, event Event) (string, err
 	if len(data) == 0 || len(data) > maxMediaBytes {
 		return withMediaNote(caption, "[Anexo WhatsApp recebido, mas o arquivo está vazio ou excede 16 MiB.]"), nil
 	}
-	// A voice note can have a missing or inaccurate MIME in the transport.
-	// Prefer an accepted audio signature when it was declared as audio, and
-	// recover a missing declaration only when the bytes identify audio.
-	if mimeErr != nil || declaredMIME == "" || strings.HasPrefix(declaredMIME, "audio/") {
+	// A voice note can arrive with a missing, generic, or inaccurate MIME.
+	// Inspect the audio signature for generic binary attachments too, while
+	// leaving explicitly declared image, document, and video formats alone.
+	inspectAudio := mimeErr != nil || declaredMIME == "" || strings.HasPrefix(declaredMIME, "audio/") ||
+		declaredMIME == "application/octet-stream" || declaredMIME == "binary/octet-stream"
+	if inspectAudio {
 		if actualMIME := audio.DetectAudioMIME(data); actualMIME != "" {
 			return m.renderAudio(ctx, caption, actualMIME, data)
+		}
+		if declaredMIME == "application/octet-stream" || declaredMIME == "binary/octet-stream" {
+			return withMediaNote(caption, "[Anexo WhatsApp recebido com tipo genérico; o formato não foi identificado.]"), nil
 		}
 		if mimeErr != nil || declaredMIME == "" {
 			return withMediaNote(caption, "[Anexo WhatsApp recebido, mas o tipo de mídia é inválido e o áudio não foi identificado.]"), nil
