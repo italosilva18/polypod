@@ -4,25 +4,54 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"gopkg.in/yaml.v3"
 )
+
+type snapshotSource uint8
+
+const (
+	sourceUnknown snapshotSource = iota
+	sourceMemory
+	sourceSQLite
+	sourceDisk
+	sourcePostgres
+)
+
+// sessionSlot is one session handle. Message bodies are loaded on demand so
+// startup does not retain every transcript.
+type sessionSlot struct {
+	mu     sync.Mutex
+	sess   *Session
+	loaded bool
+	source snapshotSource
+	// diskName is the YAML base name in dataDir. Empty uses the canonical path.
+	diskName string
+	// alsoJournal records a backend whose body was replaced in the index.
+	// Startup still journals that body before any later save overwrites it.
+	alsoJournal []snapshotSource
+	// Superseded YAML copies may contain unique turns, including stale .yml.
+	alsoJournalDiskNames []string
+}
 
 // Store persists sessions. Supports PostgreSQL, SQLite, YAML file, or in-memory only.
 type Store struct {
 	journalInitErr error
 	journalMu      sync.Mutex
-	journal        []JournalEntry
-	journalLoaded  bool
+	journalEntries []JournalEntry // bodies for memory or YAML-only journals
 	journalIDs     map[string]bool
+	journalLast    uint64
+	journalLoaded  bool
 	mu             sync.RWMutex
-	sessions       map[string]*Session
+	sessions       map[string]*sessionSlot
 	pool           *pgxpool.Pool // nil = no postgres
 	sqliteDB       *sql.DB       // nil = no sqlite
 	dataDir        string        // non-empty = YAML file persistence
@@ -35,28 +64,27 @@ type Store struct {
 // - all nil/empty → in-memory only
 func NewStore(pool *pgxpool.Pool, sqliteDB *sql.DB, dataDir string) *Store {
 	s := &Store{
-		sessions: make(map[string]*Session),
+		sessions: make(map[string]*sessionSlot),
 		pool:     pool,
 		sqliteDB: sqliteDB,
 		dataDir:  dataDir,
 	}
 
-	// Load existing sessions from SQLite on startup
+	// Index sessions without retaining message bodies. Postgres stays
+	// on demand, matching the previous startup path.
 	if sqliteDB != nil {
-		s.loadAllFromSQLite()
-	}
-
-	// Load existing sessions from YAML files on startup
-	if dataDir != "" {
-		s.loadAllFromDisk()
-	}
-
-	for _, sess := range s.GetAllSessions() {
-		if err := s.appendJournal(context.Background(), sess); err != nil {
-			s.journalInitErr = err
-			break
+		if err := s.loadIndexFromSQLite(); err != nil {
+			s.journalInitErr = fmt.Errorf("indexing SQLite sessions: %w", err)
+			return s
 		}
 	}
+	if dataDir != "" {
+		if err := s.loadIndexFromDisk(); err != nil {
+			s.journalInitErr = fmt.Errorf("indexing YAML sessions: %w", err)
+			return s
+		}
+	}
+	s.migrateSnapshots(context.Background())
 	return s
 }
 
@@ -64,55 +92,39 @@ func sessionKey(channel, userID string) string {
 	return channel + ":" + userID
 }
 
-// Get retrieves or creates a session.
+// Get retrieves or creates a session. The same channel and user keep one pointer.
 func (s *Store) Get(ctx context.Context, channel, userID string) (*Session, error) {
+	if s.journalInitErr != nil {
+		return nil, s.journalInitErr
+	}
 	key := sessionKey(channel, userID)
 
-	s.mu.RLock()
-	sess, ok := s.sessions[key]
-	s.mu.RUnlock()
-	if ok {
-		return sess, nil
-	}
-
-	// Try loading from DB
-	if s.pool != nil {
-		sess, err := s.loadFromDB(ctx, key, channel, userID)
-		if err != nil {
-			return nil, err
-		}
-		if sess != nil {
-			s.mu.Lock()
-			s.sessions[key] = sess
-			s.mu.Unlock()
-			return sess, nil
-		}
-	}
-
-	// Try loading from SQLite
-	if s.sqliteDB != nil {
-		sess, err := s.loadFromSQLite(ctx, key, channel, userID)
-		if err != nil {
-			return nil, err
-		}
-		if sess != nil {
-			s.mu.Lock()
-			s.sessions[key] = sess
-			s.mu.Unlock()
-			return sess, nil
-		}
-	}
-
-	// Create new
-	sess = NewSession(key, channel, userID)
 	s.mu.Lock()
-	s.sessions[key] = sess
+	sl, ok := s.sessions[key]
+	if !ok {
+		sl = &sessionSlot{sess: &Session{ID: key, Channel: channel, UserID: userID}}
+		s.sessions[key] = sl
+	}
 	s.mu.Unlock()
-	return sess, nil
+	return s.materialize(ctx, sl)
 }
 
 // Save persists a session (to DB, SQLite, and/or YAML file).
 func (s *Store) Save(ctx context.Context, sess *Session) error {
+	if s.journalInitErr != nil {
+		return s.journalInitErr
+	}
+	if sess == nil {
+		return fmt.Errorf("saving session: session is nil")
+	}
+	if err := s.ensureLoaded(ctx, sess); err != nil {
+		return err
+	}
+	// Journal a backend that lost the working copy before this save replaces
+	// its row. A failed read must not continue into the snapshot write.
+	if err := s.journalSuperseded(ctx, sess); err != nil {
+		return err
+	}
 	if err := s.appendJournal(ctx, sess); err != nil {
 		return err
 	}
@@ -137,7 +149,7 @@ func (s *Store) Save(ctx context.Context, sess *Session) error {
 	return nil
 }
 
-// ListSessions returns all active session IDs.
+// ListSessions returns all active session IDs without loading message bodies.
 func (s *Store) ListSessions() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -148,15 +160,257 @@ func (s *Store) ListSessions() []string {
 	return ids
 }
 
-// GetAllSessions returns all active sessions.
+// GetAllSessions returns every session, loading each body. ListSessions is the
+// path that stays cheap when only identifiers are needed.
 func (s *Store) GetAllSessions() []*Session {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	sessions := make([]*Session, 0, len(s.sessions))
-	for _, sess := range s.sessions {
+	slots := make([]*sessionSlot, 0, len(s.sessions))
+	for _, sl := range s.sessions {
+		slots = append(slots, sl)
+	}
+	s.mu.RUnlock()
+	sessions := make([]*Session, 0, len(slots))
+	for _, sl := range slots {
+		sess, err := s.materialize(context.Background(), sl)
+		if err != nil || sess == nil {
+			continue
+		}
 		sessions = append(sessions, sess)
 	}
 	return sessions
+}
+
+func (s *Store) ensureLoaded(ctx context.Context, sess *Session) error {
+	s.mu.RLock()
+	sl := s.sessions[sess.ID]
+	s.mu.RUnlock()
+	if sl == nil {
+		return nil
+	}
+	sl.mu.Lock()
+	same := sl.sess == sess
+	loaded := sl.loaded
+	sl.mu.Unlock()
+	if !same || loaded {
+		return nil
+	}
+	_, err := s.materialize(ctx, sl)
+	return err
+}
+
+func (s *Store) materialize(ctx context.Context, sl *sessionSlot) (*Session, error) {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+	if sl.loaded {
+		return sl.sess, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	switch sl.source {
+	case sourceDisk, sourceSQLite, sourcePostgres:
+		loaded, err := s.readSnapshot(ctx, sl.sess, sl.source, sl.diskName)
+		if err != nil {
+			return nil, err
+		}
+		if loaded == nil {
+			return nil, fmt.Errorf("loading session %s: snapshot not found", sl.sess.ID)
+		}
+		sl.sess.Messages = loaded.Messages
+		sl.sess.CreatedAt = loaded.CreatedAt
+		sl.sess.UpdatedAt = loaded.UpdatedAt
+		if loaded.Channel != "" {
+			sl.sess.Channel = loaded.Channel
+		}
+		if loaded.UserID != "" {
+			sl.sess.UserID = loaded.UserID
+		}
+		if err := stampSessionIDs(sl.sess); err != nil {
+			return nil, err
+		}
+		sl.loaded = true
+		return sl.sess, nil
+	default:
+		if s.pool != nil {
+			loaded, err := s.loadFromDB(ctx, sl.sess.ID, sl.sess.Channel, sl.sess.UserID)
+			if err != nil {
+				return nil, err
+			}
+			if loaded != nil {
+				if err := stampSessionIDs(loaded); err != nil {
+					return nil, err
+				}
+				sl.sess = loaded
+				sl.source = sourcePostgres
+				sl.loaded = true
+				return sl.sess, nil
+			}
+		}
+		if s.sqliteDB != nil {
+			loaded, err := s.loadFromSQLite(ctx, sl.sess.ID, sl.sess.Channel, sl.sess.UserID)
+			if err != nil {
+				return nil, err
+			}
+			if loaded != nil {
+				if err := stampSessionIDs(loaded); err != nil {
+					return nil, err
+				}
+				sl.sess = loaded
+				sl.source = sourceSQLite
+				sl.loaded = true
+				return sl.sess, nil
+			}
+		}
+		fresh := NewSession(sl.sess.ID, sl.sess.Channel, sl.sess.UserID)
+		sl.sess = fresh
+		sl.source = sourceMemory
+		sl.loaded = true
+		return sl.sess, nil
+	}
+}
+
+// migrateSnapshots journals existing snapshots one at a time, then drops the
+// temporary bodies. Legacy messages gain stable IDs inside the journal.
+func (s *Store) migrateSnapshots(ctx context.Context) {
+	s.mu.RLock()
+	slots := make([]*sessionSlot, 0, len(s.sessions))
+	for _, sl := range s.sessions {
+		slots = append(slots, sl)
+	}
+	s.mu.RUnlock()
+	for _, sl := range slots {
+		if err := ctx.Err(); err != nil {
+			s.journalInitErr = err
+			return
+		}
+		sl.mu.Lock()
+		header := sl.sess
+		source := sl.source
+		diskName := sl.diskName
+		extra := append([]snapshotSource(nil), sl.alsoJournal...)
+		extraDisk := append([]string(nil), sl.alsoJournalDiskNames...)
+		sl.mu.Unlock()
+		if header == nil {
+			s.journalInitErr = fmt.Errorf("journaling indexed session: missing header")
+			return
+		}
+		if len(extra) > 0 {
+			if err := s.journalSources(ctx, header, extra, diskName); err != nil {
+				s.journalInitErr = err
+				return
+			}
+		}
+		if err := s.journalDiskCopies(ctx, header, extraDisk); err != nil {
+			s.journalInitErr = err
+			return
+		}
+		sl.mu.Lock()
+		sl.alsoJournal = nil
+		sl.alsoJournalDiskNames = nil
+		sl.mu.Unlock()
+		snap, err := s.readSnapshot(ctx, header, source, diskName)
+		if err != nil {
+			s.journalInitErr = fmt.Errorf("journaling indexed session %s: %w", header.ID, err)
+			return
+		}
+		if snap == nil {
+			s.journalInitErr = fmt.Errorf("journaling indexed session %s: snapshot not found", header.ID)
+			return
+		}
+		if err := s.appendJournal(ctx, snap); err != nil {
+			s.journalInitErr = err
+			return
+		}
+	}
+}
+
+// journalSuperseded journals snapshots that lost the index race. alsoJournal
+// is cleared only after those bodies are in the journal.
+func (s *Store) journalSuperseded(ctx context.Context, sess *Session) error {
+	s.mu.RLock()
+	sl := s.sessions[sess.ID]
+	s.mu.RUnlock()
+	if sl == nil {
+		return nil
+	}
+	sl.mu.Lock()
+	extra := append([]snapshotSource(nil), sl.alsoJournal...)
+	extraDisk := append([]string(nil), sl.alsoJournalDiskNames...)
+	header := sl.sess
+	diskName := sl.diskName
+	sl.mu.Unlock()
+	if len(extra) == 0 && len(extraDisk) == 0 {
+		return nil
+	}
+	if header == nil {
+		header = sess
+	}
+	if err := s.journalSources(ctx, header, extra, diskName); err != nil {
+		return err
+	}
+	if err := s.journalDiskCopies(ctx, header, extraDisk); err != nil {
+		return err
+	}
+	sl.mu.Lock()
+	sl.alsoJournal = nil
+	sl.alsoJournalDiskNames = nil
+	sl.mu.Unlock()
+	return nil
+}
+
+func (s *Store) journalSources(ctx context.Context, header *Session, sources []snapshotSource, diskName string) error {
+	seen := make(map[snapshotSource]bool, len(sources))
+	for _, src := range sources {
+		if seen[src] || src == sourceUnknown || src == sourceMemory {
+			continue
+		}
+		seen[src] = true
+		snap, err := s.readSnapshot(ctx, header, src, diskName)
+		if err != nil {
+			return fmt.Errorf("journaling superseded session %s: %w", header.ID, err)
+		}
+		if snap == nil {
+			return fmt.Errorf("journaling superseded session %s: snapshot not found", header.ID)
+		}
+		if err := s.appendJournal(ctx, snap); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) journalDiskCopies(ctx context.Context, header *Session, diskNames []string) error {
+	seen := make(map[string]bool, len(diskNames))
+	for _, name := range diskNames {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		snap, err := s.readSnapshot(ctx, header, sourceDisk, name)
+		if err != nil {
+			return fmt.Errorf("journaling superseded YAML session %s (%s): %w", header.ID, name, err)
+		}
+		if snap == nil {
+			return fmt.Errorf("journaling superseded YAML session %s (%s): snapshot not found", header.ID, name)
+		}
+		if err := s.appendJournal(ctx, snap); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) readSnapshot(ctx context.Context, header *Session, source snapshotSource, diskName string) (*Session, error) {
+	switch source {
+	case sourceDisk:
+		return s.loadSnapshotFromDisk(header, diskName)
+	case sourceSQLite:
+		return s.loadFromSQLite(ctx, header.ID, header.Channel, header.UserID)
+	case sourcePostgres:
+		return s.loadFromDB(ctx, header.ID, header.Channel, header.UserID)
+	default:
+		return nil, nil
+	}
 }
 
 // --- PostgreSQL backend ---
@@ -190,8 +444,11 @@ func (s *Store) loadFromDB(ctx context.Context, key, channel, userID string) (*S
 		key,
 	).Scan(&sess.ID, &sess.Channel, &sess.UserID, &msgsJSON, &sess.CreatedAt, &sess.UpdatedAt)
 
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
 	if err != nil {
-		return nil, nil // not found
+		return nil, fmt.Errorf("loading session from db: %w", err)
 	}
 
 	if err := json.Unmarshal(msgsJSON, &sess.Messages); err != nil {
@@ -257,8 +514,11 @@ func (s *Store) loadFromSQLite(ctx context.Context, key, channel, userID string)
 		key,
 	).Scan(&sess.ID, &sess.Channel, &sess.UserID, &msgsJSON, &sess.CreatedAt, &sess.UpdatedAt)
 
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
 	if err != nil {
-		return nil, nil // not found
+		return nil, fmt.Errorf("loading session from sqlite: %w", err)
 	}
 
 	if err := json.Unmarshal([]byte(msgsJSON), &sess.Messages); err != nil {
@@ -268,30 +528,42 @@ func (s *Store) loadFromSQLite(ctx context.Context, key, channel, userID string)
 	return &sess, nil
 }
 
-func (s *Store) loadAllFromSQLite() {
-	rows, err := s.sqliteDB.Query("SELECT id, channel, user_id, messages, created_at, updated_at FROM sessions")
+func (s *Store) loadIndexFromSQLite() error {
+	// A journal-only SQLite store may not have a sessions table yet.
+	var tableName string
+	err := s.sqliteDB.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sessions'`).Scan(&tableName)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
 	if err != nil {
-		return
+		return err
+	}
+	rows, err := s.sqliteDB.Query("SELECT id, channel, user_id, created_at, updated_at FROM sessions")
+	if err != nil {
+		return err
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var sess Session
-		var msgsJSON string
-		if err := rows.Scan(&sess.ID, &sess.Channel, &sess.UserID, &msgsJSON, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
-			continue
+		sess := &Session{}
+		if err := rows.Scan(&sess.ID, &sess.Channel, &sess.UserID, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
+			return err
 		}
-		if err := json.Unmarshal([]byte(msgsJSON), &sess.Messages); err != nil {
-			continue
+		if sess.ID == "" {
+			return fmt.Errorf("SQLite session row has empty ID")
 		}
-		s.sessions[sess.ID] = &sess
+		s.sessions[sess.ID] = &sessionSlot{sess: sess, source: sourceSQLite}
 	}
+	return rows.Err()
 }
 
-func (s *Store) loadAllFromDisk() {
+func (s *Store) loadIndexFromDisk() error {
 	entries, err := os.ReadDir(s.dataDir)
 	if err != nil {
-		return // dir doesn't exist yet
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
 	}
 
 	for _, entry := range entries {
@@ -299,17 +571,79 @@ func (s *Store) loadAllFromDisk() {
 		if ext != ".yaml" && ext != ".yml" {
 			continue
 		}
-
 		data, err := os.ReadFile(filepath.Join(s.dataDir, entry.Name()))
 		if err != nil {
-			continue
+			return fmt.Errorf("reading session file %s: %w", entry.Name(), err)
 		}
 
+		// Decode fully to verify the transcript. Only the header is retained;
+		// migrateSnapshots reads each body once more.
 		var sess Session
 		if err := yaml.Unmarshal(data, &sess); err != nil {
+			return fmt.Errorf("parsing session file %s: %w", entry.Name(), err)
+		}
+		if sess.ID == "" {
+			return fmt.Errorf("session file %s has empty ID", entry.Name())
+		}
+		header := &Session{
+			ID: sess.ID, Channel: sess.Channel, UserID: sess.UserID,
+			CreatedAt: sess.CreatedAt, UpdatedAt: sess.UpdatedAt,
+		}
+		if prev := s.sessions[sess.ID]; prev != nil {
+			if prev.source == sourceDisk {
+				canonical := filepath.Base(s.sessionFilePath(header))
+				if !preferDiskSnapshot(prev.diskName, entry.Name(), canonical) {
+					prev.alsoJournalDiskNames = append(prev.alsoJournalDiskNames, entry.Name())
+					continue
+				}
+				prev.alsoJournalDiskNames = append(prev.alsoJournalDiskNames, prev.diskName)
+			} else if prev.source != sourceUnknown && prev.source != sourceMemory {
+				prev.alsoJournal = append(prev.alsoJournal, prev.source)
+			}
+			prev.sess = header
+			prev.source = sourceDisk
+			prev.diskName = entry.Name()
+			prev.loaded = false
 			continue
 		}
-
-		s.sessions[sess.ID] = &sess
+		s.sessions[sess.ID] = &sessionSlot{sess: header, source: sourceDisk, diskName: entry.Name()}
 	}
+	return nil
+}
+
+func preferDiskSnapshot(current, candidate, canonical string) bool {
+	if current == canonical {
+		return false
+	}
+	if candidate == canonical {
+		return true
+	}
+	if filepath.Ext(current) != filepath.Ext(candidate) {
+		return filepath.Ext(candidate) == ".yaml"
+	}
+	return candidate < current
+}
+
+func (s *Store) loadSnapshotFromDisk(header *Session, diskName string) (*Session, error) {
+	path := s.sessionFilePath(header)
+	if base := filepath.Base(diskName); base != "" && base != "." && base != string(filepath.Separator) {
+		path = filepath.Join(s.dataDir, base)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading session file: %w", err)
+	}
+	var sess Session
+	if err := yaml.Unmarshal(data, &sess); err != nil {
+		return nil, fmt.Errorf("parsing session file: %w", err)
+	}
+	if sess.ID == "" {
+		sess.ID = header.ID
+	} else if sess.ID != header.ID {
+		return nil, fmt.Errorf("session file %s contains ID %q instead of %q", path, sess.ID, header.ID)
+	}
+	return &sess, nil
 }

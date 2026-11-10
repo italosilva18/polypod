@@ -72,7 +72,9 @@ func (s *Session) AddMessage(role Role, content string) Message {
 	return msg
 }
 
-// History returns the messages suitable for the AI API.
+// History returns the stored transcript. Compaction persists from this list.
+// A prompt-side selector is intentionally absent: turns after a summary stay
+// until a newly persisted summary replaces the transcript.
 func (s *Session) History() []Message {
 	return s.Messages
 }

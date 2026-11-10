@@ -49,7 +49,8 @@ func (m *Manager) AddAssistantMessage(ctx context.Context, sess *Session, conten
 	return nil
 }
 
-// GetHistory returns the conversation history for the AI API.
+// GetHistory returns the stored transcript. Callers that persist compaction
+// use this list so a summary is produced from every turn it must cover.
 func (m *Manager) GetHistory(sess *Session) []Message {
 	return sess.History()
 }
@@ -95,6 +96,13 @@ func (m *Manager) TruncateMessages(ctx context.Context, sess *Session, n int) ([
 func (m *Manager) ReplaceMessages(ctx context.Context, sess *Session, msgs []Message) error {
 	previous := append([]Message(nil), sess.Messages...)
 	previousUpdatedAt := sess.UpdatedAt
+	// Stamp ids on the caller slice before copying so a compacted history that
+	// is sent to the model names the same journal rows Save is about to write.
+	for i := range msgs {
+		if err := assignStoredID(sess.ID, &msgs[i]); err != nil {
+			return err
+		}
+	}
 	sess.Messages = append(sess.Messages[:0], msgs...)
 	sess.UpdatedAt = time.Now()
 	if err := m.store.Save(ctx, sess); err != nil {
