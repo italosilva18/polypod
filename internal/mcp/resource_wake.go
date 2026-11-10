@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ const (
 	defaultResourceWakeInterval = 30 * time.Second
 	resourceWakeTimeout         = 15 * time.Second
 	resourceWakeMaxRetry        = time.Minute
+	resourceWakeReconcileEvery  = 10 * time.Second
 )
 
 // ResourceUpdateHandler persists a wake for a subscribed resource. Returning
@@ -49,6 +51,9 @@ type resourceWakeDispatcher struct {
 	done         chan struct{}
 	closed       bool
 	logger       *slog.Logger
+	// storePath is configured before the handler starts. mu protects it and
+	// every in-memory view of the durable pending snapshot.
+	storePath string
 }
 
 func newResourceWakeDispatcher(logger *slog.Logger) *resourceWakeDispatcher {
@@ -85,60 +90,89 @@ func (d *resourceWakeDispatcher) setHandler(handler ResourceUpdateHandler, optio
 		go d.loop(ctx, d.done)
 	}
 	if handler == nil {
-		clear(d.pending)
-		clear(d.nextRetry)
-		clear(d.failures)
-		clear(d.generation)
+		// The handler can be disabled temporarily. Accepted wakes remain on
+		// disk and in memory so re-enabling it does not discard them.
+		if d.storePath == "" {
+			clear(d.pending)
+			clear(d.nextRetry)
+			clear(d.failures)
+			clear(d.generation)
+		}
 	}
 	d.mu.Unlock()
 	d.wake()
 }
 
-func (d *resourceWakeDispatcher) notify(update ResourceUpdate) {
+// notify persists an accepted wake before returning to the SDK callback.
+// A storage error prevents the in-memory dispatcher from treating the wake
+// as accepted; the callback reports that error to the operational log.
+func (d *resourceWakeDispatcher) notify(update ResourceUpdate) error {
 	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.closed || d.handler == nil {
-		d.mu.Unlock()
-		return
+		return nil
 	}
 	key := resourceWakeKey(update.Server, update.URI)
-	if pending, ok := d.pending[key]; ok {
+	if d.storePath != "" {
+		var queue []resourceWakeRecord
+		err := updateResourceWakeFile(d.storePath, func(state *resourceWakeFile) (bool, error) {
+			items := state.Pending[key]
+			if len(items) == 0 || items[len(items)-1].HandoffStarted {
+				if len(items) >= 2 {
+					return false, fmt.Errorf("mcp: fila de notificacoes do recurso cheia")
+				}
+				update.WakeID = "task_" + uuid.NewString()
+				update.WakeRevision = 1
+				items = append(items, resourceWakeRecord{ResourceUpdate: update})
+			} else {
+				last := len(items) - 1
+				pending := items[last].ResourceUpdate
+				update = latestWake(update, pending)
+				update.WakeID = pending.WakeID
+				if pending.WakeRevision == ^uint64(0) {
+					return false, fmt.Errorf("mcp: revisao de notificacao de recurso esgotada")
+				}
+				update.WakeRevision = pending.WakeRevision + 1
+				items[last].ResourceUpdate = update
+			}
+			state.Pending[key] = items
+			queue = append([]resourceWakeRecord(nil), items...)
+			return true, nil
+		})
+		if err != nil {
+			return fmt.Errorf("mcp: salvando notificacao de recurso: %w", err)
+		}
+		d.adoptQueueHeadLocked(key, queue)
+	} else if pending, ok := d.pending[key]; ok {
 		update.WakeID = pending.WakeID
+		d.pending[key] = update
 	} else {
 		update.WakeID = "task_" + uuid.NewString()
+		d.pending[key] = update
 		d.nextGen++
 		d.generation[key] = d.nextGen
 	}
-	d.pending[key] = update
-	d.mu.Unlock()
 	d.wake()
+	return nil
 }
 
-func (d *resourceWakeDispatcher) drop(server, uri string) {
-	key := resourceWakeKey(server, uri)
-	d.mu.Lock()
-	delete(d.pending, key)
-	delete(d.lastAccepted, key)
-	delete(d.nextRetry, key)
-	delete(d.failures, key)
-	delete(d.generation, key)
-	d.mu.Unlock()
-	d.wake()
-}
-
-func (d *resourceWakeDispatcher) dropServer(server string) {
-	d.mu.Lock()
-	for key, update := range d.pending {
-		if update.Server != server {
-			continue
-		}
+func (d *resourceWakeDispatcher) adoptQueueHeadLocked(key string, queue []resourceWakeRecord) {
+	if len(queue) == 0 {
 		delete(d.pending, key)
-		delete(d.lastAccepted, key)
+		delete(d.generation, key)
 		delete(d.nextRetry, key)
 		delete(d.failures, key)
-		delete(d.generation, key)
+		return
 	}
-	d.mu.Unlock()
-	d.wake()
+	head := queue[0].ResourceUpdate
+	current, exists := d.pending[key]
+	if !exists || current.WakeID != head.WakeID || current.WakeRevision != head.WakeRevision {
+		d.nextGen++
+		d.generation[key] = d.nextGen
+		delete(d.nextRetry, key)
+		delete(d.failures, key)
+	}
+	d.pending[key] = head
 }
 
 func (d *resourceWakeDispatcher) wake() {
@@ -168,6 +202,67 @@ func (d *resourceWakeDispatcher) next(now time.Time) (string, ResourceUpdate, ui
 	return selected, d.pending[selected], d.generation[selected], d.handler, max(time.Duration(0), selectedDue.Sub(now))
 }
 
+// markHandoff commits the dispatch boundary before a queue call. A later
+// notification observes this marker and is assigned a successor WakeID. If
+// another process changed the head, the local snapshot is refreshed instead.
+func (d *resourceWakeDispatcher) markHandoff(key string, update ResourceUpdate, generation uint64) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed || d.generation[key] != generation || d.pending[key].WakeID != update.WakeID {
+		return false, nil
+	}
+	if d.storePath == "" {
+		return true, nil
+	}
+	var queue []resourceWakeRecord
+	err := updateResourceWakeFile(d.storePath, func(state *resourceWakeFile) (bool, error) {
+		items := state.Pending[key]
+		queue = append([]resourceWakeRecord(nil), items...)
+		if len(items) == 0 || items[0].WakeID != update.WakeID || items[0].WakeRevision != update.WakeRevision {
+			return false, nil
+		}
+		if items[0].HandoffStarted {
+			return false, nil
+		}
+		items[0].HandoffStarted = true
+		state.Pending[key] = items
+		queue = append([]resourceWakeRecord(nil), items...)
+		return true, nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("mcp: persistindo inicio de entrega: %w", err)
+	}
+	d.adoptQueueHeadLocked(key, queue)
+	return len(queue) > 0 && queue[0].WakeID == update.WakeID && queue[0].WakeRevision == update.WakeRevision, nil
+}
+
+// reconcile adopts wakes created by another Polypod process. A process that
+// survives a CLI crash can then hand off that CLI's persisted notifications.
+func (d *resourceWakeDispatcher) reconcile() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed || d.storePath == "" {
+		return nil
+	}
+	var state resourceWakeFile
+	if err := withResourceWakeFileLock(d.storePath, func() error {
+		var readErr error
+		state, _, readErr = readResourceWakeFile(d.storePath)
+		return readErr
+	}); err != nil {
+		return fmt.Errorf("mcp: reconciliando notificacoes de recursos: %w", err)
+	}
+	for key, queue := range state.Pending {
+		d.adoptQueueHeadLocked(key, queue)
+	}
+	for key := range d.pending {
+		if _, exists := state.Pending[key]; !exists {
+			d.adoptQueueHeadLocked(key, nil)
+		}
+	}
+	return nil
+}
+
 func (d *resourceWakeDispatcher) complete(key string, update ResourceUpdate, generation uint64, err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -176,6 +271,36 @@ func (d *resourceWakeDispatcher) complete(key string, update ResourceUpdate, gen
 	}
 	now := time.Now()
 	if err == nil {
+		if d.storePath != "" {
+			var queue []resourceWakeRecord
+			persistErr := updateResourceWakeFile(d.storePath, func(state *resourceWakeFile) (bool, error) {
+				items := state.Pending[key]
+				queue = append([]resourceWakeRecord(nil), items...)
+				if len(items) == 0 || items[0].WakeID != update.WakeID {
+					return false, nil
+				}
+				if items[0].WakeRevision != update.WakeRevision {
+					return false, fmt.Errorf("mcp: revisao do wake mudou durante a entrega")
+				}
+				items = items[1:]
+				if len(items) == 0 {
+					delete(state.Pending, key)
+				} else {
+					state.Pending[key] = items
+				}
+				queue = append([]resourceWakeRecord(nil), items...)
+				return true, nil
+			})
+			if persistErr != nil {
+				d.retryLocked(key, update, now, fmt.Errorf("mcp: registrando aceite do wake: %w", persistErr))
+				return
+			}
+			d.lastAccepted[key] = now
+			delete(d.nextRetry, key)
+			delete(d.failures, key)
+			d.adoptQueueHeadLocked(key, queue)
+			return
+		}
 		d.lastAccepted[key] = now
 		delete(d.nextRetry, key)
 		delete(d.failures, key)
@@ -190,6 +315,10 @@ func (d *resourceWakeDispatcher) complete(key string, update ResourceUpdate, gen
 		}
 		return
 	}
+	d.retryLocked(key, update, now, err)
+}
+
+func (d *resourceWakeDispatcher) retryLocked(key string, update ResourceUpdate, now time.Time, err error) {
 	d.failures[key]++
 	backoff := time.Second << min(d.failures[key], 6)
 	if backoff > resourceWakeMaxRetry {
@@ -201,13 +330,27 @@ func (d *resourceWakeDispatcher) complete(key string, update ResourceUpdate, gen
 
 func (d *resourceWakeDispatcher) loop(ctx context.Context, done chan struct{}) {
 	defer close(done)
+	ticker := time.NewTicker(resourceWakeReconcileEvery)
+	defer ticker.Stop()
 	for {
+		select {
+		case <-ticker.C:
+			if err := d.reconcile(); err != nil {
+				d.logger.Warn("mcp resource wake reconciliation failed", "error", err)
+			}
+		default:
+		}
 		key, update, generation, handler, wait := d.next(time.Now())
 		if handler == nil {
 			select {
 			case <-ctx.Done():
 				return
 			case <-d.signal:
+				continue
+			case <-ticker.C:
+				if err := d.reconcile(); err != nil {
+					d.logger.Warn("mcp resource wake reconciliation failed", "error", err)
+				}
 				continue
 			}
 		}
@@ -220,9 +363,27 @@ func (d *resourceWakeDispatcher) loop(ctx context.Context, done chan struct{}) {
 			case <-d.signal:
 				timer.Stop()
 				continue
+			case <-ticker.C:
+				timer.Stop()
+				if err := d.reconcile(); err != nil {
+					d.logger.Warn("mcp resource wake reconciliation failed", "error", err)
+				}
+				continue
 			case <-timer.C:
 				continue
 			}
+		}
+		marked, markErr := d.markHandoff(key, update, generation)
+		if markErr != nil {
+			d.mu.Lock()
+			if d.generation[key] == generation {
+				d.retryLocked(key, update, time.Now(), markErr)
+			}
+			d.mu.Unlock()
+			continue
+		}
+		if !marked {
+			continue
 		}
 		handoffCtx, cancel := context.WithTimeout(ctx, resourceWakeTimeout)
 		err := handler(handoffCtx, update)

@@ -39,6 +39,9 @@ type Manager struct {
 	subscriptionSaveMu sync.Mutex
 	resourceUpdates    map[string][]ResourceUpdate
 	resourceWake       *resourceWakeDispatcher
+	// disconnecting keeps session identity available to notification callbacks
+	// while ClientSession.Close drains them. mu protects the map and channels.
+	disconnecting      map[string]chan struct{}
 	prompts            map[string][]*mcpsdk.Prompt
 	elicitationHandler ElicitationHandler
 	elicitationWaiters map[*mcpsdk.ClientSession]map[string]chan struct{}
@@ -63,6 +66,7 @@ func NewManager(logger *slog.Logger) *Manager {
 		subscriptions:      make(map[string]map[string]struct{}),
 		resourceUpdates:    make(map[string][]ResourceUpdate),
 		resourceWake:       newResourceWakeDispatcher(logger),
+		disconnecting:      make(map[string]chan struct{}),
 		elicitationWaiters: make(map[*mcpsdk.ClientSession]map[string]chan struct{}),
 		prompts:            make(map[string][]*mcpsdk.Prompt),
 		logger:             logger,
@@ -105,6 +109,10 @@ func (m *Manager) Connect(ctx context.Context, cfg ServerConfig) error {
 		return err
 	}
 	m.mu.Lock()
+	if m.closed || m.disconnecting[cfg.Name] != nil {
+		m.mu.Unlock()
+		return fmt.Errorf("mcp: servidor %q em encerramento", cfg.Name)
+	}
 	m.configs[cfg.Name] = cloneServerConfig(cfg)
 	_, alreadyConnected := m.sessions[cfg.Name]
 	m.mu.Unlock()
@@ -138,10 +146,10 @@ func (m *Manager) Connect(ctx context.Context, cfg ServerConfig) error {
 	}
 
 	m.mu.Lock()
-	if m.closed {
+	if m.closed || m.disconnecting[cfg.Name] != nil {
 		m.mu.Unlock()
 		session.Close()
-		return fmt.Errorf("mcp: manager fechado")
+		return fmt.Errorf("mcp: servidor %q em encerramento", cfg.Name)
 	}
 	if old := m.sessions[cfg.Name]; old != nil {
 		m.mu.Unlock()
@@ -172,25 +180,43 @@ func (m *Manager) Connect(ctx context.Context, cfg ServerConfig) error {
 
 // Disconnect closes a server connection.
 func (m *Manager) Disconnect(name string) error {
-	m.reconnect.Stop(name)
 	m.mu.Lock()
-
+	if m.closed {
+		m.mu.Unlock()
+		return fmt.Errorf("mcp: manager fechado")
+	}
 	session, ok := m.sessions[name]
 	if !ok {
 		m.mu.Unlock()
 		return fmt.Errorf("mcp: servidor %q nao conectado", name)
 	}
-
-	m.removeServerSkillsLocked(name)
-	delete(m.sessions, name)
-	delete(m.tools, name)
-	delete(m.resources, name)
-	delete(m.resourceTemplates, name)
-	delete(m.resourceUpdates, name)
-	delete(m.prompts, name)
+	if m.disconnecting[name] != nil {
+		m.mu.Unlock()
+		return fmt.Errorf("mcp: servidor %q ja esta desconectando", name)
+	}
+	done := make(chan struct{})
+	m.disconnecting[name] = done
 	m.mu.Unlock()
-	m.resourceWake.dropServer(name)
-	return session.Close()
+
+	m.reconnect.Stop(name)
+	err := session.Close()
+	m.mu.Lock()
+	if m.sessions[name] == session {
+		m.removeServerSkillsLocked(name)
+		delete(m.sessions, name)
+		delete(m.tools, name)
+		delete(m.resources, name)
+		delete(m.resourceTemplates, name)
+		delete(m.resourceUpdates, name)
+		delete(m.prompts, name)
+	}
+	delete(m.disconnecting, name)
+	close(done)
+	m.mu.Unlock()
+	// A notification already accepted by the local journal survives an
+	// explicit disconnect. The queued task has a bounded retry budget; dropping
+	// it here would erase acknowledged work before that budget is used.
+	return err
 }
 
 // RegisterTools registers all MCP tools from connected servers into a skill registry.
@@ -332,12 +358,42 @@ func (m *Manager) ListServers() map[string][]string {
 
 // Close disconnects all servers.
 func (m *Manager) Close() error {
-	m.resourceWake.Close()
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil
+	}
+	// Reject new connections while retaining session identity and desired
+	// subscriptions for resource callbacks already being drained by Close.
+	m.closed = true
+	var disconnects []chan struct{}
+	for _, done := range m.disconnecting {
+		disconnects = append(disconnects, done)
+	}
+	m.mu.Unlock()
+	for _, done := range disconnects {
+		<-done
+	}
+	m.mu.Lock()
+	sessions := make(map[string]*mcpsdk.ClientSession, len(m.sessions))
+	for name, session := range m.sessions {
+		sessions[name] = session
+	}
+	m.mu.Unlock()
+
 	m.reconnect.StopAll()
+	var lastErr error
+	for name, session := range sessions {
+		if err := session.Close(); err != nil {
+			lastErr = err
+			m.logger.Warn("mcp close error", "server", name, "error", err)
+		}
+	}
+	// The SDK has finished closing its sessions, including callbacks they
+	// invoked. Keep the wake dispatcher open until those callbacks can persist.
+	m.resourceWake.Close()
 
 	m.mu.Lock()
-	m.closed = true
-	sessions := m.sessions
 	for name := range sessions {
 		m.removeServerSkillsLocked(name)
 	}
@@ -351,14 +407,6 @@ func (m *Manager) Close() error {
 	m.elicitationWaiters = make(map[*mcpsdk.ClientSession]map[string]chan struct{})
 	m.prompts = make(map[string][]*mcpsdk.Prompt)
 	m.mu.Unlock()
-
-	var lastErr error
-	for name, session := range sessions {
-		if err := session.Close(); err != nil {
-			lastErr = err
-			m.logger.Warn("mcp close error", "server", name, "error", err)
-		}
-	}
 	return lastErr
 }
 

@@ -10,8 +10,9 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Reconnect redials a configured server and keeps the old session available
-// until the replacement has initialized and published its tool catalog.
+// Reconnect redials a configured server and keeps the old session identifiable
+// until it has drained its notification callbacks. The replacement is already
+// initialized before the old session is closed, then published atomically.
 func (m *Manager) Reconnect(ctx context.Context, name string) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -20,9 +21,10 @@ func (m *Manager) Reconnect(ctx context.Context, name string) error {
 	cfg, configured := m.configs[name]
 	old := m.sessions[name]
 	closed := m.closed
+	disconnecting := m.disconnecting[name] != nil
 	m.mu.RUnlock()
-	if closed {
-		return fmt.Errorf("mcp: manager fechado")
+	if closed || disconnecting {
+		return fmt.Errorf("mcp: servidor %q em encerramento", name)
 	}
 	if !configured {
 		return fmt.Errorf("mcp: servidor %q nao configurado", name)
@@ -66,12 +68,41 @@ func (m *Manager) Reconnect(ctx context.Context, name string) error {
 	}
 
 	m.mu.Lock()
-	if m.closed || m.sessions[name] != old {
+	if m.closed || m.disconnecting[name] != nil || m.sessions[name] != old {
 		m.mu.Unlock()
 		if closeErr := replacement.Close(); closeErr != nil {
 			m.logger.Warn("mcp stale replacement close failed", "server", name, "error", closeErr)
 		}
 		return fmt.Errorf("mcp: estado de %q mudou durante reconexao", name)
+	}
+	done := make(chan struct{})
+	m.disconnecting[name] = done
+	m.mu.Unlock()
+
+	// The old session remains in m.sessions while Close drains callbacks. A
+	// concurrent Manager.Close waits for done before it clears that identity.
+	m.reconnect.Stop(name)
+	if old != nil {
+		if err := old.Close(); err != nil {
+			m.logger.Warn("mcp replaced session close failed", "server", name, "error", err)
+		}
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.removeServerSkillsLocked(name)
+		delete(m.sessions, name)
+		delete(m.tools, name)
+		delete(m.resources, name)
+		delete(m.resourceTemplates, name)
+		delete(m.resourceUpdates, name)
+		delete(m.prompts, name)
+		delete(m.disconnecting, name)
+		close(done)
+		m.mu.Unlock()
+		if closeErr := replacement.Close(); closeErr != nil {
+			m.logger.Warn("mcp replacement close during shutdown failed", "server", name, "error", closeErr)
+		}
+		return fmt.Errorf("mcp: manager fechado")
 	}
 	m.removeServerSkillsLocked(name)
 	m.sessions[name] = replacement
@@ -85,16 +116,9 @@ func (m *Manager) Reconnect(ctx context.Context, name string) error {
 			m.registerMCPToolLocked(name, item, replacement)
 		}
 	}
+	delete(m.disconnecting, name)
+	close(done)
 	m.mu.Unlock()
-
-	// The previous reconnect state owns the previous session's context. Stop it
-	// only after the new session is visible to callers.
-	m.reconnect.Stop(name)
-	if old != nil {
-		if err := old.Close(); err != nil {
-			m.logger.Warn("mcp replaced session close failed", "server", name, "error", err)
-		}
-	}
 	m.refreshOptionalLists(ctx, replacement)
 	m.restoreSubscriptions(ctx, name, replacement)
 	m.logger.Info("mcp server reconnected", "server", name, "tools", len(items))

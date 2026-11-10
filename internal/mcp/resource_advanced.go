@@ -15,10 +15,11 @@ const maxResourceUpdates = 64
 // ResourceUpdate is a notification from a subscribed MCP resource. It does
 // not contain resource contents; callers read the URI again when needed.
 type ResourceUpdate struct {
-	Server string    `json:"server"`
-	URI    string    `json:"uri"`
-	At     time.Time `json:"at"`
-	WakeID string    `json:"wake_id,omitempty"`
+	Server       string    `json:"server"`
+	URI          string    `json:"uri"`
+	At           time.Time `json:"at"`
+	WakeID       string    `json:"wake_id,omitempty"`
+	WakeRevision uint64    `json:"wake_revision,omitempty"`
 }
 
 func (m *Manager) refreshResourceTemplates(ctx context.Context, session *mcpsdk.ClientSession) error {
@@ -75,6 +76,10 @@ func (m *Manager) SubscribeResource(ctx context.Context, server, uri string) err
 		return fmt.Errorf("mcp: URI de recurso obrigatoria")
 	}
 	m.mu.RLock()
+	if m.closed || m.disconnecting[server] != nil {
+		m.mu.RUnlock()
+		return fmt.Errorf("mcp: servidor %q em encerramento", server)
+	}
 	session := m.sessions[server]
 	_, already := m.subscriptions[server][uri]
 	m.mu.RUnlock()
@@ -92,7 +97,7 @@ func (m *Manager) SubscribeResource(ctx context.Context, server, uri string) err
 		return fmt.Errorf("mcp subscribe %s %s: %w", server, uri, err)
 	}
 	m.mu.Lock()
-	if m.closed || m.sessions[server] != session {
+	if m.closed || m.disconnecting[server] != nil || m.sessions[server] != session {
 		m.mu.Unlock()
 		return fmt.Errorf("mcp: conexao de %q mudou durante a assinatura", server)
 	}
@@ -116,6 +121,10 @@ func (m *Manager) UnsubscribeResource(ctx context.Context, server, uri string) e
 		return fmt.Errorf("mcp: URI de recurso obrigatoria")
 	}
 	m.mu.RLock()
+	if m.closed || m.disconnecting[server] != nil {
+		m.mu.RUnlock()
+		return fmt.Errorf("mcp: servidor %q em encerramento", server)
+	}
 	session := m.sessions[server]
 	_, subscribed := m.subscriptions[server][uri]
 	m.mu.RUnlock()
@@ -128,12 +137,18 @@ func (m *Manager) UnsubscribeResource(ctx context.Context, server, uri string) e
 		}
 	}
 	m.mu.Lock()
+	if m.closed || m.disconnecting[server] != nil {
+		m.mu.Unlock()
+		return fmt.Errorf("mcp: servidor %q em encerramento", server)
+	}
 	delete(m.subscriptions[server], uri)
 	if len(m.subscriptions[server]) == 0 {
 		delete(m.subscriptions, server)
 	}
 	m.mu.Unlock()
-	m.resourceWake.drop(server, uri)
+	// A notification accepted before unsubscription remains a pending task.
+	// The server may stop future notifications, but this does not revoke work
+	// already durably acknowledged by this client.
 	if err := m.persistSubscriptionChange(server, uri); err != nil {
 		return fmt.Errorf("mcp: assinatura removida, mas nao foi salva: %w", err)
 	}
@@ -183,10 +198,6 @@ func (m *Manager) recordResourceUpdate(req *mcpsdk.ResourceUpdatedNotificationRe
 		return
 	}
 	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		return
-	}
 	for name, session := range m.sessions {
 		if session != req.Session {
 			continue
@@ -200,7 +211,12 @@ func (m *Manager) recordResourceUpdate(req *mcpsdk.ResourceUpdatedNotificationRe
 		_, subscribed := m.subscriptions[name][req.Params.URI]
 		m.mu.Unlock()
 		if subscribed {
-			m.resourceWake.notify(update)
+			// The callback observed this subscription and session before it
+			// returned. Keep the accepted wake even if a disconnect races with
+			// the journal write; never hold Manager.mu over disk I/O.
+			if err := m.resourceWake.notify(update); err != nil {
+				m.logger.Error("mcp resource wake could not be persisted", "server", name, "uri", update.URI, "error", err)
+			}
 		}
 		return
 	}

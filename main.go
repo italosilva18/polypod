@@ -1252,6 +1252,9 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	if err := mcpMgr.SetSubscriptionStore(filepath.Join(cfg.Data.Dir, "mcp-subscriptions.json")); err != nil {
 		logger.Warn("MCP resource subscription persistence unavailable", "error", err)
 	}
+	if err := mcpMgr.SetResourceWakeStore(filepath.Join(cfg.Data.Dir, "mcp-resource-wakes.json")); err != nil {
+		return fmt.Errorf("initializing durable MCP resource wakes: %w", err)
+	}
 	mcpMgr.SetResourceUpdateHandler(func(wakeCtx context.Context, update mcp.ResourceUpdate) error {
 		_, err := taskQueue.Create(wakeCtx, taskqueue.CreateInput{
 			ID:          update.WakeID,
