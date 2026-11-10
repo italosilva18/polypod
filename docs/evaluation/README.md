@@ -1,6 +1,6 @@
 # Avaliação reproduzível
 
-Este pacote oferece duas etapas: um runner programático que executa tarefas por um `Executor` injetado e o harness offline que importa resultados de verificadores e traces. Nenhum comando deste diretório chama um modelo ou executa tarefas sozinho. O manifesto `manifest.v1.json` é um smoke test local de cinco capacidades, **não** uma reprodução dos benchmarks oficiais. A fixture é sintética e todo relatório gerado a partir dela traz esse aviso.
+Este pacote oferece um runner programático, um comando para executar casos reais em ambientes preparados e o harness offline que importa resultados e traces. O comando de execução só chama o agente quando recebe um manifesto com prompts, metadados e um plano explícito de comandos/verificadores. O manifesto `manifest.v1.json` é um smoke test local de cinco capacidades, **não** uma reprodução dos benchmarks oficiais. A fixture é sintética e todo relatório gerado a partir dela traz esse aviso.
 
 ```bash
 go run ./internal/evaluation/cmd \
