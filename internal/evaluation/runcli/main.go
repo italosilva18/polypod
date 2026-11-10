@@ -55,6 +55,28 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	outputAbs, err := filepath.Abs(*outputPath)
+	if err != nil {
+		return err
+	}
+	for _, input := range []string{*manifestPath, *metadataPath, *planPath} {
+		inputAbs, err := filepath.Abs(input)
+		if err != nil {
+			return err
+		}
+		if inputAbs == outputAbs {
+			return fmt.Errorf("o arquivo de resultados não pode sobrescrever uma entrada")
+		}
+	}
+	file, err := os.CreateTemp(filepath.Dir(outputAbs), ".polypod-eval-*.tmp")
+	if err != nil {
+		return fmt.Errorf("criar resultados temporários: %w", err)
+	}
+	defer file.Close()
+	defer os.Remove(file.Name())
+	if err := file.Chmod(0600); err != nil {
+		return err
+	}
 	results, err := evaluation.Run(ctx, manifest, metadata, evaluation.RunOptions{
 		Executor: runner.Execute,
 		Verifier: runner.Verify,
@@ -67,28 +89,16 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 	data = append(data, '\n')
-	outputDir := filepath.Dir(*outputPath)
-	file, err := os.CreateTemp(outputDir, ".polypod-eval-*.tmp")
-	if err != nil {
-		return fmt.Errorf("criar resultados temporários: %w", err)
-	}
-	defer os.Remove(file.Name())
-	if err := file.Chmod(0600); err != nil {
-		file.Close()
-		return err
-	}
 	if _, err := file.Write(data); err != nil {
-		file.Close()
 		return err
 	}
 	if err := file.Sync(); err != nil {
-		file.Close()
 		return err
 	}
 	if err := file.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(file.Name(), *outputPath); err != nil {
+	if err := os.Rename(file.Name(), outputAbs); err != nil {
 		return fmt.Errorf("publicar resultados: %w", err)
 	}
 	return nil

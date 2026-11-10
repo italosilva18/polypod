@@ -79,21 +79,23 @@ type Metrics struct {
 	P95     *float64 `json:"p95"`
 }
 type Report struct {
-	SchemaVersion   int                   `json:"schema_version"`
-	ManifestID      string                `json:"manifest_id"`
-	ManifestVersion string                `json:"manifest_version"`
-	ManifestSHA256  string                `json:"manifest_sha256"`
-	ResultsSHA256   string                `json:"results_sha256"`
-	Metadata        Metadata              `json:"metadata"`
-	Overall         Score                 `json:"overall"`
-	Categories      map[string]Score      `json:"categories"`
-	Recovery        Score                 `json:"recovery"`
-	LatencyMS       Metrics               `json:"latency_ms"`
-	CostUSD         Metrics               `json:"cost_usd"`
-	Missing         []string              `json:"missing"`
-	BudgetExceeded  []string              `json:"budget_exceeded"`
-	Outcomes        []Outcome             `json:"outcomes"`
-	Traces          map[string]TraceStats `json:"traces,omitempty"`
+	SchemaVersion    int                   `json:"schema_version"`
+	ManifestID       string                `json:"manifest_id"`
+	ManifestVersion  string                `json:"manifest_version"`
+	ManifestSHA256   string                `json:"manifest_sha256"`
+	ResultsSHA256    string                `json:"results_sha256"`
+	Metadata         Metadata              `json:"metadata"`
+	Overall          Score                 `json:"overall"`
+	BudgetMeasured   Score                 `json:"budget_measured"`
+	Categories       map[string]Score      `json:"categories"`
+	Recovery         Score                 `json:"recovery"`
+	LatencyMS        Metrics               `json:"latency_ms"`
+	CostUSD          Metrics               `json:"cost_usd"`
+	Missing          []string              `json:"missing"`
+	BudgetExceeded   []string              `json:"budget_exceeded"`
+	BudgetUnmeasured []string              `json:"budget_unmeasured"`
+	Outcomes         []Outcome             `json:"outcomes"`
+	Traces           map[string]TraceStats `json:"traces,omitempty"`
 }
 
 // Decode rejects unknown fields and trailing documents for versioned contracts.
@@ -133,7 +135,9 @@ func metrics(xs []float64) Metrics {
 	return m
 }
 func Evaluate(m Manifest, r Results) (Report, error) {
-	p := Report{SchemaVersion: SchemaVersion, ManifestID: m.ID, ManifestVersion: m.Version, Metadata: r.Metadata, Categories: map[string]Score{}, Missing: []string{}, BudgetExceeded: []string{}, Outcomes: r.Outcomes}
+	p := Report{SchemaVersion: SchemaVersion, ManifestID: m.ID, ManifestVersion: m.Version, Metadata: r.Metadata,
+		Categories: map[string]Score{}, Missing: []string{}, BudgetExceeded: []string{},
+		BudgetUnmeasured: []string{}, Outcomes: r.Outcomes}
 	if m.SchemaVersion != SchemaVersion || r.SchemaVersion != SchemaVersion {
 		return p, fmt.Errorf("schema_version incompatível")
 	}
@@ -196,6 +200,7 @@ func Evaluate(m Manifest, r Results) (Report, error) {
 		s := p.Categories[t.Category]
 		s.Total++
 		p.Overall.Total++
+		p.BudgetMeasured.Total++
 		if t.Recovery {
 			p.Recovery.Total++
 		}
@@ -207,6 +212,12 @@ func Evaluate(m Manifest, r Results) (Report, error) {
 		}
 		s.Reported++
 		p.Overall.Reported++
+		completeBudget := o.LatencyMS != nil && o.CostUSD != nil && o.Steps != nil
+		if completeBudget {
+			p.BudgetMeasured.Reported++
+		} else {
+			p.BudgetUnmeasured = append(p.BudgetUnmeasured, t.ID)
+		}
 		exceeded := (o.LatencyMS != nil && *o.LatencyMS > md.Budget.MaxSeconds*1000) || (o.CostUSD != nil && *o.CostUSD > md.Budget.MaxUSD) || (o.Steps != nil && *o.Steps > md.Budget.MaxSteps)
 		if exceeded {
 			p.BudgetExceeded = append(p.BudgetExceeded, t.ID)
@@ -214,6 +225,9 @@ func Evaluate(m Manifest, r Results) (Report, error) {
 		if o.Status == "success" && !exceeded {
 			s.Success++
 			p.Overall.Success++
+			if completeBudget {
+				p.BudgetMeasured.Success++
+			}
 		}
 		if t.Recovery && o.Recovered != nil {
 			p.Recovery.Reported++
@@ -233,6 +247,7 @@ func Evaluate(m Manifest, r Results) (Report, error) {
 		p.Categories[c] = rate(s)
 	}
 	p.Overall = rate(p.Overall)
+	p.BudgetMeasured = rate(p.BudgetMeasured)
 	p.Recovery = rate(p.Recovery)
 	p.LatencyMS = metrics(latency)
 	p.CostUSD = metrics(cost)
@@ -250,7 +265,7 @@ func Markdown(p Report) (string, error) {
 	if p.Metadata.Synthetic {
 		b.WriteString("**Dados sintéticos: validam o harness, não demonstram desempenho do agente.**\n\n")
 	}
-	b.WriteString("| Dimensão | Sucessos | Total | Reportados | Taxa |\n|---|---:|---:|---:|---:|\n")
+	b.WriteString("| Dimensão | Sucessos observados | Total | Reportados | Taxa provisória |\n|---|---:|---:|---:|---:|\n")
 	for _, c := range append([]string{"overall"}, Categories...) {
 		s := p.Categories[c]
 		if c == "overall" {
@@ -258,7 +273,7 @@ func Markdown(p Report) (string, error) {
 		}
 		fmt.Fprintf(&b, "| %s | %d | %d | %d | %s |\n", c, s.Success, s.Total, s.Reported, percent(s.Rate))
 	}
-	fmt.Fprintf(&b, "\nRecuperação: %s (%d/%d; %d reportados).\n\nLatência: %d amostras. Custo: US$ %.6f (%d amostras). Valores ausentes não são zero.\n\nAusentes: %v. Orçamento excedido: %v.\n\nMetadados e resultados completos:\n\n", percent(p.Recovery.Rate), p.Recovery.Success, p.Recovery.Total, p.Recovery.Reported, p.LatencyMS.Samples, p.CostUSD.Total, p.CostUSD.Samples, p.Missing, p.BudgetExceeded)
+	fmt.Fprintf(&b, "\nSucessos com orçamento integral medido: %d/%d (%s); medições completas em %d tarefas.\n\nRecuperação provisória: %s (%d/%d; %d reportados).\n\nLatência: %d amostras. Custo: US$ %.6f (%d amostras). Valores ausentes não são zero.\n\nAusentes: %v. Orçamento excedido: %v. Orçamento sem medição completa: %v.\n\nMetadados e resultados completos:\n\n", p.BudgetMeasured.Success, p.BudgetMeasured.Total, percent(p.BudgetMeasured.Rate), p.BudgetMeasured.Reported, percent(p.Recovery.Rate), p.Recovery.Success, p.Recovery.Total, p.Recovery.Reported, p.LatencyMS.Samples, p.CostUSD.Total, p.CostUSD.Samples, p.Missing, p.BudgetExceeded, p.BudgetUnmeasured)
 	raw, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("serializar relatório: %w", err)

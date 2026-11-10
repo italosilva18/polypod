@@ -110,6 +110,18 @@ e respostas do modelo não vira instrução. A evidência completa fica no regis
 para consulta. `Review` aprova um corpo revisado ou descarta a proposta;
 `Apply` aceita apenas propostas aprovadas e publica a skill em `skillsDir`.
 
+`SearchVerified(ctx, query, limit)` recupera automaticamente padrões com três
+sucessos internos, taxa mínima de 75% e sequência repetida, quando a categoria
+tem palavras relevantes para o pedido atual. O resumo contém somente contagens,
+nomes de ferramentas e tipos de verificador; resultados manuais, prompts,
+argumentos e referências privadas não entram no contexto. `SearchApplied`
+recupera no máximo uma skill já revisada, confere o hash do arquivo aprovado e
+limita a leitura a 16 KiB. O serviço de IA injeta esses trechos apenas no CLI
+local, no canal do proprietário validado pelo WhatsApp e no contexto interno
+`system/owner`. As observações ajudam a escolher um procedimento, mas cada
+execução ainda precisa conferir o próprio resultado. A aplicação da skill
+continua exigindo revisão explícita.
+
 A ferramenta `skill_evolution` expõe `plan`, `patterns`, `propose`, `get`,
 `list`, `review` e `apply`. Ela não expõe `record`: o agente não pode certificar
 o próprio sucesso. `RecordOutcome` permanece uma API para chamadores confiáveis.

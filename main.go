@@ -78,6 +78,7 @@ import (
 	"github.com/costa/polypod/internal/sessionmem"
 	"github.com/costa/polypod/internal/setup"
 	"github.com/costa/polypod/internal/skill"
+	"github.com/costa/polypod/internal/smartroute"
 	"github.com/costa/polypod/internal/sshexec"
 	"github.com/costa/polypod/internal/taskplan"
 	"github.com/costa/polypod/internal/taskqueue"
@@ -1499,6 +1500,16 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	aiClient = ai.NewClient(cfg.AI, sys.ToolAdapter)
 	aiSvc := ai.NewService(aiClient, ai.NewDocumentKnowledgeSearcher(documentIndex, cfg.WhatsApp.OwnerChat),
 		agents, "default", memStore, logger)
+	aiSvc.SetExperienceSearcher(evolutionStore, cfg.WhatsApp.OwnerChat)
+	if cfg.AI.RoutingPolicyFile != "" {
+		policy, err := smartroute.ReadPolicy(cfg.AI.RoutingPolicyFile)
+		if err != nil {
+			return fmt.Errorf("reading model routing policy: %w", err)
+		}
+		if err := aiSvc.SetRoutingPolicy(policy, cfg.AI.Provider, cfg.AI.Model, cfg.AI.RoutingModelIDs()); err != nil {
+			return fmt.Errorf("configuring model routing: %w", err)
+		}
+	}
 	workspaceStore, err := workdir.Open(filepath.Join(cfg.Data.Dir, "workdirs.json"))
 	if err != nil {
 		logger.Warn("scoped workdirs unavailable", "error", err)
@@ -1556,6 +1567,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		prompt := fmt.Sprintf("TAREFA PONTUAL: %s\nID: %s\nTentativa: %d\nObjetivo:\n%s\n\nExecute o objetivo completo e confira o resultado. Em uma retomada, confira primeiro se a tentativa anterior ja produziu o efeito desejado antes de repetir a acao.",
 			task.Title, task.ID, task.Attempts, task.Prompt)
 		turnCtx, toolTrace := evolution.WithToolTrace(taskCtx)
+		turnCtx = tool.WithRemoteDocumentScope(turnCtx, "task_queue", task.ID)
 		out, err := handler(turnCtx, adapter.InMessage{
 			ID:        fmt.Sprintf("task-%s-%d", task.ID, task.Attempts),
 			Channel:   "task_queue",
@@ -2085,6 +2097,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		}
 		prompt := fmt.Sprintf("ROTINA AGENDADA: %s\nID: %s\nExecucao: %s\nTentativa: %d\nObjetivo:\n%s\n\nExecute o objetivo completo, verifique o resultado e relate de forma objetiva. Se esta for uma retomada, confirme o efeito da tentativa anterior antes de repetir a acao. Nao crie outra rotina a menos que o objetivo mande explicitamente.", task.Name, task.ID, task.CurrentRunID, task.CurrentAttempt, task.Prompt)
 		turnCtx, toolTrace := evolution.WithToolTrace(runCtx)
+		turnCtx = tool.WithRemoteDocumentScope(turnCtx, "scheduler", task.ID)
 		out, err := handler(turnCtx, adapter.InMessage{
 			ID:        fmt.Sprintf("routine-%s-%s-%d", task.ID, task.CurrentRunID, task.CurrentAttempt),
 			Channel:   "scheduler",

@@ -13,9 +13,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
-const maxCommandOutput = 16 << 20
+const (
+	maxCommandOutput = 16 << 20
+	maxVerifiedFile  = 128 << 20
+)
 
 // CommandCase describes an independently prepared evaluation workspace. The
 // command must be an argv array, not a shell script, and contain {prompt} in
@@ -181,7 +185,14 @@ func observedFileSHA256(ctx context.Context, root, relative string) (string, err
 	} else if err != nil {
 		return "", err
 	}
-	f, err := os.Open(filepath.Join(root, relative))
+	confined, err := os.OpenRoot(root)
+	if err != nil {
+		return "", err
+	}
+	defer confined.Close()
+	// O_NONBLOCK prevents an attacker-controlled FIFO from freezing the runner
+	// after the path check. O_NOFOLLOW rejects a swapped final symlink.
+	f, err := confined.OpenFile(relative, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
 	if errors.Is(err, os.ErrNotExist) {
 		return "missing", nil
 	}
@@ -196,9 +207,32 @@ func observedFileSHA256(ctx context.Context, root, relative string) (string, err
 	if !info.Mode().IsRegular() {
 		return "", errors.New("não é arquivo regular")
 	}
+	if info.Size() > maxVerifiedFile {
+		return "", errors.New("arquivo verificado excede 128 MiB")
+	}
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
+	buf := make([]byte, 64<<10)
+	total := int64(0)
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		n, readErr := f.Read(buf)
+		if n > 0 {
+			total += int64(n)
+			if total > maxVerifiedFile {
+				return "", errors.New("arquivo verificado excede 128 MiB")
+			}
+			if _, err := h.Write(buf[:n]); err != nil {
+				return "", err
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return "", readErr
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return "", err

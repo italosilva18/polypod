@@ -73,9 +73,10 @@ cada fato. O serviço confere ambos no journal antes de atribuir a origem da
 memória. Uma citação confirmada recebe confiança 0,75 e a marca
 `evidence:quote_verified`; duas mensagens distintas recebem 0,80. A
 importância de 1 a 5 continua definindo prioridade, separada da
-confiança. Um lote antigo sem citações individuais mantém a origem do lote com
-confiança 0,35 e a marca `evidence:batch_unattributed`. Citações inválidas não
-são gravadas. A conferência comprova que o trecho veio daquela mensagem, mas
+confiança. Um lote pendente criado antes dessa mudança e sem citações
+individuais mantém a origem do lote com confiança 0,35 e a marca
+`evidence:batch_unattributed`. Extrações novas sem citação ou com citação
+inválida não são gravadas. A conferência comprova que o trecho veio daquela mensagem, mas
 não verifica se a interpretação do modelo ou a afirmação do usuário é verdadeira.
 
 Para testar a instalação real sem rede:

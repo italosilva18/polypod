@@ -4,11 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"unicode"
 	"unicode/utf8"
 )
@@ -166,8 +169,7 @@ func (s *Store) SearchApplied(ctx context.Context, query string, limit int) ([]s
 		if strings.Contains(strings.ToLower(query), candidate.pattern) {
 			candidate.score += 4
 		}
-		path := filepath.Join(s.skillsDir, candidate.name, "SKILL.md")
-		body, err := os.ReadFile(path)
+		body, err := s.readAppliedBody(candidate.name)
 		if err != nil {
 			continue
 		}
@@ -199,6 +201,35 @@ func (s *Store) SearchApplied(ctx context.Context, query string, limit int) ([]s
 		out = append(out, fmt.Sprintf("Skill revisada `%s`:\n%s", candidate.name, body))
 	}
 	return out, nil
+}
+
+func (s *Store) readAppliedBody(name string) ([]byte, error) {
+	root, err := os.OpenRoot(s.skillsDir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	f, err := root.OpenFile(filepath.Join(name, "SKILL.md"),
+		os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxSkillBodyBytes {
+		return nil, errors.New("skill aplicada não é arquivo regular dentro do limite")
+	}
+	body, err := io.ReadAll(io.LimitReader(f, maxSkillBodyBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxSkillBodyBytes {
+		return nil, errors.New("skill aplicada excede limite")
+	}
+	return body, nil
 }
 
 var experienceStopWords = map[string]bool{

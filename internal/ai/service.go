@@ -45,19 +45,22 @@ type AnswerResponse struct {
 
 // Service orchestrates prompt building, knowledge retrieval, and AI completion.
 type Service struct {
-	client        *Client
-	knowledge     KnowledgeSearcher
-	agentReg      *agent.Registry
-	agentName     string
-	memStore      memory.Store
-	sessionMem    *sessionmem.FileStore
-	logger        *slog.Logger
-	autoCompact   *compact.AutoCompactService
-	onActivity    func()
-	workdirs      *workdir.Store
-	routingMu     sync.RWMutex // protects routingPolicy and manualModel
-	routingPolicy *smartroute.CalibratedPolicy
-	manualModel   bool
+	client              *Client
+	knowledge           KnowledgeSearcher
+	agentReg            *agent.Registry
+	agentName           string
+	memStore            memory.Store
+	sessionMem          *sessionmem.FileStore
+	logger              *slog.Logger
+	autoCompact         *compact.AutoCompactService
+	onActivity          func()
+	workdirs            *workdir.Store
+	routingMu           sync.RWMutex // protects routingPolicy and manualModel
+	routingPolicy       *smartroute.CalibratedPolicy
+	manualModel         bool
+	experienceMu        sync.RWMutex // protects experienceSearcher and experienceOwnerChat
+	experienceSearcher  ExperienceSearcher
+	experienceOwnerChat string
 	// Budget-triggered compaction is retried after a short delay when the
 	// summarizer is unavailable. Each session has its own delay so one failed
 	// summary does not hold back another session. Capacity-triggered compaction
@@ -309,6 +312,9 @@ func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) ([]ChatM
 
 	// Build messages using agent persona
 	systemPrompt := BuildSystemPrompt(ag.Persona, knowledgeCtx, memoryCtx)
+	if experiences := s.relevantExperiences(ctx, req); experiences != "" {
+		systemPrompt += "\n\n" + experiences
+	}
 	if req.ToolTranscriptSummary != "" {
 		systemPrompt += "\n\n" + req.ToolTranscriptSummary
 	}

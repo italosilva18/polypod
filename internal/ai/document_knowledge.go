@@ -44,10 +44,13 @@ func (s *DocumentKnowledgeSearcher) Search(ctx context.Context, query, channel, 
 	}
 	searchCtx, cancel := context.WithTimeout(ctx, autoDocumentSearchTimeout)
 	defer cancel()
-	// The document index rejects queries longer than 1000 Unicode characters.
-	// A long user turn should still retrieve from its leading task description.
-	if utf8.RuneCountInString(query) > 1000 {
-		query = string([]rune(query)[:1000])
+	// The document index enforces a 1000-byte limit, so truncate at a UTF-8
+	// boundary while keeping the leading task description.
+	if len(query) > 1000 {
+		query = query[:1000]
+		for !utf8.ValidString(query) {
+			query = query[:len(query)-1]
+		}
 	}
 	available := false
 	for _, scope := range scopes {

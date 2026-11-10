@@ -47,12 +47,13 @@ type DreamConfig struct {
 // ExtractedMemory is the structured output the AI callback returns for each
 // memory worth persisting.
 type ExtractedMemory struct {
-	FactKey    string `json:"fact_key,omitempty"` // stable subject/property key, never a value
-	Type       string // "fact", "preference", "skill", "context"
-	Content    string
-	Tags       []string
-	Importance int              // 1-5
-	Evidence   []MemoryEvidence `json:"evidence,omitempty"`
+	FactKey            string `json:"fact_key,omitempty"` // stable subject/property key, never a value
+	Type               string // "fact", "preference", "skill", "context"
+	Content            string
+	Tags               []string
+	Importance         int              // 1-5
+	Evidence           []MemoryEvidence `json:"evidence,omitempty"`
+	legacyUnattributed bool
 }
 
 // MemoryEvidence is a verbatim excerpt from one user message. It grounds an
@@ -303,7 +304,7 @@ func (d *DreamService) extractMemoriesOwned(ctx context.Context) error {
 	if !cached {
 		clean := make([]ExtractedMemory, 0, len(memories))
 		for _, m := range memories {
-			if strings.TrimSpace(m.Content) != "" && !looksSensitive(m.Content) &&
+			if strings.TrimSpace(m.Content) != "" && len(m.Evidence) > 0 && !looksSensitive(m.Content) &&
 				!looksSensitive(strings.Join(m.Tags, " ")) && !sensitiveEvidence(m.Evidence) {
 				clean = append(clean, m)
 			}
@@ -470,7 +471,7 @@ func sensitiveEvidence(items []MemoryEvidence) bool {
 // for the user's statement, not independent proof that the statement is true.
 func groundMemory(m ExtractedMemory, messages map[string]string, batch []string) ([]string, float64, bool) {
 	if len(m.Evidence) == 0 {
-		if len(batch) == 0 {
+		if !m.legacyUnattributed || len(batch) == 0 {
 			return nil, 0, false
 		}
 		// Legacy pending extractions had no per-memory citations. Preserve
@@ -622,6 +623,7 @@ func normalisePriority(importance int) int {
 // Persist model output before applying it. A crash after a partial memory write
 // reuses the same topics/content instead of invoking a nondeterministic model.
 type pendingDream struct {
+	Version  int               `json:"version,omitempty"`
 	Cursor   uint64            `json:"cursor"`
 	Through  uint64            `json:"through"`
 	Memories []ExtractedMemory `json:"memories"`
@@ -648,6 +650,13 @@ func (d *DreamService) loadPending(through uint64) ([]ExtractedMemory, bool, err
 	if p.Cursor != cursor || p.Through != through {
 		return nil, false, nil
 	}
+	if p.Version == 0 {
+		for i := range p.Memories {
+			if len(p.Memories[i].Evidence) == 0 {
+				p.Memories[i].legacyUnattributed = true
+			}
+		}
+	}
 	return p.Memories, true, nil
 }
 
@@ -658,7 +667,7 @@ func (d *DreamService) savePending(through uint64, memories []ExtractedMemory) e
 	d.mu.Lock()
 	cursor := d.lastSequence
 	d.mu.Unlock()
-	raw, err := json.Marshal(pendingDream{Cursor: cursor, Through: through, Memories: memories})
+	raw, err := json.Marshal(pendingDream{Version: 2, Cursor: cursor, Through: through, Memories: memories})
 	if err != nil {
 		return err
 	}
