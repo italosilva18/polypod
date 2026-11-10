@@ -24,6 +24,8 @@ polypod remote --participant costa-notebook
 
 O comando cria a primeira sessão, mostra seu ID `session_...` e grava somente esse ID em `~/.config/polypod/remote-session-costa-notebook.txt`. Na próxima execução, a mesma identidade retoma a sessão e o cursor de leitura salvo no servidor. Digite uma mensagem e pressione Enter; `/exit` fecha somente o cliente.
 
+Se o agente usar `ask_user`, a pergunta aparecerá na mesma sessão com um ID `q_...`. Responda na linha do terminal com `resposta q_ID seu texto`, substituindo o ID pelo mostrado na pergunta. A resposta só é aceita da mesma identidade que iniciou o turno; a espera dura até cinco minutos. Pergunta e resposta ficam registradas para uma eventual retomada do turno após reinício.
+
 Comandos úteis:
 
 ```bash

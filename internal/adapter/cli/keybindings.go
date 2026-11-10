@@ -33,6 +33,12 @@ func DefaultKeyBindings() []KeyBinding {
 			Handler:     handleKeyCtrlB,
 		},
 		{
+			Key:         tea.KeyCtrlG,
+			Label:       "Ctrl+G",
+			Description: "iniciar/parar gravação de voz",
+			Handler:     handleKeyCtrlG,
+		},
+		{
 			Key:         tea.KeyCtrlD,
 			Label:       "Ctrl+D",
 			Description: "sair do CLI",
@@ -113,6 +119,13 @@ func handleKeyCtrlB(m *model) (model, tea.Cmd) {
 		m.updateViewport()
 	}
 	return *m, nil
+}
+
+func handleKeyCtrlG(m *model) (model, tea.Cmd) {
+	if m.voiceRecording {
+		return m.stopVoiceCapture()
+	}
+	return m.beginVoiceCapture(0, true)
 }
 
 // keybindingMap builds a lookup table from key type to handler for O(1) dispatch.

@@ -69,6 +69,8 @@ type Adapter struct {
 	activeSessionID   string
 	taskRegistry      *tasks.TaskRegistry
 	taskQueue         *taskqueue.Queue
+	sessionPeers      *session.ConcurrentSessionManager
+	sessionEmbedder   session.TextEmbedder
 	sessionMemory     *sessionmem.FileStore
 	toolTranscript    *session.ToolTranscriptStore
 }
@@ -81,6 +83,12 @@ func (a *Adapter) SetTaskRegistry(registry *tasks.TaskRegistry) {
 // SetTaskQueue enables durable /bg work from the CLI.
 func (a *Adapter) SetTaskQueue(queue *taskqueue.Queue) {
 	a.taskQueue = queue
+}
+
+// SetSessionEmbedder enables semantic ranking for /sessions search when the
+// configured embedding backend is available.
+func (a *Adapter) SetSessionEmbedder(embedder session.TextEmbedder) {
+	a.sessionEmbedder = embedder
 }
 
 // SetSessionMemory retains concise facts across compaction for each session.
@@ -101,6 +109,11 @@ func (a *Adapter) SetTurnCheckpointManager(manager *turncheckpoint.Manager) {
 // SetActiveSessionID identifies the persisted CLI session updated by rewind.
 func (a *Adapter) SetActiveSessionID(id string) {
 	a.activeSessionID = id
+	if a.sessionPeers != nil {
+		if err := a.sessionPeers.UpdateSessionID(id); err != nil {
+			a.logger.Warn("registro de sessão ativa indisponível", "error", err)
+		}
+	}
 }
 
 // ActiveSessionID returns the session selected by startup or /resume.
@@ -247,6 +260,8 @@ func (a *Adapter) SetRestoredMessages(msgs []RestoredMessage) {
 func (a *Adapter) Start(ctx context.Context, handler adapter.MessageHandler) error {
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
+	cleanupPeer := a.startPeerRegistration()
+	defer cleanupPeer()
 	deps := a.buildCommandDeps(runCtx)
 
 	// Use stream handler if available, otherwise wrap the sync handler
@@ -254,6 +269,7 @@ func (a *Adapter) Start(ctx context.Context, handler adapter.MessageHandler) err
 	if sh == nil {
 		sh = syncToStreamHandler(handler)
 	}
+	sh = a.trackPeerActivity(sh)
 
 	m := newModel(runCtx, sh, deps, a.dataDir, a.userPromptHandler, a.approvalHandler, a.fileIndex)
 	m.taskQueue = a.taskQueue
@@ -512,9 +528,12 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 			return entries, nil
 		}
 		deps.searchSessions = func(query string) ([]sessionEntry, error) {
-			summaries, err := a.sessStorage.Search(query)
+			summaries, err := session.SearchRelevant(ctx, a.sessStorage, a.sessionEmbedder, query, 50)
 			if err != nil {
-				return nil, err
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				a.logger.Warn("busca semântica de sessões indisponível; usando relevância textual", "error", err)
 			}
 			entries := make([]sessionEntry, len(summaries))
 			for i, s := range summaries {
@@ -605,7 +624,7 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 			for _, warning := range a.restoreSessionMetadata(restored.Metadata) {
 				entries = append(entries, chatEntry{role: "system", content: warning, timestamp: time.Now()})
 			}
-			a.activeSessionID = restored.ID
+			a.SetActiveSessionID(restored.ID)
 			entries = a.appendTranscriptHistory(restored.ID, entries)
 			notice, draft := a.inspectRecovery(restored.ID, restored.Messages)
 			if notice != "" {
@@ -809,6 +828,7 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 		}
 	}
 
+	a.attachDiscoveryDeps(&deps, ctx)
 	return deps
 }
 

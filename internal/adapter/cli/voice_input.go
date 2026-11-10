@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -16,7 +17,7 @@ import (
 // newVoiceCapture reuses the configured speech-to-text backend for CLI
 // dictation. Recording and transcription run in a Bubbletea command, leaving
 // the chat and composer responsive while the microphone is active.
-func newVoiceCapture(cfg config.AudioTranscriptionConfig) func(context.Context, time.Duration) (string, error) {
+func newVoiceCapture(cfg config.AudioTranscriptionConfig) func(context.Context, context.Context, time.Duration) (string, error) {
 	var transcribe func(context.Context, []byte, string) (string, error)
 	var setupErr error
 	switch strings.ToLower(strings.TrimSpace(cfg.Backend)) {
@@ -42,22 +43,28 @@ func newVoiceCapture(cfg config.AudioTranscriptionConfig) func(context.Context, 
 	default:
 		setupErr = fmt.Errorf("backend de transcrição desconhecido: %s", cfg.Backend)
 	}
-	return func(ctx context.Context, duration time.Duration) (string, error) {
+	return func(recordCtx, transcribeCtx context.Context, duration time.Duration) (string, error) {
 		if setupErr != nil {
 			return "", setupErr
 		}
-		data, err := recordMicrophone(ctx, duration)
+		data, err := recordMicrophone(recordCtx, duration)
 		if err != nil {
 			return "", err
 		}
-		return transcribe(ctx, data, "audio/wav")
+		if err := transcribeCtx.Err(); err != nil {
+			return "", err
+		}
+		return transcribe(transcribeCtx, data, "audio/wav")
 	}
 }
 
 func recordMicrophone(ctx context.Context, duration time.Duration) ([]byte, error) {
 	seconds := int(duration / time.Second)
-	if seconds < 1 || seconds > 120 {
+	if duration < 0 || (duration > 0 && (seconds < 1 || seconds > 120)) {
 		return nil, fmt.Errorf("duração de gravação inválida")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("gravação interrompida antes de começar: %w", err)
 	}
 	recorder, err := exec.LookPath("arecord")
 	if err != nil {
@@ -73,27 +80,64 @@ func recordMicrophone(ctx context.Context, duration time.Duration) ([]byte, erro
 	if device == "" {
 		device = "default"
 	}
-	recordCtx, cancel := context.WithTimeout(ctx, duration+15*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(recordCtx, recorder, "-q", "-D", device,
-		"-f", "S16_LE", "-r", "16000", "-c", "1", "-d", fmt.Sprint(seconds),
-		"-t", "wav", path)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		message := strings.TrimSpace(string(output))
+	recordCtx := ctx
+	if duration > 0 {
+		var cancel context.CancelFunc
+		recordCtx, cancel = context.WithTimeout(ctx, duration+15*time.Second)
+		defer cancel()
+	}
+	args := []string{"-q", "-D", device, "-f", "S16_LE", "-r", "16000", "-c", "1"}
+	if duration > 0 {
+		args = append(args, "-d", fmt.Sprint(seconds))
+	}
+	args = append(args, "-t", "wav", path)
+	cmd := exec.Command(recorder, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("iniciar microfone (%s): %w", device, err)
+	}
+	finished := make(chan error, 1)
+	go func() { finished <- cmd.Wait() }()
+	var runErr error
+	stopped := false
+	select {
+	case runErr = <-finished:
+	case <-recordCtx.Done():
+		stopped = true
+		// Give arecord a chance to finalize the WAV header before reading it.
+		_ = cmd.Process.Signal(os.Interrupt)
+		timer := time.NewTimer(3 * time.Second)
+		select {
+		case runErr = <-finished:
+			timer.Stop()
+		case <-timer.C:
+			_ = cmd.Process.Kill()
+			runErr = <-finished
+		}
+	}
+	if recordCtx.Err() == context.DeadlineExceeded {
+		return nil, fmt.Errorf("microfone (%s) não encerrou após o prazo da gravação", device)
+	}
+	if runErr != nil && !stopped {
+		message := strings.TrimSpace(stderr.String())
 		if len(message) > 300 {
 			message = message[:300]
 		}
 		if message != "" {
-			return nil, fmt.Errorf("microfone (%s): %s: %w", device, message, err)
+			return nil, fmt.Errorf("microfone (%s): %s: %w", device, message, runErr)
 		}
-		return nil, fmt.Errorf("microfone (%s): %w", device, err)
+		return nil, fmt.Errorf("microfone (%s): %w", device, runErr)
 	}
 	info, err := os.Stat(path)
 	if err != nil {
-		return nil, fmt.Errorf("ler gravação: %w", err)
+		return nil, fmt.Errorf("microfone (%s) não gerou arquivo de áudio: %w", device, err)
 	}
-	if info.Size() == 0 || info.Size() > audio.MaxAudioBytes {
-		return nil, fmt.Errorf("gravação vazia ou muito grande")
+	if info.Size() <= 44 {
+		return nil, fmt.Errorf("gravação vazia; fale antes de parar")
+	}
+	if info.Size() > audio.MaxAudioBytes {
+		return nil, fmt.Errorf("gravação excede %d MiB; pare e envie partes menores", audio.MaxAudioBytes>>20)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {

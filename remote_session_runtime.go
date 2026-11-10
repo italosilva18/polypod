@@ -56,11 +56,19 @@ func startRemoteSessionRuntime(parent context.Context, dataDir string, store *hu
 	if err != nil {
 		return nil, fmt.Errorf("abrindo sessões remotas: %w", err)
 	}
-	server, err := remote.NewServer(remote.ServerConfig{
+	var server *remote.Server
+	server, err = remote.NewServer(remote.ServerConfig{
 		DatabasePath: filepath.Join(dataDir, "remote-sessions", "sessions.db"),
 		AuthToken:    token,
 		Logger:       logger,
 		OnUserMessage: func(ctx context.Context, session remote.RemoteSession, msg remote.Message) error {
+			consumed, err := server.ConsumeQuestionAnswer(ctx, session, msg)
+			if err != nil {
+				return fmt.Errorf("registrando resposta da sessão remota: %w", err)
+			}
+			if consumed {
+				return nil
+			}
 			userID := session.ID + ":" + msg.Sender
 			externalID := session.ID + ":" + msg.ID
 			if _, err := store.EnqueueInboundOnce(remoteSessionChannel, userID, msg.Content, externalID); err != nil {
@@ -86,6 +94,31 @@ func startRemoteSessionRuntime(parent context.Context, dataDir string, store *hu
 	}()
 	logger.Info("sessões remotas disponíveis", "listen", listen)
 	return runtime, nil
+}
+
+func (r *remoteSessionRuntime) Ask(ctx context.Context, requestID, prompt string) (string, error) {
+	if r == nil {
+		return "", humanloop.ErrRemoteUnavailable
+	}
+	return r.server.AskQuestion(ctx, requestID, prompt)
+}
+
+func (r *remoteSessionRuntime) OwnsQuestion(requestID string) (bool, error) {
+	if r == nil {
+		return false, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return r.server.OwnsQuestion(ctx, requestID)
+}
+
+func (r *remoteSessionRuntime) ResolveQuestion(requestID, answer string) error {
+	if r == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return r.server.ResolveQuestion(ctx, requestID, answer)
 }
 
 func (r *remoteSessionRuntime) Deliver(ctx context.Context, msg humanloop.Message) error {

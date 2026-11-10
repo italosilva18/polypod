@@ -66,6 +66,9 @@ func openSessionStore(path string) (*sessionStore, error) {
 		"CREATE TABLE IF NOT EXISTS remote_cursors (session_id TEXT NOT NULL, participant TEXT NOT NULL, sequence INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(session_id, participant), FOREIGN KEY(session_id, participant) REFERENCES remote_participants(session_id, participant) ON DELETE CASCADE)",
 		"CREATE TABLE IF NOT EXISTS remote_forwards (sequence INTEGER PRIMARY KEY REFERENCES remote_messages(sequence) ON DELETE CASCADE, forwarded_at INTEGER, claim_owner TEXT, claim_until INTEGER)",
 		"CREATE INDEX IF NOT EXISTS remote_forwards_pending ON remote_forwards(forwarded_at, claim_until, sequence)",
+		"CREATE TABLE IF NOT EXISTS remote_questions (id TEXT PRIMARY KEY, source_key TEXT NOT NULL, source_message_id TEXT NOT NULL, session_id TEXT NOT NULL REFERENCES remote_sessions(id) ON DELETE CASCADE, participant TEXT NOT NULL, prompt TEXT NOT NULL, answer TEXT NOT NULL DEFAULT '', answer_message_id TEXT NOT NULL DEFAULT '', expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL)",
+		"CREATE INDEX IF NOT EXISTS remote_questions_source ON remote_questions(source_key, created_at DESC)",
+		"CREATE TABLE IF NOT EXISTS remote_question_aliases (alias TEXT PRIMARY KEY, question_id TEXT NOT NULL REFERENCES remote_questions(id) ON DELETE CASCADE)",
 		"INSERT OR IGNORE INTO remote_forwards(sequence) SELECT sequence FROM remote_messages WHERE type='user'",
 	} {
 		if _, err := db.Exec(statement); err != nil {

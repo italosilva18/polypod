@@ -122,6 +122,8 @@ type model struct {
 	state                  state
 	queued                 []queuedInput
 	voiceRecording         bool
+	voiceStopping          bool
+	voiceCancel            context.CancelFunc
 	streamRedrawPending    bool
 	streamRedrawGeneration uint64
 	lastViewportRedraw     time.Time
@@ -758,6 +760,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case msg.Type == tea.KeyCtrlC:
 			return m, tea.Quit
 
+		case msg.Type == tea.KeyCtrlG:
+			return handleKeyCtrlG(&m)
+
 		case msg.Type == tea.KeyCtrlB && m.state == stateStreaming && !m.waitingForUserAnswer:
 			return handleKeyCtrlB(&m)
 
@@ -988,10 +993,13 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			if result.handled {
-				if result.voiceSeconds > 0 && m.voiceRecording {
+				if result.voiceStart && m.voiceRecording {
 					m.messages = append(m.messages, chatEntry{role: "system", content: "Uma gravação já está em andamento.", timestamp: time.Now()})
 					m.updateViewport()
 					return m, nil
+				}
+				if result.voiceStop {
+					return m.stopVoiceCapture()
 				}
 				if result.clearDisplay {
 					m.messages = nil
@@ -1023,15 +1031,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if result.openModelPicker {
 					m.openModelPicker()
 				}
-				if result.voiceSeconds > 0 {
-					m.voiceRecording = true
-					capture := m.cmdDeps.captureVoice
+				if result.voiceStart {
 					duration := time.Duration(result.voiceSeconds) * time.Second
-					m.updateViewport()
-					return m, func() tea.Msg {
-						text, err := capture(m.ctx, duration)
-						return voiceResultMsg{text: text, err: err}
-					}
+					return m.beginVoiceCapture(duration, false)
 				}
 				m.updateViewport()
 				return m, nil
@@ -1072,6 +1074,11 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case voiceResultMsg:
 		m.voiceRecording = false
+		m.voiceStopping = false
+		if m.voiceCancel != nil {
+			m.voiceCancel()
+			m.voiceCancel = nil
+		}
 		if msg.err != nil {
 			m.messages = append(m.messages, chatEntry{role: "error", content: "Entrada por voz: " + msg.err.Error(), timestamp: time.Now()})
 			m.updateViewport()

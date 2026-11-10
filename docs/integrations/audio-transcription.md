@@ -27,7 +27,7 @@ O `doctor` confere os arquivos e executáveis sem abrir o modelo; a prova de fal
 
 ## Ditado no CLI
 
-Com `whatsapp.audio_transcription.enabled: true`, o CLI reutiliza o mesmo backend de transcrição para o comando `/voice [segundos]`. A duração padrão é 15 segundos, com máximo de 120. O comando grava pelo `arecord` no dispositivo ALSA `default`; `POLYPOD_VOICE_INPUT_DEVICE` escolhe outro dispositivo, como `pulse` ou `pipewire`. A gravação e a transcrição ocorrem em segundo plano. Ao terminar, o texto é inserido no campo de mensagem para revisão e envio com Enter. O arquivo WAV temporário é removido após a transcrição. Uma configuração `backend: local` mantém o áudio na máquina.
+Com `whatsapp.audio_transcription.enabled: true`, o CLI reutiliza o mesmo backend de transcrição. Pressione Ctrl+G ou digite `/voice` para iniciar; pressione Ctrl+G novamente ou use `/voice stop` para encerrar. `/voice N` preserva a captura por duração fixa, de 1 a 120 segundos. O comando grava pelo `arecord` no dispositivo ALSA `default`; `POLYPOD_VOICE_INPUT_DEVICE` escolhe outro dispositivo, como `pulse` ou `pipewire`. A gravação e a transcrição ocorrem em segundo plano. Ao terminar, o texto é inserido no campo de mensagem para revisão e envio com Enter. O arquivo WAV temporário é removido após a transcrição. Uma configuração `backend: local` mantém o áudio na máquina. O texto parcial durante a fala ainda não é exibido.
 
 ## Backend HTTP opcional
 

@@ -28,7 +28,9 @@ type commandResult struct {
 	handled      bool
 	quit         bool
 	clearDisplay bool // limpa m.messages quando true
-	voiceSeconds int  // inicia captura assíncrona de voz no compositor
+	voiceSeconds int  // captura por duração fixa; 0 quando a parada é manual
+	voiceStart   bool // inicia captura assíncrona de voz no compositor
+	voiceStop    bool // encerra a gravação atual e inicia a transcrição
 	// replaceMessages, when non-nil, replaces m.messages entirely.
 	// Used by /resume to load messages from a persisted session and by
 	// /rewind to drop the last N turns from the display.
@@ -107,21 +109,27 @@ func processCommand(input string, deps commandDeps, messages []chatEntry) comman
 		return handleCopy(messages)
 
 	case "/voice":
-		seconds := 15
-		if len(parts) > 2 {
-			return commandResult{output: "uso: /voice [segundos: 1-120]", handled: true}
+		if len(parts) == 2 && strings.EqualFold(parts[1], "stop") {
+			return commandResult{voiceStop: true, handled: true}
 		}
+		if len(parts) > 2 {
+			return commandResult{output: "uso: /voice [segundos: 1-120 | stop]", handled: true}
+		}
+		seconds := 0
 		if len(parts) == 2 {
 			var err error
 			seconds, err = strconv.Atoi(parts[1])
 			if err != nil || seconds < 1 || seconds > 120 {
-				return commandResult{output: "uso: /voice [segundos: 1-120]", handled: true}
+				return commandResult{output: "uso: /voice [segundos: 1-120 | stop]", handled: true}
 			}
 		}
 		if deps.captureVoice == nil {
 			return commandResult{output: "Entrada por voz indisponível: configure whatsapp.audio_transcription para usar /voice.", handled: true}
 		}
-		return commandResult{output: fmt.Sprintf("Gravando por %d segundo(s)... O texto aparecerá no campo de mensagem.", seconds), voiceSeconds: seconds, handled: true}
+		if seconds == 0 {
+			return commandResult{output: "Gravando. Use Ctrl+G ou /voice stop para parar e transcrever.", voiceStart: true, handled: true}
+		}
+		return commandResult{output: fmt.Sprintf("Gravando por %d segundo(s)... Ctrl+G pode parar antes.", seconds), voiceSeconds: seconds, voiceStart: true, handled: true}
 
 	case "/run":
 		if len(parts) < 2 {
@@ -168,6 +176,9 @@ func processCommand(input string, deps commandDeps, messages []chatEntry) comman
 
 	case "/sessions":
 		return handleSessions(parts, deps)
+
+	case "/suggest":
+		return handleSuggestions(deps)
 
 	case "/init":
 		return handleInit(parts)
@@ -296,7 +307,8 @@ func helpText() string {
 		{"/model", "mostra agente/modelo atual"},
 		{"/session", "info da sessao"},
 		{"/copy", "copia ultima resposta pro clipboard"},
-		{"/voice [segundos]", "grava e transcreve voz no campo de mensagem"},
+		{"/voice [segundos|stop]", "grava ate Ctrl+G ou /voice stop; segundos sao opcionais"},
+		{"Ctrl+G", "inicia ou para a gravacao de voz"},
 		{"/bg <objetivo>", "cria tarefa durável separada; list/status/retry/cancel para acompanhar"},
 		{"/run <cmd>  ou  !<cmd>", "executa comando shell inline"},
 		{"/file <path>", "mostra conteudo de arquivo"},
@@ -306,7 +318,8 @@ func helpText() string {
 		{"/export [file]", "exporta conversa pra markdown"},
 		{"/context", "mostra info do contexto atual"},
 		{"/cost", "mostra custo detalhado da sessao"},
-		{"/sessions [search <q>]", "lista ou busca sessoes persistidas"},
+		{"/sessions [search <q>|live]", "busca sessoes salvas ou mostra instancias ativas"},
+		{"/suggest", "sugere proximas acoes a partir da conversa"},
 		{"/resume [id]", "lista ou carrega uma sessao persistida"},
 		{"/recover", "prepara rascunho editavel para retomar turno interrompido"},
 		{"/rewind [n] [--conversation|--files]", "restaura turnos, arquivos e conversa"},
@@ -932,6 +945,16 @@ func handleContext(deps commandDeps, messages []chatEntry) commandResult {
 }
 
 func handleSessions(parts []string, deps commandDeps) commandResult {
+	if len(parts) >= 2 && strings.EqualFold(parts[1], "live") {
+		if deps.listLiveSessions == nil {
+			return commandResult{output: "Registro de sessões ativas indisponível.", handled: true}
+		}
+		output, err := deps.listLiveSessions()
+		if err != nil {
+			return commandResult{output: errorStyle.Render(fmt.Sprintf("erro: %v", err)), handled: true}
+		}
+		return commandResult{output: output, handled: true}
+	}
 	if deps.listSessions == nil {
 		return commandResult{output: cmdLabelStyle.Render("session storage nao disponivel"), handled: true}
 	}
@@ -1046,23 +1069,25 @@ type rewindOutcome struct {
 
 // commandDeps holds function callbacks for slash commands.
 type commandDeps struct {
-	captureVoice func(context.Context, time.Duration) (string, error)
+	captureVoice func(context.Context, context.Context, time.Duration) (string, error)
 	// bindBranches connects /branch to persisted transcripts and the active
 	// conversation. The CLI state binds lazily on the first /branch command.
-	bindBranches    func(*cliSessionState) error
-	commandRegistry *command.Registry
-	activeAgent     func() string
-	setAgent        func(name string)
-	listAgents      func() []string
-	listSkills      func() []string
-	listMemories    func() ([]memoryEntry, error)
-	searchMemories  func(query string) ([]memoryEntry, error)
-	clearSession    func() error
-	sessionInfo     func() (string, int, error) // id, count, err
-	activeSessionID func() string
-	listSessions    func(count int) ([]sessionEntry, error)
-	searchSessions  func(query string) ([]sessionEntry, error)
-	costReport      func() string // returns formatted cost report from CostEngine
+	bindBranches     func(*cliSessionState) error
+	commandRegistry  *command.Registry
+	activeAgent      func() string
+	setAgent         func(name string)
+	listAgents       func() []string
+	listSkills       func() []string
+	listMemories     func() ([]memoryEntry, error)
+	searchMemories   func(query string) ([]memoryEntry, error)
+	clearSession     func() error
+	sessionInfo      func() (string, int, error) // id, count, err
+	activeSessionID  func() string
+	listSessions     func(count int) ([]sessionEntry, error)
+	searchSessions   func(query string) ([]sessionEntry, error)
+	listLiveSessions func() (string, error)
+	suggestPrompts   func() ([]string, error)
+	costReport       func() string // returns formatted cost report from CostEngine
 
 	// sessionCost returns the current session total cost in USD. Used by
 	// the rich status bar. Optional.

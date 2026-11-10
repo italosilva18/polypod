@@ -103,8 +103,16 @@ func (m *ConcurrentSessionManager) Register(sessionID, cwd string, kind SessionK
 // (e.g. after --resume).
 func (m *ConcurrentSessionManager) UpdateSessionID(sessionID string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.patchPidFile(map[string]interface{}{"session_id": sessionID})
+	err := m.patchPidFile(map[string]interface{}{"session_id": sessionID})
+	callbacks := append([]func(string){}, m.onSwitch...)
+	m.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	for _, callback := range callbacks {
+		callback(sessionID)
+	}
+	return nil
 }
 
 // UpdateName updates the session name in the PID file.
@@ -270,7 +278,7 @@ func (m *ConcurrentSessionManager) writePeerFile(peer PeerSession) error {
 	if err != nil {
 		return fmt.Errorf("marshaling peer data: %w", err)
 	}
-	return os.WriteFile(m.pidFile, data, 0600)
+	return m.writePeerFileAtomic(data)
 }
 
 func (m *ConcurrentSessionManager) patchPidFile(patch map[string]interface{}) error {
@@ -292,7 +300,34 @@ func (m *ConcurrentSessionManager) patchPidFile(patch map[string]interface{}) er
 	if err != nil {
 		return fmt.Errorf("marshaling PID file: %w", err)
 	}
-	return os.WriteFile(m.pidFile, out, 0600)
+	return m.writePeerFileAtomic(out)
+}
+
+func (m *ConcurrentSessionManager) writePeerFileAtomic(data []byte) error {
+	tmp, err := os.CreateTemp(m.sessDir, ".session-peer-*")
+	if err != nil {
+		return fmt.Errorf("creating temporary session record: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp.Name(), m.pidFile); err != nil {
+		return fmt.Errorf("publishing session record: %w", err)
+	}
+	return nil
 }
 
 // isProcessRunning checks if a process with the given PID exists.

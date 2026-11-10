@@ -67,6 +67,7 @@ import (
 	"github.com/costa/polypod/internal/project"
 	"github.com/costa/polypod/internal/provider"
 	"github.com/costa/polypod/internal/prstatus"
+	"github.com/costa/polypod/internal/remote"
 	"github.com/costa/polypod/internal/review"
 	"github.com/costa/polypod/internal/sandbox"
 	"github.com/costa/polypod/internal/scheduler"
@@ -1670,8 +1671,17 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 			logger.Warn("agent skill unavailable in tool registry", "skill", name)
 		}
 	}
-	if remoteRelay != nil || whatsappQuestions != nil {
+	if remoteRelay != nil || whatsappQuestions != nil || os.Getenv("POLYPOD_REMOTE_SESSION_HOST") == "1" {
 		sys.UserPromptHandler.SetQuestionResolved(func(requestID, answer string) error {
+			if remoteSessions != nil {
+				owned, err := remoteSessions.OwnsQuestion(requestID)
+				if err != nil {
+					return err
+				}
+				if owned {
+					return remoteSessions.ResolveQuestion(requestID, answer)
+				}
+			}
 			if whatsappQuestions != nil && whatsappQuestions.Owns(requestID) {
 				return whatsappQuestions.ResolveQuestion(requestID, answer)
 			}
@@ -1695,10 +1705,16 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 				}
 				return whatsappQuestions.Ask(questionCtx, requestID, prompt.String())
 			}
+			if _, fromRemoteSession := remote.InboundFromContext(questionCtx); fromRemoteSession {
+				return remoteSessions.Ask(questionCtx, requestID, prompt.String())
+			}
 			if remoteRelay != nil {
 				return remoteRelay.AskQuestion(questionCtx, requestID, prompt.String())
 			}
-			return whatsappQuestions.Ask(questionCtx, requestID, prompt.String())
+			if whatsappQuestions != nil {
+				return whatsappQuestions.Ask(questionCtx, requestID, prompt.String())
+			}
+			return "", humanloop.ErrRemoteUnavailable
 		})
 	}
 	heartbeat, err = humanloop.NewProcessor(humanloop.ProcessorConfig{
@@ -1708,6 +1724,21 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		MaxAttempts: 4,
 		Process: func(processCtx context.Context, msg humanloop.Message) (string, error) {
 			processCtx = tool.WithRemoteDocumentScope(processCtx, msg.Channel, msg.UserID)
+			if msg.Channel == remoteSessionChannel {
+				if remoteSessions == nil {
+					return "", humanloop.ErrRemoteUnavailable
+				}
+				sessionID, participant, found := strings.Cut(msg.UserID, ":")
+				if !found {
+					return "", fmt.Errorf("origem da sessão remota inválida")
+				}
+				processCtx = remote.WithInboundContext(processCtx, remote.InboundContext{
+					MessageID: msg.ID, SessionID: sessionID, ParticipantID: participant,
+				})
+				if _, ok := remote.InboundFromContext(processCtx); !ok {
+					return "", fmt.Errorf("identidade da sessão remota inválida")
+				}
+			}
 			messageText := msg.Text
 			var askStatus *whatsappgateway.AskDeliveryStatus
 			if msg.Channel == whatsappgateway.Channel {
@@ -2102,6 +2133,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	cliCh.SetTurnCheckpointManager(turnCheckpoint)
 	cliCh.SetTaskRegistry(sys.TaskRegistry)
 	cliCh.SetTaskQueue(taskQueue)
+	cliCh.SetSessionEmbedder(embedder)
 	cliCh.SetSessionMemory(sessionMemory)
 	cliCh.SetToolTranscriptStore(toolTranscript)
 	cliCh.SetActiveSessionID(currentSessionID)
