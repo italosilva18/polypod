@@ -1,14 +1,12 @@
 package swarm
 
 import (
-	"bufio"
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -18,11 +16,20 @@ import (
 // TeamJournal retains team coordination evidence across process restarts.
 // It records outcomes but deliberately never replays an in-flight agent turn:
 // repeating a tool call after a crash could repeat an external side effect.
+//
+// Latest-state queries use a rebuildable sidecar index so they materialize
+// only the newest run of each team. The JSONL files stay the source of truth.
 type TeamJournal struct {
-	mu   sync.Mutex
-	dir  string
-	path string
-	lock *os.File
+	mu       sync.Mutex
+	dir      string
+	path     string
+	lock     *os.File
+	logger   *slog.Logger
+	verified map[string]verifiedJournal
+	// This instance alone appends to path. Avoid loading the whole sidecar
+	// after every durable JSONL record.
+	indexReady bool
+	indexEnd   int64
 }
 
 type journalRecord struct {
@@ -64,8 +71,7 @@ type ArchivedTurn struct {
 type ArchivedTeam struct {
 	RunID     string
 	OwnerLive bool
-	// ExternalOwner is true when a different live process holds events for
-	// this run. The current process's own journal file does not set it.
+	// A different live process owns the created run.
 	ExternalOwner bool `json:"-"`
 	Summary       TeamSummary
 	Members       []MemberInfo
@@ -76,6 +82,8 @@ type ArchivedTeam struct {
 const maxJournalText = 256 << 10
 const teamJournalVersion = 1
 const maxJournalRecord = 4 << 20
+const defaultHistoryLimit = 20
+const maxHistoryLimit = 100
 
 // NewTeamJournal opens a private append-only event log. It rejects malformed
 // complete records; an incomplete final line from a crash is ignored.
@@ -96,10 +104,23 @@ func NewTeamJournal(dir string) (*TeamJournal, error) {
 		return nil, fmt.Errorf("locking team journal instance: %w", err)
 	}
 	j := &TeamJournal{dir: dir, path: strings.TrimSuffix(lock.Name(), ".lock") + ".jsonl", lock: lock}
-	if _, err := j.readLocked(); err != nil {
+	// Opening still parses every complete record. A trusted sidecar only
+	// speeds later queries; it must not hide a malformed journal at startup.
+	// The retention lock is taken before any journal mutex and released
+	// before return so dead-file index repair cannot race a prune.
+	release, held, lockErr := j.tryRetentionLock()
+	if lockErr != nil {
+		// Index publication is an optimization. A lock error must not hide
+		// journals that can still be validated and appended.
+		j.warnIndex(lockErr)
+		held = false
+	}
+	if _, err := j.listFiles(false, held); err != nil {
+		release()
 		_ = j.Close()
 		return nil, err
 	}
+	release()
 	file, err := os.OpenFile(j.path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		_ = j.Close()
@@ -113,19 +134,8 @@ func NewTeamJournal(dir string) (*TeamJournal, error) {
 		_ = j.Close()
 		return nil, fmt.Errorf("syncing team journal directory: %w", err)
 	}
+	j.indexReady = true
 	return j, nil
-}
-
-func syncTeamJournalDir(path string) error {
-	dir, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	if err := dir.Sync(); err != nil {
-		_ = dir.Close()
-		return err
-	}
-	return dir.Close()
 }
 
 // Close releases this instance lease. Historical files remain for inspection.
@@ -190,6 +200,12 @@ func (j *TeamJournal) append(event journalEvent) error {
 	if err != nil {
 		return fmt.Errorf("writing team journal: %w", err)
 	}
+	// The JSONL line is already durable. An index miss is repaired on read;
+	// failing here would make callers retry and duplicate the event.
+	line := make([]byte, len(data)+1)
+	copy(line, data)
+	line[len(data)] = '\n'
+	j.noteIndexAppend(before, line, event)
 	return nil
 }
 
@@ -200,62 +216,6 @@ func trimJournalText(value string) string {
 	return value[:maxJournalText] + "\n[truncated in team journal]"
 }
 
-func (j *TeamJournal) readLocked() ([]journalRecord, error) {
-	paths, err := filepath.Glob(filepath.Join(j.dir, "instance-*.jsonl"))
-	if err != nil {
-		return nil, fmt.Errorf("listing team journals: %w", err)
-	}
-	var records []journalRecord
-	for _, path := range paths {
-		self := path == j.path
-		live := self
-		if !self {
-			live, err = teamJournalOwnerLive(strings.TrimSuffix(path, ".jsonl") + ".lock")
-			if err != nil {
-				return nil, fmt.Errorf("checking team journal owner: %w", err)
-			}
-		}
-		file, err := os.Open(path)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("opening team journal: %w", err)
-		}
-		reader := bufio.NewReaderSize(file, maxJournalRecord)
-		for {
-			line, readErr := reader.ReadSlice('\n')
-			if errors.Is(readErr, io.EOF) {
-				// Incomplete final record from a crash: do not interpret it.
-				break
-			}
-			if readErr != nil {
-				_ = file.Close()
-				return nil, fmt.Errorf("reading bounded team journal record: %w", readErr)
-			}
-			line = bytes.TrimSpace(line)
-			if len(line) == 0 {
-				continue
-			}
-			var event journalEvent
-			if err := json.Unmarshal(line, &event); err != nil {
-				_ = file.Close()
-				return nil, fmt.Errorf("decoding team journal: %w", err)
-			}
-			if event.Version != teamJournalVersion {
-				_ = file.Close()
-				return nil, fmt.Errorf("unsupported team journal version %d", event.Version)
-			}
-			records = append(records, journalRecord{event: event, ownerLive: live, self: self})
-		}
-		if err := file.Close(); err != nil {
-			return nil, fmt.Errorf("closing team journal: %w", err)
-		}
-	}
-	sort.SliceStable(records, func(i, k int) bool { return records[i].event.At.Before(records[k].event.At) })
-	return records, nil
-}
-
 // Teams returns the latest recorded state of every team name.
 func (j *TeamJournal) Teams() ([]ArchivedTeam, error) {
 	if j == nil {
@@ -263,23 +223,30 @@ func (j *TeamJournal) Teams() ([]ArchivedTeam, error) {
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	records, err := j.readLocked()
+	records, err := j.latestRecordsLocked()
 	if err != nil {
 		return nil, err
 	}
+	return archivedTeams(records), nil
+}
+
+// archivedTeams folds journal records into the latest run of each team.
+// records must be in directory then offset order; equal timestamps keep that order.
+func archivedTeams(records []journalRecord) []ArchivedTeam {
+	sort.SliceStable(records, func(i, k int) bool {
+		return records[i].event.At.Before(records[k].event.At)
+	})
 	latest := make(map[string]string)
+	liveOwner := make(map[string]bool)
+	externalOwner := make(map[string]bool)
 	for _, record := range records {
 		event := record.event
 		if event.Kind == "created" {
 			latest[event.Team] = event.RunID
 		}
 	}
-	liveOwner := make(map[string]bool)
-	externalOwner := make(map[string]bool)
 	for _, record := range records {
 		event := record.event
-		// Acknowledgements and other inspection events may be appended by a
-		// later process. Only creation establishes ownership of a worker run.
 		if event.Kind != "created" || latest[event.Team] != event.RunID || !record.ownerLive {
 			continue
 		}
@@ -362,8 +329,7 @@ func (j *TeamJournal) Teams() ([]ArchivedTeam, error) {
 			}
 			item.Results[event.Agent] = turns
 		case "resumed", "turn_resumed":
-			// Checkpoint resume evidence. These events never open a turn
-			// and never supply a prompt that can be replayed.
+			// Checkpoint evidence is diagnostic and does not open a new turn.
 		}
 	}
 	items := make([]ArchivedTeam, 0, len(archive))
@@ -393,7 +359,7 @@ func (j *TeamJournal) Teams() ([]ArchivedTeam, error) {
 		items = append(items, *item)
 	}
 	sort.Slice(items, func(i, k int) bool { return items[i].Summary.Name < items[k].Summary.Name })
-	return items, nil
+	return items
 }
 
 func (j *TeamJournal) Team(name string) (ArchivedTeam, bool, error) {

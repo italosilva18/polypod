@@ -20,7 +20,25 @@ como um serviço root e uma CLI de usuário, têm diários separados para manter
 permissões privadas. Uma falha de gravação é registrada no log; o agente em
 execução continua, então o diário é evidência persistente de melhor esforço.
 
-O diário cresce com o uso e atualmente é lido por inteiro para consultas de
-histórico. A consulta expõe apenas a execução mais recente de cada nome de
-equipe, embora registros anteriores permaneçam no JSONL. Limpeza, retenção e
-busca paginada ainda podem ser adicionadas sem mudar o formato v1.
+O formato dos registros permanece na versão 1. Cada `instance-*.jsonl` pode
+ter um índice auxiliar `instance-*.jsonl.idx`. O JSONL é a fonte de verdade:
+na abertura, o Polypod percorre os registros completos para recusar JSON
+inválido, versão desconhecida ou linha acima do limite. Uma linha final sem
+quebra, típica de queda, continua ignorada. Consultas seguintes usam os
+metadados validados em memória e materializam apenas os registros necessários.
+Uma alteração no arquivo invalida ou atualiza esse cache. O índice em disco é
+reconstruível e seus metadados são conferidos contra o JSONL antes do uso.
+
+`Teams` devolve a execução mais recente de cada nome, ordenada pelo nome.
+`History` lista as execuções criadas, da mais nova para a mais antiga, em
+páginas de no máximo 100. Cada página aplica a mesma dobra de estado que
+`Teams`; o cursor é opaco.
+
+`Prune` é explícito e não roda na abertura. Com `Apply` verdadeiro, pode
+remover execuções antigas que tenham estado final `stopped` gravado, sem
+mensagem pendente do líder e sem turno em aberto. A execução mais recente de
+cada nome permanece. `KeepRuns` abaixo de 1 ainda conserva essa execução;
+valor negativo é recusado. `MaxAge` maior que zero também exige idade.
+Arquivos do processo atual, arquivos com lock ativo, arquivos cujo lock não
+existe e arquivos com cauda truncada não são reescritos. Uma execução
+interrompida ou incerta permanece no disco, mesmo se estiver ociosa.

@@ -157,11 +157,30 @@ func (sm *SwarmManager) EnableJournal(path string) error {
 		_ = j.Close()
 		return err
 	}
+	j.logger = sm.logger
 	sm.mu.Lock()
 	sm.journal = j
 	sm.checkpoints = store
 	sm.mu.Unlock()
 	return nil
+}
+
+// JournalHistory returns a page of recorded runs, newest created run first.
+func (sm *SwarmManager) JournalHistory(query RunQuery) (RunPage, error) {
+	j := sm.Journal()
+	if j == nil {
+		return RunPage{}, nil
+	}
+	return j.History(query)
+}
+
+// PruneJournal applies an explicit retention policy.
+func (sm *SwarmManager) PruneJournal(policy RetentionPolicy) (PruneReport, error) {
+	j := sm.Journal()
+	if j == nil {
+		return PruneReport{}, nil
+	}
+	return j.Prune(policy)
 }
 
 func (sm *SwarmManager) Journal() *TeamJournal {
