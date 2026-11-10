@@ -25,8 +25,12 @@ func (m *model) beginVoiceCapture(duration time.Duration, announce bool) (model,
 	if parent == nil {
 		parent = context.Background()
 	}
+	m.voiceGeneration++
+	generation := m.voiceGeneration
 	recordCtx, cancel := context.WithCancel(parent)
+	transcribeCtx, abort := context.WithCancel(parent)
 	m.voiceCancel = cancel
+	m.voiceAbort = abort
 	m.voiceRecording = true
 	m.voiceStopping = false
 	m.voicePartialText = ""
@@ -43,7 +47,7 @@ func (m *model) beginVoiceCapture(duration time.Duration, announce bool) (model,
 	capture := m.cmdDeps.captureVoice
 	final := func() tea.Msg {
 		defer close(partials)
-		text, err := capture(recordCtx, parent, duration, func(text string) {
+		text, err := capture(recordCtx, transcribeCtx, duration, func(text string) {
 			select {
 			case partials <- text:
 			default:
@@ -57,19 +61,38 @@ func (m *model) beginVoiceCapture(duration time.Duration, announce bool) (model,
 				}
 			}
 		})
-		return voiceResultMsg{text: text, err: err}
+		return voiceResultMsg{text: text, err: err, generation: generation}
 	}
-	return *m, tea.Batch(final, waitForVoicePartial(partials))
+	return *m, tea.Batch(final, waitForVoicePartial(partials, generation))
 }
 
-func waitForVoicePartial(partials <-chan string) tea.Cmd {
+func waitForVoicePartial(partials <-chan string, generation uint64) tea.Cmd {
 	if partials == nil {
 		return nil
 	}
 	return func() tea.Msg {
 		text, ok := <-partials
-		return voicePartialMsg{text: text, ok: ok, source: partials}
+		return voicePartialMsg{text: text, ok: ok, source: partials, generation: generation}
 	}
+}
+
+// invalidateVoiceCapture cancels both microphone and transcription when a
+// command replaces the conversation. A late result from the old session has
+// a different generation and cannot enter the new composer.
+func (m *model) invalidateVoiceCapture() {
+	m.voiceGeneration++
+	if m.voiceCancel != nil {
+		m.voiceCancel()
+		m.voiceCancel = nil
+	}
+	if m.voiceAbort != nil {
+		m.voiceAbort()
+		m.voiceAbort = nil
+	}
+	m.voiceRecording = false
+	m.voiceStopping = false
+	m.voicePartialText = ""
+	m.voicePartials = nil
 }
 
 func (m *model) stopVoiceCapture() (model, tea.Cmd) {

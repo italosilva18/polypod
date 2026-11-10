@@ -62,14 +62,16 @@ type streamRedrawMsg struct{ generation uint64 }
 const streamRedrawInterval = 33 * time.Millisecond
 
 type voiceResultMsg struct {
-	text string
-	err  error
+	text       string
+	err        error
+	generation uint64
 }
 
 type voicePartialMsg struct {
-	text   string
-	ok     bool
-	source <-chan string
+	text       string
+	ok         bool
+	source     <-chan string
+	generation uint64
 }
 
 type taskEventMsg struct{ event tasks.TaskEvent }
@@ -132,6 +134,8 @@ type model struct {
 	voicePartialText       string
 	voicePartials          <-chan string
 	voiceCancel            context.CancelFunc
+	voiceAbort             context.CancelFunc
+	voiceGeneration        uint64
 	streamRedrawPending    bool
 	streamRedrawGeneration uint64
 	lastViewportRedraw     time.Time
@@ -1025,11 +1029,13 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m.stopVoiceCapture()
 				}
 				if result.clearDisplay {
+					m.invalidateVoiceCapture()
 					m.messages = nil
 					m.recoveryDraft = ""
 					m.resetHistoryPaging()
 				}
 				if result.replaceMessages != nil {
+					m.invalidateVoiceCapture()
 					m.messages = append([]chatEntry{}, result.replaceMessages...)
 					m.recoveryDraft = result.recoveryDraft
 					m.adoptHistoryPaging(result.resumeSessionID, result.historyBefore)
@@ -1090,6 +1096,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case voiceResultMsg:
+		if !m.voiceRecording || msg.generation != m.voiceGeneration {
+			return m, nil
+		}
 		m.voiceRecording = false
 		m.voiceStopping = false
 		m.voicePartialText = ""
@@ -1097,6 +1106,10 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.voiceCancel != nil {
 			m.voiceCancel()
 			m.voiceCancel = nil
+		}
+		if m.voiceAbort != nil {
+			m.voiceAbort()
+			m.voiceAbort = nil
 		}
 		if msg.err != nil {
 			m.messages = append(m.messages, chatEntry{role: "error", content: "Entrada por voz: " + msg.err.Error(), timestamp: time.Now()})
@@ -1117,12 +1130,12 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, clearNotifyAfter(6*time.Second, m.notification)
 
 	case voicePartialMsg:
-		if !msg.ok || !m.voiceRecording || msg.source != m.voicePartials {
+		if !msg.ok || !m.voiceRecording || msg.source != m.voicePartials || msg.generation != m.voiceGeneration {
 			return m, nil
 		}
 		m.voicePartialText = strings.TrimSpace(msg.text)
 		m.updateViewport()
-		return m, waitForVoicePartial(m.voicePartials)
+		return m, waitForVoicePartial(m.voicePartials, m.voiceGeneration)
 
 	case streamMsg:
 		if msg.err != nil {

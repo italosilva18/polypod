@@ -20,8 +20,8 @@ import (
 // the chat and composer responsive while the microphone is active.
 func newVoiceCapture(cfg config.AudioTranscriptionConfig) func(context.Context, context.Context, time.Duration, func(string)) (string, error) {
 	var transcribe func(context.Context, []byte, string) (string, error)
+	var local *audio.LocalTranscriber
 	var setupErr error
-	partialSupported := false
 	switch strings.ToLower(strings.TrimSpace(cfg.Backend)) {
 	case "", "http":
 		var backend *audio.HTTPTranscriber
@@ -41,7 +41,7 @@ func newVoiceCapture(cfg config.AudioTranscriptionConfig) func(context.Context, 
 		})
 		if setupErr == nil {
 			transcribe = backend.Transcribe
-			partialSupported = true
+			local = backend
 		}
 	default:
 		setupErr = fmt.Errorf("backend de transcrição desconhecido: %s", cfg.Backend)
@@ -50,65 +50,36 @@ func newVoiceCapture(cfg config.AudioTranscriptionConfig) func(context.Context, 
 		if setupErr != nil {
 			return "", setupErr
 		}
-		var snapshot func([]byte)
-		stopPartials := func() {}
-		if partialSupported && onPartial != nil {
-			partialCtx, cancel := context.WithCancel(transcribeCtx)
-			snapshots := make(chan []byte, 1)
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				for wav := range snapshots {
-					if partialCtx.Err() != nil {
-						return
-					}
-					text, err := transcribe(partialCtx, wav, "audio/wav")
-					if err == nil && partialCtx.Err() == nil && strings.TrimSpace(text) != "" {
-						onPartial(text)
-					}
-				}
-			}()
-			snapshot = func(wav []byte) {
-				// Keep only the newest preview while the local model is busy.
-				select {
-				case snapshots <- wav:
-				default:
-					select {
-					case <-snapshots:
-					default:
-					}
-					select {
-					case snapshots <- wav:
-					default:
-					}
-				}
-			}
-			stopPartials = func() {
-				cancel()
-				close(snapshots)
-				<-done
-			}
+		// HTTP stays final-only. A resident worker is local and only useful
+		// when the caller can show partial text.
+		if local == nil || onPartial == nil {
+			return captureFinalOnly(recordCtx, transcribeCtx, duration, transcribe)
 		}
-		data, err := recordMicrophoneProgress(recordCtx, duration, snapshot)
-		stopPartials()
-		if err != nil {
-			return "", err
-		}
-		if err := transcribeCtx.Err(); err != nil {
-			return "", err
-		}
-		return transcribe(transcribeCtx, data, "audio/wav")
+		return captureLocalDictation(recordCtx, transcribeCtx, duration, onPartial, local, transcribe)
 	}
+}
+
+func captureFinalOnly(recordCtx, transcribeCtx context.Context, duration time.Duration, transcribe func(context.Context, []byte, string) (string, error)) (string, error) {
+	data, err := recordMicrophoneProgress(recordCtx, duration, nil)
+	if err != nil {
+		return "", err
+	}
+	if err := transcribeCtx.Err(); err != nil {
+		return "", err
+	}
+	return transcribe(transcribeCtx, data, "audio/wav")
 }
 
 func recordMicrophone(ctx context.Context, duration time.Duration) ([]byte, error) {
 	return recordMicrophoneProgress(ctx, duration, nil)
 }
 
-// recordMicrophoneProgress emits bounded, self-contained WAV snapshots while
-// arecord writes the full recording. A snapshot is only a preview: the final
-// transcriber always reads the recorder's completed WAV file.
-func recordMicrophoneProgress(ctx context.Context, duration time.Duration, onSnapshot func([]byte)) ([]byte, error) {
+// recordMicrophoneProgress records with arecord and, when feed is set, calls
+// it with the WAV path while the file grows. feed runs on the microphone
+// select loop, so it must not block on a worker pipe. A true result means
+// another bounded chunk is still unread. The completed file is still what a
+// one-shot final transcription reads.
+func recordMicrophoneProgress(ctx context.Context, duration time.Duration, feed func(string) bool) ([]byte, error) {
 	seconds := int(duration / time.Second)
 	if duration < 0 || (duration > 0 && (seconds < 1 || seconds > 120)) {
 		return nil, fmt.Errorf("duração de gravação inválida")
@@ -153,27 +124,20 @@ func recordMicrophoneProgress(ctx context.Context, duration time.Duration, onSna
 	stopped := false
 	var ticker *time.Ticker
 	var ticks <-chan time.Time
-	if onSnapshot != nil {
-		ticker = time.NewTicker(time.Second)
+	if feed != nil {
+		// Short ticks keep a resident worker supplied with new PCM. Callers
+		// that only want bounded previews apply their own slower cadence.
+		ticker = time.NewTicker(voiceTailInterval)
 		defer ticker.Stop()
 		ticks = ticker.C
 	}
-	previewCount := 0
-	nextPreview := time.Now().Add(4 * time.Second)
 	recording := true
 	for recording {
 		select {
 		case runErr = <-finished:
 			recording = false
 		case <-ticks:
-			if previewCount >= 4 || time.Now().Before(nextPreview) {
-				continue
-			}
-			if wav, err := readRecordingPreview(path); err == nil {
-				onSnapshot(wav)
-				previewCount++
-				nextPreview = time.Now().Add(12 * time.Second)
-			}
+			feed(path)
 		case <-recordCtx.Done():
 			stopped = true
 			// Give arecord a chance to finalize the WAV header before reading it.
@@ -213,6 +177,17 @@ func recordMicrophoneProgress(ctx context.Context, duration time.Duration, onSna
 	}
 	if info.Size() > audio.MaxAudioBytes {
 		return nil, fmt.Errorf("gravação excede %d MiB; pare e envie partes menores", audio.MaxAudioBytes>>20)
+	}
+	// arecord has closed the file. Drain PCM written since the previous tick
+	// before the directory is removed. Each call copies at most one bounded
+	// chunk and does not write the worker pipe. A late worker therefore still
+	// sees the whole recording, and cancellation is not stuck on that pipe.
+	if feed != nil {
+		for range 64 {
+			if !feed(path) {
+				break
+			}
+		}
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {

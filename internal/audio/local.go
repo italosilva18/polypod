@@ -89,6 +89,15 @@ func NewLocalTranscriber(cfg LocalConfig) (*LocalTranscriber, error) {
 	}, nil
 }
 
+// Timeout bounds one local Whisper invocation. Resident dictation uses the
+// same limit for its final pass over the whole recording.
+func (t *LocalTranscriber) Timeout() time.Duration {
+	if t == nil {
+		return defaultLocalTimeout
+	}
+	return t.timeout
+}
+
 func (t *LocalTranscriber) Transcribe(ctx context.Context, data []byte, declaredMIME string) (string, error) {
 	if len(data) == 0 || len(data) > MaxAudioBytes {
 		return "", ErrUnsupportedAudio

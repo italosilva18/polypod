@@ -27,7 +27,11 @@ O `doctor` confere os arquivos e executáveis sem abrir o modelo; a prova de fal
 
 ## Ditado no CLI
 
-Com `whatsapp.audio_transcription.enabled: true`, o CLI reutiliza o mesmo backend de transcrição. Pressione Ctrl+G ou digite `/voice` para iniciar; pressione Ctrl+G novamente ou use `/voice stop` para encerrar. `/voice N` preserva a captura por duração fixa, de 1 a 120 segundos. O comando grava pelo `arecord` no dispositivo ALSA `default`; `POLYPOD_VOICE_INPUT_DEVICE` escolhe outro dispositivo, como `pulse` ou `pipewire`. A gravação e a transcrição ocorrem em segundo plano. Ao terminar, o texto é inserido no campo de mensagem para revisão e envio com Enter. O arquivo WAV temporário é removido após a transcrição. Uma configuração `backend: local` mantém o áudio na máquina. O texto parcial durante a fala ainda não é exibido.
+Com `whatsapp.audio_transcription.enabled: true`, o CLI reutiliza o mesmo backend de transcrição. Pressione Ctrl+G ou digite `/voice` para iniciar; pressione Ctrl+G novamente ou use `/voice stop` para encerrar. `/voice N` preserva a captura por duração fixa, de 1 a 120 segundos. O comando grava pelo `arecord` no dispositivo ALSA `default`; `POLYPOD_VOICE_INPUT_DEVICE` escolhe outro dispositivo, como `pulse` ou `pipewire`. A gravação e a transcrição ocorrem em segundo plano. Ao terminar, o texto é inserido no campo de mensagem para revisão e envio com Enter. O WAV temporário sai do disco depois de lido. Uma configuração `backend: local` mantém o áudio na máquina.
+
+Com o worker `scripts/transcribe-faster.py`, cada ditado mantém um processo do modelo. O Polypod acompanha o WAV do `arecord` e envia o PCM novo para esse processo. A prévia substitui a anterior e aparece como texto não enviado; ela não entra no compositor. A passagem final usa o áudio acumulado no processo e respeita `timeout_seconds`. Se o worker não aceitar esse modo, o modelo for um checkpoint `.pt`, ou o processo falhar, o CLI volta às prévias em arquivo — no máximo quatro — e à transcrição final já existente. `backend: http` envia o áudio uma única vez, só ao terminar. O processo residente segura o mesmo bloqueio do modelo que o serviço usa, então uma transcrição do WhatsApp espera o ditado acabar.
+
+Se a conversa for trocada enquanto grava ou transcreve, a captura é cancelada e o resultado antigo não entra no novo rascunho. O caminho residente ainda não foi ensaiado com microfone real; compilação e análise estática não medem latência nem precisão.
 
 ## Backend HTTP opcional
 
