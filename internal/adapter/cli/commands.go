@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/atotto/clipboard"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/costa/polypod/internal/command"
 	"github.com/costa/polypod/internal/commitai"
@@ -106,7 +107,7 @@ func processCommand(input string, deps commandDeps, messages []chatEntry) comman
 		return handleSession(deps)
 
 	case "/copy":
-		return handleCopy(messages)
+		return handleCopy(messages, parts[1:])
 
 	case "/voice":
 		if len(parts) == 2 && strings.EqualFold(parts[1], "stop") {
@@ -308,7 +309,7 @@ func helpText() string {
 		{"/memory search <q>", "busca memorias"},
 		{"/model", "mostra agente/modelo atual"},
 		{"/session", "info da sessao"},
-		{"/copy", "copia ultima resposta pro clipboard"},
+		{"/copy [numero|list|all]", "copia uma resposta, lista respostas ou copia as respostas carregadas"},
 		{"/voice [segundos|stop]", "grava ate Ctrl+G ou /voice stop; segundos sao opcionais"},
 		{"Ctrl+G", "inicia ou para a gravacao de voz"},
 		{"/bg <objetivo>", "cria tarefa durável separada; list/status/retry/cancel para acompanhar"},
@@ -644,24 +645,95 @@ func handleCost(deps commandDeps) commandResult {
 
 // ── Power commands ──────────────────────────────────────────────────────────
 
-func handleCopy(messages []chatEntry) commandResult {
-	// Find last assistant message
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].role == "assistant" {
-			if err := clipboard.WriteAll(messages[i].content); err != nil {
-				return commandResult{
-					output:  errorStyle.Render("erro ao copiar: ") + cmdLabelStyle.Render(err.Error()),
-					handled: true,
-				}
-			}
-			preview := truncate(messages[i].content, 60)
-			return commandResult{
-				output:  notifySuccessStyle.Render("copiado pro clipboard ") + cmdLabelStyle.Render("("+preview+")"),
-				handled: true,
-			}
-		}
+func handleCopy(messages []chatEntry, args []string) commandResult {
+	const usage = "uso: /copy [numero|list|all]"
+	if len(args) > 1 {
+		return commandResult{output: cmdLabelStyle.Render(usage), handled: true}
 	}
-	return commandResult{output: cmdLabelStyle.Render("nenhuma resposta pra copiar"), handled: true}
+	if len(args) == 1 && strings.EqualFold(args[0], "all") {
+		// This is the resident display history, which can be shorter than the
+		// persisted session when older pages have not been loaded with PgUp.
+		const maxCopyBytes = 4 << 20
+		var combined strings.Builder
+		count := 0
+		for _, entry := range messages {
+			if entry.role != "assistant" || entry.content == "" {
+				continue
+			}
+			separator := ""
+			if count > 0 {
+				separator = "\n\n---\n\n"
+			}
+			if combined.Len()+len(separator)+len(entry.content) > maxCopyBytes {
+				return commandResult{output: errorStyle.Render("respostas carregadas excedem 4 MiB; copie por numero"), handled: true}
+			}
+			combined.WriteString(separator)
+			combined.WriteString(entry.content)
+			count++
+		}
+		if count == 0 {
+			return commandResult{output: cmdLabelStyle.Render("nenhuma resposta para copiar"), handled: true}
+		}
+		if err := clipboard.WriteAll(combined.String()); err != nil {
+			return commandResult{output: errorStyle.Render("erro ao copiar: ") + cmdLabelStyle.Render(err.Error()), handled: true}
+		}
+		return commandResult{output: notifySuccessStyle.Render(fmt.Sprintf("%d respostas carregadas copiadas", count)), handled: true}
+	}
+	listing := len(args) == 1 && strings.EqualFold(args[0], "list")
+	position := 1
+	if len(args) == 1 && !listing {
+		parsed, err := strconv.Atoi(args[0])
+		if err != nil || parsed < 1 {
+			return commandResult{output: cmdLabelStyle.Render(usage), handled: true}
+		}
+		position = parsed
+	}
+	count := 0
+	var list strings.Builder
+	for i := len(messages) - 1; i >= 0; i-- {
+		entry := messages[i]
+		if entry.role != "assistant" || entry.content == "" {
+			continue
+		}
+		count++
+		if listing {
+			if count <= 10 {
+				list.WriteString(fmt.Sprintf("%d. %s\n", count, copyPreview(entry.content, 80)))
+			}
+			continue
+		}
+		if count != position {
+			continue
+		}
+		if err := clipboard.WriteAll(entry.content); err != nil {
+			return commandResult{output: errorStyle.Render("erro ao copiar: ") + cmdLabelStyle.Render(err.Error()), handled: true}
+		}
+		return commandResult{output: notifySuccessStyle.Render(fmt.Sprintf("resposta %d copiada ", position)) +
+			cmdLabelStyle.Render("("+copyPreview(entry.content, 60)+")"), handled: true}
+	}
+	if listing {
+		if count == 0 {
+			return commandResult{output: cmdLabelStyle.Render("nenhuma resposta carregada"), handled: true}
+		}
+		if count > 10 {
+			list.WriteString(fmt.Sprintf("... %d respostas carregadas no total\n", count))
+		}
+		list.WriteString("Use /copy <numero> para copiar uma resposta. PgUp carrega respostas mais antigas.")
+		return commandResult{output: strings.TrimSpace(list.String()), handled: true}
+	}
+	if count == 0 {
+		return commandResult{output: cmdLabelStyle.Render("nenhuma resposta para copiar"), handled: true}
+	}
+	return commandResult{output: cmdLabelStyle.Render(fmt.Sprintf("resposta %d indisponível; há %d respostas carregadas", position, count)), handled: true}
+}
+
+func copyPreview(content string, maxRunes int) string {
+	plain := strings.Join(strings.Fields(ansi.Strip(content)), " ")
+	runes := []rune(plain)
+	if len(runes) <= maxRunes {
+		return plain
+	}
+	return string(runes[:maxRunes-3]) + "..."
 }
 
 func handleRun(command string, deps commandDeps) commandResult {
