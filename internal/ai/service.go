@@ -19,7 +19,7 @@ import (
 
 // KnowledgeSearcher is implemented by the knowledge service.
 type KnowledgeSearcher interface {
-	Search(ctx context.Context, query string) ([]string, error)
+	Search(ctx context.Context, query, channel, userID string) ([]string, error)
 }
 
 // AnswerRequest contains the data needed to generate an answer.
@@ -261,7 +261,7 @@ func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) ([]ChatM
 	// Search knowledge base
 	var knowledgeCtx string
 	if s.knowledge != nil {
-		fragments, err := s.knowledge.Search(ctx, req.Query)
+		fragments, err := s.knowledge.Search(ctx, req.Query, req.Channel, req.UserID)
 		if err != nil {
 			s.logger.Warn("knowledge search failed, continuing without context", "error", err)
 		} else {

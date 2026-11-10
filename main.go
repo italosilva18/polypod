@@ -1495,9 +1495,10 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	activeAgent := agents.Get("default")
 	logger.Info("agent active", "name", activeAgent.Name, "skills", len(activeAgent.Skills))
 
-	// AI client (no knowledge service in CLI-only build)
+	// Retrieve cited, scope-limited document chunks before each AI turn.
 	aiClient = ai.NewClient(cfg.AI, sys.ToolAdapter)
-	aiSvc := ai.NewService(aiClient, nil, agents, "default", memStore, logger)
+	aiSvc := ai.NewService(aiClient, ai.NewDocumentKnowledgeSearcher(documentIndex, cfg.WhatsApp.OwnerChat),
+		agents, "default", memStore, logger)
 	workspaceStore, err := workdir.Open(filepath.Join(cfg.Data.Dir, "workdirs.json"))
 	if err != nil {
 		logger.Warn("scoped workdirs unavailable", "error", err)

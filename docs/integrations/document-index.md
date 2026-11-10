@@ -17,6 +17,20 @@ busca semântica. Falha do provedor de embeddings conserva a busca textual.
 - `DeleteSource` remove uma fonte e todos os trechos dela. Atualizar uma fonte
   substitui os trechos anteriores em uma transação.
 
+O serviço de IA agora consulta automaticamente o índice antes de cada turno
+com uma pergunta substantiva. Inclui no máximo quatro trechos citados e 3.600
+caracteres Unicode no contexto, com limite de cinco segundos para a busca. Se
+não houver resultado ou a busca falhar, o turno continua sem os trechos. O
+modelo recebe `source_id`, ordinal e citação para poder pedir outros trechos à
+ferramenta `document_knowledge` quando precisar.
+
+O escopo automático segue a identidade do turno: CLI e tarefas internas podem
+consultar `local`; WhatsApp usa o `ChatID` validado no contexto da mensagem,
+com `local` adicional apenas para o chat do proprietário configurado; outros
+canais remotos usam somente o escopo exato da sua inbox. Uma chamada WhatsApp
+sem esse contexto não recebe documentos. Texto de documento entra como dado de
+referência, não como instrução para o agente.
+
 Cada resultado traz o hash da revisão, o ordinal do trecho e uma citação
 `[doc:…#N]` calculada sem expor o escopo. `ReadChunk` recupera o trecho pelo
 escopo, identificador da fonte e ordinal. A citação muda quando a fonte muda.

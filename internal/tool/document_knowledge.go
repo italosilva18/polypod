@@ -180,21 +180,16 @@ func knowledgeScopes(ctx context.Context, ownerChat string) []string {
 		}
 		return []string{source.ChatID}
 	}
-	if scope, ok := ctx.Value(remoteDocumentScopeKey{}).(string); ok && scope != "" {
+	if scope, ok := document.RemoteScopeFromContext(ctx); ok {
 		return []string{scope}
 	}
 	return []string{document.LocalScope}
 }
 
-type remoteDocumentScopeKey struct{}
-
 // WithRemoteDocumentScope prevents a non-WhatsApp humanloop channel from
 // inheriting the local CLI's document scope. The identity remains in memory.
 func WithRemoteDocumentScope(ctx context.Context, channel, userID string) context.Context {
-	if ctx == nil || channel == "" || userID == "" {
-		return ctx
-	}
-	return context.WithValue(ctx, remoteDocumentScopeKey{}, channel+":"+userID)
+	return document.WithRemoteScope(ctx, channel, userID)
 }
 
 func selectKnowledgeScopes(allowed []string, args map[string]any) ([]string, error) {
