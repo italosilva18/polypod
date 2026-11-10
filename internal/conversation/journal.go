@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,16 +27,32 @@ func (s *Store) journalPath() string {
 	return filepath.Join(s.dataDir, "journal.jsonl")
 }
 
-// loadJournal runs under journalMu. Corruption is reported, never silently skipped.
-// SQLite keeps message IDs and the last sequence. YAML-only stores retain
-// journal bodies in memory so cursor pages do not rescan the JSONL file.
+// loadJournal runs under journalMu. SQLite rows are validated when they are
+// read or deduplicated; a startup probe does not decode every historical row.
+// SQLite's unique index owns message IDs and its primary key owns sequence.
+// YAML-only stores retain journal bodies in memory so cursor pages do not
+// rescan the JSONL file.
 func (s *Store) loadJournal(ctx context.Context) error {
 	if s.journalLoaded {
 		return nil
 	}
+	if s.sqliteDB != nil {
+		if _, err := s.sqliteDB.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS conversation_journal (sequence INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, entry TEXT NOT NULL)`); err != nil {
+			return err
+		}
+		if err := s.validateSQLiteFirstSequence(ctx); err != nil {
+			return err
+		}
+		last, err := s.sqliteJournalLast(ctx)
+		if err != nil {
+			return err
+		}
+		s.journalLast = uint64(last)
+		s.journalLoaded = true
+		return nil
+	}
 	ids := make(map[string]bool)
 	var last uint64
-	keepBodies := s.sqliteDB == nil
 	var memory []JournalEntry
 	err := s.scanJournal(ctx, func(e JournalEntry) error {
 		if err := ctx.Err(); err != nil {
@@ -46,9 +63,7 @@ func (s *Store) loadJournal(ctx context.Context) error {
 		}
 		last = e.Sequence
 		ids[e.Message.ID] = true
-		if keepBodies {
-			memory = append(memory, e)
-		}
+		memory = append(memory, e)
 		return nil
 	})
 	if err != nil {
@@ -62,34 +77,32 @@ func (s *Store) loadJournal(ctx context.Context) error {
 }
 
 func (s *Store) scanJournal(ctx context.Context, fn func(JournalEntry) error) error {
-	if s.sqliteDB != nil {
-		if _, err := s.sqliteDB.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS conversation_journal (sequence INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, entry TEXT NOT NULL)`); err != nil {
-			return err
-		}
-		rows, err := s.sqliteDB.QueryContext(ctx, `SELECT entry FROM conversation_journal ORDER BY sequence`)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var raw string
-			var e JournalEntry
-			if err := rows.Scan(&raw); err != nil {
-				return err
-			}
-			if err := json.Unmarshal([]byte(raw), &e); err != nil {
-				return err
-			}
-			if err := fn(e); err != nil {
-				return err
-			}
-		}
-		return rows.Err()
-	}
 	if s.dataDir != "" {
 		return s.scanJournalFile(fn)
 	}
 	return nil
+}
+
+func (s *Store) validateSQLiteFirstSequence(ctx context.Context) error {
+	var first sql.NullInt64
+	if err := s.sqliteDB.QueryRowContext(ctx, `SELECT MIN(sequence) FROM conversation_journal`).Scan(&first); err != nil {
+		return fmt.Errorf("reading conversation journal first sequence: %w", err)
+	}
+	if first.Valid && first.Int64 <= 0 {
+		return fmt.Errorf("conversation journal first sequence is invalid: %d", first.Int64)
+	}
+	return nil
+}
+
+func (s *Store) sqliteJournalLast(ctx context.Context) (int64, error) {
+	var last int64
+	if err := s.sqliteDB.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence), 0) FROM conversation_journal`).Scan(&last); err != nil {
+		return 0, fmt.Errorf("reading conversation journal sequence: %w", err)
+	}
+	if last < 0 || last == math.MaxInt64 {
+		return 0, fmt.Errorf("conversation journal sequence is invalid: %d", last)
+	}
+	return last, nil
 }
 
 // scanJournalFile requires a newline after every record. A torn final append
@@ -154,6 +167,12 @@ func (s *Store) journalSlice(ctx context.Context, sess *Session, msgs []Message)
 			return err
 		}
 		msg := msgs[i]
+		if s.sqliteDB != nil {
+			if err := s.appendSQLiteJournalMessage(ctx, sess, msg); err != nil {
+				return err
+			}
+			continue
+		}
 		if s.journalIDs[msg.ID] {
 			continue
 		}
@@ -163,11 +182,7 @@ func (s *Store) journalSlice(ctx context.Context, sess *Session, msgs []Message)
 		if err != nil {
 			return err
 		}
-		if s.sqliteDB != nil {
-			if _, err = s.sqliteDB.ExecContext(ctx, `INSERT INTO conversation_journal(sequence,message_id,entry) VALUES(?,?,?)`, seq, msg.ID, string(raw)); err != nil {
-				return fmt.Errorf("writing conversation journal: %w", err)
-			}
-		} else if s.dataDir != "" {
+		if s.dataDir != "" {
 			if err = os.MkdirAll(s.dataDir, 0700); err != nil {
 				return err
 			}
@@ -188,13 +203,97 @@ func (s *Store) journalSlice(ctx context.Context, sess *Session, msgs []Message)
 				return closeErr
 			}
 		}
-		if s.sqliteDB == nil {
-			s.journalEntries = append(s.journalEntries, e)
-		}
+		s.journalEntries = append(s.journalEntries, e)
 		s.journalIDs[msg.ID] = true
 		s.journalLast = seq
 	}
 	return nil
+}
+
+// appendSQLiteJournalMessage asks SQLite for the next sequence on every write,
+// so another Polypod process cannot leave this store's cached sequence stale.
+// A competing insert is retried only when the primary key advanced; a row
+// with the same message ID is checked before it is treated as already saved.
+func (s *Store) appendSQLiteJournalMessage(ctx context.Context, sess *Session, msg Message) error {
+	prior, found, err := s.sqliteEntryByID(ctx, msg.ID)
+	if err != nil {
+		return err
+	}
+	if found {
+		return sameSessionJournalID(sess.ID, prior)
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		last, err := s.sqliteJournalLast(ctx)
+		if err != nil {
+			return err
+		}
+		seq := uint64(last) + 1
+		e := JournalEntry{Sequence: seq, SessionID: sess.ID, Channel: sess.Channel, Message: msg}
+		raw, err := json.Marshal(e)
+		if err != nil {
+			return err
+		}
+		_, err = s.sqliteDB.ExecContext(ctx,
+			`INSERT INTO conversation_journal(sequence,message_id,entry) VALUES(?,?,?)`, seq, msg.ID, string(raw))
+		if err == nil {
+			s.journalLast = seq
+			return nil
+		}
+		prior, found, lookupErr := s.sqliteEntryByID(ctx, msg.ID)
+		if lookupErr != nil {
+			return fmt.Errorf("writing conversation journal: %w; checking existing ID: %w", err, lookupErr)
+		}
+		if found {
+			return sameSessionJournalID(sess.ID, prior)
+		}
+		advanced, queryErr := s.sqliteJournalLast(ctx)
+		if queryErr != nil {
+			return fmt.Errorf("writing conversation journal: %w; checking sequence: %w", err, queryErr)
+		}
+		if advanced <= last {
+			return fmt.Errorf("writing conversation journal: %w", err)
+		}
+	}
+	return fmt.Errorf("writing conversation journal: sequence changed during three attempts")
+}
+
+func sameSessionJournalID(sessionID string, entry JournalEntry) error {
+	if entry.SessionID != sessionID {
+		return fmt.Errorf("conversation journal: message ID belongs to session %q instead of %q", entry.SessionID, sessionID)
+	}
+	return nil
+}
+
+func (s *Store) sqliteEntryByID(ctx context.Context, messageID string) (JournalEntry, bool, error) {
+	var rowSequence int64
+	var raw string
+	err := s.sqliteDB.QueryRowContext(ctx,
+		`SELECT sequence, entry FROM conversation_journal WHERE message_id = ?`, messageID).Scan(&rowSequence, &raw)
+	if err == sql.ErrNoRows {
+		return JournalEntry{}, false, nil
+	}
+	if err != nil {
+		return JournalEntry{}, false, fmt.Errorf("reading conversation journal message: %w", err)
+	}
+	e, err := decodeSQLiteEntry(rowSequence, messageID, raw)
+	if err != nil {
+		return JournalEntry{}, false, err
+	}
+	return e, true, nil
+}
+
+func decodeSQLiteEntry(rowSequence int64, messageID, raw string) (JournalEntry, error) {
+	var e JournalEntry
+	if rowSequence <= 0 || messageID == "" {
+		return JournalEntry{}, fmt.Errorf("conversation journal: invalid SQLite row metadata")
+	}
+	if err := json.Unmarshal([]byte(raw), &e); err != nil {
+		return JournalEntry{}, fmt.Errorf("decoding conversation journal: %w", err)
+	}
+	if e.Sequence != uint64(rowSequence) || e.Message.ID != messageID || e.SessionID == "" {
+		return JournalEntry{}, fmt.Errorf("conversation journal: SQLite row does not match its entry")
+	}
+	return e, nil
 }
 
 func stampSessionIDs(sess *Session) error {
@@ -248,7 +347,7 @@ func (s *Store) JournalAfter(ctx context.Context, sequence uint64, limit int) ([
 }
 
 func (s *Store) journalAfterSQLite(ctx context.Context, sequence uint64, limit int) ([]JournalEntry, error) {
-	query := `SELECT entry FROM conversation_journal WHERE sequence > ? ORDER BY sequence`
+	query := `SELECT sequence, message_id, entry FROM conversation_journal WHERE sequence > ? ORDER BY sequence`
 	args := []any{sequence}
 	if limit > 0 {
 		query += ` LIMIT ?`
@@ -265,11 +364,13 @@ func (s *Store) journalAfterSQLite(ctx context.Context, sequence uint64, limit i
 			return nil, err
 		}
 		var raw string
-		var e JournalEntry
-		if err := rows.Scan(&raw); err != nil {
+		var messageID string
+		var rowSequence int64
+		if err := rows.Scan(&rowSequence, &messageID, &raw); err != nil {
 			return nil, err
 		}
-		if err := json.Unmarshal([]byte(raw), &e); err != nil {
+		e, err := decodeSQLiteEntry(rowSequence, messageID, raw)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, e)
@@ -296,28 +397,20 @@ func (s *Store) ReadJournalMessage(ctx context.Context, messageID string) (Messa
 	if err := s.loadJournal(ctx); err != nil {
 		return Message{}, false, err
 	}
+	if s.sqliteDB != nil {
+		e, found, err := s.sqliteEntryByID(ctx, messageID)
+		if err != nil || !found {
+			return Message{}, found, err
+		}
+		return e.Message, true, nil
+	}
 	if !s.journalIDs[messageID] {
 		return Message{}, false, nil
 	}
-	if s.sqliteDB == nil {
-		for _, e := range s.journalEntries {
-			if e.Message.ID == messageID {
-				return e.Message, true, nil
-			}
+	for _, e := range s.journalEntries {
+		if e.Message.ID == messageID {
+			return e.Message, true, nil
 		}
-		return Message{}, false, nil
 	}
-	var raw string
-	err := s.sqliteDB.QueryRowContext(ctx, `SELECT entry FROM conversation_journal WHERE message_id = ?`, messageID).Scan(&raw)
-	if err == sql.ErrNoRows {
-		return Message{}, false, nil
-	}
-	if err != nil {
-		return Message{}, false, err
-	}
-	var e JournalEntry
-	if err := json.Unmarshal([]byte(raw), &e); err != nil {
-		return Message{}, false, err
-	}
-	return e.Message, true, nil
+	return Message{}, false, nil
 }

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -42,12 +43,22 @@ type sessionSlot struct {
 	alsoJournalDiskNames []string
 }
 
+// sessionHeader lets startup identify YAML sessions without constructing a
+// second copy of their message bodies. Migration still reads every body once.
+type sessionHeader struct {
+	ID        string    `yaml:"id"`
+	Channel   string    `yaml:"channel"`
+	UserID    string    `yaml:"user_id"`
+	CreatedAt time.Time `yaml:"created_at"`
+	UpdatedAt time.Time `yaml:"updated_at"`
+}
+
 // Store persists sessions. Supports PostgreSQL, SQLite, YAML file, or in-memory only.
 type Store struct {
 	journalInitErr error
 	journalMu      sync.Mutex
-	journalEntries []JournalEntry // bodies for memory or YAML-only journals
-	journalIDs     map[string]bool
+	journalEntries []JournalEntry  // bodies for memory or YAML-only journals
+	journalIDs     map[string]bool // YAML or memory stores only; SQLite uses its unique index
 	journalLast    uint64
 	journalLoaded  bool
 	mu             sync.RWMutex
@@ -576,20 +587,20 @@ func (s *Store) loadIndexFromDisk() error {
 			return fmt.Errorf("reading session file %s: %w", entry.Name(), err)
 		}
 
-		// Decode fully to verify the transcript. Only the header is retained;
-		// migrateSnapshots reads each body once more.
-		var sess Session
-		if err := yaml.Unmarshal(data, &sess); err != nil {
+		// Decode the complete YAML document but materialize only header fields.
+		// migrateSnapshots validates and journals every message body once.
+		var metadata sessionHeader
+		if err := yaml.Unmarshal(data, &metadata); err != nil {
 			return fmt.Errorf("parsing session file %s: %w", entry.Name(), err)
 		}
-		if sess.ID == "" {
+		if metadata.ID == "" {
 			return fmt.Errorf("session file %s has empty ID", entry.Name())
 		}
 		header := &Session{
-			ID: sess.ID, Channel: sess.Channel, UserID: sess.UserID,
-			CreatedAt: sess.CreatedAt, UpdatedAt: sess.UpdatedAt,
+			ID: metadata.ID, Channel: metadata.Channel, UserID: metadata.UserID,
+			CreatedAt: metadata.CreatedAt, UpdatedAt: metadata.UpdatedAt,
 		}
-		if prev := s.sessions[sess.ID]; prev != nil {
+		if prev := s.sessions[metadata.ID]; prev != nil {
 			if prev.source == sourceDisk {
 				canonical := filepath.Base(s.sessionFilePath(header))
 				if !preferDiskSnapshot(prev.diskName, entry.Name(), canonical) {
@@ -606,7 +617,7 @@ func (s *Store) loadIndexFromDisk() error {
 			prev.loaded = false
 			continue
 		}
-		s.sessions[sess.ID] = &sessionSlot{sess: header, source: sourceDisk, diskName: entry.Name()}
+		s.sessions[metadata.ID] = &sessionSlot{sess: header, source: sourceDisk, diskName: entry.Name()}
 	}
 	return nil
 }
