@@ -363,15 +363,53 @@ func (d *DreamService) extractMemoriesOwned(ctx context.Context) error {
 		return fmt.Errorf("extract callback: %w", err)
 	}
 
+	nonSensitiveCandidates := 0
 	if !cached {
 		clean := make([]ExtractedMemory, 0, len(memories))
 		for _, m := range memories {
-			if strings.TrimSpace(m.Content) != "" && len(m.Evidence) > 0 && !looksSensitive(m.Content) &&
-				!looksSensitive(strings.Join(m.Tags, " ")) && !sensitiveEvidence(m.Evidence) {
+			if looksSensitive(m.Content) || looksSensitive(strings.Join(m.Tags, " ")) || sensitiveEvidence(m.Evidence) {
+				continue
+			}
+			nonSensitiveCandidates++
+			if strings.TrimSpace(m.Content) != "" && len(m.Evidence) > 0 {
 				clean = append(clean, m)
 			}
 		}
 		memories = clean
+	} else {
+		for _, m := range memories {
+			if !looksSensitive(m.Content) && !looksSensitive(strings.Join(m.Tags, " ")) && !sensitiveEvidence(m.Evidence) {
+				nonSensitiveCandidates++
+			}
+		}
+	}
+	// A non-sensitive candidate with no verifiable evidence is an invalid
+	// extraction. Secret-only output may be deliberately discarded. Keep the
+	// cursor on invalid output so a later idle cycle can retry.
+	grounded := make([]ExtractedMemory, 0, len(memories))
+	for _, m := range memories {
+		if strings.TrimSpace(m.Content) == "" || looksSensitive(m.Content) ||
+			looksSensitive(strings.Join(m.Tags, " ")) || sensitiveEvidence(m.Evidence) {
+			continue
+		}
+		if _, _, _, ok := groundMemory(m, evidence, provenance); ok {
+			grounded = append(grounded, m)
+		}
+	}
+	if nonSensitiveCandidates > 0 && len(grounded) == 0 {
+		if cached && d.config.StateFile != "" {
+			// A previously cached invalid result must not poison every retry.
+			if err := os.Remove(d.config.StateFile + ".pending"); err != nil && !os.IsNotExist(err) {
+				d.recordError(err)
+				return fmt.Errorf("removing invalid dream cache: %w", err)
+			}
+		}
+		err := fmt.Errorf("dream: modelo retornou candidatos sem evidencia verificavel")
+		d.recordError(err)
+		return err
+	}
+	memories = grounded
+	if !cached {
 		if err := d.savePending(sequence, memories); err != nil {
 			d.recordError(err)
 			return err

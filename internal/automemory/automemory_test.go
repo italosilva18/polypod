@@ -613,9 +613,10 @@ func TestDreamService_StatePreventsReprocessing(t *testing.T) {
 	}})
 	stateFile := filepath.Join(t.TempDir(), "dream-state.json")
 	calls := 0
-	extract := func(_ context.Context, _ string) ([]ExtractedMemory, error) {
+	extract := func(_ context.Context, transcript string) ([]ExtractedMemory, error) {
 		calls++
-		return []ExtractedMemory{{Type: "preference", Content: "prefere respostas curtas", Importance: 4}}, nil
+		return []ExtractedMemory{{Type: "preference", Content: "prefere respostas curtas", Importance: 4,
+			Evidence: dreamEvidenceForQuote(t, transcript, "prefiro respostas curtas")}}, nil
 	}
 
 	d1 := NewDreamService(DreamConfig{

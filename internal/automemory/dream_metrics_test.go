@@ -134,6 +134,91 @@ func TestDreamPersistsFailureAndEmptyExtractionMetrics(t *testing.T) {
 		stats.EmptyExtractions != 1 || stats.LastBatchExtracted != 0 || stats.LastError != "" {
 		t.Fatalf("empty extraction not distinguished from failure: %+v", stats)
 	}
+	if restarted.lastSequence == 0 {
+		t.Fatal("a legitimate empty extraction did not advance the cursor")
+	}
+}
+
+func TestDreamInvalidEvidencePreservesCursorForRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		evidence func(*testing.T, string) []MemoryEvidence
+	}{
+		{name: "missing", evidence: func(*testing.T, string) []MemoryEvidence { return nil }},
+		{name: "incorrect_quote", evidence: func(t *testing.T, transcript string) []MemoryEvidence {
+			items := dreamEvidenceForQuote(t, transcript, "Prefiro respostas curtas.")
+			items[0].Quote = "Esta frase nao aparece na origem."
+			return items
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			stateFile := filepath.Join(t.TempDir(), "dream-state.json")
+			sessions := seededSessionStore(t, []conversation.Message{{Role: conversation.RoleUser, Content: "Prefiro respostas curtas."}})
+			memories := &stubMemoryStore{}
+			valid := false
+			d := NewDreamService(DreamConfig{
+				Logger: quietLogger(), SessionStore: sessions, Memory: memories, StateFile: stateFile,
+				ExtractFn: func(_ context.Context, transcript string) ([]ExtractedMemory, error) {
+					evidence := tc.evidence(t, transcript)
+					if valid {
+						evidence = dreamEvidenceForQuote(t, transcript, "Prefiro respostas curtas.")
+					}
+					return []ExtractedMemory{{Type: "preference", FactKey: "usuario.estilo_resposta",
+						Content: "Prefere respostas curtas.", Importance: 3, Evidence: evidence}}, nil
+				},
+			})
+			if err := d.RunNow(ctx); err == nil {
+				t.Fatal("invalid extraction was acknowledged")
+			}
+			if stats := d.Stats(); stats.FailedRuns != 1 || stats.SuccessfulRuns != 0 || stats.MessagesProcessed != 0 || d.lastSequence != 0 {
+				t.Fatalf("invalid extraction changed cursor or committed metrics: %+v cursor=%d", stats, d.lastSequence)
+			}
+			if _, err := os.Stat(stateFile + ".pending"); !os.IsNotExist(err) {
+				t.Fatalf("invalid extraction was cached: %v", err)
+			}
+			valid = true
+			if err := d.RunNow(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if stats := d.Stats(); stats.Runs != 2 || stats.SuccessfulRuns != 1 || stats.FailedRuns != 1 ||
+				stats.MessagesProcessed != 1 || stats.MemoriesAdded != 1 || d.lastSequence == 0 {
+				t.Fatalf("retry did not commit fact and cursor: %+v cursor=%d", stats, d.lastSequence)
+			}
+			if len(memories.snapshot()) != 1 {
+				t.Fatal("retry did not save the grounded memory")
+			}
+		})
+	}
+}
+
+func TestDreamSensitiveOnlyExtractionDoesNotRetry(t *testing.T) {
+	ctx := context.Background()
+	sessions := seededSessionStore(t, []conversation.Message{{Role: conversation.RoleUser, Content: "Prefiro respostas curtas."}})
+	memories := &stubMemoryStore{}
+	calls := 0
+	d := NewDreamService(DreamConfig{
+		Logger: quietLogger(), SessionStore: sessions, Memory: memories,
+		StateFile: filepath.Join(t.TempDir(), "dream-state.json"),
+		ExtractFn: func(_ context.Context, transcript string) ([]ExtractedMemory, error) {
+			calls++
+			return []ExtractedMemory{{Type: "preference", Content: "A senha ficticia e exemplo123.",
+				Evidence: dreamEvidenceForQuote(t, transcript, "Prefiro respostas curtas.")}}, nil
+		},
+	})
+	if err := d.RunNow(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if stats := d.Stats(); stats.FailedRuns != 0 || stats.SuccessfulRuns != 1 || stats.EmptyExtractions != 1 ||
+		stats.MemoriesAdded != 0 || d.lastSequence == 0 {
+		t.Fatalf("sensitive-only extraction was not safely acknowledged: %+v cursor=%d", stats, d.lastSequence)
+	}
+	if err := d.RunNow(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || len(memories.snapshot()) != 0 {
+		t.Fatalf("sensitive-only extraction was retried or saved: calls=%d saved=%d", calls, len(memories.snapshot()))
+	}
 }
 
 func TestDreamCountsSavedBatchOnlyAfterRetrySucceeds(t *testing.T) {

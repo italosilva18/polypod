@@ -36,6 +36,9 @@ Se nada merecer memoria de longo prazo, retorne [].`
 // though the extraction prompt already forbids credentials.
 func ParseExtractedMemories(content string) ([]ExtractedMemory, error) {
 	raw := extractJSONArray(content)
+	if !strings.HasPrefix(strings.TrimSpace(raw), "[") {
+		return nil, fmt.Errorf("decodificando memorias do dreaming: esperado array JSON")
+	}
 	var candidates []ExtractedMemory
 	if err := json.Unmarshal([]byte(raw), &candidates); err != nil {
 		return nil, fmt.Errorf("decodificando memorias do dreaming: %w", err)
@@ -46,14 +49,20 @@ func ParseExtractedMemories(content string) ([]ExtractedMemory, error) {
 	allowed := map[string]bool{"fact": true, "preference": true, "skill": true, "context": true}
 	result := make([]ExtractedMemory, 0, len(candidates))
 	seen := make(map[string]bool)
+	invalidCandidates := 0
 	for _, memory := range candidates {
 		memory.Type = strings.ToLower(strings.TrimSpace(memory.Type))
 		memory.Content = strings.TrimSpace(memory.Content)
 		memory.FactKey = strings.ToLower(strings.TrimSpace(memory.FactKey))
-		if memory.FactKey != "" && (!factKeyPattern.MatchString(memory.FactKey) || looksSensitive(memory.FactKey)) {
+		if looksSensitive(memory.FactKey) || looksSensitive(memory.Content) || sensitiveEvidence(memory.Evidence) {
 			continue
 		}
-		if !allowed[memory.Type] || len(memory.Content) < 10 || len(memory.Content) > 800 || looksSensitive(memory.Content) {
+		if memory.FactKey != "" && !factKeyPattern.MatchString(memory.FactKey) {
+			invalidCandidates++
+			continue
+		}
+		if !allowed[memory.Type] || len(memory.Content) < 10 || len(memory.Content) > 800 {
+			invalidCandidates++
 			continue
 		}
 		key := strings.ToLower(memory.Content)
@@ -80,10 +89,10 @@ func ParseExtractedMemories(content string) ([]ExtractedMemory, error) {
 		if len(memory.Evidence) > 3 {
 			memory.Evidence = memory.Evidence[:3]
 		}
-		if sensitiveEvidence(memory.Evidence) {
-			continue
-		}
 		result = append(result, memory)
+	}
+	if invalidCandidates > 0 && len(result) == 0 {
+		return nil, fmt.Errorf("decodificando memorias do dreaming: nenhum candidato valido")
 	}
 	return result, nil
 }

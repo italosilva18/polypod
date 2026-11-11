@@ -145,6 +145,8 @@ func captureScreenCOSMIC(ctx context.Context, outPath string) error {
 		"--notify=false",
 		"--save-dir", dir,
 	)
+	superviseScreenshotCommand(cmd)
+	defer terminateScreenshotCommand(cmd)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("cosmic-screenshot: %w (%s)", err, strings.TrimSpace(string(output)))
 	}

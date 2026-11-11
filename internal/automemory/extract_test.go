@@ -30,3 +30,20 @@ func TestParseExtractedMemoriesAcceptsFencedJSON(t *testing.T) {
 		t.Fatalf("resultado inesperado: %+v", got)
 	}
 }
+
+func TestParseExtractedMemoriesDistinguishesEmptyFromInvalid(t *testing.T) {
+	if got, err := ParseExtractedMemories("[]"); err != nil || len(got) != 0 {
+		t.Fatalf("explicitly empty extraction: count=%d err=%v", len(got), err)
+	}
+	for _, raw := range []string{
+		`null`,
+		`[{"type":"other","content":"Synthetic invalid fact."}]`,
+	} {
+		if _, err := ParseExtractedMemories(raw); err == nil {
+			t.Fatalf("invalid model output was accepted")
+		}
+	}
+	if got, err := ParseExtractedMemories(`[{"type":"preference","content":"A senha do teste e segredo123."}]`); err != nil || len(got) != 0 {
+		t.Fatalf("sensitive-only output should be discarded without retry: count=%d err=%v", len(got), err)
+	}
+}
