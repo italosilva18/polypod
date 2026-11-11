@@ -78,3 +78,66 @@ func TestWizardRejectsUnsafeCredentialAndAuthorizationInputs(t *testing.T) {
 		t.Fatal("legacy key retained")
 	}
 }
+
+func TestWizardNVIDIANIMUsesEnvironmentReference(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	input, err := os.CreateTemp(dir, "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	if _, err := input.WriteString("7\n\n\ns\nn\nn\n2\ns\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := input.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	output, err := os.CreateTemp(dir, "output")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer output.Close()
+	oldIn, oldOut := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = input, output
+	defer func() { os.Stdin, os.Stdout = oldIn, oldOut }()
+	path := filepath.Join(dir, "config.yaml")
+	if err := Run(path); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for _, expected := range []string{"provider: nvidia", "https://integrate.api.nvidia.com/v1", "nvidia/nemotron-3-super-120b-a12b", "${NVIDIA_API_KEY:}"} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("NVIDIA NIM configuration missing %q", expected)
+		}
+	}
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0600 {
+		t.Fatal("NVIDIA NIM config not private")
+	}
+}
+
+func TestNVIDIANIMKeyCheckAvoidsLegacyPlaintextFlow(t *testing.T) {
+	t.Setenv("NVIDIA_API_KEY", "")
+	cfg := config.DefaultConfig()
+	cfg.AI.Provider = "nvidia"
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := CheckAPIKey(cfg, path); err == nil || !strings.Contains(err.Error(), "NVIDIA_API_KEY") {
+		t.Fatalf("missing key should show environment instruction: %v", err)
+	}
+	cfg.AI.APIKey = "synthetic-key"
+	if err := CheckAPIKey(cfg, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("key check wrote config: %v", err)
+	}
+	cfg.AI.APIKey = ""
+	t.Setenv("NVIDIA_API_KEY", "synthetic-env-key")
+	if err := CheckAPIKey(cfg, path); err != nil || cfg.AI.APIKey != "synthetic-env-key" {
+		t.Fatalf("environment key not used: %v", err)
+	}
+}

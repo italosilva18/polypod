@@ -1,6 +1,10 @@
 package provider
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -91,6 +95,7 @@ func TestProviderFactory(t *testing.T) {
 		{"anthropic", "anthropic"},
 		{"google", "google"},
 		{"openrouter", "openrouter"},
+		{"nvidia", "nvidia"},
 		{"custom", "custom"},
 	}
 
@@ -122,10 +127,44 @@ func TestSupportedProviders(t *testing.T) {
 	for _, p := range providers {
 		has[p] = true
 	}
-	for _, need := range []string{"deepseek", "openai", "ollama", "anthropic", "google", "groq"} {
+	for _, need := range []string{"deepseek", "openai", "ollama", "anthropic", "google", "groq", "nvidia"} {
 		if !has[need] {
 			t.Errorf("missing provider: %s", need)
 		}
+	}
+}
+
+func TestNVIDIAProviderUsesCompatibleEndpointAndBearerKey(t *testing.T) {
+	var gotPath, gotAuth, gotModel string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		var body struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		gotModel = body.Model
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write([]byte(`{"id":"test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	p := ProviderFactory("nvidia", "synthetic-key", server.URL+"/v1")
+	resp, err := p.Chat(context.Background(), ChatRequest{
+		Model: "nvidia/test-model", Messages: []Message{{Role: "user", Content: "olá"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/v1/chat/completions" || gotAuth != "Bearer synthetic-key" || gotModel != "nvidia/test-model" {
+		t.Fatalf("request mismatch: path=%q auth=%q model=%q", gotPath, gotAuth, gotModel)
+	}
+	if resp.Content != "ok" {
+		t.Fatalf("response content = %q", resp.Content)
 	}
 }
 

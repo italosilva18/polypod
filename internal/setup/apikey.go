@@ -65,6 +65,17 @@ func needsAPIKey(cfg *config.Config) bool {
 // is missing or returns 401, it interactively asks the user to pick a
 // provider and enter a valid key.
 func CheckAPIKey(cfg *config.Config, configPath string) error {
+	if strings.EqualFold(cfg.AI.Provider, "nvidia") {
+		if strings.TrimSpace(cfg.AI.APIKey) == "" {
+			cfg.AI.APIKey = strings.TrimSpace(os.Getenv("NVIDIA_API_KEY"))
+		}
+		if cfg.AI.APIKey == "" {
+			return fmt.Errorf("NVIDIA NIM: defina NVIDIA_API_KEY no .env privado antes de iniciar")
+		}
+		// NVIDIA keys stay in the environment. The legacy interactive path below
+		// persists pasted keys in config.yaml, so it must not handle this provider.
+		return nil
+	}
 	if !needsAPIKey(cfg) {
 		return nil
 	}

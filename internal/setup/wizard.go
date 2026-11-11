@@ -34,6 +34,7 @@ var providers = []provider{
 	{Name: "Kimi", BaseURL: "https://api.moonshot.cn/v1", Model: "moonshot-v1-8k"},
 	{Name: "OpenAI", BaseURL: "https://api.openai.com/v1", Model: "gpt-4o-mini"},
 	{Name: "Claude", BaseURL: "https://openrouter.ai/api/v1", Model: "anthropic/claude-sonnet-4-20250514"},
+	{Name: "NVIDIA NIM", BaseURL: "https://integrate.api.nvidia.com/v1", Model: "nvidia/nemotron-3-super-120b-a12b"},
 }
 
 // Run executes the interactive setup wizard and writes config to configPath.
@@ -50,7 +51,7 @@ func Run(configPath string) error {
 	// --- Provider ---
 	fmt.Println()
 	fmt.Println(cB + cW + "--- Provedor de IA ---" + cR)
-	choices := []string{"DeepSeek", "Kimi (Moonshot)", "OpenAI (GPT)", "Claude (via OpenRouter)", "Outro (compativel OpenAI)", "ChatGPT (OAuth; sem API key, recomendado)"}
+	choices := []string{"DeepSeek", "Kimi (Moonshot)", "OpenAI (GPT)", "Claude (via OpenRouter)", "Outro (compativel OpenAI)", "ChatGPT (OAuth; sem API key, recomendado)", "NVIDIA NIM (API hospedada)"}
 	provIdx := askChoice(scanner, "Qual provedor?", choices, 6)
 
 	switch provIdx {
@@ -79,10 +80,18 @@ func Run(configPath string) error {
 		if err := configureChatGPT(cfg, model); err != nil {
 			return err
 		}
+	case 7:
+		cfg.AI.Provider = "nvidia"
+		cfg.AI.BaseURL = providers[4].BaseURL
+		cfg.AI.Model = askString(scanner, "Modelo NVIDIA NIM (ID exibido no catalogo):", providers[4].Model)
 	}
 
 	if cfg.AI.Provider != "chatgpt" {
-		variable := askString(scanner, "Nome da variavel de ambiente da API key (nao cole a chave):", "POLYPOD_AI_API_KEY")
+		defaultVariable := "POLYPOD_AI_API_KEY"
+		if cfg.AI.Provider == "nvidia" {
+			defaultVariable = "NVIDIA_API_KEY"
+		}
+		variable := askString(scanner, "Nome da variavel de ambiente da API key (nao cole a chave):", defaultVariable)
 		reference, err := environmentReference(variable)
 		if err != nil {
 			return err
@@ -223,6 +232,9 @@ skills:
 	fmt.Println(cW + "Proximos passos:" + cR)
 	if cfg.AI.Provider == "chatgpt" {
 		fmt.Println("  polypod auth chatgpt login\n  polypod auth chatgpt models")
+	} else if cfg.AI.Provider == "nvidia" {
+		fmt.Println("  Crie a chave em https://build.nvidia.com/explore/discover e grave NVIDIA_API_KEY no .env privado (0600).")
+		fmt.Println("  Confira docs/integrations/nvidia-nim.md para selecionar o modelo da sua conta.")
 	}
 	fmt.Println("  polypod doctor --live (OAuth, Telegram, captura, entrada, heartbeat e boot)")
 	fmt.Println("  Para boot, use a mesma sessao desktop e diretorio de dados; confira systemctl is-enabled e is-active.")

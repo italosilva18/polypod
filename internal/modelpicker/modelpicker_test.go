@@ -20,7 +20,7 @@ func TestListConfiguredModels_ReturnsAllKnownProviders(t *testing.T) {
 		providers[m.Provider] = true
 	}
 
-	expected := []string{"deepseek", "openai", "anthropic", "google"}
+	expected := []string{"deepseek", "openai", "anthropic", "google", "nvidia"}
 	for _, p := range expected {
 		if !providers[p] {
 			t.Errorf("expected provider %q to be present", p)
@@ -31,8 +31,8 @@ func TestListConfiguredModels_ReturnsAllKnownProviders(t *testing.T) {
 func TestListConfiguredModels_TotalCount(t *testing.T) {
 	models := ListConfiguredModels("", "")
 
-	// 3 deepseek + 4 openai + 3 anthropic + 3 google = 13
-	expected := 13
+	// 3 deepseek + 4 openai + 3 anthropic + 3 google + 1 nvidia = 14
+	expected := 14
 	if len(models) != expected {
 		t.Errorf("expected %d models, got %d", expected, len(models))
 	}
@@ -99,7 +99,7 @@ func TestFormatModelList_IncludesHeaderAndProviders(t *testing.T) {
 	if !strings.Contains(out, "## Modelos disponiveis") {
 		t.Error("expected header in output")
 	}
-	for _, p := range []string{"deepseek", "openai", "anthropic", "google"} {
+	for _, p := range []string{"deepseek", "openai", "anthropic", "google", "nvidia"} {
 		if !strings.Contains(out, "### "+p) {
 			t.Errorf("expected provider section %q in output", p)
 		}

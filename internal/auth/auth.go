@@ -64,6 +64,7 @@ var EnvVarProviderMap = map[string]string{
 	"TOGETHER_API_KEY":   "together",
 	"PERPLEXITY_API_KEY": "perplexity",
 	"XAI_API_KEY":        "xai",
+	"NVIDIA_API_KEY":     "nvidia",
 }
 
 // ProviderEnvVarMap is the reverse: provider → env var name.
@@ -78,6 +79,7 @@ var ProviderEnvVarMap = map[string]string{
 	"together":   "TOGETHER_API_KEY",
 	"perplexity": "PERPLEXITY_API_KEY",
 	"xai":        "XAI_API_KEY",
+	"nvidia":     "NVIDIA_API_KEY",
 }
 
 // ─── KeyStore ───────────────────────────────────────────────────────────────
@@ -343,6 +345,7 @@ func RunKeySetup(store *KeyStore) error {
 		{"deepseek", "DEEPSEEK_API_KEY"},
 		{"google", "GOOGLE_API_KEY"},
 		{"groq", "GROQ_API_KEY"},
+		{"nvidia", "NVIDIA_API_KEY"},
 	}
 
 	for _, p := range knownProviders {
@@ -407,6 +410,7 @@ func providerBaseURL(provider string) string {
 		"together":   "https://api.together.xyz/v1",
 		"perplexity": "https://api.perplexity.ai",
 		"xai":        "https://api.x.ai/v1",
+		"nvidia":     "https://integrate.api.nvidia.com/v1",
 	}
 	return m[provider]
 }
@@ -423,6 +427,7 @@ func providerDefaultModel(provider string) string {
 		"together":   "meta-llama/Llama-3-8b-chat-hf",
 		"perplexity": "sonar-small-chat",
 		"xai":        "grok-beta",
+		"nvidia":     "nvidia/nemotron-3-super-120b-a12b",
 	}
 	if v, ok := m[provider]; ok {
 		return v

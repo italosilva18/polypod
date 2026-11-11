@@ -1,5 +1,10 @@
 package provider
 
+const (
+	NVIDIAHostedBaseURL = "https://integrate.api.nvidia.com/v1"
+	NVIDIADefaultModel  = "nvidia/nemotron-3-super-120b-a12b"
+)
+
 // Pre-configured providers using OpenAI-compatible API.
 // Each is a thin wrapper over OpenAICompat with the correct base URL.
 
@@ -53,6 +58,14 @@ func NewXAI(apiKey string) *OpenAICompat {
 	return NewOpenAICompat("xai", apiKey, "https://api.x.ai/v1")
 }
 
+// NewNVIDIA creates a provider for NVIDIA-hosted NIM or a self-hosted NIM.
+func NewNVIDIA(apiKey, baseURL string) *OpenAICompat {
+	if baseURL == "" {
+		baseURL = NVIDIAHostedBaseURL
+	}
+	return NewOpenAICompat("nvidia", apiKey, baseURL)
+}
+
 // NewCerebras creates a Cerebras provider (fastest inference).
 func NewCerebras(apiKey string) *OpenAICompat {
 	return NewOpenAICompat("cerebras", apiKey, "https://api.cerebras.ai/v1")
@@ -90,6 +103,8 @@ func ProviderFactory(name, apiKey, baseURL string) Provider {
 		return NewDeepInfra(apiKey)
 	case "xai":
 		return NewXAI(apiKey)
+	case "nvidia":
+		return NewNVIDIA(apiKey, baseURL)
 	case "cerebras":
 		return NewCerebras(apiKey)
 	case "sambanova":
@@ -108,6 +123,6 @@ func SupportedProviders() []string {
 		"deepseek", "openai", "ollama", "anthropic", "google",
 		"groq", "mistral", "cohere", "openrouter", "together",
 		"perplexity", "fireworks", "deepinfra", "xai", "cerebras",
-		"sambanova", "azure",
+		"sambanova", "azure", "nvidia",
 	}
 }

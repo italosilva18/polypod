@@ -1,0 +1,14 @@
+# NVIDIA NIM hospedado. Escolha um modelo no catalogo oficial e grave a chave
+# apenas no .env privado como NVIDIA_API_KEY; nunca inclua a chave neste arquivo.
+# Execute: ./polypod examples/nvidia-nim.yaml
+ai:
+  provider: nvidia
+  base_url: https://integrate.api.nvidia.com/v1
+  api_key: "${NVIDIA_API_KEY:}"
+  model: "${NVIDIA_NIM_MODEL:nvidia/nemotron-3-super-120b-a12b}"
+  max_tokens: 4096
+  temperature: 0.5
+  tools: true
+
+cli:
+  enabled: true

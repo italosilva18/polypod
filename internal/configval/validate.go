@@ -29,10 +29,14 @@ func Validate(cfg *config.Config) []ConfigError {
 
 	// AI config
 	if cfg.AI.Provider != "chatgpt" && (cfg.AI.APIKey == "" || strings.HasPrefix(cfg.AI.APIKey, "sk-your") || cfg.AI.APIKey == "${DEEPSEEK_API_KEY}") {
+		suggestion := "defina DEEPSEEK_API_KEY no ambiente ou configure ai.api_key"
+		if cfg.AI.Provider == "nvidia" {
+			suggestion = "defina NVIDIA_API_KEY no .env privado e use ai.api_key: ${NVIDIA_API_KEY:}"
+		}
 		errs = append(errs, ConfigError{
 			Field:      "ai.api_key",
 			Message:    "API key nao configurada",
-			Suggestion: "defina DEEPSEEK_API_KEY no ambiente ou configure ai.api_key",
+			Suggestion: suggestion,
 			Severity:   "error",
 		})
 	}

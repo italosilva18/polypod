@@ -347,6 +347,29 @@ func TestMultiProviderAuth_GetCredentials_FromEnvVar(t *testing.T) {
 	}
 }
 
+func TestMultiProviderAuth_NVIDIAEnvironmentCredential(t *testing.T) {
+	clearProviderEnv(t)
+	t.Setenv("NVIDIA_API_KEY", "synthetic-nvidia-key")
+
+	auth := NewMultiProviderAuth(NewKeyStore(t.TempDir()))
+	cred, err := auth.GetCredentials("nvidia")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cred.Provider != AuthProviderEnvVar || cred.APIKey != "synthetic-nvidia-key" {
+		t.Fatalf("NVIDIA env credential was not resolved: provider=%q present=%t", cred.Provider, cred.APIKey != "")
+	}
+	if !auth.AutoDetect()["nvidia"] {
+		t.Fatal("NVIDIA_API_KEY was not detected")
+	}
+	if got := providerBaseURL("nvidia"); got != "https://integrate.api.nvidia.com/v1" {
+		t.Fatalf("NVIDIA base URL = %q", got)
+	}
+	if got := providerDefaultModel("nvidia"); got != "nvidia/nemotron-3-super-120b-a12b" {
+		t.Fatalf("NVIDIA default model = %q", got)
+	}
+}
+
 func TestMultiProviderAuth_DeleteCredentials(t *testing.T) {
 	clearProviderEnv(t)
 

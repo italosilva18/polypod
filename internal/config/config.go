@@ -255,6 +255,14 @@ func setDefaults(cfg *Config) {
 	if cfg.Database.Path == "" {
 		cfg.Database.Path = "data/polypod.db"
 	}
+	if cfg.AI.Provider == "nvidia" {
+		if cfg.AI.BaseURL == "" {
+			cfg.AI.BaseURL = "https://integrate.api.nvidia.com/v1"
+		}
+		if cfg.AI.Model == "" {
+			cfg.AI.Model = "nvidia/nemotron-3-super-120b-a12b"
+		}
+	}
 	if cfg.AI.Model == "" {
 		cfg.AI.Model = "deepseek-chat"
 	}

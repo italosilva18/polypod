@@ -1,6 +1,7 @@
 package configval
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/costa/polypod/internal/config"
@@ -24,6 +25,23 @@ func TestValidateEmptyAPIKey(t *testing.T) {
 	if !hasAPIKeyError {
 		t.Error("expected ai.api_key error")
 	}
+}
+
+func TestValidateNVIDIAMissingKeyShowsCorrectSetup(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.AI.Provider = "nvidia"
+	cfg.AI.BaseURL = "https://integrate.api.nvidia.com/v1"
+	cfg.AI.APIKey = ""
+
+	for _, problem := range Validate(cfg) {
+		if problem.Field == "ai.api_key" {
+			if problem.Severity != "error" || !strings.Contains(problem.Suggestion, "NVIDIA_API_KEY") {
+				t.Fatalf("NVIDIA API key guidance = %+v", problem)
+			}
+			return
+		}
+	}
+	t.Fatal("missing NVIDIA API key did not produce a configuration error")
 }
 
 func TestValidateGoodConfig(t *testing.T) {

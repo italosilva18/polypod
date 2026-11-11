@@ -103,6 +103,8 @@ connect a second terminal to a persistent Polypod session.
 The [self-hosted model guide](docs/integrations/self-hosted-model.md) explains
 how to connect a private OpenAI-compatible inference server without changing
 the existing WhatsApp and scheduler configuration.
+The [NVIDIA NIM guide](docs/integrations/nvidia-nim.md) explains the optional
+hosted API provider, model selection and private key setup.
 The [continuous operations guide](docs/integrations/continuous-operations.md)
 explains scheduled routines, inbox recovery and automatic memory.
 The [conversation recall guide](docs/integrations/history-recall.md) explains

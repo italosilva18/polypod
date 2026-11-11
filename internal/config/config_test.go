@@ -53,6 +53,21 @@ data:
 	}
 }
 
+func TestLoad_MinimalNVIDIAConfigUsesHostedDefaults(t *testing.T) {
+	t.Setenv("NVIDIA_API_KEY", "synthetic-nvidia-key")
+	path := writeConfig(t, "ai:\n  provider: nvidia\n  api_key: ${NVIDIA_API_KEY:}\n")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AI.Provider != "nvidia" || cfg.AI.BaseURL != "https://integrate.api.nvidia.com/v1" ||
+		cfg.AI.Model != "nvidia/nemotron-3-super-120b-a12b" || cfg.AI.APIKey != "synthetic-nvidia-key" {
+		t.Fatalf("NVIDIA defaults missing: provider=%q base_url=%q model=%q key_present=%t",
+			cfg.AI.Provider, cfg.AI.BaseURL, cfg.AI.Model, cfg.AI.APIKey != "")
+	}
+}
+
 func TestLoad_MissingFile(t *testing.T) {
 	_, err := Load("/nonexistent/path/config.yaml")
 	if err == nil {

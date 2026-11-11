@@ -6,6 +6,7 @@ database:
 ai:
   # Grok pela API: veja examples/grok-api.yaml (XAI_API_KEY).
   # Grok pela conta: grok login + ferramenta grok_delegate; docs/integrations/grok.md.
+  # NVIDIA NIM pela API: veja examples/nvidia-nim.yaml (NVIDIA_API_KEY).
   provider: deepseek
   base_url: https://api.deepseek.com/v1
   api_key: "${DEEPSEEK_API_KEY}"
