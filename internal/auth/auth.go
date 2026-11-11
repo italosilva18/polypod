@@ -427,7 +427,7 @@ func providerDefaultModel(provider string) string {
 		"together":   "meta-llama/Llama-3-8b-chat-hf",
 		"perplexity": "sonar-small-chat",
 		"xai":        "grok-beta",
-		"nvidia":     "nvidia/nemotron-3-super-120b-a12b",
+		"nvidia":     "nvidia/nemotron-3.5-super-vl-120b-a12b",
 	}
 	if v, ok := m[provider]; ok {
 		return v

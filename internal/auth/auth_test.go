@@ -365,7 +365,7 @@ func TestMultiProviderAuth_NVIDIAEnvironmentCredential(t *testing.T) {
 	if got := providerBaseURL("nvidia"); got != "https://integrate.api.nvidia.com/v1" {
 		t.Fatalf("NVIDIA base URL = %q", got)
 	}
-	if got := providerDefaultModel("nvidia"); got != "nvidia/nemotron-3-super-120b-a12b" {
+	if got := providerDefaultModel("nvidia"); got != "nvidia/nemotron-3.5-super-vl-120b-a12b" {
 		t.Fatalf("NVIDIA default model = %q", got)
 	}
 }

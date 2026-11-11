@@ -62,7 +62,7 @@ func TestLoad_MinimalNVIDIAConfigUsesHostedDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.AI.Provider != "nvidia" || cfg.AI.BaseURL != "https://integrate.api.nvidia.com/v1" ||
-		cfg.AI.Model != "nvidia/nemotron-3-super-120b-a12b" || cfg.AI.APIKey != "synthetic-nvidia-key" {
+		cfg.AI.Model != "nvidia/nemotron-3.5-super-vl-120b-a12b" || cfg.AI.APIKey != "synthetic-nvidia-key" {
 		t.Fatalf("NVIDIA defaults missing: provider=%q base_url=%q model=%q key_present=%t",
 			cfg.AI.Provider, cfg.AI.BaseURL, cfg.AI.Model, cfg.AI.APIKey != "")
 	}

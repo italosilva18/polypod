@@ -110,7 +110,7 @@ func TestWizardNVIDIANIMUsesEnvironmentReference(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(raw)
-	for _, expected := range []string{"provider: nvidia", "https://integrate.api.nvidia.com/v1", "nvidia/nemotron-3-super-120b-a12b", "${NVIDIA_API_KEY:}"} {
+	for _, expected := range []string{"provider: nvidia", "https://integrate.api.nvidia.com/v1", "nvidia/nemotron-3.5-super-vl-120b-a12b", "${NVIDIA_API_KEY:}"} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("NVIDIA NIM configuration missing %q", expected)
 		}

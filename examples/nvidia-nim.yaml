@@ -5,7 +5,7 @@ ai:
   provider: nvidia
   base_url: https://integrate.api.nvidia.com/v1
   api_key: "${NVIDIA_API_KEY:}"
-  model: "${NVIDIA_NIM_MODEL:nvidia/nemotron-3-super-120b-a12b}"
+  model: "${NVIDIA_NIM_MODEL:nvidia/nemotron-3.5-super-vl-120b-a12b}"
   max_tokens: 4096
   temperature: 0.5
   tools: true

@@ -34,7 +34,7 @@ var providers = []provider{
 	{Name: "Kimi", BaseURL: "https://api.moonshot.cn/v1", Model: "moonshot-v1-8k"},
 	{Name: "OpenAI", BaseURL: "https://api.openai.com/v1", Model: "gpt-4o-mini"},
 	{Name: "Claude", BaseURL: "https://openrouter.ai/api/v1", Model: "anthropic/claude-sonnet-4-20250514"},
-	{Name: "NVIDIA NIM", BaseURL: "https://integrate.api.nvidia.com/v1", Model: "nvidia/nemotron-3-super-120b-a12b"},
+	{Name: "NVIDIA NIM", BaseURL: "https://integrate.api.nvidia.com/v1", Model: "nvidia/nemotron-3.5-super-vl-120b-a12b"},
 }
 
 // Run executes the interactive setup wizard and writes config to configPath.

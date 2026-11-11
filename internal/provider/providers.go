@@ -2,7 +2,7 @@ package provider
 
 const (
 	NVIDIAHostedBaseURL = "https://integrate.api.nvidia.com/v1"
-	NVIDIADefaultModel  = "nvidia/nemotron-3-super-120b-a12b"
+	NVIDIADefaultModel  = "nvidia/nemotron-3.5-super-vl-120b-a12b"
 )
 
 // Pre-configured providers using OpenAI-compatible API.

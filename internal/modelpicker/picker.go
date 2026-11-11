@@ -67,7 +67,7 @@ func ListConfiguredModels(currentModel, currentProvider string) []ModelInfo {
 		"openai":    {"gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"},
 		"anthropic": {"claude-3-5-sonnet-latest", "claude-3-haiku-20240307", "claude-3-opus-latest"},
 		"google":    {"gemini-1.5-pro", "gemini-1.5-flash", "gemini-1.5-flash-8b"},
-		"nvidia":    {"nvidia/nemotron-3-super-120b-a12b"},
+		"nvidia":    {"nvidia/nemotron-3.5-super-vl-120b-a12b"},
 	}
 
 	var models []ModelInfo

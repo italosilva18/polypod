@@ -260,7 +260,7 @@ func setDefaults(cfg *Config) {
 			cfg.AI.BaseURL = "https://integrate.api.nvidia.com/v1"
 		}
 		if cfg.AI.Model == "" {
-			cfg.AI.Model = "nvidia/nemotron-3-super-120b-a12b"
+			cfg.AI.Model = "nvidia/nemotron-3.5-super-vl-120b-a12b"
 		}
 	}
 	if cfg.AI.Model == "" {
