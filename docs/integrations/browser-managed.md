@@ -14,7 +14,9 @@ Um login pode ser preenchido pelo agente quando o usuário autorizou a credencia
 
 Testes automatizados cobrem ciclo de vida, abas, navegação e observação com Chrome isolado. O teste de abertura no serviço root e um login real com handoff ainda precisam ser realizados no desktop do usuário.
 
-Nesta máquina COSMIC, a captura pela sessão do usuário e o socket `ydotool`
-foram verificados com `python3 scripts/doctor-live-service.py`. Esse comando
+Nesta máquina COSMIC, a captura usa `grim` 1.5 ou superior, que entende o
+protocolo Wayland `ext-image-copy-capture`; se ele falhar, o Polypod tenta o
+capturador nativo. A captura pela sessão do usuário e o socket `ydotool`
+podem ser verificados com `python3 scripts/doctor-live-service.py`. Esse comando
 herda somente as variáveis gráficas declaradas na unidade systemd; um `sudo`
 direto descarta essas variáveis. A verificação não envia eventos de entrada.

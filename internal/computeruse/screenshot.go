@@ -98,7 +98,20 @@ func CaptureRegion(ctx context.Context, x, y, w, h int) ([]byte, error) {
 // ─── Linux screenshot tools ───────────────────────────────────────────
 
 func captureScreenLinux(ctx context.Context, outPath string) error {
-	// Try tools in order of preference.
+	// Modern Wayland compositors such as COSMIC expose ext-image-copy-capture,
+	// which grim 1.5 can use without the desktop screenshot portal. Prefer it
+	// before a portal client that may wait for a response indefinitely.
+	grimAttempted := os.Getenv("WAYLAND_DISPLAY") != "" && hasCmd("grim")
+	if grimAttempted {
+		if err := desktopCommandContext(ctx, "grim", outPath).Run(); err == nil {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		_ = os.Remove(outPath)
+	}
+	// Keep the native tool and other backends as fallbacks.
 	if hasCmd("cosmic-screenshot") {
 		return captureScreenCOSMIC(ctx, outPath)
 	}
@@ -118,7 +131,7 @@ func captureScreenLinux(ctx context.Context, outPath string) error {
 		cmd := desktopCommandContext(ctx, "import", "-window", "root", outPath)
 		return cmd.Run()
 	}
-	if hasCmd("grim") { // Wayland
+	if !grimAttempted && hasCmd("grim") { // Wayland
 		cmd := desktopCommandContext(ctx, "grim", outPath)
 		return cmd.Run()
 	}
@@ -208,6 +221,17 @@ func captureWindowLinux(ctx context.Context, title, outPath string) error {
 
 func captureRegionLinux(ctx context.Context, x, y, w, h int, outPath string) error {
 	geometry := fmt.Sprintf("%dx%d+%d+%d", w, h, x, y)
+	grimAttempted := os.Getenv("WAYLAND_DISPLAY") != "" && hasCmd("grim")
+	if grimAttempted {
+		cmd := desktopCommandContext(ctx, "grim", "-g", fmt.Sprintf("%d,%d %dx%d", x, y, w, h), outPath)
+		if err := cmd.Run(); err == nil {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		_ = os.Remove(outPath)
+	}
 
 	if hasCmd("maim") {
 		cmd := desktopCommandContext(ctx, "maim", "-g", geometry, outPath)
@@ -222,7 +246,7 @@ func captureRegionLinux(ctx context.Context, x, y, w, h int, outPath string) err
 			fmt.Sprintf("%d,%d,%d,%d", x, y, w, h), outPath)
 		return cmd.Run()
 	}
-	if hasCmd("grim") {
+	if !grimAttempted && hasCmd("grim") {
 		cmd := desktopCommandContext(ctx, "grim", "-g",
 			fmt.Sprintf("%d,%d %dx%d", x, y, w, h), outPath)
 		return cmd.Run()
