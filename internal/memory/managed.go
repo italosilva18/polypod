@@ -48,7 +48,7 @@ func (s *ManagedStore) SaveWithMeta(ctx context.Context, m Memory) error {
 		return err
 	}
 	for _, old := range all {
-		if old.Topic != m.Topic {
+		if old.Topic != m.Topic || old.SessionID != m.SessionID {
 			continue
 		}
 		// A model extraction must never replace a fact the user explicitly
@@ -119,12 +119,12 @@ func (s *ManagedStore) Delete(ctx context.Context, topic string) error {
 	found := false
 	var targetScope string
 	for _, m := range all {
-		if m.Topic == topic {
-			if !memoryVisible(ctx, m) {
-				return fmt.Errorf("memoria '%s' nao encontrada", topic)
-			}
+		if m.Topic == topic && memoryVisible(ctx, m) {
 			found = true
 			targetScope = m.SessionID
+			if targetScope == sessionScope(ctx) {
+				break
+			}
 		}
 	}
 	if !found {
@@ -166,16 +166,16 @@ func (s *ManagedStore) Search(ctx context.Context, q string) ([]Memory, error) {
 	return visibleOnly(ctx, activeOnly(all)), nil
 }
 func (s *ManagedStore) SearchRelevant(ctx context.Context, q string, max int, min float64) ([]Memory, error) {
+	if live, ok := s.Store.(interface{ NeedsFreshIndex() bool }); ok && live.NeedsFreshIndex() {
+		// Another process may have updated the owner store since the last query.
+		s.index.invalidate()
+	}
 	s.mu.Lock()
 	embedder := s.embedder
 	s.mu.Unlock()
-	// Rank before applying the caller's limit. Otherwise a set of stronger
-	// matches from other sessions can fill the candidate window and hide the
-	// current conversation's fact after the visibility filter runs.
-	searchMax := max
-	if sessionScope(ctx) != "" {
-		searchMax = 0
-	}
+	// Rank before applying the caller's limit. Hidden facts, inactive
+	// revisions, and other sessions must not fill the candidate window.
+	searchMax := 0
 	var all []Memory
 	var err error
 	if named, ok := embedder.(interface{ Name() string }); ok && named.Name() != "" {

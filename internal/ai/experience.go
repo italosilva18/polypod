@@ -72,5 +72,5 @@ func ownerExperienceTurn(ctx context.Context, req AnswerRequest, ownerChat strin
 		return false
 	}
 	inbound, ok := whatsappgateway.InboundFromContext(ctx)
-	return ok && inbound.ChatID == ownerChat && req.UserID == inbound.ChatID
+	return ok && inbound.ChatID == ownerChat && inbound.SenderID == ownerChat && req.UserID == inbound.ChatID
 }

@@ -32,10 +32,12 @@ type ToolEventInfo struct {
 
 // StreamChunk represents a single piece of a streamed response.
 type StreamChunk struct {
-	Delta     string
-	Done      bool
-	Error     error
-	ToolEvent *ToolEventInfo // non-nil when this chunk carries a tool event
+	Delta string
+	Done  bool
+	Error error
+	// SessionRevision is the manifest revision durably saved with a CLI turn.
+	SessionRevision string
+	ToolEvent       *ToolEventInfo // non-nil when this chunk carries a tool event
 }
 
 // StreamHandler processes an incoming message and streams the response via chunks channel.

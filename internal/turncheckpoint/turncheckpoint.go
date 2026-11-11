@@ -55,17 +55,19 @@ type RestoreResult struct {
 // Manager owns the active turn records. Disk manifests make completed and
 // interrupted turns available to a later process.
 type Manager struct {
-	mu     sync.Mutex
-	root   string
-	logger *slog.Logger
-	active map[identity]*turnRecord
+	mu             sync.Mutex
+	root           string
+	logger         *slog.Logger
+	active         map[identity]*turnRecord
+	resumeTouched  map[identity]map[string]bool
+	resumeConflict map[identity]map[string]bool
 }
 
 func New(root string, logger *slog.Logger) *Manager {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Manager{root: root, logger: logger, active: make(map[identity]*turnRecord)}
+	return &Manager{root: root, logger: logger, active: make(map[identity]*turnRecord), resumeTouched: make(map[identity]map[string]bool), resumeConflict: make(map[identity]map[string]bool)}
 }
 
 // BeginTurn associates later file-write callbacks with this conversation turn.
@@ -75,6 +77,8 @@ func (m *Manager) BeginTurn(ctx context.Context, sessionID, turnID string) conte
 	}
 	id := identity{sessionID: sessionID, turnID: turnID}
 	m.mu.Lock()
+	delete(m.resumeTouched, id)
+	delete(m.resumeConflict, id)
 	m.active[id] = &turnRecord{
 		SessionID: sessionID,
 		TurnID:    turnID,
@@ -83,6 +87,32 @@ func (m *Manager) BeginTurn(ctx context.Context, sessionID, turnID string) conte
 	}
 	m.mu.Unlock()
 	return context.WithValue(ctx, turnKey{}, id)
+}
+
+// ResumeTurn preserves file snapshots captured before an interrupted turn.
+// A fresh BeginTurn would replace them and make rewind of already executed
+// edits impossible after a safe AI checkpoint is resumed.
+func (m *Manager) ResumeTurn(ctx context.Context, sessionID, turnID string) (context.Context, error) {
+	if sessionID == "" || turnID == "" {
+		return ctx, fmt.Errorf("identidade de turno vazia")
+	}
+	id := identity{sessionID: sessionID, turnID: turnID}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	record, err := m.loadRecord(id)
+	if os.IsNotExist(err) {
+		record = &turnRecord{SessionID: sessionID, TurnID: turnID, StartedAt: time.Now(), Files: make(map[string]Snapshot)}
+	} else if err != nil {
+		return ctx, fmt.Errorf("lendo checkpoint de arquivos do turno: %w", err)
+	}
+	if record.Files == nil {
+		record.Files = make(map[string]Snapshot)
+	}
+	record.EndedAt = time.Time{}
+	m.active[id] = record
+	m.resumeTouched[id] = make(map[string]bool)
+	m.resumeConflict[id] = make(map[string]bool)
+	return context.WithValue(ctx, turnKey{}, id), nil
 }
 
 // CaptureBefore records the first pre-write state for a file in this turn.
@@ -104,6 +134,16 @@ func (m *Manager) CaptureBefore(ctx context.Context, path string, original []byt
 	record := m.active[id]
 	if record == nil {
 		return nil
+	}
+	if touched := m.resumeTouched[id]; touched != nil {
+		touched[absolute] = true
+		if snap, found := record.Files[absolute]; found &&
+			(!snap.AfterKnown || snap.AfterExists != existed || (existed && snap.AfterHash != digest(original))) {
+			// An external edit occurred after the old snapshot, or the old
+			// post-state was never confirmed. Keep the old expectation so
+			// rewind still reports the uncertainty.
+			m.resumeConflict[id][absolute] = true
+		}
 	}
 	if _, found := record.Files[absolute]; found {
 		return nil
@@ -142,10 +182,23 @@ func (m *Manager) FinishTurn(ctx context.Context) error {
 		return nil
 	}
 	defer delete(m.active, id)
+	defer delete(m.resumeTouched, id)
+	defer delete(m.resumeConflict, id)
+	if touched := m.resumeTouched[id]; touched != nil && len(touched) == 0 {
+		// A failed resume may not rewrite the expected post-state of files
+		// captured before the process stopped.
+		return nil
+	}
 	if len(record.Files) == 0 {
 		return nil
 	}
 	for path, snap := range record.Files {
+		if touched := m.resumeTouched[id]; touched != nil && !touched[path] {
+			continue
+		}
+		if m.resumeConflict[id][path] {
+			continue
+		}
 		exists, hash, err := state(path)
 		if err != nil {
 			m.logger.Warn("checkpoint post-write state unavailable", "path", path, "error", err)

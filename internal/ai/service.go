@@ -29,6 +29,7 @@ type AnswerRequest struct {
 	UserID                string
 	RoutingCategory       string // Trusted internal evaluation category; empty uses known channel mapping.
 	Query                 string
+	CurrentMessageID      string // Durable journal ID of Query, when it was saved before this turn.
 	History               []conversation.Message
 	HistoryPrepared       bool   // The caller already checked and persisted auto-compaction.
 	SessionMemoryScope    string // Internal persisted session or branch ID; never trust remote message metadata.
@@ -50,6 +51,7 @@ type Service struct {
 	agentReg            *agent.Registry
 	agentName           string
 	memStore            memory.Store
+	journal             *conversation.Store
 	sessionMem          *sessionmem.FileStore
 	logger              *slog.Logger
 	autoCompact         *compact.AutoCompactService
@@ -140,6 +142,13 @@ func (s *Service) CurrentModel() string {
 	return s.client.Model()
 }
 
+func (s *Service) requestModel(ctx context.Context) string {
+	if s.client == nil {
+		return ""
+	}
+	return s.client.modelFor(ctx)
+}
+
 // AgentRegistry returns the agent registry.
 func (s *Service) AgentRegistry() *agent.Registry {
 	return s.agentReg
@@ -156,6 +165,12 @@ func (s *Service) SetAutoCompact(svc *compact.AutoCompactService) {
 // caller provides a trusted scope in AnswerRequest for each turn.
 func (s *Service) SetSessionMemory(store *sessionmem.FileStore) {
 	s.sessionMem = store
+}
+
+// SetConversationStore enables scope-checked references to long journaled
+// turns in the transient model prompt.
+func (s *Service) SetConversationStore(store *conversation.Store) {
+	s.journal = store
 }
 
 // PrepareHistory compacts a session before a new user message is appended. The
@@ -175,7 +190,7 @@ func (s *Service) PrepareHistoryForScope(ctx context.Context, scope string, hist
 	}
 	estimated := compact.EstimateTokens(history)
 	atCapacity := len(history) >= conversation.MaxMessages
-	budget := historyWindowBudget(s.CurrentModel())
+	budget := historyWindowBudget(s.requestModel(ctx))
 	budgetTrigger := estimated > budget && !atCapacity
 	if budgetTrigger {
 		budgetTrigger = s.historyBudgetRetryReady(scope)
@@ -269,7 +284,7 @@ func (s *Service) SetToolEventCallback(cb ToolEventCallback) {
 }
 
 // buildMessages assembles the full message list for a request.
-func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) ([]ChatMessage, []string) {
+func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) ([]ChatMessage, []string, error) {
 	ag := s.agentReg.Get(s.agentName)
 
 	// Search knowledge base
@@ -349,19 +364,26 @@ func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) ([]ChatM
 		}
 		history, _ = s.PrepareHistoryForScope(ctx, scope, history)
 	}
-	messages := []ChatMessage{{Role: "system", Content: systemPrompt}}
-
-	// Add conversation history
-	for _, m := range history {
-		messages = append(messages, ChatMessage{
-			Role:    string(m.Role),
-			Content: m.Content,
-		})
+	budget, err := promptConversationBudget(s.requestModel(ctx), systemPrompt)
+	if err != nil {
+		return nil, nil, err
 	}
-
-	// Add current query
-	messages = append(messages, ChatMessage{Role: "user", Content: req.Query})
-	return messages, ag.Skills
+	var canRecall journalReferenceLookup
+	if s.journal != nil && agentHasHistoryTools(ag.Skills) {
+		canRecall = func(ctx context.Context, ids []string) (map[string]bool, error) {
+			scope, ok := conversation.JournalScopeFromContext(ctx)
+			if !ok {
+				return nil, nil
+			}
+			return s.journal.CanReadJournalScopedBatch(ctx, scope, ids)
+		}
+	}
+	messages, err := windowConversationPrompt(ctx, history, req.Query, req.CurrentMessageID, budget, canRecall)
+	if err != nil {
+		return nil, nil, err
+	}
+	messages = append([]ChatMessage{{Role: "system", Content: systemPrompt}}, messages...)
+	return messages, ag.Skills, nil
 }
 
 // Answer processes a query through the full pipeline (synchronous).
@@ -373,7 +395,10 @@ func (s *Service) Answer(ctx context.Context, req AnswerRequest) (*AnswerRespons
 	ctx = workdir.WithScope(ctx, s.workdirs, req.Channel, req.UserID, req.SessionMemoryScope)
 	ctx = s.withRoutedModel(ctx, req)
 	ctx = s.withProjectInstructions(ctx)
-	messages, names := s.buildMessages(ctx, req)
+	messages, names, err := s.buildMessages(ctx, req)
+	if err != nil {
+		return nil, err
+	}
 
 	ctx = withRequestToolSession(ctx, req.Channel, req.UserID, s.agentName, req.SessionMemoryScope)
 	resp, err := s.client.CompleteWithTools(withRequestSkillNames(ctx, names), messages, s.logger)
@@ -406,7 +431,10 @@ func (s *Service) AnswerStream(ctx context.Context, req AnswerRequest, callback 
 	ctx = workdir.WithScope(ctx, s.workdirs, req.Channel, req.UserID, req.SessionMemoryScope)
 	ctx = s.withRoutedModel(ctx, req)
 	ctx = s.withProjectInstructions(ctx)
-	messages, names := s.buildMessages(ctx, req)
+	messages, names, err := s.buildMessages(ctx, req)
+	if err != nil {
+		return nil, err
+	}
 
 	ctx = withRequestToolSession(ctx, req.Channel, req.UserID, s.agentName, req.SessionMemoryScope)
 	resp, err := s.client.CompleteWithToolsStream(withRequestSkillNames(ctx, names), messages, callback, s.logger)

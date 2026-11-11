@@ -40,3 +40,7 @@ O executável inteiro compilou com `CGO_ENABLED=0 go build`. Os testes de compor
 ## Partes que não convém transpor literalmente
 
 O prazo automático de sete dias para rotinas recorrentes em `utils/cronTasks.ts:315` conflita com a operação contínua desejada para o Polypod. A busca semântica de sessões em `utils/agenticSessionSearch.ts:146` pode enviar até 100 trechos de transcript por consulta ao modelo; uma versão do Polypod deve limitar custo e preservar busca textual rápida. `utils/tasks.ts:458` grava os dois lados de uma dependência separadamente e não impede ciclos; o novo store deve usar transação e validar o grafo. Integrações CCR, OAuth e voz da referência dependem de serviços privados e requerem alternativas próprias.
+
+## Atualização de 11 de novembro
+
+O item 2 descreve a primeira implementação de `/recover`. A versão atual tem checkpoint durável do turno e continua a resposta sem reenviar chamadas de ferramenta concluídas. Uma chamada cujo resultado não foi persistido exige inspeção do efeito e descarte explícito do turno; consulte [recuperação do CLI](cli-turn-recovery.md). O prompt também passou a usar uma janela limitada com recuperação por `message_id`, sem declarar que toda a árvore da referência foi lida linha a linha.

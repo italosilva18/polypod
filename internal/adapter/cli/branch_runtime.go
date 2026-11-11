@@ -36,6 +36,15 @@ type persistentBranchController struct {
 	deleteMemory     func(string) error
 	forkTranscript   func(string, string) error
 	deleteTranscript func(string) error
+	// checkPending refuses to copy or replace a conversation while its last
+	// tool call has an unresolved outcome. The CLI adapter owns the check.
+	checkPending func() error
+	// acquireProfileLease is held through the complete branch mutation, not
+	// only the checkpoint inspection before it.
+	acquireProfileLease func() (func() error, error)
+	// checkTarget refuses to activate a branch whose interrupted turn needs
+	// the explicit /resume recovery flow instead of a silent history swap.
+	checkTarget func(string, []session.Message) error
 }
 
 type branchManifest struct {
@@ -123,15 +132,31 @@ func (r *persistentBranchController) load() (branchSnapshot, error) {
 }
 
 func (r *persistentBranchController) create(name string, _ []chatEntry) (branchSnapshot, error) {
+	if r.acquireProfileLease != nil {
+		release, err := r.acquireProfileLease()
+		if err != nil {
+			return branchSnapshot{}, err
+		}
+		defer func() {
+			if err := release(); err != nil {
+				slog.Warn("CLI branch lease release failed", "error", err)
+			}
+		}()
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.validate(); err != nil {
 		return branchSnapshot{}, err
 	}
+	if r.checkPending != nil {
+		if err := r.checkPending(); err != nil {
+			return branchSnapshot{}, err
+		}
+	}
 	if name == "" {
 		return branchSnapshot{}, errBranchEmptyName
 	}
-	manifest, err := r.manifestForActiveID()
+	manifest, err := r.manifestForMutation()
 	if err != nil {
 		return branchSnapshot{}, err
 	}
@@ -232,12 +257,28 @@ func (r *persistentBranchController) cleanupNewChild(child *session.RestoredSess
 }
 
 func (r *persistentBranchController) switchTo(name string, _ []chatEntry) (branchSnapshot, error) {
+	if r.acquireProfileLease != nil {
+		release, err := r.acquireProfileLease()
+		if err != nil {
+			return branchSnapshot{}, err
+		}
+		defer func() {
+			if err := release(); err != nil {
+				slog.Warn("CLI branch lease release failed", "error", err)
+			}
+		}()
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.validate(); err != nil {
 		return branchSnapshot{}, err
 	}
-	manifest, err := r.manifestForActiveID()
+	if r.checkPending != nil {
+		if err := r.checkPending(); err != nil {
+			return branchSnapshot{}, err
+		}
+	}
+	manifest, err := r.manifestForMutation()
 	if err != nil {
 		return branchSnapshot{}, err
 	}
@@ -261,6 +302,11 @@ func (r *persistentBranchController) switchTo(name string, _ []chatEntry) (branc
 	}
 	if stored == nil {
 		return branchSnapshot{}, fmt.Errorf("historico da branch %q nao encontrado", name)
+	}
+	if r.checkTarget != nil {
+		if err := r.checkTarget(target.SessionID, stored.Messages); err != nil {
+			return branchSnapshot{}, err
+		}
 	}
 	before := append([]conversation.Message(nil), active.Messages...)
 	next := toConversationMessages(stored.Messages)
@@ -290,12 +336,28 @@ func (r *persistentBranchController) switchTo(name string, _ []chatEntry) (branc
 }
 
 func (r *persistentBranchController) delete(name string, _ []chatEntry) (branchSnapshot, error) {
+	if r.acquireProfileLease != nil {
+		release, err := r.acquireProfileLease()
+		if err != nil {
+			return branchSnapshot{}, err
+		}
+		defer func() {
+			if err := release(); err != nil {
+				slog.Warn("CLI branch lease release failed", "error", err)
+			}
+		}()
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.validate(); err != nil {
 		return branchSnapshot{}, err
 	}
-	manifest, err := r.manifestForActiveID()
+	if r.checkPending != nil {
+		if err := r.checkPending(); err != nil {
+			return branchSnapshot{}, err
+		}
+	}
+	manifest, err := r.manifestForMutation()
 	if err != nil {
 		return branchSnapshot{}, err
 	}
@@ -373,7 +435,27 @@ func (r *persistentBranchController) snapshot(manifest *branchManifest, active [
 }
 
 func (r *persistentBranchController) manifestForActiveID() (*branchManifest, error) {
-	id := r.activeID()
+	return r.manifestForID(r.activeID(), false, true)
+}
+
+func (r *persistentBranchController) manifestForMutation() (*branchManifest, error) {
+	return r.manifestForID(r.activeID(), true, true)
+}
+
+// activateSessionForResume records a deliberate /resume selection while the
+// caller holds the profile lease. An independent session starts a new branch
+// tree on its first branch command.
+func (r *persistentBranchController) activateSessionForResume(id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	manifest, err := r.manifestForID(id, false, false)
+	if err != nil || manifest == nil {
+		return err
+	}
+	return r.writeManifest(manifest)
+}
+
+func (r *persistentBranchController) manifestForID(id string, strict, create bool) (*branchManifest, error) {
 	idDigest := sha256.Sum256([]byte(id))
 	directName := hex.EncodeToString(idDigest[:]) + ".json"
 	entries, err := os.ReadDir(r.directory)
@@ -409,10 +491,16 @@ func (r *persistentBranchController) manifestForActiveID() (*branchManifest, err
 		}
 		for name, record := range manifest.Branches {
 			if record.SessionID == id {
+				if strict && manifest.Active != name {
+					return nil, fmt.Errorf("%w: a branch ativa mudou em outra instância", session.ErrSessionConflict)
+				}
 				manifest.Active = name
 				return &manifest, nil
 			}
 		}
+	}
+	if !create {
+		return nil, nil
 	}
 	manifest := &branchManifest{
 		Root: id, Active: "main",

@@ -7,11 +7,11 @@ import (
 )
 
 func TestFactTemporalUpdateReviewAndForget(t *testing.T) {
-	ctx := context.Background()
+	ctx := WithSessionScope(WithGlobalMemoryAccess(context.Background()), "cli-branch:main")
 	dir := t.TempDir()
 	store := NewManagedStore(NewFileStore(dir))
-	first := Memory{Topic: "user_city", Content: "Moro em Recife", Source: "dream", Tags: []string{"journal:1"}}
-	second := Memory{Topic: "user_city", Content: "Agora moro em Salvador", Source: "dream", Tags: []string{"journal:2"}}
+	first := Memory{Topic: "user_city", Content: "Moro em Recife", SessionID: "cli-branch:main", Source: "dream", Tags: []string{"journal:1"}}
+	second := Memory{Topic: "user_city", Content: "Agora moro em Salvador", SessionID: "cli-branch:main", Source: "dream", Tags: []string{"journal:2"}}
 	for _, m := range []Memory{first, second, second} {
 		if err := store.SaveWithMeta(ctx, m); err != nil {
 			t.Fatal(err)

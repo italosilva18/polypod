@@ -144,6 +144,9 @@ func (a *Adapter) saveActiveSession(sess *conversation.Session) error {
 	if a.sessStorage == nil || a.activeSessionID == "" {
 		return nil
 	}
+	if appended, err := a.appendActiveSessionIfUnchanged(sess); appended || err != nil {
+		return err
+	}
 	persisted, err := a.sessStorage.Load(a.activeSessionID)
 	if err != nil {
 		return err
@@ -312,9 +315,10 @@ func (a *Adapter) Start(ctx context.Context, handler adapter.MessageHandler) err
 				content: rm.Content,
 			})
 		}
-		if notice, draft := a.activeRecovery(runCtx); notice != "" {
+		if notice, draft, resumeID := a.activeRecovery(runCtx); notice != "" {
 			m.messages = append(m.messages, chatEntry{role: "system", content: notice, timestamp: time.Now()})
 			m.recoveryDraft = draft
+			m.recoveryTurnID = resumeID
 		}
 		m.historyStart = max(0, len(m.messages)-historyPageSize)
 	}
@@ -342,7 +346,23 @@ func (a *Adapter) Send(ctx context.Context, msg adapter.OutMessage) error {
 
 // buildCommandDeps creates the closure-based command deps from real implementations.
 func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
-	deps := commandDeps{commandRegistry: a.commandRegistry, activeSessionID: a.ActiveSessionID}
+	deps := commandDeps{commandRegistry: a.commandRegistry, activeSessionID: a.ActiveSessionID,
+		activeSessionRevision:    a.ActiveSessionRevision,
+		setActiveSessionRevision: func(revision string) { a.activeSessionRevision = revision }}
+	deps.checkPendingTurn = a.pendingCheckpointGuard
+	deps.discardRecovery = func() (string, error) { return a.discardRecovery(ctx) }
+	if a.convMgr != nil {
+		deps.recoveryState = func() (string, string, string) {
+			if a.activeSessionID == "" {
+				return "", "", ""
+			}
+			sess, err := a.convMgr.GetSession(ctx, "cli", "local")
+			if err != nil {
+				return "Retomada bloqueada: histórico da conversa indisponível.", "", ""
+			}
+			return a.inspectRecovery(a.activeSessionID, recoveryMessages(sess.Messages))
+		}
+	}
 	if a.aiSvc != nil {
 		deps.workingDir = func() string {
 			fallback, err := os.Getwd()
@@ -355,9 +375,15 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 	if a.cfg != nil && a.cfg.WhatsApp.AudioTranscription.Enabled {
 		deps.captureVoice = newVoiceCapture(a.cfg.WhatsApp.AudioTranscription)
 	}
+	var controller *persistentBranchController
 	if a.convMgr != nil && a.sessStorage != nil {
-		controller := newPersistentBranchController(a.dataDir, a.sessStorage, a.convMgr,
+		controller = newPersistentBranchController(a.dataDir, a.sessStorage, a.convMgr,
 			a.ActiveSessionID, a.SetActiveSessionSnapshot, a.saveActiveSession)
+		controller.checkPending = a.pendingCheckpointGuardUnlocked
+		controller.acquireProfileLease = func() (func() error, error) {
+			return a.acquireCLIProfileLease(context.Background())
+		}
+		controller.checkTarget = a.pendingCheckpointFor
 		if a.aiSvc != nil {
 			controller.activeAgent = a.aiSvc.ActiveAgent
 		}
@@ -417,11 +443,19 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 
 	if a.convMgr != nil {
 		deps.clearSession = func() error {
-			sess, err := a.convMgr.GetSession(context.Background(), "cli", "local")
-			if err != nil {
-				return err
-			}
-			return a.convMgr.ClearSession(context.Background(), sess)
+			return a.withCLIProfileLease(context.Background(), func() error {
+				if err := a.pendingCheckpointGuardUnlocked(); err != nil {
+					return err
+				}
+				sess, err := a.convMgr.GetSession(context.Background(), "cli", "local")
+				if err != nil {
+					return err
+				}
+				if err := a.convMgr.ClearSession(context.Background(), sess); err != nil {
+					return err
+				}
+				return a.saveActiveSession(sess)
+			})
 		}
 		deps.sessionInfo = func() (string, int, error) {
 			sess, err := a.convMgr.GetSession(context.Background(), "cli", "local")
@@ -474,12 +508,21 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 	if a.aiSvc != nil && a.convMgr != nil {
 		deps.compactAvailable = func() bool { return true }
 		deps.compactHistory = func() ([]chatEntry, int, int, error) {
-			sess, err := a.convMgr.GetSession(ctx, "cli", "local")
+			release, err := a.acquireCLIProfileLease(ctx)
+			if err != nil {
+				return nil, 0, 0, err
+			}
+			defer a.releaseCLIProfileLease(release)
+			if err := a.pendingCheckpointGuardUnlocked(); err != nil {
+				return nil, 0, 0, err
+			}
+			compactCtx := conversation.WithJournalScope(ctx, "cli", "local", a.ActiveSessionID(), a.aiSvc.ActiveAgent())
+			sess, err := a.convMgr.GetSession(compactCtx, "cli", "local")
 			if err != nil {
 				return nil, 0, 0, err
 			}
 			history := append([]conversation.Message(nil), a.convMgr.GetHistory(sess)...)
-			result, err := a.aiSvc.CompactHistory(ctx, history)
+			result, err := a.aiSvc.CompactHistory(compactCtx, history)
 			if err != nil {
 				return nil, 0, 0, err
 			}
@@ -489,11 +532,11 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 					a.logger.Warn("session memory capture failed", "error", err)
 				}
 			}
-			if err := a.convMgr.ReplaceMessages(ctx, sess, compacted); err != nil {
+			if err := a.convMgr.ReplaceMessages(compactCtx, sess, compacted); err != nil {
 				return nil, 0, 0, err
 			}
 			if err := a.saveActiveSession(sess); err != nil {
-				a.logger.Warn("compacted CLI session snapshot unavailable", "error", err)
+				return nil, 0, 0, fmt.Errorf("salvando sessão compactada: %w", err)
 			}
 			entries := make([]chatEntry, 0, len(compacted))
 			for _, msg := range compacted {
@@ -589,6 +632,16 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 
 		// /resume: load a persisted session into the active conversation.
 		deps.loadSession = func(id string) (sessionLoad, error) {
+			release, err := a.acquireCLIProfileLease(ctx)
+			if err != nil {
+				return sessionLoad{}, err
+			}
+			defer a.releaseCLIProfileLease(release)
+			if id != a.activeSessionID {
+				if err := a.pendingCheckpointGuardUnlocked(); err != nil {
+					return sessionLoad{}, err
+				}
+			}
 			restored, err := a.sessStorage.Load(id)
 			if err != nil {
 				return sessionLoad{}, err
@@ -650,12 +703,12 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 					a.displayHistoryRevision = ""
 					activeEntries := toBranchEntries(sess.Messages)
 					activeEntries = a.appendTranscriptHistory(restored.ID, activeEntries)
-					notice, draft := a.inspectRecovery(restored.ID, recoveryMessages(sess.Messages))
+					notice, draft, resumeID := a.inspectRecovery(restored.ID, recoveryMessages(sess.Messages))
 					if notice != "" {
 						activeEntries = append(activeEntries, chatEntry{role: "system", content: notice, timestamp: time.Now()})
 					}
 					return sessionLoad{
-						entries: activeEntries, start: 0, total: len(sess.Messages), recoveryDraft: draft,
+						entries: activeEntries, start: 0, total: len(sess.Messages), recoveryDraft: draft, recoveryTurnID: resumeID,
 					}, nil
 				}
 				if err := a.saveActiveSession(sess); err != nil {
@@ -677,8 +730,17 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 						Timestamp: m.Timestamp,
 					})
 				}
+				before := append([]conversation.Message(nil), sess.Messages...)
 				if err := a.convMgr.ReplaceMessages(context.Background(), sess, conv); err != nil {
 					return sessionLoad{}, fmt.Errorf("restaurando mensagens da sessao: %w", err)
+				}
+				if controller != nil {
+					if err := controller.activateSessionForResume(restored.ID); err != nil {
+						if rollbackErr := a.convMgr.ReplaceMessages(context.Background(), sess, before); rollbackErr != nil {
+							return sessionLoad{}, fmt.Errorf("sincronizando branch retomada: %w; rollback falhou: %v", err, rollbackErr)
+						}
+						return sessionLoad{}, fmt.Errorf("sincronizando branch retomada: %w", err)
+					}
 				}
 			}
 			for _, warning := range a.restoreSessionMetadata(restored.Metadata) {
@@ -688,12 +750,12 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 			a.displayHistoryID = restored.ID
 			a.displayHistoryRevision = restored.Revision
 			entries = a.appendTranscriptHistory(restored.ID, entries)
-			notice, draft := a.inspectRecovery(restored.ID, restored.Messages)
+			notice, draft, resumeID := a.inspectRecovery(restored.ID, restored.Messages)
 			if notice != "" {
 				entries = append(entries, chatEntry{role: "system", content: notice, timestamp: time.Now()})
 			}
 			return sessionLoad{
-				entries: entries, start: start, total: len(restored.Messages), recoveryDraft: draft,
+				entries: entries, start: start, total: len(restored.Messages), recoveryDraft: draft, recoveryTurnID: resumeID,
 			}, nil
 		}
 		deps.loadOlderHistory = func(id string, before, limit int) ([]chatEntry, int, error) {
@@ -732,12 +794,23 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 	// /rewind: drop the last N messages from the active conversation.
 	if a.convMgr != nil {
 		deps.truncateMessages = func(n int) (int, error) {
+			release, err := a.acquireCLIProfileLease(context.Background())
+			if err != nil {
+				return 0, err
+			}
+			defer a.releaseCLIProfileLease(release)
+			if err := a.pendingCheckpointGuardUnlocked(); err != nil {
+				return 0, err
+			}
 			sess, err := a.convMgr.GetSession(context.Background(), "cli", "local")
 			if err != nil {
 				return 0, err
 			}
 			removed, err := a.convMgr.TruncateMessages(context.Background(), sess, n)
-			return len(removed), err
+			if err != nil {
+				return len(removed), err
+			}
+			return len(removed), a.saveActiveSession(sess)
 		}
 		deps.listRewindTurns = func() ([]rewindTurn, error) {
 			sess, err := a.convMgr.GetSession(ctx, "cli", "local")
@@ -754,6 +827,14 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 		}
 		deps.rewindTurns = func(n int, withFiles, withConversation bool) (rewindOutcome, error) {
 			var outcome rewindOutcome
+			release, err := a.acquireCLIProfileLease(ctx)
+			if err != nil {
+				return outcome, err
+			}
+			defer a.releaseCLIProfileLease(release)
+			if err := a.pendingCheckpointGuardUnlocked(); err != nil {
+				return outcome, err
+			}
 			sess, err := a.convMgr.GetSession(ctx, "cli", "local")
 			if err != nil {
 				return outcome, err
@@ -794,7 +875,7 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 					return outcome, err
 				}
 				if err := a.saveActiveSession(sess); err != nil {
-					outcome.warnings = append(outcome.warnings, fmt.Sprintf("sessao externa nao atualizada: %v", err))
+					return outcome, fmt.Errorf("salvando sessão após rewind: %w", err)
 				}
 				outcome.messages = make([]chatEntry, 0, len(kept))
 				for _, msg := range kept {

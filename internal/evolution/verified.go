@@ -283,6 +283,12 @@ func (s *Store) FinishVerificationRun(ctx context.Context, sourceKind, subjectID
 	if run.finishedAt > 0 && !run.finalSHA256.Valid {
 		return false, nil
 	}
+	// A goal closes its attempt in a separate durable store. If that write
+	// fails, a retry must reuse the first captured end state instead of
+	// sampling a later change and rewriting the evidence boundary.
+	if sourceKind == "goal" && run.finishedAt > 0 && run.finalSHA256.Valid {
+		return true, nil
+	}
 	actual, err := verificationState(ctx, plan.VerificationPlanInput)
 	if err != nil {
 		return false, fmt.Errorf("capturar estado final da execução: %w", err)

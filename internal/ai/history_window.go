@@ -1,6 +1,10 @@
 package ai
 
-import "github.com/costa/polypod/internal/contextwindow"
+import (
+	"fmt"
+
+	"github.com/costa/polypod/internal/contextwindow"
+)
 
 const (
 	maxHistoryWindowTokens = 24_000
@@ -21,4 +25,16 @@ func historyWindowBudget(model string) int {
 		budget = minHistoryWindowTokens
 	}
 	return budget
+}
+
+// promptConversationBudget also accounts for the already-built system prompt.
+// Tool schemas and provider formatting have a separate conservative reserve.
+func promptConversationBudget(model, systemPrompt string) (int, error) {
+	limits := contextwindow.WellKnownLimits(model)
+	const toolAndFramingReserve = 4096
+	remaining := limits.MaxContextTokens - limits.ReservedForOutput - promptTokens(systemPrompt) - toolAndFramingReserve
+	if remaining < 1024 {
+		return 0, fmt.Errorf("instruções e contexto de sistema excedem a janela do modelo %s", model)
+	}
+	return min(historyWindowBudget(model), remaining), nil
 }

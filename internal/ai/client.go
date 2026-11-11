@@ -328,6 +328,9 @@ func (c *Client) Complete(ctx context.Context, messages []ChatMessage) (*ChatRes
 
 // CompleteWithTools sends a chat completion with tool calling loop and retry.
 func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, logger *slog.Logger) (*ChatResponse, error) {
+	if _, checkpointed := checkpointScopeFor(ctx); checkpointed {
+		return c.CompleteWithToolsStream(ctx, messages, nil, logger)
+	}
 	if c.responseProvider != nil {
 		resp, err := c.completeWithResponseTools(ctx, messages, nil, logger)
 		return resp, err
@@ -446,6 +449,12 @@ func (c *Client) CompleteWithTools(ctx context.Context, messages []ChatMessage, 
 // CompleteWithToolsStream sends a streaming chat completion with tool calling loop.
 // It calls callback for each content delta token, and handles tool calls between stream cycles.
 func (c *Client) CompleteWithToolsStream(ctx context.Context, messages []ChatMessage, callback StreamCallback, logger *slog.Logger) (*ChatResponse, error) {
+	if _, checkpointed := checkpointScopeFor(ctx); checkpointed {
+		if c.responseProvider != nil {
+			return c.completeWithCheckpointedProvider(ctx, messages, callback, logger)
+		}
+		return c.completeWithCheckpointedOpenAI(ctx, messages, callback, logger)
+	}
 	if c.responseProvider != nil {
 		resp, err := c.completeWithResponseTools(ctx, messages, callback, logger)
 		return resp, err

@@ -29,6 +29,9 @@ type SessionHeader struct {
 	MessageCount int
 	Preview      string
 	Revision     string
+	// PrefixHash is empty for old manifests; such sessions need one full Save
+	// before a caller can prove that append leaves older messages unchanged.
+	PrefixHash string
 }
 
 // SessionPage is a chronological window of messages. Start is the zero-based
@@ -58,6 +61,7 @@ type sessionManifest struct {
 	Version      int              `json:"version"`
 	MessageCount int              `json:"message_count"`
 	Preview      string           `json:"preview,omitempty"`
+	PrefixHash   string           `json:"prefix_hash,omitempty"`
 	Pages        []messagePageRef `json:"pages"`
 }
 
@@ -66,6 +70,7 @@ func (m *sessionManifest) header() *SessionHeader {
 		ID: m.ID, Title: m.Title, Metadata: m.Metadata,
 		CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt, Version: m.Version,
 		MessageCount: m.MessageCount, Preview: m.Preview,
+		PrefixHash: m.PrefixHash,
 	}
 }
 
@@ -154,6 +159,9 @@ func (fs *FileSystemStorage) readDocumentWithRevision(id string) (*sessionManife
 	}
 	if manifest.ID != id || manifest.MessageCount < 0 {
 		return nil, nil, "", fmt.Errorf("invalid session manifest %s", id)
+	}
+	if manifest.PrefixHash != "" && !validPrefixHash(manifest.PrefixHash) {
+		return nil, nil, "", fmt.Errorf("invalid prefix hash in session %s", id)
 	}
 	count := 0
 	for _, ref := range manifest.Pages {

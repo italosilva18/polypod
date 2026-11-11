@@ -117,6 +117,7 @@ type CompactService struct {
 	logger *slog.Logger
 
 	summarize SummaryFunc
+	journal   *conversation.Store
 
 	mu               sync.Mutex
 	compacting       bool
@@ -131,6 +132,12 @@ type CompactService struct {
 // invocation. Passing nil disables hook firing (same as the default).
 func (s *CompactService) SetHookBridge(b *HookBridge) {
 	s.bridge = b
+}
+
+// SetJournalStore enables exact, scope-checked references when a single
+// message is too large for a summarizer batch.
+func (s *CompactService) SetJournalStore(store *conversation.Store) {
+	s.journal = store
 }
 
 // NewCompactService creates a new compact service.
@@ -262,7 +269,7 @@ func (s *CompactService) Compact(
 	systemPrompt := "You are a helpful AI assistant tasked with summarizing conversations."
 
 	// Call the LLM to generate the summary
-	rawSummary, err := s.summarize(ctx, systemPrompt, sanitized, prompt)
+	rawSummary, err := s.summarizeBounded(ctx, systemPrompt, sanitized, prompt)
 	if err != nil {
 		if isAuto {
 			s.mu.Lock()
@@ -396,7 +403,7 @@ func (s *CompactService) PartialCompact(
 	prompt := GetPartialCompactPrompt(customInstructions, direction)
 	systemPrompt := "You are a helpful AI assistant tasked with summarizing conversations."
 
-	rawSummary, err := s.summarize(ctx, systemPrompt, sanitized, prompt)
+	rawSummary, err := s.summarizeBounded(ctx, systemPrompt, sanitized, prompt)
 	if err != nil {
 		return nil, fmt.Errorf("generating partial summary: %w", err)
 	}

@@ -50,6 +50,7 @@ Voce tem acesso completo a: read_file, write_file, edit_file, list_directory, ru
 			"list_directory", "run_command", "search_files",
 			"glob", "grep", "web_fetch", "web_search",
 			"agent_run",
+			"history_search", "history_recall",
 		},
 	}
 }
@@ -93,6 +94,7 @@ Retorne seus achados em formato estruturado:
 - **Observacoes**: padroes notados, dependencias, pontos de atencao`,
 		Skills: []string{
 			"glob", "grep", "list_directory", "read_file",
+			"history_search", "history_recall",
 		},
 	}
 }
@@ -146,6 +148,7 @@ Voce NAO modifica arquivos. Voce apenas le, analisa e reporta.
 		Skills: []string{
 			"read_file", "list_directory", "glob", "grep",
 			"run_command", "search_files",
+			"history_search", "history_recall",
 		},
 	}
 }
@@ -188,6 +191,7 @@ Antes de executar comandos destrutivos (rm -rf, DROP TABLE, docker system prune,
 			"read_file", "write_file", "edit_file",
 			"list_directory", "run_command", "search_files",
 			"glob", "grep",
+			"history_search", "history_recall",
 		},
 	}
 }
@@ -253,6 +257,7 @@ Voce NAO cria, modifica ou deleta arquivos. Voce apenas le, analisa e planeja.
 		Skills: []string{
 			"read_file", "list_directory", "glob", "grep",
 			"run_command", "search_files",
+			"history_search", "history_recall",
 		},
 	}
 }

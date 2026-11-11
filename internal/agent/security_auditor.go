@@ -90,6 +90,7 @@ func SecurityAuditorAgent() *Agent {
 			"search_files",
 			"web_search",
 			"web_fetch",
+			"history_search", "history_recall",
 		},
 	}
 }

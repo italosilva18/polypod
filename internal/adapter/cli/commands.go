@@ -39,6 +39,7 @@ type commandResult struct {
 	resumeSessionID string
 	historyBefore   int
 	recoveryDraft   string
+	recoveryTurnID  string
 	// openConfigForm asks the host model to display the interactive
 	// /config form overlay. Used by the bare "/config" invocation.
 	openConfigForm bool
@@ -49,10 +50,11 @@ type commandResult struct {
 }
 
 type sessionLoad struct {
-	entries       []chatEntry
-	start         int
-	total         int
-	recoveryDraft string
+	entries        []chatEntry
+	start          int
+	total          int
+	recoveryDraft  string
+	recoveryTurnID string
 }
 
 // processCommand checks if input is a slash command and executes it locally.
@@ -325,7 +327,7 @@ func helpText() string {
 		{"/sessions [search <q>|live]", "busca sessoes salvas ou mostra instancias ativas"},
 		{"/suggest", "sugere proximas acoes a partir da conversa"},
 		{"/resume [id]", "lista ou carrega uma sessao persistida"},
-		{"/recover", "prepara rascunho editavel para retomar turno interrompido"},
+		{"/recover", "retoma um ponto seguro; /recover discard abandona turno incerto"},
 		{"/rewind [n] [--conversation|--files]", "restaura turnos, arquivos e conversa"},
 		{"/permissions [sub]", "gerencia regras de permissoes"},
 		{"/plan [on|off|show|execute]", "alterna/gerencia plan mode"},
@@ -426,6 +428,11 @@ func handleAgents(deps commandDeps) commandResult {
 func handleAgentSwitch(deps commandDeps, name string) commandResult {
 	if deps.setAgent == nil {
 		return commandResult{output: cmdLabelStyle.Render("servico AI nao disponivel"), handled: true}
+	}
+	if deps.checkPendingTurn != nil {
+		if err := deps.checkPendingTurn(); err != nil {
+			return commandResult{output: errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()), handled: true}
+		}
 	}
 	deps.setAgent(name)
 	return commandResult{
@@ -1141,17 +1148,24 @@ type commandDeps struct {
 	captureVoice func(context.Context, context.Context, time.Duration, func(string)) (string, error)
 	// bindBranches connects /branch to persisted transcripts and the active
 	// conversation. The CLI state binds lazily on the first /branch command.
-	bindBranches     func(*cliSessionState) error
-	commandRegistry  *command.Registry
-	activeAgent      func() string
-	setAgent         func(name string)
-	listAgents       func() []string
-	listSkills       func() []string
-	listMemories     func() ([]memoryEntry, error)
-	searchMemories   func(query string) ([]memoryEntry, error)
-	clearSession     func() error
-	sessionInfo      func() (string, int, error) // id, count, err
-	activeSessionID  func() string
+	bindBranches             func(*cliSessionState) error
+	commandRegistry          *command.Registry
+	activeAgent              func() string
+	setAgent                 func(name string)
+	checkPendingTurn         func() error
+	discardRecovery          func() (string, error)
+	listAgents               func() []string
+	listSkills               func() []string
+	listMemories             func() ([]memoryEntry, error)
+	searchMemories           func(query string) ([]memoryEntry, error)
+	clearSession             func() error
+	sessionInfo              func() (string, int, error) // id, count, err
+	activeSessionID          func() string
+	activeSessionRevision    func() string
+	setActiveSessionRevision func(string)
+	// recoveryState rechecks the durable turn after a stream error. This is
+	// required before offering /recover or allowing a full-message retry.
+	recoveryState    func() (notice, draft, resumeTurnID string)
 	listSessions     func(count int) ([]sessionEntry, error)
 	searchSessions   func(query string) ([]sessionEntry, error)
 	listLiveSessions func() (string, error)
@@ -1915,6 +1929,7 @@ func handleResume(deps commandDeps, arg string) commandResult {
 		resumeSessionID: target,
 		historyBefore:   loaded.start,
 		recoveryDraft:   loaded.recoveryDraft,
+		recoveryTurnID:  loaded.recoveryTurnID,
 	}
 }
 

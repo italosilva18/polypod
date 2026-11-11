@@ -84,7 +84,7 @@ func RegisterHistoryRecallTools(reg *Registry, store *conversation.Store) {
 	reg.RegisterDef(types.ToolDef{
 		NameFn: func() string { return "history_recall" },
 		DescriptionFn: func() string {
-			return "Ler o texto original exato de uma mensagem desta conversa pelo message_id retornado por history_search. " +
+			return "Ler o texto exato de uma mensagem ou resumo salvo desta conversa pelo message_id retornado por history_search ou citado no contexto. " +
 				"Use start e max_chars para ler mensagens longas em partes."
 		},
 		InputSchemaFn: func() map[string]any {

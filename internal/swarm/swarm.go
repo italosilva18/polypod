@@ -775,7 +775,7 @@ func (t *Team) TeammateOutputs(name string) ([]TeammateOutput, bool) {
 	return runner.Outputs(), true
 }
 
-// IdleTeammates returns the names of idle teammates.
+// IdleTeammates returns the names of started teammates whose runners are idle.
 func (t *Team) IdleTeammates() []string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -788,7 +788,8 @@ func (t *Team) IdleTeammates() []string {
 	return idle
 }
 
-// SetMemberIdle updates a member's idle state.
+// SetMemberIdle updates member metadata. Runner availability is derived from
+// its actual state by IdleTeammates and RunningTeammates.
 func (t *Team) SetMemberIdle(name string, idle bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

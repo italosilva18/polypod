@@ -324,11 +324,11 @@ func TestNewAgentToolWithFunc_Schema(t *testing.T) {
 	if tool.Description() == "" {
 		t.Error("tool description empty")
 	}
-	if !tool.IsReadOnly(nil) {
-		t.Error("agent_run tool should be read-only")
+	if tool.IsReadOnly(nil) {
+		t.Error("legacy agent_run cannot be read-only without inspecting the executor")
 	}
-	if !tool.IsConcurrencySafe(nil) {
-		t.Error("agent_run tool should be concurrency-safe")
+	if tool.IsConcurrencySafe(nil) {
+		t.Error("legacy agent_run cannot be concurrency-safe for arbitrary executor effects")
 	}
 	if !tool.IsEnabled() {
 		t.Error("agent_run tool should be enabled")

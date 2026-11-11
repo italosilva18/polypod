@@ -12,10 +12,31 @@ compactação:
 - `history_recall({"message_id":"...","start":0,"max_chars":6000})` retorna
   o trecho original exato. Use `next_start` para ler partes seguintes.
 
-Marcadores e resumos sintéticos de compactação ficam fora da busca e da
-recuperação. O journal pode preservá-los para auditoria interna, mas eles não
-são tratados como falas originais do usuário nem como evidência para aprender
-fatos novos.
+Marcadores e resumos sintéticos de compactação ficam fora da busca. Um resumo
+salvo pode ser lido por `history_recall` quando o prompt cita seu ID; ele
+continua sem ser tratado como fala original do usuário nem como evidência para
+aprender fatos novos.
+
+## Janela de contexto grande
+
+Antes de chamar o modelo, o runtime limita o histórico e a mensagem atual ao
+orçamento da janela. Conversas curtas seguem intactas. Se um turno ou resumo
+for grande, o prompt recebe o começo, o fim e o `message_id` para ler o texto
+integral em partes com `history_recall`. As mensagens recentes entram primeiro;
+um resumo de compactação salvo recebe espaço reservado. Turnos anteriores que
+não couberem permanecem no journal e o prompt avisa quantos foram omitidos.
+
+O limite age somente no pedido enviado ao modelo. A sessão e o journal não são
+truncados. Se um texto longo não tiver ID salvo ou não houver escopo de diário,
+o pedido falha com erro explícito. Isso evita passar uma versão incompleta como
+se fosse a mensagem inteira. A compactação persistida continua funcionando
+separadamente e pode reduzir o histórico em turnos seguintes. Quando o próprio
+pedido de compactação é grande, ele passa por lotes de resumo limitados pelo
+contexto configurado. Mensagens individuais enormes levam ao resumo uma prévia
+com seu ID, e o resumo final registra esses IDs para recuperar detalhes. Cada
+ID é verificado no escopo do agente e branch atual antes de aparecer como
+recuperável; uma troca de agente que torne o texto inacessível produz erro
+explícito se a janela não puder carregá-lo integralmente.
 
 O canal, usuário, branch da CLI e agente são definidos pelo runtime, não por
 argumentos das ferramentas. Um ID de outra conversa aparece como não

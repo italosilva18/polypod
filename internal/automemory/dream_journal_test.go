@@ -74,9 +74,10 @@ func TestDreamReplaysPersistedBatchAfterWriteFailure(t *testing.T) {
 	store := seededSessionStore(t, []conversation.Message{{Role: conversation.RoleUser, Content: "prefiro respostas curtas"}})
 	mem := &stubMemoryStore{saveErr: errors.New("disk unavailable")}
 	calls := 0
-	cfg := DreamConfig{SessionStore: store, Memory: mem, StateFile: filepath.Join(t.TempDir(), "state.json"), Logger: quietLogger(), ExtractFn: func(context.Context, string) ([]ExtractedMemory, error) {
+	cfg := DreamConfig{SessionStore: store, Memory: mem, StateFile: filepath.Join(t.TempDir(), "state.json"), Logger: quietLogger(), ExtractFn: func(_ context.Context, transcript string) ([]ExtractedMemory, error) {
 		calls++
-		return []ExtractedMemory{{Type: "preference", Content: "prefere respostas curtas", Importance: 3}}, nil
+		return []ExtractedMemory{{Type: "preference", Content: "prefere respostas curtas", Importance: 3,
+			Evidence: dreamEvidenceForQuote(t, transcript, "prefiro respostas curtas")}}, nil
 	}}
 	if err := NewDreamService(cfg).RunNow(ctx); err == nil {
 		t.Fatal("expected memory failure")
@@ -97,7 +98,7 @@ func TestDreamReplaysPersistedBatchAfterWriteFailure(t *testing.T) {
 		t.Fatalf("model called again for interrupted batch: %d", calls)
 	}
 	if len(mem.saved) != 1 || len(mem.saved[0].Tags) != 2 ||
-		mem.saved[0].Tags[0] != "evidence:batch_unattributed" ||
+		mem.saved[0].Tags[0] != "evidence:quote_verified" ||
 		!strings.HasPrefix(mem.saved[0].Tags[1], "journal:") {
 		t.Fatal("missing provenance")
 	}
@@ -114,10 +115,13 @@ func TestDreamFactKeyUpdatesAcrossBatches(t *testing.T) {
 	mem := memory.NewStoreFromDB(nil, t.TempDir())
 	d := NewDreamService(DreamConfig{SessionStore: store, Memory: mem, Logger: quietLogger(), ExtractFn: func(_ context.Context, transcript string) ([]ExtractedMemory, error) {
 		content := "Moro em Recife"
+		quote := "Moro em Recife"
 		if strings.Contains(transcript, "Salvador") {
 			content = "Moro em Salvador"
+			quote = "Agora moro em Salvador"
 		}
-		return []ExtractedMemory{{Type: "fact", FactKey: "usuario.cidade", Content: content, Importance: 3}}, nil
+		return []ExtractedMemory{{Type: "fact", FactKey: "usuario.cidade", Content: content, Importance: 3,
+			Evidence: dreamEvidenceForQuote(t, transcript, quote)}}, nil
 	}})
 	for _, content := range []string{"Moro em Recife", "Agora moro em Salvador"} {
 		sess.AddMessage(conversation.RoleUser, content)
@@ -128,11 +132,12 @@ func TestDreamFactKeyUpdatesAcrossBatches(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	facts, err := mem.List(ctx)
+	scopedCtx := memory.WithSessionScope(ctx, "cli:user")
+	facts, err := mem.List(scopedCtx)
 	if err != nil || len(facts) != 1 || facts[0].Content != "Moro em Salvador" {
 		t.Fatalf("conflicting facts remained active: %v %v", facts, err)
 	}
-	if err := mem.Delete(ctx, facts[0].Topic); err != nil {
+	if err := mem.Delete(scopedCtx, facts[0].Topic); err != nil {
 		t.Fatal(err)
 	}
 	// Reset consolidation state: private historical evidence must not resurrect
@@ -141,7 +146,7 @@ func TestDreamFactKeyUpdatesAcrossBatches(t *testing.T) {
 	if err := d.RunNow(ctx); err != nil {
 		t.Fatal(err)
 	}
-	facts, err = mem.List(ctx)
+	facts, err = mem.List(scopedCtx)
 	if err != nil || len(facts) != 0 {
 		t.Fatalf("forgotten fact resurrected from raw journal: %v %v", facts, err)
 	}

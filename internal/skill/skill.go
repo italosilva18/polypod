@@ -194,7 +194,8 @@ func (r *Registry) TryRegister(s *Skill) error {
 }
 
 // RegisterTrusted is for a file whose bytes and path have just been verified
-// against the applied evolution draft. It bypasses only the name reservation.
+// against the applied evolution draft. It bypasses the name reservation and
+// ordinary origin collision check.
 func (r *Registry) RegisterTrusted(s *Skill) error {
 	return r.register(s, true)
 }

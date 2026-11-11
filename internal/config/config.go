@@ -188,8 +188,10 @@ type EmbeddingConfig struct {
 }
 
 type DataConfig struct {
-	Dir       string `yaml:"dir"`
-	AgentsDir string `yaml:"agents_dir"`
+	Dir                    string `yaml:"dir"`
+	AgentsDir              string `yaml:"agents_dir"`
+	OwnerMemoryDir         string `yaml:"owner_memory_dir"`
+	OwnerMemoryImportLocal bool   `yaml:"owner_memory_import_local"`
 }
 
 type CLIConfig struct {

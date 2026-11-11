@@ -576,7 +576,7 @@ func buildProviderRegistry(cfg *config.Config, multiAuth *auth.MultiProviderAuth
 
 // prepareSessionHistory keeps the persisted session and the next model context aligned.
 func prepareSessionHistory(ctx context.Context, convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionmem.FileStore, scope string, sess *conversation.Session) ([]conversation.Message, error) {
-	history := append([]conversation.Message(nil), convMgr.GetHistory(sess)...)
+	history := convMgr.GetHistory(sess)
 	prepared, changed := aiSvc.PrepareHistoryForScope(ctx, scope, history)
 	if !changed {
 		return history, nil
@@ -639,20 +639,51 @@ func toolTranscriptSummary(store *session.ToolTranscriptStore, scope string, log
 	return summary
 }
 
-func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionmem.FileStore, trace *session.ToolTranscriptStore, turns *turncheckpoint.Manager, logger *slog.Logger) adapter.MessageHandler {
+func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionmem.FileStore, trace *session.ToolTranscriptStore, turns *turncheckpoint.Manager, logger *slog.Logger, cliStorage ...session.SessionStorage) adapter.MessageHandler {
 	return func(ctx context.Context, msg adapter.InMessage) (adapter.OutMessage, error) {
+		var storage session.SessionStorage
+		if len(cliStorage) > 0 {
+			storage = cliStorage[0]
+		}
+		guard, err := beginCLITurnGuard(ctx, msg, turns, storage)
+		if err != nil {
+			return adapter.OutMessage{Text: err.Error()}, err
+		}
+		defer func() {
+			if guard != nil {
+				if err := guard.Close(); err != nil {
+					logger.Warn("CLI turn lease release failed", "error", err)
+				}
+			}
+		}()
 		sess, err := convMgr.GetSession(ctx, msg.Channel, msg.UserID)
 		if err != nil {
 			return adapter.OutMessage{Text: "Erro de sessao"}, err
 		}
+		if guard != nil {
+			if err := convMgr.CheckCurrentSnapshot(ctx, sess); err != nil {
+				return adapter.OutMessage{Text: err.Error()}, err
+			}
+		}
 		scope := sessionMemoryScope(msg, sess)
 		ctx = conversation.WithJournalScope(ctx, msg.Channel, msg.UserID, scope, aiSvc.ActiveAgent())
+		if msg.Channel == "cli" {
+			if err := ensureCLINextTurnResolved(turns, scope, sess); err != nil {
+				return adapter.OutMessage{Text: err.Error()}, err
+			}
+		}
 		history, err := prepareSessionHistory(ctx, convMgr, aiSvc, mem, scope, sess)
 		if err != nil {
 			return adapter.OutMessage{Text: "Erro ao preparar o contexto"}, err
 		}
-		userMessage := convMgr.AddUserMessage(ctx, sess, msg.Text)
+		userMessage, err := convMgr.AddUserMessageDurable(ctx, sess, msg.Text)
+		if err != nil {
+			return adapter.OutMessage{Text: "Erro ao salvar mensagem"}, err
+		}
 		turnCtx := turns.BeginTurn(ctx, sess.ID, userMessage.ID)
+		if msg.Channel == "cli" {
+			turnCtx = ai.WithTurnCheckpoint(turnCtx, turns, scope, userMessage.ID)
+		}
 		turnCtx = ai.WithToolEventCallback(turnCtx, func(event ai.ToolEvent) {
 			appendToolTrace(trace, scope, userMessage.ID, event, logger)
 		})
@@ -665,6 +696,7 @@ func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionm
 			Channel:               msg.Channel,
 			UserID:                msg.UserID,
 			Query:                 msg.Text,
+			CurrentMessageID:      userMessage.ID,
 			SessionMemoryScope:    scope,
 			ToolTranscriptSummary: toolTranscriptSummary(trace, scope, logger),
 			History:               history,
@@ -676,6 +708,11 @@ func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionm
 		if err := convMgr.AddAssistantMessage(ctx, sess, resp.Content); err != nil {
 			return adapter.OutMessage{Text: resp.Content}, err
 		}
+		if guard != nil {
+			if _, err := guard.PublishSnapshot(sess, aiSvc.ActiveAgent()); err != nil {
+				return adapter.OutMessage{Text: resp.Content}, err
+			}
+		}
 		return adapter.OutMessage{
 			Text:    resp.Content,
 			Channel: msg.Channel,
@@ -686,24 +723,91 @@ func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionm
 }
 
 // makeStreamHandler builds the inline stream handler that replaces router.StreamHandler.
-func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionmem.FileStore, trace *session.ToolTranscriptStore, turns *turncheckpoint.Manager, logger *slog.Logger) adapter.StreamHandler {
+func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionmem.FileStore, trace *session.ToolTranscriptStore, turns *turncheckpoint.Manager, logger *slog.Logger, cliStorage ...session.SessionStorage) adapter.StreamHandler {
 	return func(ctx context.Context, msg adapter.InMessage, chunks chan<- adapter.StreamChunk) {
 		defer close(chunks)
+		var storage session.SessionStorage
+		if len(cliStorage) > 0 {
+			storage = cliStorage[0]
+		}
+		guard, err := beginCLITurnGuard(ctx, msg, turns, storage)
+		if err != nil {
+			chunks <- adapter.StreamChunk{Error: err, Done: true}
+			return
+		}
+		defer func() {
+			if guard != nil {
+				if err := guard.Close(); err != nil {
+					logger.Warn("CLI turn lease release failed", "error", err)
+				}
+			}
+		}()
 
 		sess, err := convMgr.GetSession(ctx, msg.Channel, msg.UserID)
 		if err != nil {
 			chunks <- adapter.StreamChunk{Error: err, Done: true}
 			return
 		}
+		if guard != nil {
+			if err := convMgr.CheckCurrentSnapshot(ctx, sess); err != nil {
+				chunks <- adapter.StreamChunk{Error: err, Done: true}
+				return
+			}
+		}
 		scope := sessionMemoryScope(msg, sess)
 		ctx = conversation.WithJournalScope(ctx, msg.Channel, msg.UserID, scope, aiSvc.ActiveAgent())
-		history, err := prepareSessionHistory(ctx, convMgr, aiSvc, mem, scope, sess)
-		if err != nil {
-			chunks <- adapter.StreamChunk{Error: err, Done: true}
-			return
+		resumeTurnID := ""
+		if msg.Metadata != nil {
+			resumeTurnID = msg.Metadata["polypod_resume_turn_id"]
 		}
-		userMessage := convMgr.AddUserMessage(ctx, sess, msg.Text)
-		turnCtx := turns.BeginTurn(ctx, sess.ID, userMessage.ID)
+		if msg.Channel == "cli" && resumeTurnID == "" {
+			if err := ensureCLINextTurnResolved(turns, scope, sess); err != nil {
+				chunks <- adapter.StreamChunk{Error: err, Done: true}
+				return
+			}
+		}
+		var history []conversation.Message
+		var userMessage conversation.Message
+		var resumeCheckpoint *turncheckpoint.AICheckpoint
+		var turnCtx context.Context
+		if resumeTurnID != "" {
+			if msg.Channel != "cli" || msg.UserID != "local" || len(sess.Messages) == 0 ||
+				sess.Messages[len(sess.Messages)-1].Role != conversation.RoleUser ||
+				sess.Messages[len(sess.Messages)-1].ID != resumeTurnID {
+				chunks <- adapter.StreamChunk{Error: fmt.Errorf("turno de retomada nao corresponde a ultima mensagem do CLI"), Done: true}
+				return
+			}
+			userMessage = sess.Messages[len(sess.Messages)-1]
+			resumeCheckpoint, err = turns.LoadAI(scope, resumeTurnID)
+			if err == nil {
+				err = resumeCheckpoint.ValidateResume()
+			}
+			if err != nil {
+				chunks <- adapter.StreamChunk{Error: fmt.Errorf("retomada bloqueada: %w", err), Done: true}
+				return
+			}
+			turnCtx, err = turns.ResumeTurn(ctx, sess.ID, userMessage.ID)
+			if err != nil {
+				chunks <- adapter.StreamChunk{Error: err, Done: true}
+				return
+			}
+			turnCtx = ai.WithResumeTurnCheckpoint(turnCtx, turns, scope, userMessage.ID)
+		} else {
+			history, err = prepareSessionHistory(ctx, convMgr, aiSvc, mem, scope, sess)
+			if err != nil {
+				chunks <- adapter.StreamChunk{Error: err, Done: true}
+				return
+			}
+			userMessage, err = convMgr.AddUserMessageDurable(ctx, sess, msg.Text)
+			if err != nil {
+				chunks <- adapter.StreamChunk{Error: err, Done: true}
+				return
+			}
+			turnCtx = turns.BeginTurn(ctx, sess.ID, userMessage.ID)
+			if msg.Channel == "cli" {
+				turnCtx = ai.WithTurnCheckpoint(turnCtx, turns, scope, userMessage.ID)
+			}
+		}
 		turnCtx = ai.WithToolEventCallback(turnCtx, func(ev ai.ToolEvent) {
 			appendToolTrace(trace, scope, userMessage.ID, ev, logger)
 			chunks <- adapter.StreamChunk{
@@ -724,17 +828,25 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *se
 			}
 		}()
 
-		resp, err := aiSvc.AnswerStream(turnCtx, ai.AnswerRequest{
+		answerReq := ai.AnswerRequest{
 			Channel:               msg.Channel,
 			UserID:                msg.UserID,
-			Query:                 msg.Text,
+			Query:                 userMessage.Content,
+			CurrentMessageID:      userMessage.ID,
 			SessionMemoryScope:    scope,
 			ToolTranscriptSummary: toolTranscriptSummary(trace, scope, logger),
 			History:               history,
 			HistoryPrepared:       true,
-		}, func(delta string) {
+		}
+		streamCallback := func(delta string) {
 			chunks <- adapter.StreamChunk{Delta: delta}
-		})
+		}
+		var resp *ai.AnswerResponse
+		if resumeCheckpoint != nil {
+			resp, err = aiSvc.ResumeStream(turnCtx, answerReq, resumeCheckpoint, streamCallback)
+		} else {
+			resp, err = aiSvc.AnswerStream(turnCtx, answerReq, streamCallback)
+		}
 		if err != nil {
 			chunks <- adapter.StreamChunk{Error: err, Done: true}
 			return
@@ -743,22 +855,68 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *se
 			chunks <- adapter.StreamChunk{Error: err, Done: true}
 			return
 		}
-		chunks <- adapter.StreamChunk{Done: true}
+		revision := ""
+		if guard != nil {
+			revision, err = guard.PublishSnapshot(sess, aiSvc.ActiveAgent())
+			if err != nil {
+				chunks <- adapter.StreamChunk{Error: err, Done: true}
+				return
+			}
+			// The TUI may start a queued turn as soon as it reads Done. Release
+			// the profile lease first so that next turn cannot fail spuriously.
+			closeErr := guard.Close()
+			guard = nil
+			if closeErr != nil {
+				chunks <- adapter.StreamChunk{Error: closeErr, Done: true}
+				return
+			}
+		}
+		chunks <- adapter.StreamChunk{Done: true, SessionRevision: revision}
 	}
 }
 
 // autoSaveSession persists the current CLI conversation to disk on shutdown.
-func autoSaveSession(convMgr *conversation.Manager, sessStorage session.SessionStorage, sessMgr *session.Manager, currentSessionID, expectedRevision, agentName, mode string, logger *slog.Logger) {
+func autoSaveSession(convMgr *conversation.Manager, sessStorage session.SessionStorage, sessMgr *session.Manager, currentSessionID, expectedRevision, agentName, mode string, logger *slog.Logger, cliLease ...*turncheckpoint.Manager) {
+	if len(cliLease) > 0 && cliLease[0] != nil {
+		release, err := cliLease[0].AcquireBranchLease(context.Background(), cliProfileLeaseID)
+		if err != nil {
+			logger.Warn("CLI session auto-save blocked by another active turn", "error", err)
+			return
+		}
+		defer release()
+	}
 	sess, err := convMgr.GetSession(context.Background(), "cli", "local")
 	if err != nil || len(sess.Messages) == 0 {
 		return
+	}
+	if len(cliLease) > 0 && cliLease[0] != nil {
+		if err := convMgr.CheckCurrentSnapshot(context.Background(), sess); err != nil {
+			logger.Warn("CLI session auto-save skipped stale conversation", "error", err)
+			return
+		}
 	}
 
 	now := time.Now()
 	cwd, _ := os.Getwd()
 	createdAt := sess.CreatedAt
 	metadata := session.SessionMetadata{ProjectRoot: cwd, Tag: "cli"}
-	if previous, loadErr := sessStorage.Load(currentSessionID); loadErr != nil {
+	var paged pagedShutdownStorage
+	var previousHeader *session.SessionHeader
+	if candidate, ok := sessStorage.(pagedShutdownStorage); ok {
+		var loadErr error
+		previousHeader, loadErr = candidate.LoadHeader(currentSessionID)
+		if loadErr != nil {
+			logger.Warn("failed to load existing session metadata", "error", loadErr)
+		} else {
+			paged = candidate
+			if previousHeader != nil {
+				metadata = previousHeader.Metadata
+				if !previousHeader.CreatedAt.IsZero() {
+					createdAt = previousHeader.CreatedAt
+				}
+			}
+		}
+	} else if previous, loadErr := sessStorage.Load(currentSessionID); loadErr != nil {
 		logger.Warn("failed to load existing session metadata", "error", loadErr)
 	} else if previous != nil {
 		metadata = previous.Metadata
@@ -803,7 +961,7 @@ func autoSaveSession(convMgr *conversation.Manager, sessStorage session.SessionS
 	}
 
 	savedID := currentSessionID
-	if err := sessStorage.Save(persisted); err != nil {
+	if err := saveShutdownSessionSnapshot(sessStorage, paged, previousHeader, persisted); err != nil {
 		if !errors.Is(err, session.ErrSessionConflict) {
 			logger.Warn("failed to auto-save session", "error", err)
 			return
@@ -889,7 +1047,33 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	}
 
 	// Wire core subsystems via wiring.WireAll
-	memStore := memory.NewStoreFromDB(sqlDB, cfg.Data.Dir)
+	var memStore memory.Store
+	if cfg.Data.OwnerMemoryDir == "" {
+		memStore = memory.NewStoreFromDB(sqlDB, cfg.Data.Dir)
+	} else {
+		var privateMemory memory.Store
+		if sqlDB != nil {
+			privateMemory = memory.NewSQLiteStore(sqlDB)
+		} else {
+			privateMemory = memory.NewFileStore(cfg.Data.Dir)
+		}
+		ownerMemory, err := memory.NewOwnerOverlayStore(privateMemory, cfg.Data.OwnerMemoryDir, cfg.WhatsApp.OwnerChat)
+		if err != nil {
+			return fmt.Errorf("configuring shared owner memory: %w", err)
+		}
+		backupParent := filepath.Dir(cfg.Database.Path)
+		if sqlDB == nil {
+			backupParent = cfg.Data.Dir
+		}
+		imported, err := ownerMemory.BackfillOwnerFacts(context.Background(), filepath.Join(backupParent, "owner-memory-backups"), cfg.Data.OwnerMemoryImportLocal)
+		if err != nil {
+			return fmt.Errorf("importing owner memory: %w", err)
+		}
+		if imported > 0 {
+			logger.Info("owner memory imported", "count", imported)
+		}
+		memStore = memory.NewManagedStore(ownerMemory)
+	}
 	var embedder memory.Embedder
 	if cfg.Embedding.Enabled {
 		backend := strings.ToLower(strings.TrimSpace(cfg.Embedding.Backend))
@@ -1157,6 +1341,17 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	sessionsDir := filepath.Join(cfg.Data.Dir, "sessions")
 	sessStorage := session.NewFileSystemStorage(sessionsDir, logger)
 	sessRestorer := session.NewSessionRestorer(sessionsDir, logger)
+	startupLeaseRelease, err := turnCheckpoint.AcquireBranchLease(ctx, cliProfileLeaseID)
+	if err != nil {
+		return fmt.Errorf("restaurando sessão CLI sob lease: %w", err)
+	}
+	defer func() {
+		if startupLeaseRelease != nil {
+			if err := startupLeaseRelease(); err != nil {
+				logger.Warn("CLI startup lease release failed", "error", err)
+			}
+		}
+	}()
 
 	restoredSession, currentSessionID := loadRestoredSession(sessRestorer, sessStorage, continueSession, resumeSessionID, logger)
 
@@ -1195,6 +1390,10 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 			}
 		}
 	}
+	if err := startupLeaseRelease(); err != nil {
+		return fmt.Errorf("liberando lease da restauração CLI: %w", err)
+	}
+	startupLeaseRelease = nil
 
 	if projCtx := project.InjectProjectContext(); projCtx != "" {
 		logger.Info("project instructions loaded")
@@ -1415,6 +1614,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	ctxWinMgr := sys.ContextWindow
 	var aiClient *ai.Client
 	compactSvc := buildCompactService(&aiClient, logger)
+	compactSvc.SetJournalStore(store)
 	autoCompactSvc := compact.NewAutoCompactService(compact.AutoCompactConfig{
 		CtxWinMgr:      ctxWinMgr,
 		CompactService: compactSvc,
@@ -1511,6 +1711,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	aiClient = ai.NewClient(cfg.AI, sys.ToolAdapter)
 	aiSvc := ai.NewService(aiClient, ai.NewDocumentKnowledgeSearcher(documentIndex, cfg.WhatsApp.OwnerChat),
 		agents, "default", memStore, logger)
+	aiSvc.SetConversationStore(store)
 	aiSvc.SetExperienceSearcher(evolutionStore, cfg.WhatsApp.OwnerChat)
 	if cfg.AI.RoutingPolicyFile != "" {
 		policy, err := smartroute.ReadPolicy(cfg.AI.RoutingPolicyFile)
@@ -1558,8 +1759,8 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	}
 
 	// Inline handlers (replace router)
-	handler := makeHandler(convMgr, aiSvc, sessionMemory, toolTranscript, turnCheckpoint, logger)
-	streamHandler := makeStreamHandler(convMgr, aiSvc, sessionMemory, toolTranscript, turnCheckpoint, logger)
+	handler := makeHandler(convMgr, aiSvc, sessionMemory, toolTranscript, turnCheckpoint, logger, sessStorage)
+	streamHandler := makeStreamHandler(convMgr, aiSvc, sessionMemory, toolTranscript, turnCheckpoint, logger, sessStorage)
 	// Background routines and one-off tasks share the same operational state.
 	// Serialize their full agent turns while leaving interactive messages free.
 	backgroundAgentGate := make(chan struct{}, 1)
@@ -2246,7 +2447,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	}
 
 	// Shutdown
-	autoSaveSession(convMgr, sessStorage, sessMgr, cliCh.ActiveSessionID(), cliCh.ActiveSessionRevision(), aiSvc.ActiveAgent(), string(modeState.Current), logger)
+	autoSaveSession(convMgr, sessStorage, sessMgr, cliCh.ActiveSessionID(), cliCh.ActiveSessionRevision(), aiSvc.ActiveAgent(), string(modeState.Current), logger, turnCheckpoint)
 
 	hookMgr.Fire(context.Background(), hooks.HookPayload{
 		Event:     hooks.EventSessionEnd,

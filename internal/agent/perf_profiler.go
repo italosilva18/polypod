@@ -91,6 +91,7 @@ func PerfProfilerAgent() *Agent {
 		Skills: []string{
 			"read_file", "list_directory", "glob", "grep",
 			"search_files", "run_command",
+			"history_search", "history_recall",
 		},
 	}
 }

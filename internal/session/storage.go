@@ -133,7 +133,7 @@ func (fs *FileSystemStorage) saveLocked(sess *RestoredSession) error {
 		Format: pagedFormat, ID: sess.ID, Title: sess.Title,
 		Metadata: sess.Metadata, CreatedAt: sess.CreatedAt,
 		UpdatedAt: sess.UpdatedAt, Version: sess.Version,
-		MessageCount: len(sess.Messages),
+		MessageCount: len(sess.Messages), PrefixHash: MessagePrefixHash(sess.Messages),
 	}
 	if len(sess.Messages) > 0 {
 		manifest.Preview = previewContent(sess.Messages[0].Content)

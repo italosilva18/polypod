@@ -46,7 +46,9 @@ func TestDreamPersistsExtractedFactAndMetricsAcrossRestart(t *testing.T) {
 		if !strings.Contains(transcript, "Prefiro respostas em português") {
 			t.Fatalf("user fact missing from transcript: %q", transcript)
 		}
-		return ParseExtractedMemories(`[{"type":"preference","fact_key":"usuario.idioma","content":"Prefere respostas em português.","tags":["idioma"],"importance":4}]`)
+		return []ExtractedMemory{{Type: "preference", FactKey: "usuario.idioma",
+			Content: "Prefere respostas em português.", Tags: []string{"idioma"}, Importance: 4,
+			Evidence: dreamEvidenceForQuote(t, transcript, "Prefiro respostas em português.")}}, nil
 	}
 	d := NewDreamService(DreamConfig{
 		Logger: quietLogger(), SessionStore: sessions,
@@ -69,7 +71,7 @@ func TestDreamPersistsExtractedFactAndMetricsAcrossRestart(t *testing.T) {
 	}
 	defer db.Close()
 	memStore := memory.NewSQLiteStore(db)
-	fact, err := memStore.Get(ctx, d.topicFor(ExtractedMemory{FactKey: "usuario.idioma"}))
+	fact, err := memStore.Get(ctx, d.topicForScope(ExtractedMemory{FactKey: "usuario.idioma"}, "test-channel:user-1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,9 +144,10 @@ func TestDreamCountsSavedBatchOnlyAfterRetrySucceeds(t *testing.T) {
 	extractions := 0
 	d := NewDreamService(DreamConfig{
 		Logger: quietLogger(), SessionStore: sessions, Memory: memories, StateFile: stateFile,
-		ExtractFn: func(context.Context, string) ([]ExtractedMemory, error) {
+		ExtractFn: func(_ context.Context, transcript string) ([]ExtractedMemory, error) {
 			extractions++
-			return []ExtractedMemory{{FactKey: "usuario.estilo", Content: "Prefere respostas curtas.", Importance: 4}}, nil
+			return []ExtractedMemory{{Type: "preference", FactKey: "usuario.estilo", Content: "Prefere respostas curtas.", Importance: 4,
+				Evidence: dreamEvidenceForQuote(t, transcript, "Gosto de respostas curtas.")}}, nil
 		},
 	})
 	if err := d.RunNow(ctx); err == nil {

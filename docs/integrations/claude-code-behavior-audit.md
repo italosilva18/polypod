@@ -36,3 +36,9 @@ Esta auditoria separa **código implementado** de **efeito comprovado**. O usuá
 | Voz em tempo real | O backend local recebe prévias periódicas, sem fluxo contínuo por amostra. | Avaliar um backend com saída incremental por segmento e medir latência/precisão com microfone real. |
 
 As lacunas abertas envolvem concorrência, captação em tempo real e integração com navegadores sem CDP. Build e análise estática não comprovam equivalência funcional nem superioridade de velocidade; isso exige ensaios interativos e medição com fluxos reais.
+
+## Atualização de 11 de novembro
+
+O CLI agora grava checkpoints do turno do modelo e das chamadas de ferramenta. `/recover` continua um turno interrompido a partir do último ponto seguro; uma ferramenta iniciada sem resultado gravado bloqueia a retomada até o operador verificar o efeito e usar `/recover discard`. Novas entradas e transições de sessão não escondem esse estado. A recuperação do turno destacado continua sujeita ao mesmo limite: o processo não é mantido vivo após uma queda e efeitos externos incertos não são repetidos automaticamente.
+
+O prompt do modelo agora limita o histórico transmitido e usa referências `message_id` verificadas para trechos longos e mensagens antigas. A compactação processa lotes limitados e o salvamento comum da sessão CLI acrescenta páginas novas quando o prefixo persistido não mudou. A carga inicial da conversa ainda materializa o histórico; isso não comprova desempenho superior em sessões muito longas. Os testes automatizados destes caminhos foram executados nesta atualização, mas ainda não substituem medição interativa de latência, voz contínua e pareamento real da extensão de navegador.

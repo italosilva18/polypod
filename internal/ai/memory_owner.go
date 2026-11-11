@@ -14,7 +14,8 @@ func (s *Service) ownerMemoryContext(ctx context.Context, req AnswerRequest) con
 	ownerChat := s.experienceOwnerChat
 	s.experienceMu.RUnlock()
 	if ownerExperienceTurn(ctx, req, ownerChat) {
-		return memory.WithGlobalMemoryAccess(ctx)
+		ctx = memory.WithGlobalMemoryAccess(ctx)
+		return memory.WithOwnerLinkedMemory(ctx, req.Channel, ownerChat)
 	}
 	return ctx
 }

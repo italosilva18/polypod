@@ -2,6 +2,7 @@ package conversation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -38,6 +39,58 @@ func (m *Manager) AddUserMessage(ctx context.Context, sess *Session, content str
 		m.logger.Warn("failed to persist user message", "session", sess.ID, "error", err)
 	}
 	return msg
+}
+
+// AddUserMessageDurable saves the turn before it may be represented by a
+// journal ID in a bounded model prompt. A known pre-commit failure rolls back
+// memory; an uncertain commit keeps it for inspection and stops the AI turn.
+func (m *Manager) AddUserMessageDurable(ctx context.Context, sess *Session, content string) (Message, error) {
+	return m.addMessageDurable(ctx, sess, RoleUser, content)
+}
+
+// AddAssistantMessageDurable publishes a recovery resolution before a pending
+// tool checkpoint may be abandoned. It shares the same transaction boundary
+// as AddUserMessageDurable.
+func (m *Manager) AddAssistantMessageDurable(ctx context.Context, sess *Session, content string) (Message, error) {
+	return m.addMessageDurable(ctx, sess, RoleAssistant, content)
+}
+
+// EnsureCurrentDurable retries publication of an already present recovery
+// resolution after a prior commit outcome was uncertain.
+func (m *Manager) EnsureCurrentDurable(ctx context.Context, sess *Session) error {
+	journalComplete, err := m.store.saveMessageDurable(ctx, sess)
+	if err != nil {
+		return err
+	}
+	if !journalComplete {
+		return fmt.Errorf("journal de conversa ainda pendente")
+	}
+	return nil
+}
+
+func (m *Manager) addMessageDurable(ctx context.Context, sess *Session, role Role, content string) (Message, error) {
+	previous := sess.Messages
+	if !sess.unbounded {
+		// AddMessage shifts the bounded ring in place when full.
+		previous = append([]Message(nil), sess.Messages...)
+	}
+	previousPending := sess.pending
+	previousUpdated := sess.UpdatedAt
+	msg := sess.AddMessage(role, content)
+	journalComplete, err := m.store.saveMessageDurable(ctx, sess)
+	if err != nil {
+		var unknown *durabilityUnknownError
+		if !errors.As(err, &unknown) {
+			sess.Messages = previous
+			sess.pending = previousPending
+			sess.UpdatedAt = previousUpdated
+		}
+		return Message{}, fmt.Errorf("persisting %s message: %w", role, err)
+	}
+	if !journalComplete && m.logger != nil {
+		m.logger.Warn("conversation snapshot persisted but journal append deferred", "session", sess.ID, "message", msg.ID)
+	}
+	return msg, nil
 }
 
 // AddAssistantMessage adds an assistant message and persists the session.

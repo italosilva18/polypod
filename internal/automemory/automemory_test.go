@@ -83,6 +83,26 @@ func seededSessionStore(t *testing.T, msgs []conversation.Message) *conversation
 	return store
 }
 
+func dreamEvidenceForQuote(t *testing.T, transcript, quote string) []MemoryEvidence {
+	t.Helper()
+	for _, line := range strings.Split(transcript, "\n") {
+		if !strings.Contains(line, quote) {
+			continue
+		}
+		start := strings.Index(line, "message=")
+		if start < 0 {
+			continue
+		}
+		start += len("message=")
+		end := strings.IndexByte(line[start:], ']')
+		if end > 0 {
+			return []MemoryEvidence{{MessageID: line[start : start+end], Quote: quote}}
+		}
+	}
+	t.Fatalf("quote %q not found in dream transcript", quote)
+	return nil
+}
+
 // --- Store (NewStore / Add / Save / Load) tests ---
 
 func TestNewStore_CreatesDirectoryAndInitializes(t *testing.T) {
@@ -390,6 +410,7 @@ func TestDreamService_RunNow_EmptySessionsIsNoop(t *testing.T) {
 func TestDreamService_RunNow_SavesExtractedMemories(t *testing.T) {
 	msgs := []conversation.Message{
 		{Role: conversation.RoleUser, Content: "uso postgres", Timestamp: time.Now().Add(-2 * time.Minute)},
+		{Role: conversation.RoleUser, Content: "prefiro go em vez de rust", Timestamp: time.Now().Add(-90 * time.Second)},
 		{Role: conversation.RoleAssistant, Content: "vou usar postgres", Timestamp: time.Now().Add(-1 * time.Minute)},
 	}
 	sessStore := seededSessionStore(t, msgs)
@@ -399,8 +420,10 @@ func TestDreamService_RunNow_SavesExtractedMemories(t *testing.T) {
 	extract := func(_ context.Context, transcript string) ([]ExtractedMemory, error) {
 		transcriptSeen = transcript
 		return []ExtractedMemory{
-			{Type: "fact", Content: "uses postgres", Tags: []string{"db"}, Importance: 5},
-			{Type: "preference", Content: "prefers go over rust", Tags: []string{"lang"}, Importance: 3},
+			{Type: "fact", Content: "uses postgres", Tags: []string{"db"}, Importance: 5,
+				Evidence: dreamEvidenceForQuote(t, transcript, "uso postgres")},
+			{Type: "preference", Content: "prefers go over rust", Tags: []string{"lang"}, Importance: 3,
+				Evidence: dreamEvidenceForQuote(t, transcript, "prefiro go em vez de rust")},
 			{Type: "", Content: "   ", Importance: 1}, // should be skipped (blank content)
 		}, nil
 	}
@@ -429,8 +452,7 @@ func TestDreamService_RunNow_SavesExtractedMemories(t *testing.T) {
 		t.Fatalf("expected 2 memories saved (blank skipped), got %d", len(saved))
 	}
 
-	// Importance controls priority, while a legacy extraction without a
-	// per-memory quote retains only weak batch-level attribution.
+	// Importance controls priority, while exact user quotes establish provenance.
 	var gotFact, gotPref bool
 	for _, m := range saved {
 		switch {
@@ -439,8 +461,8 @@ func TestDreamService_RunNow_SavesExtractedMemories(t *testing.T) {
 			if m.Priority != 2 { // importance 5 → critical (2)
 				t.Errorf("importance 5 should map to priority 2, got %d", m.Priority)
 			}
-			if m.Confidence != 0.35 {
-				t.Errorf("expected weak confidence for unquoted extraction, got %v", m.Confidence)
+			if m.Confidence != 0.75 {
+				t.Errorf("expected quoted confidence, got %v", m.Confidence)
 			}
 		case strings.HasPrefix(m.Topic, "dream_preference_"):
 			gotPref = true
@@ -463,8 +485,8 @@ func TestDreamService_RunNow_SavesExtractedMemories(t *testing.T) {
 	if stats.MemoriesAdded != 2 {
 		t.Errorf("expected MemoriesAdded=2, got %d", stats.MemoriesAdded)
 	}
-	if stats.MessagesProcessed != 1 {
-		t.Errorf("expected MessagesProcessed=1, got %d", stats.MessagesProcessed)
+	if stats.MessagesProcessed != 2 {
+		t.Errorf("expected MessagesProcessed=2, got %d", stats.MessagesProcessed)
 	}
 	if stats.LastError != "" {
 		t.Errorf("expected empty LastError, got %q", stats.LastError)

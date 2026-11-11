@@ -70,8 +70,13 @@ func TestUnregisterIfOriginKeepsReplacement(t *testing.T) {
 	fileSkill.Origin = "file:/tmp/observed/SKILL.md"
 	r.Register(fileSkill)
 	replacement := newTestSkill("observed", "replacement", nil)
-	replacement.Origin = "plugin:replacement"
-	r.Register(replacement)
+	replacement.Origin = "file:/tmp/replacement/SKILL.md"
+	if err := r.TryRegister(replacement); err == nil {
+		t.Fatal("ordinary registration replaced a skill owned by another source")
+	}
+	if err := r.RegisterTrusted(replacement); err != nil {
+		t.Fatalf("RegisterTrusted replacement: %v", err)
+	}
 	if err := r.UnregisterIfOrigin("observed", fileSkill.Origin, false); err == nil {
 		t.Fatal("watcher removed a skill owned by another source")
 	}

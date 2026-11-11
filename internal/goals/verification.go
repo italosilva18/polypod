@@ -115,19 +115,18 @@ func (s *Store) VerifyAttempt(ctx context.Context, goalID, attemptID string) (Go
 		if storedPlan != *g.Verification {
 			return Goal{}, errors.New("plano de verificacao difere do registro da meta")
 		}
-		finished, err := s.verifier.FinishVerificationRun(ctx, "goal", g.ID, attempt.ID)
-		if err != nil {
-			return Goal{}, fmt.Errorf("observando efeito da tentativa: %w", err)
-		}
-		if !finished {
-			return Goal{}, errors.New("observacao da tentativa inconclusiva; revise o alvo antes de repetir")
+		if attempt.Status != AttemptReportedSuccess {
+			return Goal{}, errors.New("falha ou interrupcao deve receber revisao negativa, sem verificacao de sucesso")
 		}
 		outcome, recorded, err := s.verifier.VerifyAndRecordAt(ctx, "goal", g.ID, attempt.ID, nil, attempt.StartedAt)
 		if err != nil {
 			return Goal{}, fmt.Errorf("registrando resultado verificado: %w", err)
 		}
 		if !recorded {
-			return Goal{}, errors.New("resultado da tentativa ainda nao pode ser verificado")
+			// Older attempts that closed without a final snapshot cannot be
+			// credited from a later observation. Reject the review and start
+			// another attempt to establish a fresh evidence boundary.
+			return Goal{}, errors.New("tentativa sem prova objetiva valida no encerramento; revise como rejeitada e inicie outra tentativa")
 		}
 		now := time.Now().UTC()
 		attempt.Verification = &AttemptVerification{

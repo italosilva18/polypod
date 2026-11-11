@@ -37,10 +37,11 @@ const version = "0.6.0"
 
 // streamMsg carries a streaming chunk for Bubbletea.
 type streamMsg struct {
-	delta     string
-	done      bool
-	err       error
-	toolEvent *adapter.ToolEventInfo // non-nil when this carries a tool event
+	delta           string
+	done            bool
+	err             error
+	sessionRevision string
+	toolEvent       *adapter.ToolEventInfo // non-nil when this carries a tool event
 }
 
 // notifyMsg triggers a timed notification in the status bar.
@@ -159,6 +160,8 @@ type model struct {
 	// /recover fills the composer only after the user asks for it. It never
 	// starts a model turn or reissues a tool call by itself.
 	recoveryDraft string
+	// recoveryTurnID points to a durable model/tool boundary for /recover.
+	recoveryTurnID string
 	// An ask_user prompt temporarily owns the composer. Preserve any draft that
 	// the user was writing while the current turn streamed.
 	heldDraft      string
@@ -963,12 +966,49 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if isRetryCommand(raw) {
 				return m.retryFailedTurn()
 			}
+			if strings.TrimSpace(raw) == "/recover discard" {
+				m.history.Add("/recover discard")
+				m.history.ResetCursor()
+				m.textarea.SetValue("")
+				m.textarea.Reset()
+				message := "Descarte de recuperação indisponível."
+				role := "error"
+				if m.cmdDeps.discardRecovery != nil {
+					if output, err := m.cmdDeps.discardRecovery(); err != nil {
+						message = "Não foi possível abandonar o turno: " + err.Error()
+					} else {
+						message, role = output, "system"
+						m.recoveryDraft, m.recoveryTurnID = "", ""
+					}
+				}
+				m.messages = append(m.messages, chatEntry{role: role, content: message, timestamp: time.Now()})
+				m.updateViewport()
+				return m, m.startQueuedCmd()
+			}
 			if strings.TrimSpace(raw) == "/recover" {
 				m.history.Add("/recover")
 				m.history.ResetCursor()
+				if m.recoveryTurnID != "" {
+					resumeID := m.recoveryTurnID
+					m.recoveryTurnID = ""
+					m.textarea.SetValue("")
+					m.state = stateStreaming
+					m.streamHidden = false
+					m.activeTurn = nil
+					m.streamStart = time.Now()
+					m.streaming.Reset()
+					m.toolEvents = nil
+					if m.progressLines != nil {
+						m.progressLines.Reset()
+					}
+					m.updateViewport()
+					ch := m.launchStream("", resumeID)
+					m.streamCh = ch
+					return m, waitForStream(ch)
+				}
 				if m.recoveryDraft == "" {
 					m.textarea.SetValue("")
-					m.messages = append(m.messages, chatEntry{role: "system", content: "Nenhum turno interrompido desta sessão está marcado para recuperação.", timestamp: time.Now()})
+					m.messages = append(m.messages, chatEntry{role: "system", content: "Nenhum ponto seguro de retomada nesta sessão. Se houve ferramenta em andamento, confira seu efeito antes de enviar outro pedido.", timestamp: time.Now()})
 				} else {
 					draft := m.recoveryDraft
 					if m.heldDraftValid {
@@ -1036,12 +1076,14 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.invalidateVoiceCapture()
 					m.messages = nil
 					m.recoveryDraft = ""
+					m.recoveryTurnID = ""
 					m.resetHistoryPaging()
 				}
 				if result.replaceMessages != nil {
 					m.invalidateVoiceCapture()
 					m.messages = append([]chatEntry{}, result.replaceMessages...)
 					m.recoveryDraft = result.recoveryDraft
+					m.recoveryTurnID = result.recoveryTurnID
 					m.adoptHistoryPaging(result.resumeSessionID, result.historyBefore)
 					m.viewport.GotoBottom()
 				}
@@ -1076,6 +1118,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				timestamp: time.Now(),
 			})
 			m.recoveryDraft = ""
+			m.recoveryTurnID = ""
 			m.state = stateStreaming
 			m.streamHidden = false
 			m.activeTurn = &retryTurn{raw: raw, images: turnImages}
@@ -1088,7 +1131,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.updateViewport()
 
 			expanded := m.expandMentionsForAI(modelInput)
-			ch := m.launchStream(expanded)
+			ch := m.launchStream(expanded, "")
 			m.streamCh = ch
 			return m, waitForStream(ch)
 
@@ -1147,11 +1190,25 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.state = stateIdle
 			wasHidden := m.streamHidden
 			m.streamHidden = false
-			m.failedTurn = m.activeTurn
+			// A full-message /retry can repeat a tool whose result was lost at
+			// the process boundary. Recheck the checkpoint and use /recover.
+			m.failedTurn = nil
 			m.activeTurn = nil
+			hint := "\nReabra a sessão com /resume para verificar o checkpoint antes de tentar de novo."
+			if m.cmdDeps.recoveryState != nil {
+				notice, draft, resumeID := m.cmdDeps.recoveryState()
+				if notice != "" {
+					m.recoveryDraft, m.recoveryTurnID = draft, resumeID
+					if resumeID != "" {
+						hint = "\nO turno tem um checkpoint seguro. Use /recover para continuar do ponto salvo."
+					} else {
+						hint = "\n" + notice
+					}
+				}
+			}
 			m.messages = append(m.messages, chatEntry{
 				role:      "error",
-				content:   msg.err.Error() + retryFailureHint(msg.err),
+				content:   msg.err.Error() + hint,
 				timestamp: time.Now(),
 			})
 			if wasHidden {
@@ -1191,6 +1248,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmds...)
 		}
 		if msg.done {
+			if msg.sessionRevision != "" && m.cmdDeps.setActiveSessionRevision != nil {
+				m.cmdDeps.setActiveSessionRevision(msg.sessionRevision)
+			}
 			elapsed := time.Since(m.streamStart)
 			content := m.streaming.String()
 			m.finishDetachedTurn(tasks.StatusCompleted, content, "")
@@ -1198,6 +1258,8 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			wasHidden := m.streamHidden
 			m.streamHidden = false
 			m.activeTurn = nil
+			m.recoveryDraft = ""
+			m.recoveryTurnID = ""
 			if content != "" {
 				m.messages = append(m.messages, chatEntry{
 					role:      "assistant",
@@ -1465,11 +1527,17 @@ func (m model) startQueuedInput() (tea.Model, tea.Cmd) {
 
 // ── Stream launch ───────────────────────────────────────────────────────────
 
-func (m *model) launchStream(input string) <-chan streamMsg {
+func (m *model) launchStream(input, resumeTurnID string) <-chan streamMsg {
 	ch := make(chan streamMsg, 64)
 	metadata := map[string]string{}
 	if m.cmdDeps.activeSessionID != nil {
 		metadata["polypod_session_id"] = m.cmdDeps.activeSessionID()
+	}
+	if m.cmdDeps.activeSessionRevision != nil {
+		metadata["polypod_session_revision"] = m.cmdDeps.activeSessionRevision()
+	}
+	if resumeTurnID != "" {
+		metadata["polypod_resume_turn_id"] = resumeTurnID
 	}
 
 	go func() {
@@ -1498,7 +1566,7 @@ func (m *model) launchStream(input string) <-chan streamMsg {
 				continue
 			}
 			if chunk.Done {
-				ch <- streamMsg{done: true}
+				ch <- streamMsg{done: true, sessionRevision: chunk.SessionRevision}
 				return
 			}
 			ch <- streamMsg{delta: chunk.Delta}

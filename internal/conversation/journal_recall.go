@@ -23,10 +23,14 @@ func validJournalScope(scope JournalScope) bool {
 }
 
 func visibleJournalEntry(scope JournalScope, entry JournalEntry, branchLimits map[string]uint64) bool {
+	return visibleJournalEntryIncludingSynthetic(scope, entry, branchLimits, false)
+}
+
+func visibleJournalEntryIncludingSynthetic(scope JournalScope, entry JournalEntry, branchLimits map[string]uint64, includeSynthetic bool) bool {
 	if entry.SessionID != scope.SessionID || entry.Channel != scope.Channel {
 		return false
 	}
-	if IsSyntheticMessage(entry.Message) {
+	if !includeSynthetic && IsSyntheticMessage(entry.Message) {
 		return false
 	}
 	// Old entries did not record branches or agents. They are available only
@@ -154,8 +158,9 @@ func (s *Store) searchJournalMemory(ctx context.Context, scope JournalScope, bra
 	return result, nil
 }
 
-// ReadJournalScoped returns an original turn only if it belongs to the bound
-// conversation, branch, and agent. Unknown and out-of-scope IDs look identical.
+// ReadJournalScoped returns an exact saved turn, including a compaction summary,
+// only if it belongs to the bound conversation, branch, and agent. Search still
+// excludes synthetic entries. Unknown and out-of-scope IDs look identical.
 func (s *Store) ReadJournalScoped(ctx context.Context, scope JournalScope, messageID string) (JournalEntry, bool, error) {
 	if !validJournalScope(scope) {
 		return JournalEntry{}, false, fmt.Errorf("conversation journal: unavailable request scope")
@@ -177,18 +182,104 @@ func (s *Store) ReadJournalScoped(ctx context.Context, scope JournalScope, messa
 	}
 	if s.sqliteDB != nil {
 		entry, found, err := s.sqliteEntryByID(ctx, messageID)
-		if err != nil || !found || !visibleJournalEntry(scope, entry, branchLimits) {
+		if err != nil || !found || !visibleJournalEntryIncludingSynthetic(scope, entry, branchLimits, true) {
 			return JournalEntry{}, false, err
 		}
 		return entry, true, nil
 	}
 	for _, entry := range s.journalEntries {
 		if entry.Message.ID == messageID {
-			if !visibleJournalEntry(scope, entry, branchLimits) {
+			if !visibleJournalEntryIncludingSynthetic(scope, entry, branchLimits, true) {
 				return JournalEntry{}, false, nil
 			}
 			return entry, true, nil
 		}
 	}
 	return JournalEntry{}, false, nil
+}
+
+// CanReadJournalScoped checks the same branch and agent rule as
+// ReadJournalScoped without transferring a potentially huge message body from
+// SQLite into the prompt builder.
+func (s *Store) CanReadJournalScoped(ctx context.Context, scope JournalScope, messageID string) (bool, error) {
+	accessible, err := s.CanReadJournalScopedBatch(ctx, scope, []string{messageID})
+	return accessible[messageID], err
+}
+
+// CanReadJournalScopedBatch verifies many references with one scope snapshot.
+// SQLite rows return only metadata; message bodies are not materialized.
+func (s *Store) CanReadJournalScopedBatch(ctx context.Context, scope JournalScope, messageIDs []string) (map[string]bool, error) {
+	accessible := make(map[string]bool, len(messageIDs))
+	if !validJournalScope(scope) {
+		return nil, fmt.Errorf("conversation journal: unavailable request scope")
+	}
+	if len(messageIDs) == 0 {
+		return accessible, nil
+	}
+	if s.journalInitErr != nil {
+		return nil, s.journalInitErr
+	}
+	s.journalMu.Lock()
+	defer s.journalMu.Unlock()
+	if err := s.loadJournal(ctx); err != nil {
+		return nil, err
+	}
+	branchLimits, err := s.journalBranchLimitsLocked(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	wanted := make(map[string]bool, len(messageIDs))
+	for _, id := range messageIDs {
+		if id != "" {
+			wanted[id] = true
+		}
+	}
+	if s.sqliteDB != nil {
+		ids := make([]string, 0, len(wanted))
+		for id := range wanted {
+			ids = append(ids, id)
+		}
+		const batchSize = 300 // safely below SQLite's common variable limit
+		for start := 0; start < len(ids); start += batchSize {
+			batch := ids[start:min(start+batchSize, len(ids))]
+			placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+			query := `SELECT message_id, sequence,
+				COALESCE(json_extract(entry, '$.session_id'), ''),
+				COALESCE(json_extract(entry, '$.channel'), ''),
+				COALESCE(json_extract(entry, '$.branch_id'), ''),
+				COALESCE(json_extract(entry, '$.agent_name'), '')
+				FROM conversation_journal WHERE message_id IN (` + placeholders + `)`
+			args := make([]any, len(batch))
+			for i, id := range batch {
+				args[i] = id
+			}
+			rows, err := s.sqliteDB.QueryContext(ctx, query, args...)
+			if err != nil {
+				return nil, fmt.Errorf("checking journal references: %w", err)
+			}
+			for rows.Next() {
+				var id string
+				var sequence int64
+				var entry JournalEntry
+				if err := rows.Scan(&id, &sequence, &entry.SessionID, &entry.Channel, &entry.BranchID, &entry.AgentName); err != nil {
+					rows.Close()
+					return nil, fmt.Errorf("reading journal reference metadata: %w", err)
+				}
+				entry.Sequence = uint64(sequence)
+				accessible[id] = visibleJournalEntryIncludingSynthetic(scope, entry, branchLimits, true)
+			}
+			err = rows.Err()
+			rows.Close()
+			if err != nil {
+				return nil, fmt.Errorf("checking journal references: %w", err)
+			}
+		}
+		return accessible, nil
+	}
+	for _, entry := range s.journalEntries {
+		if wanted[entry.Message.ID] {
+			accessible[entry.Message.ID] = visibleJournalEntryIncludingSynthetic(scope, entry, branchLimits, true)
+		}
+	}
+	return accessible, nil
 }

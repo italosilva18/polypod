@@ -18,6 +18,11 @@ ai:
 data:
   dir: data/conversations
   agents_dir: agents
+  # Use the same private directory in the local CLI and owner WhatsApp service.
+  # Its owner must be able to read and write it; never point it at a general DB.
+  owner_memory_dir: ""
+  # Enable only in a profile whose old unscoped memories all came from local CLI.
+  owner_memory_import_local: false
 
 embedding:
   enabled: false

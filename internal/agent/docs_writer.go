@@ -178,6 +178,7 @@ func DocsWriterAgent() *Agent {
 			"glob",
 			"grep",
 			"search_files",
+			"history_search", "history_recall",
 		},
 	}
 }

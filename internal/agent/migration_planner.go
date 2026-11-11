@@ -120,6 +120,7 @@ func MigrationPlannerAgent() *Agent {
 			"search_files",
 			"web_search",
 			"web_fetch",
+			"history_search", "history_recall",
 		},
 		IsBuiltIn: true,
 		Aliases:   []string{"migration", "migrate"},

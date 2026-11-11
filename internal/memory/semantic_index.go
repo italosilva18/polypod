@@ -58,7 +58,7 @@ func (idx *semanticIndex) load(ctx context.Context, store Store, embedder Embedd
 	}
 	defer idx.release()
 
-	key := named.Name() + "\x00" + sessionScope(ctx)
+	key := named.Name() + "\x00" + memoryVisibilityKey(ctx)
 	generation := idx.generation.Load()
 	if snapshot, ok := idx.snapshots[key]; ok && snapshot.generation == generation &&
 		time.Since(snapshot.builtAt) < semanticIndexTTL {

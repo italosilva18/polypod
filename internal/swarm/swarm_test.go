@@ -1,6 +1,7 @@
 package swarm
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -423,6 +424,11 @@ func TestTeam_ListIdleAndRunning(t *testing.T) {
 	if err := team.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	t.Cleanup(func() {
+		if err := team.Stop(2 * time.Second); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
 	if _, err := team.AddTeammate(TeammateConfig{Name: "w1"}); err != nil {
 		t.Fatalf("AddTeammate: %v", err)
 	}
@@ -431,21 +437,65 @@ func TestTeam_ListIdleAndRunning(t *testing.T) {
 	}
 
 	idle := team.IdleTeammates()
-	if len(idle) != 2 {
-		t.Errorf("idle teammates = %d, want 2", len(idle))
+	if len(idle) != 0 {
+		t.Errorf("unstarted teammates appear idle: %v", idle)
 	}
 	if running := team.RunningTeammates(); len(running) != 0 {
 		t.Errorf("running teammates = %d, want 0 (no runners started)", len(running))
 	}
 
-	// Flip one to non-idle via the exported setter.
+	// Metadata alone cannot make an unstarted teammate available for work.
 	team.SetMemberIdle("w1", false)
-	idle = team.IdleTeammates()
-	if len(idle) != 1 {
-		t.Errorf("after SetMemberIdle(w1,false) idle = %d, want 1", len(idle))
+	if member, ok := team.GetMember("w1"); !ok || member.IsIdle {
+		t.Errorf("SetMemberIdle did not update member metadata: %+v", member)
 	}
-	if idle[0] != "w2" {
-		t.Errorf("remaining idle = %q, want w2", idle[0])
+	if idle := team.IdleTeammates(); len(idle) != 0 {
+		t.Errorf("unstarted teammates appear idle after metadata update: %v", idle)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	if err := team.StartTeammate("w1", func(ctx context.Context, _ string, _ TeammateIdentity) (string, error) {
+		close(entered)
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return "done", nil
+	}); err != nil {
+		t.Fatalf("StartTeammate(w1): %v", err)
+	}
+	if err := team.StartTeammate("w2", func(context.Context, string, TeammateIdentity) (string, error) {
+		return "done", nil
+	}); err != nil {
+		t.Fatalf("StartTeammate(w2): %v", err)
+	}
+	if idle := team.IdleTeammates(); len(idle) != 2 {
+		t.Fatalf("started idle teammates = %v, want w1 and w2", idle)
+	}
+
+	if err := team.Router().SendMessage(NewMessage(MessageTaskAssignment, TeamLeaderName, "w1", "work")); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("w1 did not start work")
+	}
+	if running := team.RunningTeammates(); len(running) != 1 || running[0] != "w1" {
+		t.Errorf("running teammates = %v, want w1", running)
+	}
+	if idle := team.IdleTeammates(); len(idle) != 1 || idle[0] != "w2" {
+		t.Errorf("idle teammates while w1 works = %v, want w2", idle)
+	}
+
+	close(release)
+	deadline := time.Now().Add(time.Second)
+	for len(team.IdleTeammates()) != 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if idle := team.IdleTeammates(); len(idle) != 2 {
+		t.Errorf("teammates after work completed = %v, want w1 and w2", idle)
 	}
 }
 

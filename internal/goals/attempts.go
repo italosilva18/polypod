@@ -117,6 +117,9 @@ func (s *Store) FinishAttempt(goalID, attemptID string, status AttemptStatus, re
 	if status == AttemptReportedSuccess && evidence == "" {
 		return Goal{}, errors.New("sucesso declarado exige evidencia para revisao")
 	}
+	if nextAction != nil && len(*nextAction) > 4096 {
+		return Goal{}, errors.New("proxima acao excede 4096 bytes")
+	}
 	next := clone(s.goals)
 	for i := range next {
 		g := &next[i]
@@ -138,10 +141,24 @@ func (s *Store) FinishAttempt(goalID, attemptID string, status AttemptStatus, re
 		attempt.FinishedAt = &now
 		attempt.Result = result
 		attempt.Evidence = evidence
-		if nextAction != nil {
-			if len(*nextAction) > 4096 {
-				return Goal{}, errors.New("proxima acao excede 4096 bytes")
+		if g.Verification != nil && status == AttemptReportedSuccess {
+			if s.verifier == nil {
+				return Goal{}, errors.New("verificador de metas indisponivel")
 			}
+			// Capture the postcondition in the same call that closes the
+			// attempt. Reviewing the result may happen later, but its evidence
+			// must describe the state observed at this boundary.
+			verifyCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			captured, verifyErr := s.verifier.FinishVerificationRun(verifyCtx, "goal", g.ID, attempt.ID)
+			cancel()
+			if verifyErr != nil {
+				return Goal{}, fmt.Errorf("capturando estado final da tentativa: %w", verifyErr)
+			}
+			if !captured {
+				return Goal{}, errors.New("estado final inconclusivo; confirme o alvo antes de encerrar a tentativa")
+			}
+		}
+		if nextAction != nil {
 			g.NextAction = strings.TrimSpace(*nextAction)
 		}
 		g.UpdatedAt = now
