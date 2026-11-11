@@ -5,7 +5,12 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"time"
 )
+
+// A desktop launcher may exit while a graphical grandchild still holds its
+// stdout/stderr pipes. Bound Cmd.Wait's pipe drain after exit or cancellation.
+const desktopCommandWaitDelay = time.Second
 
 // desktopCommandContext runs graphical Linux commands inside the logged-in
 // desktop user's session when Polypod itself is running as root. This keeps the
@@ -13,7 +18,9 @@ import (
 func desktopCommandContext(ctx context.Context, name string, args ...string) *exec.Cmd {
 	user := os.Getenv("POLYPOD_DESKTOP_USER")
 	if runtime.GOOS != "linux" || os.Geteuid() != 0 || user == "" {
-		return exec.CommandContext(ctx, name, args...)
+		cmd := exec.CommandContext(ctx, name, args...)
+		cmd.WaitDelay = desktopCommandWaitDelay
+		return cmd
 	}
 
 	resolved, err := exec.LookPath(name)
@@ -48,7 +55,9 @@ func desktopCommandContext(ctx context.Context, name string, args ...string) *ex
 	}
 	envArgs = append(envArgs, resolved)
 	envArgs = append(envArgs, args...)
-	return exec.CommandContext(ctx, "/usr/sbin/runuser", envArgs...)
+	cmd := exec.CommandContext(ctx, "/usr/sbin/runuser", envArgs...)
+	cmd.WaitDelay = desktopCommandWaitDelay
+	return cmd
 }
 
 func desktopCommand(name string, args ...string) *exec.Cmd {

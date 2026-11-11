@@ -36,7 +36,9 @@ func defaultProbes() operationalProbes {
 	manager := chatgptauth.NewManager(chatgptauth.DefaultCredentialPath())
 	return operationalProbes{credential: manager.Status, models: manager.Models, capture: computeruse.CaptureScreen,
 		command: func(ctx context.Context, name string, args ...string) ([]byte, error) {
-			return exec.CommandContext(ctx, name, args...).Output()
+			cmd := exec.CommandContext(ctx, name, args...)
+			cmd.WaitDelay = time.Second
+			return cmd.Output()
 		},
 		http: &http.Client{Timeout: 8 * time.Second}, telegramURL: "https://api.telegram.org", now: time.Now}
 }
@@ -44,8 +46,35 @@ func defaultProbes() operationalProbes {
 // RunDiagnosticsContext includes operational checks. Live mode requires network
 // and desktop access; all errors are summarized without upstream secret text.
 func RunDiagnosticsContext(ctx context.Context, cfg *config.Config, live bool) []Check {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	checks := runBasicDiagnostics(cfg)
-	return append(checks, operationalChecks(ctx, cfg, live, defaultProbes())...)
+	if !live {
+		return append(checks, operationalChecks(ctx, cfg, false, defaultProbes())...)
+	}
+	// A third-party OAuth or desktop callback may ignore context cancellation.
+	// The one-shot doctor must still return a bounded, sanitized report.
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 45*time.Second)
+		defer cancel()
+	}
+	return runLiveDiagnosticsBounded(ctx, checks, func() []Check {
+		return operationalChecks(ctx, cfg, true, defaultProbes())
+	})
+}
+
+func runLiveDiagnosticsBounded(ctx context.Context, basic []Check, run func() []Check) []Check {
+	result := make(chan []Check, 1)
+	go func() { result <- run() }()
+	select {
+	case checks := <-result:
+		return append(basic, checks...)
+	case <-ctx.Done():
+		return append(basic, Check{Name: "Diagnóstico ao vivo", Status: "warn",
+			Message: "uma sonda excedeu o prazo; confira OAuth, desktop e rede separadamente"})
+	}
 }
 
 func operationalChecks(ctx context.Context, cfg *config.Config, live bool, p operationalProbes) []Check {

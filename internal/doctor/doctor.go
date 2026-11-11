@@ -129,6 +129,7 @@ func checkCommand(name, cmd string, args ...string) Check {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	c := exec.CommandContext(ctx, cmd, args...)
+	c.WaitDelay = time.Second
 	out, err := c.CombinedOutput()
 	if err != nil {
 		return Check{Name: name, Status: "fail", Message: fmt.Sprintf("nao encontrado (%v)", err)}

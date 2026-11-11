@@ -37,6 +37,26 @@ func TestOAuthReportsActualAccessAndSanitizesFailures(t *testing.T) {
 	}
 }
 
+func TestLiveDiagnosticsBoundedWhenProbeIgnoresContext(t *testing.T) {
+	blocked := make(chan struct{})
+	defer close(blocked)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	basic := []Check{{Name: "WhatsApp nativo", Status: "ok"}}
+	checks := runLiveDiagnosticsBounded(ctx, basic, func() []Check {
+		<-blocked
+		return []Check{{Name: "late", Status: "ok"}}
+	})
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("doctor ignored deadline for %v", elapsed)
+	}
+	if len(checks) != 2 || checks[0].Name != "WhatsApp nativo" || checks[0].Status != "ok" ||
+		checks[1].Status != "warn" || checks[1].Name != "Diagnóstico ao vivo" {
+		t.Fatalf("unexpected timeout report: %+v", checks)
+	}
+}
+
 func TestTelegramLiveDoesNotConsumeUpdatesOrSendMessages(t *testing.T) {
 	paths := []string{}
 	p := operationalProbes{telegramURL: "https://telegram.invalid", http: &http.Client{Transport: probeTransport(func(req *http.Request) (*http.Response, error) {
