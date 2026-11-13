@@ -59,6 +59,36 @@ func (p *ChatGPT) chatStream(
 	callback StreamCallback,
 	itemReady func(index int64, call *ToolCall),
 ) (*ChatResponse, error) {
+	emitted := false
+	wrappedCallback := callback
+	if callback != nil {
+		wrappedCallback = func(d StreamDelta) {
+			if d.Content != "" || len(d.ToolCalls) > 0 || d.Done {
+				emitted = true
+			}
+			callback(d)
+		}
+	}
+	resp, err := p.chatStreamOnce(ctx, req, wrappedCallback, func(idx int64, call *ToolCall) {
+		emitted = true
+		if itemReady != nil {
+			itemReady(idx, call)
+		}
+	})
+	if err != nil && !emitted && p.tokenSource != nil && IsRateLimitError(err) {
+		if _, rotated := tryRotateAccount("chatgpt"); rotated {
+			return p.chatStreamOnce(ctx, req, callback, itemReady)
+		}
+	}
+	return resp, err
+}
+
+func (p *ChatGPT) chatStreamOnce(
+	ctx context.Context,
+	req ChatRequest,
+	callback StreamCallback,
+	itemReady func(index int64, call *ToolCall),
+) (*ChatResponse, error) {
 	client, params, err := p.request(ctx, req)
 	if err != nil {
 		return nil, err

@@ -13,6 +13,8 @@ import (
 // Anthropic provides native access to Claude models via the official SDK.
 type Anthropic struct {
 	client        anthropic.Client
+	tokenSource   TokenSource
+	baseURL       string
 	enableCaching bool
 	thinkingMode  string // "", "enabled", "adaptive"
 	thinkBudget   int
@@ -29,8 +31,33 @@ func NewAnthropic(apiKey, baseURL string) *Anthropic {
 
 	return &Anthropic{
 		client:        anthropic.NewClient(opts...),
+		baseURL:       baseURL,
 		enableCaching: true,
 	}
+}
+
+// NewAnthropicWithTokenSource creates an Anthropic provider authenticated with OAuth Bearer tokens.
+func NewAnthropicWithTokenSource(tokenSource TokenSource, baseURL string) *Anthropic {
+	return &Anthropic{
+		tokenSource:   tokenSource,
+		baseURL:       baseURL,
+		enableCaching: true,
+	}
+}
+
+func (a *Anthropic) activeClient(ctx context.Context) (anthropic.Client, error) {
+	if a.tokenSource == nil {
+		return a.client, nil
+	}
+	token, err := a.tokenSource(ctx)
+	if err != nil {
+		return anthropic.Client{}, fmt.Errorf("anthropic oauth: %w", err)
+	}
+	opts := []option.RequestOption{option.WithAuthToken(token)}
+	if a.baseURL != "" {
+		opts = append(opts, option.WithBaseURL(a.baseURL))
+	}
+	return anthropic.NewClient(opts...), nil
 }
 
 func (a *Anthropic) Name() string                   { return "anthropic" }
@@ -46,19 +73,33 @@ func (a *Anthropic) SetThinking(mode string, budget int) {
 
 func (a *Anthropic) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
 	params := a.buildParams(req)
-
-	msg, err := a.client.Messages.New(ctx, params)
-	if err != nil {
+	for attempt := 0; attempt < 2; attempt++ {
+		client, err := a.activeClient(ctx)
+		if err != nil {
+			return nil, err
+		}
+		msg, err := client.Messages.New(ctx, params)
+		if err == nil {
+			return a.parseResponse(msg), nil
+		}
+		if attempt == 0 && a.tokenSource != nil && IsRateLimitError(err) {
+			if _, rotated := tryRotateAccount("anthropic"); rotated {
+				continue
+			}
+		}
 		return nil, fmt.Errorf("anthropic: %w", err)
 	}
-
-	return a.parseResponse(msg), nil
+	return nil, fmt.Errorf("anthropic: falha inesperada")
 }
 
 func (a *Anthropic) ChatStream(ctx context.Context, req ChatRequest, callback StreamCallback) (*ChatResponse, error) {
+	client, err := a.activeClient(ctx)
+	if err != nil {
+		return nil, err
+	}
 	params := a.buildParams(req)
 
-	stream := a.client.Messages.NewStreaming(ctx, params)
+	stream := client.Messages.NewStreaming(ctx, params)
 	msg := anthropic.Message{}
 
 	for stream.Next() {
@@ -172,12 +213,23 @@ func (a *Anthropic) buildParams(req ChatRequest) anthropic.MessageNewParams {
 		params.Tools = append(params.Tools, anthropic.ToolUnionParam{OfTool: &tool})
 	}
 
-	// Extended thinking
-	switch a.thinkingMode {
+	// Extended thinking (per-request budget overrides static provider default)
+	mode := a.thinkingMode
+	budget := int64(a.thinkBudget)
+	if req.ThinkingBudget >= 1024 && mode == "" {
+		mLower := strings.ToLower(req.Model)
+		if strings.Contains(mLower, "claude-3-7") || strings.Contains(mLower, "claude-4") || strings.Contains(mLower, "sonnet-4") || strings.Contains(mLower, "opus-4") {
+			mode = "enabled"
+			budget = int64(req.ThinkingBudget)
+		}
+	}
+	switch mode {
 	case "enabled":
-		budget := int64(a.thinkBudget)
 		if budget == 0 {
 			budget = 4096
+		}
+		if params.MaxTokens <= budget {
+			params.MaxTokens = budget + 4096
 		}
 		params.Thinking = anthropic.ThinkingConfigParamUnion{
 			OfEnabled: &anthropic.ThinkingConfigEnabledParam{BudgetTokens: budget},

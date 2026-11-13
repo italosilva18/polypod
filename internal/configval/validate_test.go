@@ -28,6 +28,7 @@ func TestValidateEmptyAPIKey(t *testing.T) {
 }
 
 func TestValidateNVIDIAMissingKeyShowsCorrectSetup(t *testing.T) {
+	t.Setenv("NVIDIA_API_KEY", "")
 	cfg := config.DefaultConfig()
 	cfg.AI.Provider = "nvidia"
 	cfg.AI.BaseURL = "https://integrate.api.nvidia.com/v1"
@@ -42,6 +43,19 @@ func TestValidateNVIDIAMissingKeyShowsCorrectSetup(t *testing.T) {
 		}
 	}
 	t.Fatal("missing NVIDIA API key did not produce a configuration error")
+}
+
+func TestValidateNVIDIAUsesEnvironmentKey(t *testing.T) {
+	t.Setenv("NVIDIA_API_KEY", "synthetic-key")
+	cfg := config.DefaultConfig()
+	cfg.AI.Provider = "nvidia"
+	cfg.AI.BaseURL = "https://integrate.api.nvidia.com/v1"
+	cfg.AI.APIKey = ""
+	for _, problem := range Validate(cfg) {
+		if problem.Field == "ai.api_key" {
+			t.Fatalf("chave do ambiente foi ignorada: %+v", problem)
+		}
+	}
 }
 
 func TestValidateGoodConfig(t *testing.T) {
@@ -67,6 +81,18 @@ func TestValidateChatGPTDoesNotRequireAPIKey(t *testing.T) {
 	for _, err := range Validate(cfg) {
 		if err.Field == "ai.api_key" {
 			t.Fatalf("ChatGPT OAuth nao deve exigir API key: %s", err)
+		}
+	}
+}
+
+func TestValidateOllamaDoesNotRequireAPIKey(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.AI.Provider = "ollama"
+	cfg.AI.APIKey = ""
+	cfg.AI.BaseURL = "http://127.0.0.1:11434"
+	for _, problem := range Validate(cfg) {
+		if problem.Field == "ai.api_key" {
+			t.Fatalf("Ollama local nao deve exigir API key: %s", problem)
 		}
 	}
 }

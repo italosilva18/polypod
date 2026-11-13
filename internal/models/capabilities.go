@@ -243,6 +243,80 @@ var allModels = []*ModelCapabilities{
 		Speed: "medium", Quality: "high",
 		RecommendedFor: []string{"coding", "analysis"},
 	},
+
+	// ── Qwen (Alibaba DashScope / Qwen Code 2026) ───────────────────────
+	{
+		ID: "qwen3-coder-plus", Provider: "qwen",
+		DisplayName:      "Qwen3 Coder Plus (1M)",
+		MaxContextTokens: 1_000_000, MaxOutputTokens: 65_536,
+		SupportsVision: false, SupportsTools: true, SupportsStreaming: true,
+		SupportsThinking: true, SupportsCaching: true, SupportsJSON: true,
+		InputPricePer1M: 0.35, OutputPricePer1M: 1.40, CachePricePer1M: 0.07,
+		Speed: "fast", Quality: "frontier",
+		RecommendedFor: []string{"coding", "analysis"},
+	},
+	{
+		ID: "qwen3.7-plus", Provider: "qwen",
+		DisplayName:      "Qwen 3.7 Plus (1M)",
+		MaxContextTokens: 1_000_000, MaxOutputTokens: 65_536,
+		SupportsVision: true, SupportsTools: true, SupportsStreaming: true,
+		SupportsThinking: true, SupportsCaching: true, SupportsJSON: true,
+		InputPricePer1M: 0.40, OutputPricePer1M: 1.20, CachePricePer1M: 0.08,
+		Speed: "fast", Quality: "frontier",
+		RecommendedFor: []string{"coding", "analysis"},
+	},
+	{
+		ID: "qwen3-vl-plus", Provider: "qwen",
+		DisplayName:      "Qwen3 VL Plus (Vision)",
+		MaxContextTokens: 262_144, MaxOutputTokens: 32_768,
+		SupportsVision: true, SupportsTools: true, SupportsStreaming: true,
+		SupportsThinking: true, SupportsCaching: false, SupportsJSON: true,
+		InputPricePer1M: 0.28, OutputPricePer1M: 0.84, CachePricePer1M: 0,
+		Speed: "fast", Quality: "high",
+		RecommendedFor: []string{"analysis", "coding"},
+	},
+
+	// ── Frontier 2026 Additions (ChatGPT / Anthropic / Google / NVIDIA) ─
+	{
+		ID: "gpt-6.1-sol", Provider: "chatgpt",
+		DisplayName:      "GPT-6.1 Sol",
+		MaxContextTokens: 400_000, MaxOutputTokens: 65_536,
+		SupportsVision: true, SupportsTools: true, SupportsStreaming: true,
+		SupportsThinking: true, SupportsCaching: true, SupportsJSON: true,
+		InputPricePer1M: 2.00, OutputPricePer1M: 8.00, CachePricePer1M: 0.50,
+		Speed: "medium", Quality: "frontier",
+		RecommendedFor: []string{"coding", "analysis"},
+	},
+	{
+		ID: "claude-opus-4-6", Provider: "anthropic",
+		DisplayName:      "Claude Opus 4.6",
+		MaxContextTokens: 1_000_000, MaxOutputTokens: 32_768,
+		SupportsVision: true, SupportsTools: true, SupportsStreaming: true,
+		SupportsThinking: true, SupportsCaching: true, SupportsJSON: true,
+		InputPricePer1M: 15.00, OutputPricePer1M: 75.00, CachePricePer1M: 1.50,
+		Speed: "slow", Quality: "frontier",
+		RecommendedFor: []string{"analysis", "coding"},
+	},
+	{
+		ID: "claude-sonnet-4-6", Provider: "anthropic",
+		DisplayName:      "Claude Sonnet 4.6",
+		MaxContextTokens: 1_000_000, MaxOutputTokens: 32_768,
+		SupportsVision: true, SupportsTools: true, SupportsStreaming: true,
+		SupportsThinking: true, SupportsCaching: true, SupportsJSON: true,
+		InputPricePer1M: 3.00, OutputPricePer1M: 15.00, CachePricePer1M: 0.30,
+		Speed: "medium", Quality: "frontier",
+		RecommendedFor: []string{"coding", "analysis"},
+	},
+	{
+		ID: "gemini-3-pro", Provider: "google",
+		DisplayName:      "Gemini 3 Pro",
+		MaxContextTokens: 1_048_576, MaxOutputTokens: 65_536,
+		SupportsVision: true, SupportsTools: true, SupportsStreaming: true,
+		SupportsThinking: true, SupportsCaching: true, SupportsJSON: true,
+		InputPricePer1M: 1.25, OutputPricePer1M: 10.00, CachePricePer1M: 0.31,
+		Speed: "medium", Quality: "frontier",
+		RecommendedFor: []string{"coding", "analysis"},
+	},
 }
 
 // modelIndex is built once for O(1) lookups by ID.
@@ -255,10 +329,37 @@ func init() {
 	}
 }
 
-// GetCapabilities returns the capabilities for a model by ID.
-// Returns nil if the model is not found.
+// GetCapabilities returns the capabilities for a model by ID (consulting
+// dynamically synced models.dev entries first, then built-in capabilities,
+// including "provider/model" suffixes). Returns nil if the model is not found.
 func GetCapabilities(modelID string) *ModelCapabilities {
-	return modelIndex[strings.ToLower(modelID)]
+	key := strings.ToLower(strings.TrimSpace(modelID))
+	if key == "" {
+		return nil
+	}
+
+	catalogMu.RLock()
+	if dyn, ok := dynamicModels[key]; ok {
+		catalogMu.RUnlock()
+		return dyn
+	}
+	if _, tail, hasSlash := strings.Cut(key, "/"); hasSlash && tail != "" {
+		if dyn, ok := dynamicModels[tail]; ok {
+			catalogMu.RUnlock()
+			return dyn
+		}
+	}
+	catalogMu.RUnlock()
+
+	if c, ok := modelIndex[key]; ok {
+		return c
+	}
+	if _, tail, hasSlash := strings.Cut(key, "/"); hasSlash && tail != "" {
+		if c, ok := modelIndex[tail]; ok {
+			return c
+		}
+	}
+	return nil
 }
 
 // ListModels returns all models for a given provider, sorted alphabetically by ID.
@@ -268,22 +369,32 @@ func ListModels(provider string) []*ModelCapabilities {
 		return ListAllModels()
 	}
 	p := strings.ToLower(provider)
+	all := ListAllModels()
 	var result []*ModelCapabilities
-	for _, m := range allModels {
+	for _, m := range all {
 		if strings.ToLower(m.Provider) == p {
 			result = append(result, m)
 		}
 	}
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].ID < result[j].ID
-	})
 	return result
 }
 
-// ListAllModels returns a copy of all models sorted by provider then ID.
+// ListAllModels returns a copy of all built-in + unique dynamic models sorted by provider then ID.
 func ListAllModels() []*ModelCapabilities {
-	result := make([]*ModelCapabilities, len(allModels))
-	copy(result, allModels)
+	seen := make(map[string]*ModelCapabilities, len(allModels)+16)
+	for _, m := range allModels {
+		seen[strings.ToLower(m.Provider)+"::"+strings.ToLower(m.ID)] = m
+	}
+	catalogMu.RLock()
+	for _, m := range dynamicModels {
+		seen[strings.ToLower(m.Provider)+"::"+strings.ToLower(m.ID)] = m
+	}
+	catalogMu.RUnlock()
+
+	result := make([]*ModelCapabilities, 0, len(seen))
+	for _, m := range seen {
+		result = append(result, m)
+	}
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].Provider != result[j].Provider {
 			return result[i].Provider < result[j].Provider

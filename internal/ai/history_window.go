@@ -7,19 +7,25 @@ import (
 )
 
 const (
-	maxHistoryWindowTokens = 24_000
-	minHistoryWindowTokens = 4_000
+	maxHistoryWindowTokens   = 24_000
+	maxHistoryWindowTokens1M = 120_000
+	minHistoryWindowTokens   = 4_000
 )
 
 // historyWindowBudget triggers a persisted summary before the conversation
-// occupies too much of a model prompt. If summarization fails, the original
-// history is retained; an unsummarized turn must never be silently dropped.
+// occupies too much of a model prompt. Models with >=500K token context windows
+// (such as qwen3-coder-plus, qwen3.7-plus, gemini-2.5-pro, gpt-4.1) receive a
+// scaled 120K history window so long coding sessions are not compacted early.
 func historyWindowBudget(model string) int {
 	limits := contextwindow.WellKnownLimits(model)
 	usable := limits.MaxContextTokens - limits.ReservedForOutput
 	budget := usable / 3
-	if budget > maxHistoryWindowTokens {
-		budget = maxHistoryWindowTokens
+	capTokens := maxHistoryWindowTokens
+	if limits.MaxContextTokens >= 500_000 {
+		capTokens = maxHistoryWindowTokens1M
+	}
+	if budget > capTokens {
+		budget = capTokens
 	}
 	if budget < minHistoryWindowTokens {
 		budget = minHistoryWindowTokens

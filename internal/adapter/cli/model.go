@@ -14,11 +14,15 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/costa/polypod/internal/accountauth"
 	"github.com/costa/polypod/internal/adapter"
+	"github.com/costa/polypod/internal/ai"
 	"github.com/costa/polypod/internal/inputprocessing"
 	"github.com/costa/polypod/internal/mentions"
 	"github.com/costa/polypod/internal/messages"
 	"github.com/costa/polypod/internal/permissions"
+	"github.com/costa/polypod/internal/projectchecks"
+	"github.com/costa/polypod/internal/session"
 	"github.com/costa/polypod/internal/sliceansi"
 	"github.com/costa/polypod/internal/taskqueue"
 	"github.com/costa/polypod/internal/tasks"
@@ -40,8 +44,10 @@ type streamMsg struct {
 	delta           string
 	done            bool
 	err             error
+	eventSequence   uint64
 	sessionRevision string
 	toolEvent       *adapter.ToolEventInfo // non-nil when this carries a tool event
+	usage           *adapter.Usage
 }
 
 // notifyMsg triggers a timed notification in the status bar.
@@ -55,6 +61,18 @@ type clearNotifyMsg struct{ text string }
 
 // queuedInputMsg starts the next user submission after a stream completes.
 type queuedInputMsg struct{}
+
+type semanticResultMsg struct {
+	query  string
+	result string
+	err    error
+}
+
+type verifyResultMsg struct {
+	result string
+	err    error
+	failed bool
+}
 
 // streamRedrawMsg groups frequent token deltas into one viewport render.
 // Tool events, questions, errors and turn completion still render immediately.
@@ -131,6 +149,7 @@ type model struct {
 	streamCh               <-chan streamMsg
 	state                  state
 	queued                 []queuedInput
+	steerCh                chan string
 	voiceRecording         bool
 	voiceStopping          bool
 	voicePartialText       string
@@ -168,12 +187,15 @@ type model struct {
 	heldImages     []string
 	heldDraftValid bool
 
-	streamHandler adapter.StreamHandler
-	cmdDeps       commandDeps
-	ctx           context.Context
-	taskEvents    <-chan tasks.TaskEvent
-	taskRegistry  *tasks.TaskRegistry
-	taskQueue     *taskqueue.Queue
+	streamHandler     adapter.StreamHandler
+	cmdDeps           commandDeps
+	ctx               context.Context
+	turnCancel        context.CancelFunc
+	eventJournal      *session.EventJournal
+	lastEventSequence uint64
+	taskEvents        <-chan tasks.TaskEvent
+	taskRegistry      *tasks.TaskRegistry
+	taskQueue         *taskqueue.Queue
 
 	width  int
 	height int
@@ -187,9 +209,13 @@ type model struct {
 	notifyLevel  string
 
 	// Tab completion
-	tabIndex   int
-	tabPrefix  string
-	tabMatches []string
+	tabIndex              int
+	tabPrefix             string
+	tabMatches            []string
+	paletteSelection      int
+	paletteDismissedInput string
+	paletteDraft          string
+	paletteDraftValid     bool
 
 	// Ask-user question/answer flow
 	userPromptHandler    *tool.UserPromptHandler
@@ -283,7 +309,12 @@ type model struct {
 	// picker overlay. While set, it owns the keyboard. When the user
 	// confirms a selection, the deps.setModel callback is invoked to
 	// swap the AI client's model in place.
-	modelPicker *modelPickerModel
+	modelPicker      *modelPickerModel
+	diffViewer       *diffViewer
+	sideAnswer       string
+	sideScroll       int
+	catalogModels    []ModelInfo
+	catalogCheckedAt time.Time
 
 	// toolRenderers maps tool names to custom rendering functions.
 	// Populated with DefaultRenderers() at construction time.
@@ -374,6 +405,9 @@ func newModel(ctx context.Context, streamHandler adapter.StreamHandler, deps com
 	}
 	if deps.currentModel != nil {
 		initState.Model = deps.currentModel()
+	}
+	if deps.currentProvider != nil {
+		initState.Provider = deps.currentProvider()
 	}
 	if deps.sessionInfo != nil {
 		if id, _, err := deps.sessionInfo(); err == nil {
@@ -477,7 +511,11 @@ var slashCommands = []string{
 	"/agents", "/agent switch ",
 	"/skills",
 	"/memory list", "/memory search ",
-	"/model", "/session", "/sessions", "/sessions search ",
+	"/model", "/model --vision", "/model --vision auto", "/provider", "/session", "/sessions", "/sessions search ",
+	"/waterfall", "/questions", "/answer ", "/architect ", "/bestof ",
+	"/connect", "/auth", "/auth status", "/auth accounts ", "/auth use ", "/auth logout ",
+	"/editor", "/btw ", "/queue ",
+	"/index", "/index on", "/index off", "/semantic ", "/verify",
 	"/copy", "/voice", "/voice ", "/run ", "/file ", "/search ",
 	"/git status", "/git log", "/git diff", "/git branch",
 	"/project", "/export ", "/context", "/cost",
@@ -642,11 +680,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if !isKey && !isWindowSize {
 		return m.update(msg)
 	}
-	modalWasOpen := m.currentApproval != nil || m.configForm != nil || m.historySearch != nil ||
-		m.quickOpen != nil || m.modelPicker != nil
+	previousPaletteHeight := m.slashPaletteHeight()
+	previousInput := m.textarea.Value()
+	modalWasOpen := m.currentApproval != nil || m.configForm != nil || m.historySearch != nil || m.sideAnswer != "" ||
+		m.quickOpen != nil || m.modelPicker != nil || m.diffViewer != nil
 	preExpanded := m.ready && isKey &&
 		m.currentApproval == nil && m.configForm == nil && m.historySearch == nil &&
-		m.quickOpen == nil && m.modelPicker == nil &&
+		m.quickOpen == nil && m.modelPicker == nil && m.diffViewer == nil && m.sideAnswer == "" &&
 		(m.state == stateIdle || m.state == stateStreaming || m.waitingForUserAnswer)
 	if preExpanded {
 		// Give the textarea room before it handles the key. Otherwise its
@@ -659,8 +699,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if !ok {
 		return next, cmd
 	}
+	if previousInput != updated.textarea.Value() {
+		updated.paletteSelection = 0
+		updated.paletteDismissedInput = ""
+	}
 	if preExpanded || isWindowSize {
 		updated.resizeComposer()
+	}
+	if previousPaletteHeight != updated.slashPaletteHeight() {
+		updated.updateViewport()
 	}
 	if modalWasOpen {
 		return updated, tea.Batch(cmd, updated.startQueuedCmd())
@@ -675,6 +722,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = max(1, msg.Width)
 		m.height = max(1, msg.Height)
+		if m.diffViewer != nil {
+			m.diffViewer.width, m.diffViewer.height = m.width, m.height
+		}
 		m.textarea.SetWidth(max(1, m.width-4))
 
 		viewportHeight := m.viewportHeight()
@@ -714,7 +764,114 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, cmd
 
+	case connectResultMsg:
+		provLabel := accountauth.ProviderDisplayLabel(msg.provider)
+		if provLabel == "" {
+			provLabel = "ChatGPT"
+		}
+		if msg.err != nil {
+			m.notification = "falha ao conectar " + provLabel + ": " + msg.err.Error()
+			m.notifyLevel = "error"
+		} else {
+			m.notification = provLabel + " conectado. Use /model para escolher um modelo ou /auth para gerenciar contas."
+			m.notifyLevel = "success"
+		}
+		m.updateViewport()
+		return m, nil
+
+	case editorResultMsg:
+		if msg.err != nil {
+			m.notification = "editor: " + msg.err.Error()
+			m.notifyLevel = "error"
+		} else {
+			m.textarea.SetValue(msg.content)
+			m.textarea.CursorEnd()
+			m.notification = "rascunho atualizado pelo editor"
+			m.notifyLevel = "success"
+		}
+		m.updateViewport()
+		return m, nil
+
+	case sideResultMsg:
+		if msg.err != nil {
+			m.sideAnswer = "Erro: " + msg.err.Error()
+		} else {
+			m.sideAnswer = strings.TrimSpace(msg.answer)
+			if m.sideAnswer == "" {
+				m.sideAnswer = "Nenhuma resposta recebida."
+			}
+		}
+		m.sideScroll = 0
+		return m, nil
+
+	case modelCatalogMsg:
+		m.catalogCheckedAt = time.Now()
+		if m.modelPicker == msg.picker {
+			m.modelPicker.catalogLoading = false
+			m.modelPicker.catalogOffline = msg.err != nil
+		}
+		if msg.err == nil {
+			m.catalogModels = msg.models
+			if m.modelPicker == msg.picker {
+				m.modelPicker.mergeCatalog(msg.models)
+			}
+		}
+		return m, nil
+
+	case semanticResultMsg:
+		role := "system"
+		content := "Busca semântica por: " + msg.query + "\n\n" + msg.result
+		if msg.err != nil {
+			role = "error"
+			content = "Busca semântica: " + msg.err.Error()
+		}
+		m.messages = append(m.messages, chatEntry{role: role, content: content, timestamp: time.Now()})
+		m.notification = ""
+		m.updateViewport()
+		return m, nil
+
+	case verifyResultMsg:
+		role := "system"
+		content := msg.result
+		if msg.failed {
+			role = "error"
+		}
+		if msg.err != nil {
+			role = "error"
+			content = "Verificação: " + msg.err.Error()
+		}
+		if content == "" {
+			content = "Nenhum verificador configurado. Use /init-verifiers."
+		}
+		m.messages = append(m.messages, chatEntry{role: role, content: content, timestamp: time.Now()})
+		m.notification = ""
+		m.updateViewport()
+		return m, nil
+
 	case tea.KeyMsg:
+		if m.diffViewer != nil {
+			if msg.Type == tea.KeyCtrlC {
+				return m, tea.Quit
+			}
+			if m.diffViewer.key(msg) {
+				m.diffViewer = nil
+				m.updateViewport()
+			}
+			return m, nil
+		}
+		if m.sideAnswer != "" {
+			if msg.Type == tea.KeyCtrlC {
+				return m, tea.Quit
+			}
+			if msg.Type == tea.KeyEsc || msg.Type == tea.KeyEnter {
+				m.sideAnswer = ""
+			} else if msg.Type == tea.KeyDown || msg.Type == tea.KeyPgDown {
+				m.sideScroll += 1
+			} else if msg.Type == tea.KeyUp || msg.Type == tea.KeyPgUp {
+				m.sideScroll = max(0, m.sideScroll-1)
+			}
+			return m, nil
+		}
 		// When a modal approval is active, the modal owns the keyboard.
 		// Only Ctrl+C can escape (quits the program).
 		if m.currentApproval != nil {
@@ -828,19 +985,41 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.openQuickOpen()
 			return m, nil
 
+		case msg.Type == tea.KeyCtrlK && m.state == stateIdle:
+			if !m.paletteDraftValid {
+				m.paletteDraft = m.textarea.Value()
+				m.paletteDraftValid = true
+			}
+			m.textarea.SetValue("/")
+			m.textarea.CursorEnd()
+			m.paletteSelection = 0
+			m.paletteDismissedInput = ""
+			m.updateViewport()
+			return m, nil
+
+		case msg.Type == tea.KeyCtrlE && m.state == stateIdle:
+			cmd := m.openPromptEditor()
+			return m, cmd
+
 		case msg.Type == tea.KeyCtrlY && m.state == stateIdle:
 			// Open the model picker overlay. The /model slash command
 			// can also reach this code path via the openModelPicker
 			// flag on commandResult.
-			m.openModelPicker()
-			return m, nil
+			cmd := m.openModelPicker()
+			return m, cmd
 
 		case msg.Type == tea.KeyTab && (m.state == stateIdle || m.state == stateStreaming):
+			if handled, cmd := m.acceptSlashPalette(false); handled {
+				return m, cmd
+			}
 			if m.tryTabComplete() {
 				return m, nil
 			}
 
 		case msg.Type == tea.KeyUp && m.state == stateIdle:
+			if m.moveSlashPalette(-1) {
+				return m, nil
+			}
 			m.resetTab()
 			if prev, ok := m.history.Previous(); ok {
 				m.textarea.SetValue(prev)
@@ -849,6 +1028,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case msg.Type == tea.KeyDown && m.state == stateIdle:
+			if m.moveSlashPalette(1) {
+				return m, nil
+			}
 			m.resetTab()
 			if next, ok := m.history.Next(); ok {
 				m.textarea.SetValue(next)
@@ -862,7 +1044,24 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.updateViewport()
 			return m, nil
 
+		case msg.Type == tea.KeyEsc && m.state == stateStreaming && !m.waitingForUserAnswer && !m.parallelDetached && m.textarea.Value() == "":
+			m.cancelActiveStream()
+			m.notification = "Cancelando turno ativo..."
+			m.notifyLevel = "warn"
+			m.updateViewport()
+			return m, clearNotifyAfter(4*time.Second, m.notification)
+
 		case msg.Type == tea.KeyEsc && m.state == stateIdle:
+			if m.slashPaletteHeight() > 0 {
+				if m.paletteDraftValid {
+					m.restorePaletteDraft()
+					m.updateViewport()
+					return m, nil
+				}
+				m.paletteDismissedInput = m.textarea.Value()
+				m.updateViewport()
+				return m, nil
+			}
 			m.textarea.SetValue("")
 			m.textarea.Reset()
 			m.resetTab()
@@ -932,6 +1131,25 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.updateViewport()
 				return m, clearNotifyAfter(6*time.Second, m.notification)
 			}
+			if !strings.HasPrefix(raw, "/") && !strings.HasPrefix(raw, "!") && m.steerCh != nil {
+				select {
+				case m.steerCh <- raw:
+					m.messages = append(m.messages, chatEntry{role: "user", content: raw, timestamp: time.Now()})
+					m.textarea.SetValue("")
+					m.textarea.Reset()
+					m.notification = "Orientação recebida; será aplicada na próxima etapa do modelo."
+					m.notifyLevel = "info"
+					m.updateViewport()
+					return m, clearNotifyAfter(6*time.Second, m.notification)
+				default:
+				}
+			}
+			if strings.HasPrefix(raw, "/queue ") {
+				raw = strings.TrimSpace(strings.TrimPrefix(raw, "/queue "))
+				if raw == "" {
+					return m, nil
+				}
+			}
 			m.queued = append(m.queued, queuedInput{
 				raw: raw, images: append([]string(nil), m.pastedImages...),
 			})
@@ -944,6 +1162,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, clearNotifyAfter(6*time.Second, m.notification)
 
 		case msg.Type == tea.KeyEnter && !msg.Alt && m.state == stateIdle:
+			if handled, cmd := m.acceptSlashPalette(true); handled {
+				return m, cmd
+			}
 			m.resetTab()
 			raw := m.textarea.Value()
 
@@ -1064,6 +1285,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			if result.handled {
+				m.restorePaletteDraft()
 				if result.voiceStart && m.voiceRecording {
 					m.messages = append(m.messages, chatEntry{role: "system", content: "Uma gravação já está em andamento.", timestamp: time.Now()})
 					m.updateViewport()
@@ -1098,7 +1320,50 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.openConfigForm()
 				}
 				if result.openModelPicker {
-					m.openModelPicker()
+					cmd := m.openModelPicker()
+					return m, cmd
+				}
+				if result.openConnectPicker {
+					m.openConnectPicker()
+				}
+				if result.openEditor {
+					cmd := m.openPromptEditor()
+					return m, cmd
+				}
+				if result.openDiff {
+					m.diffViewer = newDiffViewer(commandWorkingDir(m.cmdDeps), m.cmdDeps.turnDiff)
+					return m, nil
+				}
+				if result.sideQuestion != "" {
+					cmd := m.askSideQuestion(result.sideQuestion)
+					return m, cmd
+				}
+				if result.semanticQuery != "" {
+					query := result.semanticQuery
+					search := m.cmdDeps.semanticSearch
+					searchCtx := m.ctx
+					m.notification = "Buscando trechos de código por significado..."
+					m.notifyLevel = "info"
+					m.updateViewport()
+					return m, func() tea.Msg {
+						result, err := search(searchCtx, query)
+						return semanticResultMsg{query: query, result: result, err: err}
+					}
+				}
+				if result.verifyRequest {
+					root := commandWorkingDir(m.cmdDeps)
+					checkCtx := m.ctx
+					m.notification = "Executando verificadores do projeto..."
+					m.notifyLevel = "info"
+					m.updateViewport()
+					return m, func() tea.Msg {
+						results, err := projectchecks.Run(checkCtx, root, "manual")
+						failed := false
+						for _, result := range results {
+							failed = failed || result.Err != nil
+						}
+						return verifyResultMsg{result: projectchecks.FormatResults(results), err: err, failed: failed}
+					}
 				}
 				if result.voiceStart {
 					duration := time.Duration(result.voiceSeconds) * time.Second
@@ -1133,6 +1398,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			expanded := m.expandMentionsForAI(modelInput)
 			ch := m.launchStream(expanded, "")
 			m.streamCh = ch
+			m.restorePaletteDraft()
 			return m, waitForStream(ch)
 
 		default:
@@ -1185,8 +1451,16 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForVoicePartial(m.voicePartials, m.voiceGeneration)
 
 	case streamMsg:
+		if msg.eventSequence > m.lastEventSequence {
+			m.lastEventSequence = msg.eventSequence
+		}
 		if msg.err != nil {
-			m.finishDetachedTurn(tasks.StatusFailed, m.streaming.String(), msg.err.Error())
+			if m.turnCancel != nil {
+				m.turnCancel()
+				m.turnCancel = nil
+			}
+			m.drainPendingSteering()
+			m.finishDetachedTurn(tasks.StatusFailed, m.streaming.String(), msg.err.Error(), msg.usage)
 			m.state = stateIdle
 			wasHidden := m.streamHidden
 			m.streamHidden = false
@@ -1248,12 +1522,17 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmds...)
 		}
 		if msg.done {
+			if m.turnCancel != nil {
+				m.turnCancel()
+				m.turnCancel = nil
+			}
+			m.drainPendingSteering()
 			if msg.sessionRevision != "" && m.cmdDeps.setActiveSessionRevision != nil {
 				m.cmdDeps.setActiveSessionRevision(msg.sessionRevision)
 			}
 			elapsed := time.Since(m.streamStart)
 			content := m.streaming.String()
-			m.finishDetachedTurn(tasks.StatusCompleted, content, "")
+			m.finishDetachedTurn(tasks.StatusCompleted, content, "", msg.usage)
 			m.state = stateIdle
 			wasHidden := m.streamHidden
 			m.streamHidden = false
@@ -1477,6 +1756,25 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
+// drainPendingSteering preserves guidance received after the final model
+// boundary, or immediately before an error, as ordinary queued prompts.
+func (m *model) drainPendingSteering() {
+	if m.steerCh == nil {
+		return
+	}
+	var pending []queuedInput
+	for {
+		select {
+		case guidance := <-m.steerCh:
+			pending = append(pending, queuedInput{raw: guidance})
+		default:
+			m.queued = append(pending, m.queued...)
+			m.steerCh = nil
+			return
+		}
+	}
+}
+
 // startQueuedCmd schedules a queued submission when the current turn is idle.
 // It leaves the actual submission to Update so the usual command and stream
 // handling stays in one place.
@@ -1527,11 +1825,39 @@ func (m model) startQueuedInput() (tea.Model, tea.Cmd) {
 
 // ── Stream launch ───────────────────────────────────────────────────────────
 
+func (m *model) eventSessionID() string {
+	if m.cmdDeps.activeSessionID != nil {
+		if id := strings.TrimSpace(m.cmdDeps.activeSessionID()); id != "" {
+			return id
+		}
+	}
+	return "cli:local"
+}
+
+func (m *model) cancelActiveStream() {
+	if m.turnCancel != nil {
+		m.turnCancel()
+	}
+	if m.eventJournal != nil {
+		m.eventJournal.CancelSession(m.eventSessionID())
+	}
+}
+
 func (m *model) launchStream(input, resumeTurnID string) <-chan streamMsg {
 	ch := make(chan streamMsg, 64)
-	metadata := map[string]string{}
-	if m.cmdDeps.activeSessionID != nil {
-		metadata["polypod_session_id"] = m.cmdDeps.activeSessionID()
+	m.steerCh = make(chan string, 8)
+	steerCh := m.steerCh
+	if m.turnCancel != nil {
+		m.turnCancel()
+	}
+	baseCtx := m.ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	streamCtx, cancel := context.WithCancel(baseCtx)
+	m.turnCancel = cancel
+	metadata := map[string]string{
+		"polypod_session_id": m.eventSessionID(),
 	}
 	if m.cmdDeps.activeSessionRevision != nil {
 		metadata["polypod_session_revision"] = m.cmdDeps.activeSessionRevision()
@@ -1542,6 +1868,7 @@ func (m *model) launchStream(input, resumeTurnID string) <-chan streamMsg {
 
 	go func() {
 		defer close(ch)
+		defer cancel()
 
 		msg := adapter.InMessage{
 			ID:        fmt.Sprintf("cli-%d", time.Now().UnixNano()),
@@ -1552,24 +1879,25 @@ func (m *model) launchStream(input, resumeTurnID string) <-chan streamMsg {
 			Timestamp: time.Now(),
 			Metadata:  metadata,
 		}
+		msg.Metadata["polypod_turn_id"] = msg.ID
 
 		chunks := make(chan adapter.StreamChunk, 64)
-		go m.streamHandler(m.ctx, msg, chunks)
+		go m.streamHandler(ai.WithSteering(streamCtx, steerCh), msg, chunks)
 
 		for chunk := range chunks {
 			if chunk.Error != nil {
-				ch <- streamMsg{err: chunk.Error, done: true}
+				ch <- streamMsg{err: chunk.Error, done: true, eventSequence: chunk.EventSequence, usage: chunk.Usage}
 				return
 			}
 			if chunk.ToolEvent != nil {
-				ch <- streamMsg{toolEvent: chunk.ToolEvent}
+				ch <- streamMsg{toolEvent: chunk.ToolEvent, eventSequence: chunk.EventSequence}
 				continue
 			}
 			if chunk.Done {
-				ch <- streamMsg{done: true, sessionRevision: chunk.SessionRevision}
+				ch <- streamMsg{done: true, eventSequence: chunk.EventSequence, sessionRevision: chunk.SessionRevision, usage: chunk.Usage}
 				return
 			}
-			ch <- streamMsg{delta: chunk.Delta}
+			ch <- streamMsg{delta: chunk.Delta, eventSequence: chunk.EventSequence}
 		}
 		ch <- streamMsg{done: true}
 	}()
@@ -1673,6 +2001,7 @@ func (m model) inputVisualRows() int {
 
 func (m model) maxComposerHeight() int {
 	chromeHeight := 2 + 1 + 2 // header, hint line and input border
+	chromeHeight += m.slashPaletteHeight()
 	if m.statusBar != nil && m.statusBar.IsVisible() {
 		chromeHeight++
 	}
@@ -1691,6 +2020,7 @@ func (m model) maxComposerHeight() int {
 func (m model) viewportHeight() int {
 	inputHeight := m.textarea.Height() + 2
 	chromeHeight := 2 + 1 + inputHeight // header and the status line above input
+	chromeHeight += m.slashPaletteHeight()
 	if m.statusBar != nil && m.statusBar.IsVisible() {
 		chromeHeight++
 	}
@@ -1875,6 +2205,12 @@ func (m model) View() string {
 	if m.currentApproval != nil {
 		return m.overlayApprovalModal("")
 	}
+	if m.sideAnswer != "" {
+		return m.sideAnswerView()
+	}
+	if m.diffViewer != nil {
+		return m.diffViewer.View(m.width, m.height)
+	}
 
 	// /config form overlay (owns the entire screen).
 	if m.configForm != nil {
@@ -2004,6 +2340,10 @@ func (m model) View() string {
 	}
 
 	// ── Input with border ──
+	if palette := m.slashPaletteView(); palette != "" {
+		b.WriteString(palette)
+		b.WriteString("\n")
+	}
 	inputContent := m.textarea.View()
 	borderStyle := inputBorderActiveStyle
 	if m.waitingForUserAnswer {
@@ -2314,6 +2654,9 @@ func (m *model) refreshStatusBar() {
 	}
 	if m.cmdDeps.currentModel != nil {
 		state.Model = m.cmdDeps.currentModel()
+	}
+	if m.cmdDeps.currentProvider != nil {
+		state.Provider = m.cmdDeps.currentProvider()
 	}
 	if m.cmdDeps.sessionInfo != nil {
 		if id, _, err := m.cmdDeps.sessionInfo(); err == nil {

@@ -15,8 +15,8 @@ import (
 // RegisterBuiltinTools registers all built-in tools with the registry.
 func RegisterBuiltinTools(reg *Registry, workingDir string) {
 	RegisterReadFileTool(reg, workingDir)
-	reg.RegisterDef(newWriteFileTool(workingDir))
-	reg.RegisterDef(newEditFileTool(workingDir))
+	reg.RegisterDef(newWriteFileTool(workingDir, reg))
+	reg.RegisterDef(newEditFileTool(workingDir, reg))
 	reg.RegisterDef(newListDirTool(workingDir))
 	RegisterBashTool(reg, workingDir)
 	reg.RegisterDef(newGlobTool(workingDir))
@@ -26,7 +26,11 @@ func RegisterBuiltinTools(reg *Registry, workingDir string) {
 }
 
 // --- write_file ---
-func newWriteFileTool(wd string) types.ToolDef {
+func newWriteFileTool(wd string, regs ...*Registry) types.ToolDef {
+	var reg *Registry
+	if len(regs) > 0 {
+		reg = regs[0]
+	}
 	return types.ToolDef{
 		NameFn:        func() string { return constants.ToolWriteFile },
 		DescriptionFn: func() string { return "Escrever conteudo em um arquivo (cria ou sobrescreve)" },
@@ -50,17 +54,43 @@ func newWriteFileTool(wd string) types.ToolDef {
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
 			path := resolvePath(effectiveWorkingDir(ctx, wd), args["path"])
 			content, _ := args["content"].(string)
-			os.MkdirAll(filepath.Dir(path), 0755)
-			if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			orig, readErr := os.ReadFile(path)
+			existed := readErr == nil
+			if readErr != nil && !os.IsNotExist(readErr) {
+				return types.ToolResult{Content: fmt.Sprintf("Erro ao ler %s: %v", path, readErr), IsError: true}, nil
+			}
+			mode := os.FileMode(0644)
+			if existed {
+				if st, stErr := os.Stat(path); stErr == nil {
+					mode = st.Mode()
+				}
+			}
+			if reg != nil {
+				if err := reg.runBeforeFileWrite(ctx, path, orig, existed); err != nil {
+					return beforeFileWriteError(err), nil
+				}
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 				return types.ToolResult{Content: fmt.Sprintf("Erro: %v", err), IsError: true}, nil
 			}
-			return types.ToolResult{Content: fmt.Sprintf("Arquivo escrito: %s (%d bytes)", path, len(content))}, nil
+			if err := os.WriteFile(path, []byte(content), mode); err != nil {
+				return types.ToolResult{Content: fmt.Sprintf("Erro: %v", err), IsError: true}, nil
+			}
+			res := types.ToolResult{Content: fmt.Sprintf("Arquivo escrito: %s (%d bytes)", path, len(content))}
+			if reg != nil {
+				return reg.afterFileWrite(ctx, path, content, res), nil
+			}
+			return res, nil
 		},
 	}
 }
 
 // --- edit_file ---
-func newEditFileTool(wd string) types.ToolDef {
+func newEditFileTool(wd string, regs ...*Registry) types.ToolDef {
+	var reg *Registry
+	if len(regs) > 0 {
+		reg = regs[0]
+	}
 	return types.ToolDef{
 		NameFn:        func() string { return constants.ToolEditFile },
 		DescriptionFn: func() string { return "Substituir texto em um arquivo existente" },
@@ -68,7 +98,7 @@ func newEditFileTool(wd string) types.ToolDef {
 			return map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"path":     map[string]any{"type": "string", "description": "Caminho do arquivo"},
+					"path":     map[string]any{"type": "string", "description": "Caminho de arquivo existente, como math.go; nunca use um diretório como ."},
 					"old_text": map[string]any{"type": "string", "description": "Texto a encontrar"},
 					"new_text": map[string]any{"type": "string", "description": "Texto substituto"},
 				},
@@ -76,11 +106,25 @@ func newEditFileTool(wd string) types.ToolDef {
 			}
 		},
 		IsDestructiveFn: func(map[string]any) bool { return true },
+		ValidateFn: func(args map[string]any) types.ValidationResult {
+			path, _ := args["path"].(string)
+			if strings.TrimSpace(path) == "" || path == "." {
+				return types.ValidationResult{Valid: false, Message: "edit_file: path deve indicar um arquivo existente, por exemplo math.go"}
+			}
+			oldText, _ := args["old_text"].(string)
+			if oldText == "" {
+				return types.ValidationResult{Valid: false, Message: "edit_file: old_text deve conter o trecho exato a substituir"}
+			}
+			if _, ok := args["new_text"].(string); !ok {
+				return types.ValidationResult{Valid: false, Message: "edit_file: new_text deve ser texto"}
+			}
+			return types.ValidationResult{Valid: true}
+		},
 		ExecuteFn: func(ctx types.ToolContext, args map[string]any) (types.ToolResult, error) {
 			path := resolvePath(effectiveWorkingDir(ctx, wd), args["path"])
 			data, err := os.ReadFile(path)
 			if err != nil {
-				return types.ToolResult{Content: fmt.Sprintf("Erro: %v", err), IsError: true}, nil
+				return types.ToolResult{Content: fmt.Sprintf("Erro ao ler %s: %v. Use o caminho de um arquivo existente, como math.go.", path, err), IsError: true}, nil
 			}
 			oldText, _ := args["old_text"].(string)
 			newText, _ := args["new_text"].(string)
@@ -89,10 +133,23 @@ func newEditFileTool(wd string) types.ToolDef {
 				return types.ToolResult{Content: "Texto nao encontrado no arquivo", IsError: true}, nil
 			}
 			newContent := strings.Replace(content, oldText, newText, 1)
-			if err := os.WriteFile(path, []byte(newContent), 0644); err != nil {
+			mode := os.FileMode(0644)
+			if st, stErr := os.Stat(path); stErr == nil {
+				mode = st.Mode()
+			}
+			if reg != nil {
+				if err := reg.runBeforeFileWrite(ctx, path, data, true); err != nil {
+					return beforeFileWriteError(err), nil
+				}
+			}
+			if err := os.WriteFile(path, []byte(newContent), mode); err != nil {
 				return types.ToolResult{Content: fmt.Sprintf("Erro: %v", err), IsError: true}, nil
 			}
-			return types.ToolResult{Content: fmt.Sprintf("Arquivo editado: %s", path)}, nil
+			res := types.ToolResult{Content: fmt.Sprintf("Arquivo editado: %s", path)}
+			if reg != nil {
+				return reg.afterFileWrite(ctx, path, newContent, res), nil
+			}
+			return res, nil
 		},
 	}
 }

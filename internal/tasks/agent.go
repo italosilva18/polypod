@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/costa/polypod/internal/workdir"
 )
 
 // Agent task migrated from Claude Code TypeScript source.
@@ -29,6 +31,7 @@ type ToolActivity struct {
 type AgentProgress struct {
 	ToolUseCount     int            `json:"tool_use_count"`
 	TokenCount       int            `json:"token_count"`
+	CostUSD          *float64       `json:"cost_usd,omitempty"`
 	LastActivity     *ToolActivity  `json:"last_activity,omitempty"`
 	RecentActivities []ToolActivity `json:"recent_activities,omitempty"`
 	Summary          string         `json:"summary,omitempty"`
@@ -145,6 +148,10 @@ func GetAgentState(taskID string) (LocalAgentState, bool) {
 	snapshot.PendingMessages = append([]string(nil), state.PendingMessages...)
 	if state.Progress != nil {
 		progress := *state.Progress
+		if state.Progress.CostUSD != nil {
+			cost := *state.Progress.CostUSD
+			progress.CostUSD = &cost
+		}
 		progress.RecentActivities = append([]ToolActivity(nil), progress.RecentActivities...)
 		snapshot.Progress = &progress
 	}
@@ -307,6 +314,10 @@ func spawnAgentTask(
 	}
 	runCtx, cancel := context.WithCancel(base)
 	state := registerLocalAgent(registry, id, description, prompt, agentType, "", output.Name(), cancel, checkpoint, logger)
+	if workspace := workdir.Dir(parent, ""); workspace != "" {
+		registry.Update(id, func(task *TaskState) { task.Workspace = workspace })
+		state.Workspace = workspace
+	}
 
 	go func() {
 		defer cancel()
@@ -404,6 +415,11 @@ func UpdateAgentProgress(registry *TaskRegistry, agentID string, progress AgentP
 		if state.Status == StatusRunning {
 			copy := progress
 			copy.RecentActivities = append([]ToolActivity(nil), progress.RecentActivities...)
+			if progress.CostUSD != nil {
+				cost := *progress.CostUSD
+				copy.CostUSD = &cost
+				state.CostUSD = &cost
+			}
 			state.Progress = &copy
 		}
 	})

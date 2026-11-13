@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
 	official "github.com/openai/openai-go/v3"
@@ -212,4 +213,30 @@ func IsFailoverError(err error) bool {
 }
 func failoverStatus(code int) bool {
 	return code == 401 || code == 402 || code == 408 || code == 429 || code >= 500 && code <= 599
+}
+
+// IsRateLimitError reports whether err corresponds to an upstream HTTP 429 or
+// rate-limit/quota exhaustion error suitable for multi-account OAuth rotation.
+func IsRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var officialErr *official.Error
+	if errors.As(err, &officialErr) {
+		return officialErr.StatusCode == 429
+	}
+	var anthropicErr *anthropic.Error
+	if errors.As(err, &anthropicErr) {
+		return anthropicErr.StatusCode == 429
+	}
+	var apiErr *openai.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.HTTPStatusCode == 429
+	}
+	var requestErr *openai.RequestError
+	if errors.As(err, &requestErr) {
+		return requestErr.HTTPStatusCode == 429
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "http 429") || strings.Contains(msg, "rate_limit_exceeded") || strings.Contains(msg, "too many requests")
 }

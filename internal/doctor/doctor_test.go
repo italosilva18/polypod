@@ -492,3 +492,36 @@ func TestCheckSemanticMemory(t *testing.T) {
 		t.Fatalf("HTTP embedding = %+v", got)
 	}
 }
+
+func TestRunDiagnostics_NvidiaEnvAndOllama(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("NVIDIA_API_KEY", "nvapi-test-key-from-env")
+	nvidiaChecks := RunDiagnostics(&config.Config{
+		AI:        config.AIConfig{Provider: "nvidia", Model: "nvidia/nemotron-3.5-super-vl-120b-a12b"},
+		Data:      config.DataConfig{Dir: tmp, AgentsDir: tmp},
+		Templates: config.TemplatesConfig{Dir: tmp},
+	})
+	var aiCheck Check
+	for _, c := range nvidiaChecks {
+		if c.Name == "AI Provider" {
+			aiCheck = c
+		}
+	}
+	if aiCheck.Status != "ok" {
+		t.Fatalf("expected AI Provider ok for nvidia with NVIDIA_API_KEY, got %+v", aiCheck)
+	}
+
+	ollamaChecks := RunDiagnostics(&config.Config{
+		AI:        config.AIConfig{Provider: "ollama", Model: "qwen2.5-coder:3b"},
+		Data:      config.DataConfig{Dir: tmp, AgentsDir: tmp},
+		Templates: config.TemplatesConfig{Dir: tmp},
+	})
+	for _, c := range ollamaChecks {
+		if c.Name == "AI Provider" {
+			aiCheck = c
+		}
+	}
+	if aiCheck.Status != "ok" {
+		t.Fatalf("expected AI Provider ok for local ollama, got %+v", aiCheck)
+	}
+}

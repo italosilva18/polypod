@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "id": "polypod-real-coding-suite",
+  "version": "1.0.0",
+  "tasks": [
+    {
+      "id": "pr-hunk-coordinate-mapping",
+      "category": "coding",
+      "benchmark": "polypod-regressions-v1",
+      "recovery": false,
+      "timeout_seconds": 180,
+      "criterion": "Mapear comentários por linha de PR exclusivamente às coordenadas novas (+start,count) do diff unificado, tratando count omitido como 1 e hunks de deleção (+start,0) como vazios.",
+      "prompt": "Corrija CommentInPatch em patchmap.go para verificar coordenadas do arquivo novo (+start,count) nos cabeçalhos @@ de diff unificado: quando a contagem for omitida (ex.: @@ -40 +41 @@), trate como 1 linha; quando a contagem nova for 0 (ex.: @@ -10,2 +10,0 @@), nenhuma linha nova pertence ao hunk; linhas <= 0 devem retornar false. Execute go test ./... e responda objetivamente."
+    },
+    {
+      "id": "measured-cost-attribution",
+      "category": "coding",
+      "benchmark": "polypod-regressions-v1",
+      "recovery": false,
+      "timeout_seconds": 180,
+      "criterion": "Calcular custo USD medido por provedor/modelo: Ollama local retorna (0, true), prefixos mais específicos vencem (gpt-4o-mini antes de gpt-4o), IDs provider/model resolvem pelo sufixo e modelos sem tarifa positiva fora de Ollama retornam (0, false).",
+      "prompt": "Corrija LookupPricing e MeasuredCost em pricing.go para: (1) retornar (0, true) quando provider for ollama (case-insensitive); (2) aceitar IDs no formato provider/model tentando também o nome após '/'; (3) em correspondência por prefixo, escolher sempre a chave mais longa (para gpt-4o-mini não cair em gpt-4o); (4) retornar (0, false) para modelos desconhecidos ou com tarifa zero em provedores não locais. Execute go test ./... e responda objetivamente."
+    },
+    {
+      "id": "acp-mcp-tool-kind-and-diff-path",
+      "category": "coding",
+      "benchmark": "polypod-regressions-v1",
+      "recovery": false,
+      "timeout_seconds": 180,
+      "criterion": "Classificar chamadas de ferramentas ACP removendo o prefixo mcp__<servidor>__ antes da inferência de kind e extrair caminhos tanto de path quanto de file_path/filePath/notebook_path.",
+      "prompt": "Corrija InspectToolCall em acptool.go para: (1) remover o prefixo 'mcp__<servidor>__' antes de classificar o kind (para que 'mcp__editor__project_hint' seja 'other' e não 'edit'); (2) extrair o caminho dos campos JSON 'path', 'file_path', 'filePath' ou 'notebook_path'; (3) marcar isMutation=true para write_file, file_write, edit_file, file_edit, multi_edit, undo_edit, notebook_edit e apply_patch (extraindo o caminho de '*** Update File: ' ou '*** Add File: ' quando patch for usado). Execute go test ./... e responda objetivamente."
+    },
+    {
+      "id": "event-journal-cursor-replay",
+      "category": "coding",
+      "benchmark": "polypod-regressions-v1",
+      "recovery": false,
+      "timeout_seconds": 180,
+      "criterion": "Retornar apenas eventos com sequência estritamente maior que afterSeq respeitando limit, e impedir execução duplicada em ClaimTurn retornando o recibo existente com fresh=false.",
+      "prompt": "Corrija ReadAfter e ClaimTurn em journal.go para que ReadAfter retorne somente eventos com Sequence > afterSeq (respeitando limit > 0 sem duplicar o evento do cursor) e ClaimTurn retorne (reciboExistente, false) quando turnID já tiver sido registrado anteriormente, preservando a primeira resposta gravada por CompleteTurn. Execute go test ./... e responda objetivamente."
+    },
+    {
+      "id": "hybrid-rrf-diversified-budget",
+      "category": "coding",
+      "benchmark": "polypod-regressions-v1",
+      "recovery": false,
+      "timeout_seconds": 180,
+      "criterion": "Selecionar trechos ranqueados priorizando arquivos distintos na primeira passagem e preenchendo vagas restantes na segunda passagem, sem nunca ultrapassar tokenBudget nem maxChunks.",
+      "prompt": "Corrija SelectDiversified em selector.go para ordenar candidatos por Score decrescente (desempatando por Path e StartLine crescentes), selecionar na primeira passagem no máximo um trecho por arquivo distinto que caiba no tokenBudget restante, e na segunda passagem preencher vagas restantes até maxChunks com os demais trechos que caibam no tokenBudget restante (pulando trechos maiores sem encerrar prematuramente se um trecho seguinte menor couber). Execute go test ./... e responda objetivamente."
+    }
+  ]
+}

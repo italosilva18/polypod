@@ -1,0 +1,750 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-11-13T06:20:57Z",
+  "source_git_revision": "c406dbd21ed8da8111531a55f2d218498682f638",
+  "manifest_path": "docs/evaluation/coding-suite.v1.json",
+  "manifest_sha256": "aae1782f87d8f60c37eee121a77af55af4aae5a99bd182d302af3ba30f65d77d",
+  "cases_path": "docs/evaluation/coding-suite-cases.v1.json",
+  "cases_sha256": "126fe9d38606ba2b3cf03b6be96f801de235eeea93959d3b770792b417b83f9c",
+  "zero_paid_calls": true,
+  "cli_inventory": {
+    "polypod": {
+      "binary": "./polypod",
+      "version": "polypod v0.6.0"
+    },
+    "qwen": {
+      "binary": "/home/costa/.npm-global/bin/qwen",
+      "version": "0.24.0"
+    },
+    "aider": {
+      "binary": "/home/costa/.local/bin/aider",
+      "version": "aider 0.86.2"
+    },
+    "opencode": {
+      "binary": "/home/costa/.opencode/bin/opencode",
+      "version": "1.4.2"
+    },
+    "codex": {
+      "binary": "/home/costa/.local/bin/codex",
+      "version": "codex-cli 0.167.1"
+    },
+    "claude": {
+      "binary": "/home/costa/.local/bin/claude",
+      "version": "2.1.301 (Claude Code)"
+    },
+    "gemini": {
+      "binary": "/home/costa/.npm-global/bin/gemini",
+      "version": "0.60.0"
+    },
+    "kilo": {
+      "binary": "/usr/bin/kilo",
+      "version": "7.2.10"
+    },
+    "ollama": {
+      "binary": "/usr/local/bin/ollama",
+      "version": "ollama version is 0.40.14"
+    }
+  },
+  "evaluated_runs": [
+    {
+      "contender_id": "polypod-nvidia",
+      "report": {
+        "schema_version": 1,
+        "manifest_id": "polypod-real-coding-suite",
+        "manifest_version": "1.0.0",
+        "manifest_sha256": "aae1782f87d8f60c37eee121a77af55af4aae5a99bd182d302af3ba30f65d77d",
+        "results_sha256": "7c0903d9d6c3bc04e3fb686de4e4438ab83d3b035c67f8a38b889c7187caac69",
+        "metadata": {
+          "run_id": "polypod-nvidia-1794549403",
+          "agent": "polypod",
+          "agent_version": "polypod v0.6.0",
+          "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+          "model_settings": "provider=nvidia;temperature=0.2;max_tokens=8192;max_tool_iterations=16",
+          "hardware": "Linux-x86_64-cpu8",
+          "environment": "linux-isolated-home-go-go1.26.1",
+          "dataset_revision": "c406dbd21ed8:cases=126fe9d38606",
+          "evaluator_version": "polypod-evaluation-v1",
+          "seed": 20260417,
+          "budget": {
+            "max_steps": 16,
+            "max_seconds": 180,
+            "max_usd": 1
+          },
+          "synthetic": false
+        },
+        "overall": {
+          "total": 5,
+          "reported": 5,
+          "success": 2,
+          "rate": 0.4
+        },
+        "budget_measured": {
+          "total": 5,
+          "reported": 0,
+          "success": 0,
+          "rate": 0
+        },
+        "categories": {
+          "channels": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          },
+          "coding": {
+            "total": 5,
+            "reported": 5,
+            "success": 2,
+            "rate": 0.4
+          },
+          "gui": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          },
+          "memory": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          },
+          "routine": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          },
+          "safety": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          }
+        },
+        "recovery": {
+          "total": 0,
+          "reported": 0,
+          "success": 0,
+          "rate": null
+        },
+        "latency_ms": {
+          "samples": 5,
+          "total": 370205.928556,
+          "p50": 40775.00189,
+          "p95": 180101.286193
+        },
+        "cost_usd": {
+          "samples": 0,
+          "total": 0,
+          "p50": null,
+          "p95": null
+        },
+        "tokens": {
+          "samples": 3,
+          "total": 614497,
+          "p50": 175218,
+          "p95": 317669
+        },
+        "tool_failures": {
+          "samples": 3,
+          "total": 5,
+          "p50": 0,
+          "p95": 5
+        },
+        "missing": [],
+        "budget_exceeded": [
+          "acp-mcp-tool-kind-and-diff-path"
+        ],
+        "budget_unmeasured": [
+          "pr-hunk-coordinate-mapping",
+          "measured-cost-attribution",
+          "acp-mcp-tool-kind-and-diff-path",
+          "event-journal-cursor-replay",
+          "hybrid-rrf-diversified-budget"
+        ],
+        "outcomes": [
+          {
+            "task_id": "pr-hunk-coordinate-mapping",
+            "status": "success",
+            "evidence": "exit_code:0",
+            "verified_by": "external_command",
+            "latency_ms": 25387.902284,
+            "steps": 6,
+            "token_count": 121610,
+            "tool_failures": 0
+          },
+          {
+            "task_id": "measured-cost-attribution",
+            "status": "failure",
+            "evidence": "exit_code:1",
+            "verified_by": "external_command",
+            "latency_ms": 40775.00189,
+            "steps": 9,
+            "token_count": 175218,
+            "tool_failures": 0
+          },
+          {
+            "task_id": "acp-mcp-tool-kind-and-diff-path",
+            "status": "timeout",
+            "evidence": "",
+            "verified_by": "",
+            "latency_ms": 180101.286193
+          },
+          {
+            "task_id": "event-journal-cursor-replay",
+            "status": "success",
+            "evidence": "exit_code:0",
+            "verified_by": "external_command",
+            "latency_ms": 123623.54282,
+            "steps": 15,
+            "token_count": 317669,
+            "tool_failures": 5
+          },
+          {
+            "task_id": "hybrid-rrf-diversified-budget",
+            "status": "failure",
+            "evidence": "agent_exit_code:1;exit_code:1",
+            "verified_by": "external_command",
+            "latency_ms": 318.195369
+          }
+        ]
+      }
+    },
+    {
+      "contender_id": "qwen-code-nvidia",
+      "report": {
+        "schema_version": 1,
+        "manifest_id": "polypod-real-coding-suite",
+        "manifest_version": "1.0.0",
+        "manifest_sha256": "aae1782f87d8f60c37eee121a77af55af4aae5a99bd182d302af3ba30f65d77d",
+        "results_sha256": "14d1cd633a1716cb1c757e7d8dc4e560deed8bbef621ab88be4f1fc3a41ae83c",
+        "metadata": {
+          "run_id": "qwen-code-nvidia-1794549800",
+          "agent": "qwen-code",
+          "agent_version": "0.24.0",
+          "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+          "model_settings": "auth_type=openai;base_url=integrate.api.nvidia.com;yolo=true;max_tool_calls=16",
+          "hardware": "Linux-x86_64-cpu8",
+          "environment": "linux-isolated-home-go-go1.26.1",
+          "dataset_revision": "c406dbd21ed8:cases=126fe9d38606",
+          "evaluator_version": "polypod-evaluation-v1",
+          "seed": 20260417,
+          "budget": {
+            "max_steps": 16,
+            "max_seconds": 180,
+            "max_usd": 1
+          },
+          "synthetic": false
+        },
+        "overall": {
+          "total": 5,
+          "reported": 5,
+          "success": 4,
+          "rate": 0.8
+        },
+        "budget_measured": {
+          "total": 5,
+          "reported": 0,
+          "success": 0,
+          "rate": 0
+        },
+        "categories": {
+          "channels": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          },
+          "coding": {
+            "total": 5,
+            "reported": 5,
+            "success": 4,
+            "rate": 0.8
+          },
+          "gui": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          },
+          "memory": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          },
+          "routine": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          },
+          "safety": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          }
+        },
+        "recovery": {
+          "total": 0,
+          "reported": 0,
+          "success": 0,
+          "rate": null
+        },
+        "latency_ms": {
+          "samples": 5,
+          "total": 599128.392351,
+          "p50": 126202.077064,
+          "p95": 164843.87631
+        },
+        "cost_usd": {
+          "samples": 0,
+          "total": 0,
+          "p50": null,
+          "p95": null
+        },
+        "tokens": {
+          "samples": 5,
+          "total": 437111,
+          "p50": 93494,
+          "p95": 118529
+        },
+        "tool_failures": {
+          "samples": 5,
+          "total": 3,
+          "p50": 1,
+          "p95": 1
+        },
+        "missing": [],
+        "budget_exceeded": [],
+        "budget_unmeasured": [
+          "pr-hunk-coordinate-mapping",
+          "measured-cost-attribution",
+          "acp-mcp-tool-kind-and-diff-path",
+          "event-journal-cursor-replay",
+          "hybrid-rrf-diversified-budget"
+        ],
+        "outcomes": [
+          {
+            "task_id": "pr-hunk-coordinate-mapping",
+            "status": "success",
+            "evidence": "exit_code:0",
+            "verified_by": "external_command",
+            "latency_ms": 126202.077064,
+            "steps": 6,
+            "token_count": 66290,
+            "tool_failures": 0
+          },
+          {
+            "task_id": "measured-cost-attribution",
+            "status": "failure",
+            "evidence": "exit_code:1",
+            "verified_by": "external_command",
+            "latency_ms": 164843.87631,
+            "steps": 7,
+            "token_count": 93494,
+            "tool_failures": 1
+          },
+          {
+            "task_id": "acp-mcp-tool-kind-and-diff-path",
+            "status": "success",
+            "evidence": "exit_code:0",
+            "verified_by": "external_command",
+            "latency_ms": 118012.732035,
+            "steps": 8,
+            "token_count": 113090,
+            "tool_failures": 1
+          },
+          {
+            "task_id": "event-journal-cursor-replay",
+            "status": "success",
+            "evidence": "exit_code:0",
+            "verified_by": "external_command",
+            "latency_ms": 62618.521192,
+            "steps": 5,
+            "token_count": 45708,
+            "tool_failures": 0
+          },
+          {
+            "task_id": "hybrid-rrf-diversified-budget",
+            "status": "success",
+            "evidence": "exit_code:0",
+            "verified_by": "external_command",
+            "latency_ms": 127451.18575,
+            "steps": 8,
+            "token_count": 118529,
+            "tool_failures": 1
+          }
+        ]
+      }
+    },
+    {
+      "contender_id": "aider-nvidia",
+      "report": {
+        "schema_version": 1,
+        "manifest_id": "polypod-real-coding-suite",
+        "manifest_version": "1.0.0",
+        "manifest_sha256": "aae1782f87d8f60c37eee121a77af55af4aae5a99bd182d302af3ba30f65d77d",
+        "results_sha256": "c317243b3ce4a291038521b46fd4ac30e468323ab2d1051594264f416ebffd7d",
+        "metadata": {
+          "run_id": "aider-nvidia-1794550423",
+          "agent": "aider",
+          "agent_version": "aider 0.86.2",
+          "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+          "model_settings": "provider=openai-compat;base_url=integrate.api.nvidia.com;yes_always=true",
+          "hardware": "Linux-x86_64-cpu8",
+          "environment": "linux-isolated-home-go-go1.26.1",
+          "dataset_revision": "c406dbd21ed8:cases=126fe9d38606",
+          "evaluator_version": "polypod-evaluation-v1",
+          "seed": 20260417,
+          "budget": {
+            "max_steps": 16,
+            "max_seconds": 180,
+            "max_usd": 1
+          },
+          "synthetic": false
+        },
+        "overall": {
+          "total": 5,
+          "reported": 5,
+          "success": 3,
+          "rate": 0.6
+        },
+        "budget_measured": {
+          "total": 5,
+          "reported": 0,
+          "success": 0,
+          "rate": 0
+        },
+        "categories": {
+          "channels": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          },
+          "coding": {
+            "total": 5,
+            "reported": 5,
+            "success": 3,
+            "rate": 0.6
+          },
+          "gui": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          },
+          "memory": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          },
+          "routine": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          },
+          "safety": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          }
+        },
+        "recovery": {
+          "total": 0,
+          "reported": 0,
+          "success": 0,
+          "rate": null
+        },
+        "latency_ms": {
+          "samples": 5,
+          "total": 247819.01425500002,
+          "p50": 37721.19535,
+          "p95": 120076.347297
+        },
+        "cost_usd": {
+          "samples": 0,
+          "total": 0,
+          "p50": null,
+          "p95": null
+        },
+        "tokens": {
+          "samples": 5,
+          "total": 23200,
+          "p50": 4400,
+          "p95": 6400
+        },
+        "tool_failures": {
+          "samples": 5,
+          "total": 0,
+          "p50": 0,
+          "p95": 0
+        },
+        "missing": [],
+        "budget_exceeded": [],
+        "budget_unmeasured": [
+          "pr-hunk-coordinate-mapping",
+          "measured-cost-attribution",
+          "acp-mcp-tool-kind-and-diff-path",
+          "event-journal-cursor-replay",
+          "hybrid-rrf-diversified-budget"
+        ],
+        "outcomes": [
+          {
+            "task_id": "pr-hunk-coordinate-mapping",
+            "status": "success",
+            "evidence": "exit_code:0",
+            "verified_by": "external_command",
+            "latency_ms": 37721.19535,
+            "steps": 1,
+            "token_count": 3300,
+            "tool_failures": 0
+          },
+          {
+            "task_id": "measured-cost-attribution",
+            "status": "failure",
+            "evidence": "exit_code:1",
+            "verified_by": "external_command",
+            "latency_ms": 38126.91711,
+            "steps": 1,
+            "token_count": 6400,
+            "tool_failures": 0
+          },
+          {
+            "task_id": "acp-mcp-tool-kind-and-diff-path",
+            "status": "failure",
+            "evidence": "exit_code:1",
+            "verified_by": "external_command",
+            "latency_ms": 120076.347297,
+            "steps": 1,
+            "token_count": 5700,
+            "tool_failures": 0
+          },
+          {
+            "task_id": "event-journal-cursor-replay",
+            "status": "success",
+            "evidence": "exit_code:0",
+            "verified_by": "external_command",
+            "latency_ms": 20985.150535,
+            "steps": 1,
+            "token_count": 3400,
+            "tool_failures": 0
+          },
+          {
+            "task_id": "hybrid-rrf-diversified-budget",
+            "status": "success",
+            "evidence": "exit_code:0",
+            "verified_by": "external_command",
+            "latency_ms": 30909.403963,
+            "steps": 1,
+            "token_count": 4400,
+            "tool_failures": 0
+          }
+        ]
+      }
+    },
+    {
+      "contender_id": "opencode-nvidia",
+      "report": {
+        "schema_version": 1,
+        "manifest_id": "polypod-real-coding-suite",
+        "manifest_version": "1.0.0",
+        "manifest_sha256": "aae1782f87d8f60c37eee121a77af55af4aae5a99bd182d302af3ba30f65d77d",
+        "results_sha256": "4b8071f378a5b8ad1babeacebd9d5123f02d4c51f46539e5e7b0e43deceb34e1",
+        "metadata": {
+          "run_id": "opencode-nvidia-1794550678",
+          "agent": "opencode",
+          "agent_version": "1.4.2",
+          "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+          "model_settings": "provider=nvidia-openai-compat;dangerously_skip_permissions=true;pure=true",
+          "hardware": "Linux-x86_64-cpu8",
+          "environment": "linux-isolated-home-go-go1.26.1",
+          "dataset_revision": "c406dbd21ed8:cases=126fe9d38606",
+          "evaluator_version": "polypod-evaluation-v1",
+          "seed": 20260417,
+          "budget": {
+            "max_steps": 16,
+            "max_seconds": 180,
+            "max_usd": 1
+          },
+          "synthetic": false
+        },
+        "overall": {
+          "total": 5,
+          "reported": 5,
+          "success": 3,
+          "rate": 0.6
+        },
+        "budget_measured": {
+          "total": 5,
+          "reported": 0,
+          "success": 0,
+          "rate": 0
+        },
+        "categories": {
+          "channels": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          },
+          "coding": {
+            "total": 5,
+            "reported": 5,
+            "success": 3,
+            "rate": 0.6
+          },
+          "gui": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          },
+          "memory": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          },
+          "routine": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          },
+          "safety": {
+            "total": 0,
+            "reported": 0,
+            "success": 0,
+            "rate": null
+          }
+        },
+        "recovery": {
+          "total": 0,
+          "reported": 0,
+          "success": 0,
+          "rate": null
+        },
+        "latency_ms": {
+          "samples": 5,
+          "total": 178637.08545999997,
+          "p50": 34275.56421,
+          "p95": 44355.344024
+        },
+        "cost_usd": {
+          "samples": 0,
+          "total": 0,
+          "p50": null,
+          "p95": null
+        },
+        "tokens": {
+          "samples": 5,
+          "total": 157214,
+          "p50": 29450,
+          "p95": 38508
+        },
+        "tool_failures": {
+          "samples": 5,
+          "total": 0,
+          "p50": 0,
+          "p95": 0
+        },
+        "missing": [],
+        "budget_exceeded": [],
+        "budget_unmeasured": [
+          "pr-hunk-coordinate-mapping",
+          "measured-cost-attribution",
+          "acp-mcp-tool-kind-and-diff-path",
+          "event-journal-cursor-replay",
+          "hybrid-rrf-diversified-budget"
+        ],
+        "outcomes": [
+          {
+            "task_id": "pr-hunk-coordinate-mapping",
+            "status": "success",
+            "evidence": "exit_code:0",
+            "verified_by": "external_command",
+            "latency_ms": 43949.341247,
+            "steps": 7,
+            "token_count": 38508,
+            "tool_failures": 0
+          },
+          {
+            "task_id": "measured-cost-attribution",
+            "status": "failure",
+            "evidence": "exit_code:1",
+            "verified_by": "external_command",
+            "latency_ms": 26635.840061,
+            "steps": 7,
+            "token_count": 32255,
+            "tool_failures": 0
+          },
+          {
+            "task_id": "acp-mcp-tool-kind-and-diff-path",
+            "status": "failure",
+            "evidence": "exit_code:1",
+            "verified_by": "external_command",
+            "latency_ms": 44355.344024,
+            "steps": 7,
+            "token_count": 28980,
+            "tool_failures": 0
+          },
+          {
+            "task_id": "event-journal-cursor-replay",
+            "status": "success",
+            "evidence": "exit_code:0",
+            "verified_by": "external_command",
+            "latency_ms": 34275.56421,
+            "steps": 6,
+            "token_count": 29450,
+            "tool_failures": 0
+          },
+          {
+            "task_id": "hybrid-rrf-diversified-budget",
+            "status": "success",
+            "evidence": "exit_code:0",
+            "verified_by": "external_command",
+            "latency_ms": 29420.995918,
+            "steps": 7,
+            "token_count": 28021,
+            "tool_failures": 0
+          }
+        ]
+      }
+    }
+  ],
+  "excluded_or_unavailable": [
+    {
+      "cli": "claude",
+      "version": "2.1.301 (Claude Code)",
+      "status": "excluded_zero_paid_policy",
+      "reason": "Requer API proprietária Anthropic Messages (/v1/messages) ou sessão OAuth paga; excluída sob política estrita de zero chamadas pagas com HOME isolado."
+    },
+    {
+      "cli": "gemini",
+      "version": "0.60.0",
+      "status": "excluded_zero_paid_policy",
+      "reason": "Requer API Google Gemini / Vertex AI ou OAuth Google; excluída sob política estrita de zero chamadas pagas com HOME isolado."
+    },
+    {
+      "cli": "kilo",
+      "version": "7.2.10",
+      "status": "covered_by_opencode_engine",
+      "reason": "Derivado da mesma engine CLI de `opencode run`; inventariado localmente e representado na rodada OpenAI-compatível por `opencode`."
+    },
+    {
+      "cli": "codex-cli",
+      "contender_id": "codex-cli-nvidia",
+      "version": "codex-cli 0.167.1",
+      "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+      "status": "preflight_unavailable",
+      "reason": "preflight_failed:in `model_providers.nvidia.wire_api`"
+    }
+  ]
+}

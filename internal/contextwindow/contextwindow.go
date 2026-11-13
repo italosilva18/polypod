@@ -3,6 +3,8 @@ package contextwindow
 import (
 	"log/slog"
 	"sync"
+
+	"github.com/costa/polypod/internal/models"
 )
 
 // ModelLimits defines the context window constraints for a model.
@@ -15,7 +17,7 @@ type ModelLimits struct {
 	ReservedForOutput int
 }
 
-// WellKnownLimits returns limits for well-known models.
+// WellKnownLimits returns limits for well-known and dynamically cataloged models.
 func WellKnownLimits(model string) ModelLimits {
 	limits := map[string]ModelLimits{
 		// Anthropic
@@ -42,6 +44,22 @@ func WellKnownLimits(model string) ModelLimits {
 		"llama-3.3-70b-versatile": {MaxContextTokens: 131072, MaxOutputTokens: 32768, ReservedForOutput: 32768},
 		// Mistral
 		"mistral-large-latest": {MaxContextTokens: 128000, MaxOutputTokens: 8192, ReservedForOutput: 8192},
+	}
+
+	if capEntry := models.GetCapabilities(model); capEntry != nil && capEntry.MaxContextTokens > 0 {
+		out := capEntry.MaxOutputTokens
+		if out <= 0 {
+			out = 8192
+		}
+		reserved := out
+		if l, ok := limits[model]; ok {
+			reserved = l.ReservedForOutput
+		}
+		return ModelLimits{
+			MaxContextTokens:  capEntry.MaxContextTokens,
+			MaxOutputTokens:   out,
+			ReservedForOutput: reserved,
+		}
 	}
 
 	if l, ok := limits[model]; ok {

@@ -168,7 +168,7 @@ func (m *StreamingToolManager) ExecuteToolCalls(ctx context.Context, calls []Too
 	concurrentCount := 0
 	for i, call := range calls {
 		args := m.argsFor(call)
-		if t, ok := m.registry.Get(call.Name); ok && m.checkSafe(t, args, call.Name) && m.checkReadOnly(t, args, call.Name) {
+		if t, ok := m.registry.GetForContext(ctx, call.Name); ok && m.checkSafe(t, args, call.Name) && m.checkReadOnly(t, args, call.Name) {
 			canRunConcurrent[i] = true
 			concurrentCount++
 		}

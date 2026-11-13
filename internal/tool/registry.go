@@ -12,12 +12,13 @@ import (
 
 // Registry holds all registered tools and provides lookup/execution.
 type Registry struct {
-	mu              sync.RWMutex
-	tools           map[string]types.Tool
-	fileReads       *fileReadTracker
-	lsp             *lsp.LSPServerManager
-	pty             *bash.PTYManager
-	beforeFileWrite func(types.ToolContext, string, []byte, bool) error
+	mu                 sync.RWMutex
+	tools              map[string]types.Tool
+	fileReads          *fileReadTracker
+	lsp                *lsp.LSPServerManager
+	pty                *bash.PTYManager
+	beforeFileWrite    func(types.ToolContext, string, []byte, bool) error
+	afterFileWriteHook func(context.Context, string) (string, error)
 }
 
 // NewRegistry creates an empty tool registry.
@@ -40,6 +41,77 @@ func (r *Registry) RegisterDef(def types.ToolDef) types.Tool {
 	t := types.BuildTool(def)
 	r.Register(t)
 	return t
+}
+
+type sessionToolsKey struct{}
+
+// WithSessionTools attaches per-session tools (such as editor-supplied ACP MCP
+// servers) to ctx without mutating the shared process-wide Registry.
+func WithSessionTools(ctx context.Context, extra ...types.Tool) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(extra) == 0 {
+		return ctx
+	}
+	merged := make([]types.Tool, 0, len(extra))
+	seen := make(map[string]int, len(extra))
+	for _, existing := range SessionToolsFromContext(ctx) {
+		if existing == nil {
+			continue
+		}
+		seen[existing.Name()] = len(merged)
+		merged = append(merged, existing)
+	}
+	for _, t := range extra {
+		if t == nil {
+			continue
+		}
+		if idx, ok := seen[t.Name()]; ok {
+			merged[idx] = t
+			continue
+		}
+		seen[t.Name()] = len(merged)
+		merged = append(merged, t)
+	}
+	return context.WithValue(ctx, sessionToolsKey{}, merged)
+}
+
+// SessionToolsFromContext returns any session-scoped tools attached to ctx.
+func SessionToolsFromContext(ctx context.Context) []types.Tool {
+	if ctx == nil {
+		return nil
+	}
+	tools, _ := ctx.Value(sessionToolsKey{}).([]types.Tool)
+	if len(tools) == 0 {
+		return nil
+	}
+	return append([]types.Tool(nil), tools...)
+}
+
+// SessionToolFromContext looks up a single session-scoped tool on ctx.
+func SessionToolFromContext(ctx context.Context, name string) (types.Tool, bool) {
+	if ctx == nil || name == "" {
+		return nil, false
+	}
+	tools, _ := ctx.Value(sessionToolsKey{}).([]types.Tool)
+	for _, t := range tools {
+		if t != nil && t.Name() == name {
+			return t, true
+		}
+	}
+	return nil, false
+}
+
+// GetForContext resolves session-scoped tools on ctx first, then falls back to r.
+func (r *Registry) GetForContext(ctx context.Context, name string) (types.Tool, bool) {
+	if t, ok := SessionToolFromContext(ctx, name); ok {
+		return t, true
+	}
+	if r == nil {
+		return nil, false
+	}
+	return r.Get(name)
 }
 
 // Get returns a tool by name.
@@ -121,7 +193,7 @@ func (r *Registry) CheckPermissions(name string, args map[string]any, ctx types.
 
 // Execute runs a tool by name with full validation pipeline.
 func (r *Registry) Execute(name string, args map[string]any, ctx types.ToolContext) (types.ToolResult, error) {
-	t, ok := r.Get(name)
+	t, ok := r.GetForContext(ctx.Context, name)
 	if !ok {
 		return types.ToolResult{}, fmt.Errorf("ferramenta desconhecida: %s", name)
 	}
@@ -150,7 +222,7 @@ func (r *Registry) Execute(name string, args map[string]any, ctx types.ToolConte
 
 // ExecuteRaw runs a tool without validation (for internal use).
 func (r *Registry) ExecuteRaw(name string, args map[string]any, ctx types.ToolContext) (types.ToolResult, error) {
-	t, ok := r.Get(name)
+	t, ok := r.GetForContext(ctx.Context, name)
 	if !ok {
 		return types.ToolResult{}, fmt.Errorf("ferramenta desconhecida: %s", name)
 	}
@@ -217,7 +289,7 @@ func (r *Registry) ExecutionPipeline(
 	ctx types.ToolContext,
 	hookCheck func(ctx context.Context, toolName string, args map[string]any) types.PermissionDecision,
 ) (types.ToolResult, error) {
-	t, ok := r.Get(name)
+	t, ok := r.GetForContext(ctx.Context, name)
 	if !ok {
 		return types.ToolResult{}, fmt.Errorf("ferramenta desconhecida: %s", name)
 	}

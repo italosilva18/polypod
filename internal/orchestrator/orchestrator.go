@@ -145,7 +145,7 @@ func (o *Orchestrator) ExecuteTool(ctx context.Context, toolName string, args ma
 	}
 
 	// 2. Get tool
-	t, ok := tools.Get(toolName)
+	t, ok := tools.GetForContext(ctx, toolName)
 	if !ok {
 		return types.ToolResult{
 			Content: fmt.Sprintf("ferramenta desconhecida: %s", toolName),

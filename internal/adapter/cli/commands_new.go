@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/costa/polypod/internal/apilimits"
 	"github.com/costa/polypod/internal/initcmd"
+	"github.com/costa/polypod/internal/projectchecks"
 )
 
 // ── /effort ─────────────────────────────────────────────────────────────────
@@ -106,6 +109,9 @@ func handleEffort(parts []string, deps commandDeps) commandResult {
 			}
 		}
 		deps.sessionState.setEffort(level)
+		if deps.setEffort != nil {
+			deps.setEffort(string(level))
+		}
 		return formatEffortStatus(level, true)
 	}
 
@@ -290,12 +296,12 @@ func handleBranchList(deps commandDeps) commandResult {
 
 		// Stats
 		msgCount := br.messageCount
-		stats := fmt.Sprintf(" (%d messages", msgCount)
+		stats := fmt.Sprintf(" (%d mensagens", msgCount)
 		if isCurrent {
-			stats += ", current"
+			stats += ", atual"
 		}
 		if br.parent != "" {
-			stats += fmt.Sprintf(", from msg %d of %s", br.forkAtMsg, br.parent)
+			stats += fmt.Sprintf(", da mensagem %d de %s", br.forkAtMsg, br.parent)
 		}
 		stats += ")"
 		b.WriteString(cmdLabelStyle.Render(stats))
@@ -313,7 +319,7 @@ func handleBranchTree(deps commandDeps) commandResult {
 	branches, current := deps.sessionState.snapshotBranches()
 
 	var b strings.Builder
-	b.WriteString(cmdTitleStyle.Render("Conversation tree:"))
+	b.WriteString(cmdTitleStyle.Render("Árvore da conversa:"))
 	b.WriteString("\n")
 
 	// First line: main with stats.
@@ -328,9 +334,9 @@ func handleBranchTree(deps commandDeps) commandResult {
 				b.WriteString(cmdInactiveStyle.Render("○ "))
 			}
 			b.WriteString(cmdValueStyle.Render(br.name))
-			label := fmt.Sprintf(" (%d messages", msgCount)
+			label := fmt.Sprintf(" (%d mensagens", msgCount)
 			if br.name == current {
-				label += ", current"
+				label += ", atual"
 			}
 			label += ")"
 			b.WriteString(cmdLabelStyle.Render(label))
@@ -353,9 +359,9 @@ func handleBranchTree(deps commandDeps) commandResult {
 		b.WriteString(cmdValueStyle.Render(br.name))
 
 		msgCount := br.messageCount
-		label := fmt.Sprintf(" (%d messages from msg %d", msgCount, br.forkAtMsg)
+		label := fmt.Sprintf(" (%d mensagens da mensagem %d", msgCount, br.forkAtMsg)
 		if br.name == current {
-			label += ", current branch"
+			label += ", ramificação atual"
 		}
 		label += ")"
 		b.WriteString(cmdLabelStyle.Render(label))
@@ -463,7 +469,7 @@ func handleUsage(parts []string, deps commandDeps) commandResult {
 			model = deps.activeAgent()
 		}
 		if model == "" {
-			model = "unknown"
+			model = "desconhecido"
 		}
 		rows = append(rows, providerRow{
 			provider: providerNameForModel(model),
@@ -629,15 +635,8 @@ func uniqueProviders(rows []providerRow) []string {
 // ── /init-verifiers ─────────────────────────────────────────────────────────
 
 // verifiersConfig is the on-disk shape of .polypod/verifiers.yaml.
-type verifiersConfig struct {
-	Verifiers map[string]string `yaml:"verifiers"`
-	AutoRun   verifiersAutoRun  `yaml:"auto_run"`
-}
-
-type verifiersAutoRun struct {
-	OnSave   bool `yaml:"on_save"`
-	OnCommit bool `yaml:"on_commit"`
-}
+type verifiersConfig = projectchecks.Config
+type verifiersAutoRun = projectchecks.AutoRun
 
 // detectedVerifiers holds the verifiers detected for a project.
 type detectedVerifiers struct {
@@ -668,9 +667,9 @@ func handleInitVerifiers(parts []string) commandResult {
 
 	// Build the report.
 	var b strings.Builder
-	b.WriteString(cmdTitleStyle.Render("═══ VERIFIERS DETECTED ═══"))
+	b.WriteString(cmdTitleStyle.Render("═══ VERIFICADORES DETECTADOS ═══"))
 	b.WriteString("\n\n")
-	b.WriteString(cmdLabelStyle.Render("Project: "))
+	b.WriteString(cmdLabelStyle.Render("Projeto: "))
 	b.WriteString(cmdValueStyle.Render(det.stackName))
 	b.WriteString("\n")
 
@@ -684,9 +683,9 @@ func handleInitVerifiers(parts []string) commandResult {
 		b.WriteString(cmdValueStyle.Render(value))
 		b.WriteString("\n")
 	}
-	writeRow("Test", det.test)
-	writeRow("Vet", det.vet)
-	writeRow("Build", det.build)
+	writeRow("Teste", det.test)
+	writeRow("Análise", det.vet)
+	writeRow("Compilar", det.build)
 	writeRow("Lint", det.lint)
 
 	for _, n := range det.notes {
@@ -700,8 +699,34 @@ func handleInitVerifiers(parts []string) commandResult {
 		Verifiers: map[string]string{},
 		AutoRun: verifiersAutoRun{
 			OnSave:   false,
+			OnTurn:   true,
 			OnCommit: true,
 		},
+		FormatOnWrite: true,
+		Formatters:    map[string][]string{},
+	}
+	if det.stackName == "Go (go.mod)" {
+		cfg.Formatters[".go"] = []string{"gofmt", "-w", "{file}"}
+	}
+	if strings.HasPrefix(det.stackName, "Rust") {
+		if _, err := exec.LookPath("rustfmt"); err == nil {
+			cfg.Formatters[".rs"] = []string{"rustfmt", "{file}"}
+		}
+	}
+	if strings.HasPrefix(det.stackName, "Python") {
+		if _, err := exec.LookPath("ruff"); err == nil {
+			for _, ext := range []string{".py", ".pyi"} {
+				cfg.Formatters[ext] = []string{"ruff", "format", "{file}"}
+			}
+		}
+	}
+	if strings.HasPrefix(det.stackName, "JavaScript") {
+		prettier := filepath.Join(wd, "node_modules", ".bin", "prettier")
+		if info, err := os.Stat(prettier); err == nil && !info.IsDir() {
+			for _, ext := range []string{".js", ".jsx", ".ts", ".tsx", ".json", ".css", ".scss", ".html", ".md"} {
+				cfg.Formatters[ext] = []string{prettier, "--write", "{file}"}
+			}
+		}
 	}
 	if det.test != "" {
 		cfg.Verifiers["test"] = det.test
@@ -725,6 +750,22 @@ func handleInitVerifiers(parts []string) commandResult {
 		}
 	}
 	cfgPath := filepath.Join(polypodDir, "verifiers.yaml")
+	if existing, readErr := os.ReadFile(cfgPath); readErr == nil {
+		var saved verifiersConfig
+		if err := yaml.Unmarshal(existing, &saved); err != nil {
+			return commandResult{output: errorStyle.Render("configuração existente inválida: " + err.Error()), handled: true}
+		}
+		for name, command := range saved.Verifiers {
+			cfg.Verifiers[name] = command
+		}
+		for ext, command := range saved.Formatters {
+			cfg.Formatters[ext] = command
+		}
+		cfg.AutoRun = saved.AutoRun
+		cfg.FormatOnWrite = saved.FormatOnWrite
+	} else if !os.IsNotExist(readErr) {
+		return commandResult{output: errorStyle.Render("erro ao ler configuração: " + readErr.Error()), handled: true}
+	}
 
 	// Honour --dry-run if passed.
 	dryRun := false
@@ -757,7 +798,7 @@ func handleInitVerifiers(parts []string) commandResult {
 		b.WriteString(cmdLabelStyle.Render("dry-run: nada foi escrito em "))
 		b.WriteString(cmdValueStyle.Render(cfgPath))
 	} else {
-		b.WriteString(notifySuccessStyle.Render("Saved to "))
+		b.WriteString(notifySuccessStyle.Render("Salvo em "))
 		rel, relErr := filepath.Rel(wd, cfgPath)
 		if relErr != nil {
 			rel = cfgPath
@@ -765,10 +806,9 @@ func handleInitVerifiers(parts []string) commandResult {
 		b.WriteString(cmdValueStyle.Render(rel))
 	}
 	b.WriteString("\n\n")
-	b.WriteString(cmdLabelStyle.Render("Auto-run on save? (s/N): ") +
-		cmdLabelStyle.Render("(edite ") +
+	b.WriteString(cmdLabelStyle.Render("Ajuste execução automática e formatadores em ") +
 		cmdValueStyle.Render(".polypod/verifiers.yaml") +
-		cmdLabelStyle.Render(" para mudar)"))
+		cmdLabelStyle.Render("."))
 
 	return commandResult{output: b.String(), handled: true}
 }
@@ -796,16 +836,16 @@ func detectVerifiers(wd string) detectedVerifiers {
 
 	case fileExists(filepath.Join(wd, "package.json")):
 		det.stackName = "JavaScript/TypeScript (package.json)"
-		det.test, det.lint = detectNodeScripts(filepath.Join(wd, "package.json"))
-		if det.test == "" {
-			det.test = "npm test"
-		}
-		if det.lint == "" {
-			det.lint = "npm run lint"
+		det.test, det.lint, det.build = detectNodeScripts(filepath.Join(wd, "package.json"))
+		if _, err := exec.LookPath("npm"); err != nil {
+			det.test, det.lint, det.build = "", "", ""
+			det.notes = append(det.notes, "npm não encontrado; configure um verificador após instalar")
 		}
 		if fileExists(filepath.Join(wd, "tsconfig.json")) {
-			det.build = "tsc --noEmit"
-			det.notes = append(det.notes, "tsconfig.json detectado, build via tsc")
+			if det.build == "" && fileExists(filepath.Join(wd, "node_modules", ".bin", "tsc")) {
+				det.build = "node_modules/.bin/tsc --noEmit"
+				det.notes = append(det.notes, "tsconfig.json detectado, análise via tsc local")
+			}
 		}
 
 	case fileExists(filepath.Join(wd, "Cargo.toml")):
@@ -816,12 +856,18 @@ func detectVerifiers(wd string) detectedVerifiers {
 
 	case fileExists(filepath.Join(wd, "pyproject.toml")):
 		det.stackName = "Python (pyproject.toml)"
-		det.test = "pytest"
-		det.lint = "ruff check"
+		if _, err := exec.LookPath("pytest"); err == nil {
+			det.test = "pytest"
+		}
+		if _, err := exec.LookPath("ruff"); err == nil {
+			det.lint = "ruff check"
+		}
 		if fileExists(filepath.Join(wd, "mypy.ini")) ||
 			fileExists(filepath.Join(wd, ".mypy.ini")) {
-			det.vet = "mypy ."
-			det.notes = append(det.notes, "mypy.ini detectado")
+			if _, err := exec.LookPath("mypy"); err == nil {
+				det.vet = "mypy ."
+				det.notes = append(det.notes, "mypy.ini detectado")
+			}
 		}
 
 	case fileExists(filepath.Join(wd, "pom.xml")):
@@ -867,20 +913,27 @@ func detectVerifiers(wd string) detectedVerifiers {
 	return det
 }
 
-// detectNodeScripts reads package.json and extracts the test/lint scripts.
-// This is a lightweight string scan; we deliberately avoid pulling in a
-// full JSON parser dependency for what is essentially a hint extractor.
-func detectNodeScripts(path string) (testCmd, lintCmd string) {
+// detectNodeScripts reads only actual package scripts, excluding npm's
+// generated placeholder test script.
+func detectNodeScripts(path string) (testCmd, lintCmd, buildCmd string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", ""
+		return "", "", ""
 	}
-	s := string(data)
-	if strings.Contains(s, `"test"`) {
+	var manifest struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return "", "", ""
+	}
+	if script := strings.TrimSpace(manifest.Scripts["test"]); script != "" && !strings.Contains(script, "no test specified") {
 		testCmd = "npm test"
 	}
-	if strings.Contains(s, `"lint"`) {
+	if strings.TrimSpace(manifest.Scripts["lint"]) != "" {
 		lintCmd = "npm run lint"
+	}
+	if strings.TrimSpace(manifest.Scripts["build"]) != "" {
+		buildCmd = "npm run build"
 	}
 	return
 }

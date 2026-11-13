@@ -24,6 +24,7 @@ type Entry struct {
 	Dir        string `json:"dir"`
 	Previous   string `json:"previous"`
 	BaseBranch string `json:"base_branch,omitempty"`
+	BasePinned bool   `json:"base_pinned,omitempty"`
 }
 
 type storeFile struct {
@@ -70,6 +71,23 @@ func Open(path string) (*Store, error) {
 }
 
 type scopeKey struct{}
+type fixedDirKey struct{}
+
+// WithFixedDir binds an ephemeral directory override to ctx (for example, an
+// isolated temporary git worktree in Best-of-N arena runs) without mutating
+// persistent session workdir entries.
+func WithFixedDir(ctx context.Context, dir string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if dir == "" {
+		return ctx
+	}
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
+	}
+	return context.WithValue(ctx, fixedDirKey{}, dir)
+}
 
 type scope struct {
 	store *Store
@@ -118,6 +136,11 @@ func Current(ctx context.Context) (Entry, bool) {
 }
 
 func Dir(ctx context.Context, fallback string) string {
+	if ctx != nil {
+		if fixed, ok := ctx.Value(fixedDirKey{}).(string); ok && fixed != "" {
+			return fixed
+		}
+	}
 	if entry, ok := Current(ctx); ok {
 		if info, err := os.Stat(entry.Dir); os.IsNotExist(err) || err == nil && !info.IsDir() {
 			return entry.Previous
@@ -125,6 +148,46 @@ func Dir(ctx context.Context, fallback string) string {
 		return entry.Dir
 	}
 	return fallback
+}
+
+// SetBase pins an existing project directory to a conversation. It is used by
+// protocol clients that supply a workspace when they create a session.
+func SetBase(ctx context.Context, dir string) error {
+	if ctx == nil {
+		return ErrScopeUnavailable
+	}
+	sc, ok := ctx.Value(scopeKey{}).(scope)
+	if !ok {
+		return ErrScopeUnavailable
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(abs)
+	if err != nil || !info.IsDir() {
+		return fmt.Errorf("diretório de trabalho indisponível: %s", abs)
+	}
+	s := sc.store
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return withProcessLock(s.path+".lock", func() error {
+		if err := s.reloadLocked(); err != nil {
+			return err
+		}
+		if existing, found := s.entries[sc.key]; found {
+			if existing.BasePinned && existing.Previous == abs {
+				return nil
+			}
+			return fmt.Errorf("diretório da sessão já definido")
+		}
+		s.entries[sc.key] = Entry{Dir: abs, Previous: abs, BasePinned: true}
+		if err := s.saveLocked(); err != nil {
+			delete(s.entries, sc.key)
+			return err
+		}
+		return nil
+	})
 }
 
 // Enter records a newly created worktree after git has added it. A caller
@@ -156,12 +219,17 @@ func Enter(ctx context.Context, dir, previous, baseBranch string) error {
 		if err := s.reloadLocked(); err != nil {
 			return err
 		}
-		if _, exists := s.entries[sc.key]; exists {
+		current, exists := s.entries[sc.key]
+		if exists && (!current.BasePinned || current.Dir != current.Previous || current.Dir != previous) {
 			return ErrAlreadyEntered
 		}
-		s.entries[sc.key] = Entry{Dir: dir, Previous: previous, BaseBranch: baseBranch}
+		s.entries[sc.key] = Entry{Dir: dir, Previous: previous, BaseBranch: baseBranch, BasePinned: current.BasePinned}
 		if err := s.saveLocked(); err != nil {
-			delete(s.entries, sc.key)
+			if exists {
+				s.entries[sc.key] = current
+			} else {
+				delete(s.entries, sc.key)
+			}
 			return err
 		}
 		return nil
@@ -191,10 +259,14 @@ func Exit(ctx context.Context, expectedDir string) (string, error) {
 			return err
 		}
 		entry, exists := s.entries[sc.key]
-		if !exists || entry.Dir != expectedDir {
+		if !exists || entry.Dir != expectedDir || entry.BasePinned && entry.Dir == entry.Previous {
 			return ErrNotEntered
 		}
-		delete(s.entries, sc.key)
+		if entry.BasePinned {
+			s.entries[sc.key] = Entry{Dir: entry.Previous, Previous: entry.Previous, BasePinned: true}
+		} else {
+			delete(s.entries, sc.key)
+		}
 		if err := s.saveLocked(); err != nil {
 			s.entries[sc.key] = entry
 			return err

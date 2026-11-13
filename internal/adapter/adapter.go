@@ -35,9 +35,14 @@ type StreamChunk struct {
 	Delta string
 	Done  bool
 	Error error
+	// EventVersion and EventSequence carry the durable session-journal envelope
+	// when the turn is backed by session.EventJournal.
+	EventVersion  int
+	EventSequence uint64
 	// SessionRevision is the manifest revision durably saved with a CLI turn.
 	SessionRevision string
 	ToolEvent       *ToolEventInfo // non-nil when this chunk carries a tool event
+	Usage           *Usage         // populated on the terminal Done chunk
 }
 
 // StreamHandler processes an incoming message and streams the response via chunks channel.

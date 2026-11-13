@@ -61,6 +61,9 @@ type Task struct {
 	MisfirePolicy    string             `json:"misfire_policy,omitempty"` // run_once or skip
 	Command          string             `json:"command"`
 	Prompt           string             `json:"prompt"`
+	GateCommand      string             `json:"gate_command,omitempty"`
+	GateOn           string             `json:"gate_on,omitempty"` // "exit_zero" (default) or "non_empty"
+	SkippedCount     int                `json:"skipped_count,omitempty"`
 	Channel          string             `json:"channel"`
 	UserID           string             `json:"user_id"`
 	Enabled          bool               `json:"enabled"`
@@ -497,6 +500,52 @@ func (s *Scheduler) runTaskAtOwned(task *Task, now time.Time, manual bool) {
 		return
 	}
 	s.running[task.ID] = true
+	if !manual && task.CurrentRunID == "" && strings.TrimSpace(task.GateCommand) != "" {
+		gateSnap := *task
+		scheduledFor := task.NextRunAt
+		s.mu.Unlock()
+
+		gatePassed, gateOut, gateErr := EvaluateGate(context.Background(), &gateSnap)
+
+		s.mu.Lock()
+		if !gatePassed {
+			delete(s.running, task.ID)
+			next, err := nextOccurrence(task.Schedule, now, task.TimeZone)
+			if err != nil {
+				task.Enabled = false
+				task.LastError = err.Error()
+			} else {
+				task.NextRunAt = next
+			}
+			task.SkippedCount++
+			task.LastStatus = "skipped_gate"
+			reason := "gate pre-voo sem alteracoes (0 tokens gastos)"
+			if gateErr != nil {
+				reason = "gate pre-voo excedeu tempo: " + gateErr.Error()
+			} else if gateOut != "" {
+				if len(gateOut) > 180 {
+					gateOut = gateOut[:180] + "..."
+				}
+				reason = "gate pre-voo bloqueou rodada: " + gateOut
+			}
+			record := RunRecord{
+				ID:           fmt.Sprintf("gate_skip_%d", now.UnixNano()),
+				TaskID:       task.ID,
+				ScheduledFor: scheduledFor,
+				StartedAt:    now,
+				FinishedAt:   time.Now(),
+				Duration:     time.Since(now).Round(time.Millisecond).String(),
+				Status:       "skipped_gate",
+				Result:       reason,
+			}
+			s.mu.Unlock()
+			_ = s.appendHistory(task, record)
+			if saveErr := s.Save(); saveErr != nil {
+				s.logger.Error("falha ao salvar rotina filtrada por gate", "id", task.ID, "error", saveErr)
+			}
+			return
+		}
+	}
 	if task.CurrentRunID == "" {
 		b := make([]byte, 8)
 		if _, err := rand.Read(b); err != nil {
@@ -1061,6 +1110,17 @@ func (s *Scheduler) UpdateTask(id string, args map[string]string) error {
 	if v, exists := args["command"]; exists {
 		updated.Command = v
 	}
+	if v, exists := args["gate_command"]; exists {
+		updated.GateCommand = strings.TrimSpace(v)
+	}
+	if v, exists := args["gate_on"]; exists {
+		mode := strings.ToLower(strings.TrimSpace(v))
+		if mode != "" && mode != GateOnExitZero && mode != GateOnNonEmpty {
+			s.mu.Unlock()
+			return fmt.Errorf("gate_on deve ser exit_zero ou non_empty")
+		}
+		updated.GateOn = mode
+	}
 	if v, exists := args["max_retries"]; exists {
 		parsed, err := strconv.Atoi(v)
 		if err != nil {
@@ -1138,6 +1198,13 @@ func RegisterSkills(reg *skill.Registry, sched *Scheduler, verificationStores ..
 					action = "agente: " + t.Prompt
 				}
 				fmt.Fprintf(&sb, "- **%s** [%s] %s `%s` (%s)\n", t.ID, status, t.Name, t.Schedule, action)
+				if t.GateCommand != "" {
+					gateMode := t.GateOn
+					if gateMode == "" {
+						gateMode = GateOnExitZero
+					}
+					fmt.Fprintf(&sb, "  Gate pre-voo (%s): `%s` | rodadas poupadas: %d\n", gateMode, t.GateCommand, t.SkippedCount)
+				}
 				if !t.NextRunAt.IsZero() {
 					fmt.Fprintf(&sb, "  Proxima execucao: %s | fuso: %s | perda de horario: %s\n", t.NextRunAt.Format(time.RFC3339), t.TimeZone, t.MisfirePolicy)
 				}
@@ -1164,6 +1231,8 @@ func RegisterSkills(reg *skill.Registry, sched *Scheduler, verificationStores ..
 				"misfire_policy":               {Type: jsonschema.String, Description: "run_once executa uma vez apos parada; skip ignora horarios perdidos"},
 				"prompt":                       {Type: jsonschema.String, Description: "Objetivo completo para despertar o agente, incluindo contexto, verificacao de sucesso e o que fazer em caso de erro"},
 				"command":                      {Type: jsonschema.String, Description: "Comando shell exato; use somente para automacoes mecanicas que nao exigem raciocinio"},
+				"gate_command":                 {Type: jsonschema.String, Description: "Opcional: comando shell leve de pre-voo (ex: git status --porcelain); se nao passar, pula a rodada gastando 0 tokens"},
+				"gate_on":                      {Type: jsonschema.String, Description: "Opcional: exit_zero (padrao) ou non_empty (so desperta o agente quando gate_command retorna codigo 0 E saida nao vazia)"},
 				"max_retries":                  {Type: jsonschema.Integer, Description: "Numero de novas tentativas em caso de falha (padrao 3, maximo 5)"},
 				"channel":                      {Type: jsonschema.String, Description: "Canal de origem da rotina"},
 				"user_id":                      {Type: jsonschema.String, Description: "Identidade dona da rotina"},
@@ -1186,6 +1255,10 @@ func RegisterSkills(reg *skill.Registry, sched *Scheduler, verificationStores ..
 				}
 				maxRetries = parsed
 			}
+			gateOn := strings.ToLower(strings.TrimSpace(args["gate_on"]))
+			if gateOn != "" && gateOn != GateOnExitZero && gateOn != GateOnNonEmpty {
+				return "", fmt.Errorf("gate_on deve ser exit_zero ou non_empty")
+			}
 			task := &Task{
 				Name:          args["name"],
 				Schedule:      args["schedule"],
@@ -1193,6 +1266,8 @@ func RegisterSkills(reg *skill.Registry, sched *Scheduler, verificationStores ..
 				MisfirePolicy: args["misfire_policy"],
 				Command:       args["command"],
 				Prompt:        args["prompt"],
+				GateCommand:   strings.TrimSpace(args["gate_command"]),
+				GateOn:        gateOn,
 				Channel:       args["channel"],
 				UserID:        args["user_id"],
 				MaxRetries:    maxRetries,
@@ -1277,6 +1352,8 @@ func RegisterSkills(reg *skill.Registry, sched *Scheduler, verificationStores ..
 				"misfire_policy": {Type: jsonschema.String, Description: "run_once ou skip"},
 				"prompt":         {Type: jsonschema.String, Description: "Novo objetivo do agente"},
 				"command":        {Type: jsonschema.String, Description: "Novo comando"},
+				"gate_command":   {Type: jsonschema.String, Description: "Novo comando shell de pre-voo (vazio remove o gate)"},
+				"gate_on":        {Type: jsonschema.String, Description: "exit_zero ou non_empty"},
 				"max_retries":    {Type: jsonschema.Integer, Description: "0 a 5"},
 			},
 			Required: []string{"id"},

@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 
 	"golang.org/x/crypto/pbkdf2"
@@ -71,11 +72,21 @@ func (f *FallbackStorage) Delete(key string) error {
 }
 
 func (f *FallbackStorage) List() ([]string, error) {
-	keys, err := f.Primary.List()
-	if err == nil && len(keys) > 0 {
-		return keys, nil
+	primaryKeys, primaryErr := f.Primary.List()
+	secondaryKeys, secondaryErr := f.Secondary.List()
+	if primaryErr != nil && secondaryErr != nil {
+		return nil, fmt.Errorf("primary: %w; secondary: %v", primaryErr, secondaryErr)
 	}
-	return f.Secondary.List()
+	seen := make(map[string]bool, len(primaryKeys)+len(secondaryKeys))
+	var keys []string
+	for _, key := range append(primaryKeys, secondaryKeys...) {
+		if key != "" && !seen[key] {
+			keys = append(keys, key)
+			seen[key] = true
+		}
+	}
+	sort.Strings(keys)
+	return keys, nil
 }
 
 // -------------------------------------------------------------------

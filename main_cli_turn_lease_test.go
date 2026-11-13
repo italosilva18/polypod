@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/costa/polypod/internal/adapter"
@@ -11,6 +12,23 @@ import (
 	"github.com/costa/polypod/internal/session"
 	"github.com/costa/polypod/internal/turncheckpoint"
 )
+
+func TestBindDurableTurnUsesInboxIDOnce(t *testing.T) {
+	msg := bindDurableTurn(adapter.InMessage{ID: "wa-msg-1", Channel: "whatsapp", UserID: "551199999"})
+	if msg.Metadata["polypod_session_id"] != "whatsapp:551199999" || msg.Metadata["polypod_turn_id"] != "wa-msg-1" {
+		t.Fatalf("metadata = %+v", msg.Metadata)
+	}
+	again := bindDurableTurn(adapter.InMessage{ID: "wa-msg-1", Channel: "whatsapp", UserID: "551199999",
+		Metadata: map[string]string{"polypod_turn_id": "kept"}})
+	if again.Metadata["polypod_turn_id"] != "kept" {
+		t.Fatalf("existing turn id replaced: %+v", again.Metadata)
+	}
+	longID := strings.Repeat("a", 129)
+	skipped := bindDurableTurn(adapter.InMessage{ID: longID, Channel: "task_queue", UserID: "task"})
+	if _, ok := skipped.Metadata["polypod_turn_id"]; ok {
+		t.Fatal("turn id longer than 128 must stay unset")
+	}
+}
 
 func TestCLITurnRejectsStaleManifestBeforeNextTool(t *testing.T) {
 	storage := session.NewFileSystemStorage(t.TempDir(), slog.Default())

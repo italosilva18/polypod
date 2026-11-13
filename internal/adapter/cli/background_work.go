@@ -10,6 +10,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/costa/polypod/internal/adapter"
 	"github.com/costa/polypod/internal/taskqueue"
 	"github.com/costa/polypod/internal/tasks"
 )
@@ -184,6 +185,7 @@ func (m *model) detachActiveTurn() tea.Cmd {
 		description = backgroundTitle(m.activeTurn.raw)
 	}
 	state := tasks.NewTaskState(tasks.TaskTypeCLITurn, description)
+	state.Workspace = commandWorkingDir(m.cmdDeps)
 	state.Status = tasks.StatusRunning
 	state.StartTime = m.streamStart
 	state.OutputFile = "" // the completed answer lives in Result
@@ -204,7 +206,7 @@ func (m *model) detachActiveTurn() tea.Cmd {
 	return clearNotifyAfter(6*time.Second, m.notification)
 }
 
-func (m *model) finishDetachedTurn(status tasks.TaskStatus, result, failure string) {
+func (m *model) finishDetachedTurn(status tasks.TaskStatus, result, failure string, usage *adapter.Usage) {
 	id := m.detachedTaskID
 	if id == "" {
 		return
@@ -220,6 +222,18 @@ func (m *model) finishDetachedTurn(status tasks.TaskStatus, result, failure stri
 		state.EndTime = &now
 		state.Result = result
 		state.Error = failure
+		if usage != nil {
+			progress := tasks.AgentProgress{
+				ToolUseCount: usage.Steps,
+				TokenCount:   usage.TotalTokens,
+			}
+			if usage.CostUSD != nil {
+				cost := *usage.CostUSD
+				progress.CostUSD = &cost
+				state.CostUSD = &cost
+			}
+			state.Progress = &progress
+		}
 	}); err != nil {
 		m.messages = append(m.messages, chatEntry{role: "error", content: fmt.Sprintf("Resultado do turno %s está na conversa, mas falhou o registro da tarefa: %v", id, err), timestamp: now})
 	}
@@ -228,6 +242,11 @@ func (m *model) finishDetachedTurn(status tasks.TaskStatus, result, failure stri
 func formatDetachedTask(state *tasks.TaskState) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Turno %s · %s\n%s", state.ID, state.Status, state.Description)
+	if state.CostUSD != nil {
+		fmt.Fprintf(&b, "\nCusto: US$%.4f", *state.CostUSD)
+	} else {
+		b.WriteString("\nCusto: não medido")
+	}
 	if state.Error != "" {
 		b.WriteString("\nErro: ")
 		b.WriteString(state.Error)

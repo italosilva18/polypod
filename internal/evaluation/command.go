@@ -31,6 +31,7 @@ type CommandCase struct {
 	Command        []string `json:"command"`
 	ExpectedFile   string   `json:"expected_file"`
 	ExpectedSHA256 string   `json:"expected_sha256"`
+	VerifyCommand  []string `json:"verify_command,omitempty"`
 }
 
 type CommandPlan struct {
@@ -87,6 +88,16 @@ func NewCommandRunner(manifest Manifest, plan CommandPlan) (*CommandRunner, erro
 		} else if c.ExpectedSHA256 != "" {
 			return nil, fmt.Errorf("SHA-256 sem arquivo em %q", c.TaskID)
 		}
+		if len(c.VerifyCommand) > 0 {
+			if !filepath.IsAbs(c.VerifyCommand[0]) {
+				return nil, fmt.Errorf("verificador de %q deve usar executável absoluto", c.TaskID)
+			}
+			for _, arg := range c.VerifyCommand {
+				if strings.TrimSpace(arg) == "" || strings.Contains(arg, "{prompt}") {
+					return nil, fmt.Errorf("argumento inválido no verificador de %q", c.TaskID)
+				}
+			}
+		}
 		runner.cases[c.TaskID] = c
 	}
 	return runner, nil
@@ -135,11 +146,28 @@ func (r *CommandRunner) Execute(ctx context.Context, task Task) (Execution, erro
 	stderr := &limitWriter{limit: maxCommandOutput}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return Execution{}, ctx.Err()
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && (c.ExpectedFile != "" || len(c.VerifyCommand) > 0) {
+			// A coding patch can be correct even when the agent fails to produce a
+			// final answer. Let the external verifier judge the workspace.
+			code := exitErr.ExitCode()
+			return Execution{AgentExitCode: &code}, nil
+		}
 		// stderr can contain private material, so do not return it in errors.
 		return Execution{}, fmt.Errorf("agente de %q falhou: %w", task.ID, err)
 	}
 	var result struct {
-		Content string `json:"content"`
+		Content      string  `json:"content"`
+		CostMeasured bool    `json:"cost_measured"`
+		CostUSD      float64 `json:"cost_usd"`
+		Steps        *int    `json:"steps"`
+		ToolFailures *int    `json:"tool_failures"`
+		Tokens       struct {
+			Total int `json:"total"`
+		} `json:"tokens"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(stdout.buf.Bytes()))
 	if err := decoder.Decode(&result); err != nil {
@@ -149,33 +177,68 @@ func (r *CommandRunner) Execute(ctx context.Context, task Task) (Execution, erro
 	if err := decoder.Decode(&extra); err != io.EOF {
 		return Execution{}, fmt.Errorf("saída JSON adicional de %q", task.ID)
 	}
-	return Execution{Response: result.Content}, nil
+	execution := Execution{Response: result.Content, Steps: result.Steps, ToolFailures: result.ToolFailures}
+	if result.CostMeasured {
+		execution.CostUSD = &result.CostUSD
+	}
+	if result.Tokens.Total > 0 {
+		execution.Tokens = &result.Tokens.Total
+	}
+	return execution, nil
 }
 
-// Verify checks an externally observed file against a digest fixed before the
-// agent ran. Cases without a verifier stay skipped, not successful.
-func (r *CommandRunner) Verify(ctx context.Context, task Task, _ Execution) (Verification, error) {
+// Verify checks an externally observed file and/or a fixed verifier command.
+// Cases without a verifier stay skipped, not successful.
+func (r *CommandRunner) Verify(ctx context.Context, task Task, execution Execution) (Verification, error) {
 	c, ok := r.cases[task.ID]
 	if !ok {
 		return Verification{}, fmt.Errorf("caso não configurado: %q", task.ID)
 	}
-	if c.ExpectedFile == "" {
+	if c.ExpectedFile == "" && len(c.VerifyCommand) == 0 {
 		return Verification{Status: "skipped"}, nil
 	}
 	if err := ctx.Err(); err != nil {
 		return Verification{}, err
 	}
-	actual, err := observedFileSHA256(ctx, c.WorkingDir, c.ExpectedFile)
-	if err != nil {
-		return Verification{}, err
+	var evidence []string
+	var verifiedBy []string
+	if execution.AgentExitCode != nil {
+		evidence = append(evidence, fmt.Sprintf("agent_exit_code:%d", *execution.AgentExitCode))
 	}
-	if actual == "missing" {
-		return Verification{Status: "failure", VerifiedBy: "file_sha256", Evidence: "arquivo ausente"}, nil
+	if c.ExpectedFile != "" {
+		actual, err := observedFileSHA256(ctx, c.WorkingDir, c.ExpectedFile)
+		if err != nil {
+			return Verification{}, err
+		}
+		if actual == "missing" {
+			return Verification{Status: "failure", VerifiedBy: "file_sha256", Evidence: strings.Join(append(evidence, "arquivo ausente"), ";")}, nil
+		}
+		if !strings.EqualFold(actual, c.ExpectedSHA256) {
+			return Verification{Status: "failure", VerifiedBy: "file_sha256", Evidence: strings.Join(append(evidence, "sha256:"+actual), ";")}, nil
+		}
+		evidence = append(evidence, "sha256:"+actual)
+		verifiedBy = append(verifiedBy, "file_sha256")
 	}
-	if !strings.EqualFold(actual, c.ExpectedSHA256) {
-		return Verification{Status: "failure", VerifiedBy: "file_sha256", Evidence: "sha256:" + actual}, nil
+	if len(c.VerifyCommand) > 0 {
+		cmd := exec.CommandContext(ctx, c.VerifyCommand[0], c.VerifyCommand[1:]...)
+		cmd.Dir = c.WorkingDir
+		stdout := &limitWriter{limit: maxCommandOutput}
+		stderr := &limitWriter{limit: maxCommandOutput}
+		cmd.Stdout, cmd.Stderr = stdout, stderr
+		if err := cmd.Run(); err != nil {
+			if ctx.Err() != nil {
+				return Verification{}, ctx.Err()
+			}
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				return Verification{Status: "failure", VerifiedBy: "external_command", Evidence: strings.Join(append(evidence, fmt.Sprintf("exit_code:%d", exitErr.ExitCode())), ";")}, nil
+			}
+			return Verification{}, fmt.Errorf("verificador de %q: %w", task.ID, err)
+		}
+		evidence = append(evidence, "exit_code:0")
+		verifiedBy = append(verifiedBy, "external_command")
 	}
-	return Verification{Status: "success", VerifiedBy: "file_sha256", Evidence: "sha256:" + actual}, nil
+	return Verification{Status: "success", VerifiedBy: strings.Join(verifiedBy, "+"), Evidence: strings.Join(evidence, ";")}, nil
 }
 
 func observedFileSHA256(ctx context.Context, root, relative string) (string, error) {

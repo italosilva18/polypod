@@ -43,9 +43,17 @@ func (c *Client) completeWithCheckpointedOpenAI(ctx context.Context, initial []C
 	catalog := c.catalogFor(ctx)
 	replayOpenAICatalog(catalog, msgs)
 	limit := c.toolIterationLimit()
+	guard := newCognitiveGuard()
 	for limit < 0 || cp.Iteration < limit {
 		if cp.Phase == turncheckpoint.AIPhaseModel {
+			for _, guidance := range takeSteering(ctx) {
+				msgs = append(msgs, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: guidance})
+			}
+			if err := saveAICheckpoint(scope, cp, msgs); err != nil {
+				return nil, err
+			}
 			req := openai.ChatCompletionRequest{Model: cp.Model, Messages: msgs, MaxTokens: c.maxTok, Temperature: c.temp, Stream: true}
+			c.applyReasoningToOpenAIReq(ctx, &req, guard.boostedReasoning)
 			if c.toolsOn {
 				req.Tools = catalog.definitions()
 			}
@@ -82,11 +90,35 @@ func (c *Client) completeWithCheckpointedOpenAI(ctx context.Context, initial []C
 			}
 			stream.Close()
 			if len(prepared.byIndex) == 0 {
+				var guidance []string
+				if limit < 0 || cp.Iteration+1 < limit {
+					guidance = takeSteering(ctx)
+					if len(guidance) == 0 {
+						if gate := guard.checkCompletionGate(ctx); gate != "" {
+							guidance = append(guidance, gate)
+						}
+					}
+				}
+				if len(guidance) > 0 {
+					msgs = append(msgs, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, Content: content})
+					for _, message := range guidance {
+						msgs = append(msgs, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: message})
+					}
+					cp.Iteration++
+					if err := saveAICheckpoint(scope, cp, msgs); err != nil {
+						return nil, err
+					}
+					if callback != nil {
+						callback("\n")
+					}
+					continue
+				}
 				cp.Phase = turncheckpoint.AIPhaseDone
 				cp.FinalContent = content
 				if err := saveAICheckpoint(scope, cp, msgs); err != nil {
 					return nil, err
 				}
+				c.recordTurnPlaybook(ctx, guard, content)
 				return responseFromCheckpoint(cp), nil
 			}
 			toolCalls, _, err := prepared.finalize()
@@ -140,7 +172,7 @@ func (c *Client) completeWithCheckpointedOpenAI(ctx context.Context, initial []C
 			}
 			c.emitToolEvent(ctx, event)
 			msgs = append(msgs, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleTool, Content: result, Name: tc.Function.Name, ToolCallID: tc.ID})
-			if !c.textOnly {
+			if !c.isTextOnly() {
 				deferredImages = append(deferredImages, openAIImageObservations([]ToolCallResult{observation})...)
 				cp.DeferredImages, err = json.Marshal(deferredImages)
 				if err != nil {
@@ -148,6 +180,13 @@ func (c *Client) completeWithCheckpointedOpenAI(ctx context.Context, initial []C
 				}
 			}
 			catalog.observe([]ToolCallResult{observation})
+			if replan, _ := guard.observe(ctx, []guardedCall{{Name: tc.Function.Name, Arguments: tc.Function.Arguments}}, []ToolCallResult{observation}); replan != "" && (limit < 0 || cp.Iteration+1 < limit) {
+				deferredImages = append(deferredImages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: replan})
+				cp.DeferredImages, err = json.Marshal(deferredImages)
+				if err != nil {
+					return nil, err
+				}
+			}
 			cp.PendingToolCallID = ""
 			cp.NextToolIndex = i + 1
 			if err := saveAICheckpoint(scope, cp, msgs); err != nil {

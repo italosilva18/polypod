@@ -15,6 +15,7 @@ import (
 type StatusBarState struct {
 	// Core identity
 	Model        string
+	Provider     string
 	Agent        string
 	Mode         string // "edit", "plan", "ask", "auto"
 	SessionID    string
@@ -162,6 +163,9 @@ func (sb *StatusBar) renderCompact(width int) string {
 	cost := sb.renderCost()
 
 	parts := []string{brand, mode}
+	if sb.state.Provider != "" && width >= 42 {
+		parts = append(parts, sbValueStyle.Render(sb.state.Provider))
+	}
 	if tokens != "" {
 		parts = append(parts, tokens)
 	}
@@ -182,15 +186,18 @@ func (sb *StatusBar) renderCompact(width int) string {
 func (sb *StatusBar) renderNormal(width int) string {
 	parts := []string{sbBrandStyle.Render("[polypod]")}
 
-	parts = append(parts, sbLabelStyle.Render("mode:")+sb.renderModeBadge(false))
+	parts = append(parts, sbLabelStyle.Render("modo:")+sb.renderModeBadge(false))
+	if sb.state.Provider != "" {
+		parts = append(parts, sbLabelStyle.Render("provedor:")+sbValueStyle.Render(sb.state.Provider))
+	}
 
 	if sb.state.Agent != "" {
-		parts = append(parts, sbLabelStyle.Render("agent:")+sbValueStyle.Render(
+		parts = append(parts, sbLabelStyle.Render("agente:")+sbValueStyle.Render(
 			ansi.Truncate(sb.state.Agent, max(12, width/5), "…")))
 	}
 
 	if tok := sb.renderTokensDetailed(); tok != "" {
-		parts = append(parts, sbLabelStyle.Render("ctx:")+tok)
+		parts = append(parts, sbLabelStyle.Render("contexto:")+tok)
 	}
 
 	if cost := sb.renderCost(); cost != "" {
@@ -198,7 +205,7 @@ func (sb *StatusBar) renderNormal(width int) string {
 	}
 
 	if sb.state.SessionID != "" {
-		parts = append(parts, sbLabelStyle.Render("session:")+sbValueStyle.Render(shortSessionID(sb.state.SessionID)))
+		parts = append(parts, sbLabelStyle.Render("sessão:")+sbValueStyle.Render(shortSessionID(sb.state.SessionID)))
 	}
 
 	sep := sbSepStyle.Render(" | ")
@@ -215,19 +222,22 @@ func (sb *StatusBar) renderNormal(width int) string {
 func (sb *StatusBar) renderDetailed(width int) string {
 	parts := []string{sbBrandStyle.Render("[polypod]")}
 
-	parts = append(parts, sbLabelStyle.Render("mode:")+sb.renderModeBadge(true))
+	parts = append(parts, sbLabelStyle.Render("modo:")+sb.renderModeBadge(true))
+	if sb.state.Provider != "" {
+		parts = append(parts, sbLabelStyle.Render("provedor:")+sbValueStyle.Render(sb.state.Provider))
+	}
 
 	if sb.state.Model != "" {
-		parts = append(parts, sbLabelStyle.Render("model:")+sbValueStyle.Render(
+		parts = append(parts, sbLabelStyle.Render("modelo:")+sbValueStyle.Render(
 			ansi.Truncate(sb.state.Model, max(16, width/4), "…")))
 	}
 	if sb.state.Agent != "" {
-		parts = append(parts, sbLabelStyle.Render("agent:")+sbValueStyle.Render(
+		parts = append(parts, sbLabelStyle.Render("agente:")+sbValueStyle.Render(
 			ansi.Truncate(sb.state.Agent, max(12, width/5), "…")))
 	}
 
 	if tok := sb.renderTokensDetailed(); tok != "" {
-		parts = append(parts, sbLabelStyle.Render("ctx:")+tok)
+		parts = append(parts, sbLabelStyle.Render("contexto:")+tok)
 	}
 
 	if cost := sb.renderCost(); cost != "" {
@@ -235,12 +245,12 @@ func (sb *StatusBar) renderDetailed(width int) string {
 	}
 
 	if sb.state.SessionID != "" {
-		parts = append(parts, sbLabelStyle.Render("session:")+sbValueStyle.Render(shortSessionID(sb.state.SessionID)))
+		parts = append(parts, sbLabelStyle.Render("sessão:")+sbValueStyle.Render(shortSessionID(sb.state.SessionID)))
 	}
 
 	if !sb.state.SessionStart.IsZero() {
 		dur := formatSessionDuration(time.Since(sb.state.SessionStart))
-		parts = append(parts, sbLabelStyle.Render("time:")+sbValueStyle.Render(dur))
+		parts = append(parts, sbLabelStyle.Render("tempo:")+sbValueStyle.Render(dur))
 	}
 
 	sep := sbSepStyle.Render(" | ")
@@ -275,6 +285,16 @@ func (sb *StatusBar) renderModeBadge(withIcon bool) string {
 	}
 
 	label := strings.ToUpper(mode)
+	switch mode {
+	case "edit":
+		label = "EDIÇÃO"
+	case "plan":
+		label = "PLANO"
+	case "ask":
+		label = "PERGUNTAR"
+	case "auto":
+		label = "AUTOMÁTICO"
+	}
 	if withIcon && mode == "plan" {
 		label = "👁 " + label
 	}

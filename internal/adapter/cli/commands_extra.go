@@ -205,7 +205,7 @@ func handleDoctor(deps commandDeps) commandResult {
 					enabled++
 				}
 			}
-			hookChecks = append(hookChecks, doctorCheck{status: "ok", label: fmt.Sprintf("%d hooks registrados", len(hks)), detail: fmt.Sprintf("(%d enabled)", enabled)})
+			hookChecks = append(hookChecks, doctorCheck{status: "ok", label: fmt.Sprintf("%d hooks registrados", len(hks)), detail: fmt.Sprintf("(%d ativados)", enabled)})
 		}
 		writeGroup("HOOKS", hookChecks)
 	}
@@ -602,9 +602,9 @@ func handleHooksList(deps commandDeps) commandResult {
 			b.WriteString(" ")
 			b.WriteString(cmdValueStyle.Render(h.name))
 			if h.enabled {
-				b.WriteString(cmdLabelStyle.Render(" (enabled)"))
+				b.WriteString(cmdLabelStyle.Render(" (ativado)"))
 			} else {
-				b.WriteString(cmdLabelStyle.Render(" (disabled)"))
+				b.WriteString(cmdLabelStyle.Render(" (desativado)"))
 			}
 			b.WriteString("\n")
 		}
@@ -627,9 +627,9 @@ func handleHookToggle(deps commandDeps, name string, enable bool) commandResult 
 			handled: true,
 		}
 	}
-	state := "disabled"
+	state := "desativado"
 	if enable {
-		state = "enabled"
+		state = "ativado"
 	}
 	return commandResult{
 		output:  notifySuccessStyle.Render("hook "+state+": ") + cmdValueStyle.Render(name),
@@ -669,9 +669,9 @@ func handleHookShow(deps commandDeps, name string) commandResult {
 		rows = append(rows, struct{ label, value string }{"comando", target.command})
 	}
 	if target.enabled {
-		rows = append(rows, struct{ label, value string }{"status", "enabled"})
+		rows = append(rows, struct{ label, value string }{"status", "ativado"})
 	} else {
-		rows = append(rows, struct{ label, value string }{"status", "disabled"})
+		rows = append(rows, struct{ label, value string }{"status", "desativado"})
 	}
 
 	maxLabel := 0

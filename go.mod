@@ -17,6 +17,7 @@ require (
 	github.com/modelcontextprotocol/go-sdk v1.4.1
 	github.com/muesli/termenv v0.16.0
 	github.com/openai/openai-go/v3 v3.22.0
+	github.com/pmezard/go-difflib v1.0.0
 	github.com/sashabaranov/go-openai v1.41.2
 	golang.org/x/crypto v0.58.0
 	golang.org/x/image v0.43.0

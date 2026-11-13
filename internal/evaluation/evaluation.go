@@ -12,7 +12,7 @@ import (
 
 const SchemaVersion = 1
 
-var Categories = []string{"gui", "memory", "routine", "channels", "safety"}
+var Categories = []string{"gui", "memory", "routine", "channels", "safety", "coding"}
 
 type Task struct {
 	ID             string `json:"id"`
@@ -49,15 +49,17 @@ type Metadata struct {
 	Synthetic        bool   `json:"synthetic"`
 }
 type Outcome struct {
-	TaskID     string   `json:"task_id"`
-	Status     string   `json:"status"` // success, failure, timeout, error, skipped
-	Evidence   string   `json:"evidence"`
-	VerifiedBy string   `json:"verified_by"`
-	LatencyMS  *float64 `json:"latency_ms,omitempty"`
-	CostUSD    *float64 `json:"cost_usd,omitempty"`
-	Steps      *int     `json:"steps,omitempty"`
-	Recovered  *bool    `json:"recovered,omitempty"`
-	Trace      string   `json:"trace,omitempty"`
+	TaskID       string   `json:"task_id"`
+	Status       string   `json:"status"` // success, failure, timeout, error, skipped
+	Evidence     string   `json:"evidence"`
+	VerifiedBy   string   `json:"verified_by"`
+	LatencyMS    *float64 `json:"latency_ms,omitempty"`
+	CostUSD      *float64 `json:"cost_usd,omitempty"`
+	Steps        *int     `json:"steps,omitempty"`
+	TokenCount   *int     `json:"token_count,omitempty"`
+	ToolFailures *int     `json:"tool_failures,omitempty"`
+	Recovered    *bool    `json:"recovered,omitempty"`
+	Trace        string   `json:"trace,omitempty"`
 }
 type Results struct {
 	SchemaVersion   int       `json:"schema_version"`
@@ -91,6 +93,9 @@ type Report struct {
 	Recovery         Score                 `json:"recovery"`
 	LatencyMS        Metrics               `json:"latency_ms"`
 	CostUSD          Metrics               `json:"cost_usd"`
+	Tokens           Metrics               `json:"tokens"`
+	ToolFailures     Metrics               `json:"tool_failures"`
+	CostPerSolvedUSD *float64              `json:"cost_per_solved_usd,omitempty"`
 	Missing          []string              `json:"missing"`
 	BudgetExceeded   []string              `json:"budget_exceeded"`
 	BudgetUnmeasured []string              `json:"budget_unmeasured"`
@@ -184,7 +189,8 @@ func Evaluate(m Manifest, r Results) (Report, error) {
 		default:
 			return p, fmt.Errorf("status inválido: %s", o.Status)
 		}
-		if !validNumber(o.LatencyMS) || !validNumber(o.CostUSD) || (o.Steps != nil && *o.Steps < 0) {
+		if !validNumber(o.LatencyMS) || !validNumber(o.CostUSD) || (o.Steps != nil && *o.Steps < 0) ||
+			(o.TokenCount != nil && *o.TokenCount < 0) || (o.ToolFailures != nil && *o.ToolFailures < 0) {
 			return p, fmt.Errorf("medição inválida: %s", o.TaskID)
 		}
 		if o.Status == "success" && (strings.TrimSpace(o.Evidence) == "" || strings.TrimSpace(o.VerifiedBy) == "") {
@@ -195,7 +201,7 @@ func Evaluate(m Manifest, r Results) (Report, error) {
 		}
 		outcomes[o.TaskID] = o
 	}
-	var latency, cost []float64
+	var latency, cost, tokens, toolFailures []float64
 	for _, t := range m.Tasks {
 		s := p.Categories[t.Category]
 		s.Total++
@@ -241,6 +247,12 @@ func Evaluate(m Manifest, r Results) (Report, error) {
 		if o.CostUSD != nil {
 			cost = append(cost, *o.CostUSD)
 		}
+		if o.TokenCount != nil {
+			tokens = append(tokens, float64(*o.TokenCount))
+		}
+		if o.ToolFailures != nil {
+			toolFailures = append(toolFailures, float64(*o.ToolFailures))
+		}
 		p.Categories[t.Category] = s
 	}
 	for c, s := range p.Categories {
@@ -251,6 +263,12 @@ func Evaluate(m Manifest, r Results) (Report, error) {
 	p.Recovery = rate(p.Recovery)
 	p.LatencyMS = metrics(latency)
 	p.CostUSD = metrics(cost)
+	p.Tokens = metrics(tokens)
+	p.ToolFailures = metrics(toolFailures)
+	if p.Overall.Success > 0 && len(cost) == len(r.Outcomes) && len(r.Outcomes) == len(m.Tasks) {
+		perSolved := p.CostUSD.Total / float64(p.Overall.Success)
+		p.CostPerSolvedUSD = &perSolved
+	}
 	return p, nil
 }
 func percent(p *float64) string {
@@ -274,6 +292,10 @@ func Markdown(p Report) (string, error) {
 		fmt.Fprintf(&b, "| %s | %d | %d | %d | %s |\n", c, s.Success, s.Total, s.Reported, percent(s.Rate))
 	}
 	fmt.Fprintf(&b, "\nSucessos com orçamento integral medido: %d/%d (%s); medições completas em %d tarefas.\n\nRecuperação provisória: %s (%d/%d; %d reportados).\n\nLatência: %d amostras. Custo: US$ %.6f (%d amostras). Valores ausentes não são zero.\n\nAusentes: %v. Orçamento excedido: %v. Orçamento sem medição completa: %v.\n\nMetadados e resultados completos:\n\n", p.BudgetMeasured.Success, p.BudgetMeasured.Total, percent(p.BudgetMeasured.Rate), p.BudgetMeasured.Reported, percent(p.Recovery.Rate), p.Recovery.Success, p.Recovery.Total, p.Recovery.Reported, p.LatencyMS.Samples, p.CostUSD.Total, p.CostUSD.Samples, p.Missing, p.BudgetExceeded, p.BudgetUnmeasured)
+	fmt.Fprintf(&b, "Tokens: %.0f (%d amostras). Falhas de ferramenta: %.0f (%d amostras).\n\n", p.Tokens.Total, p.Tokens.Samples, p.ToolFailures.Total, p.ToolFailures.Samples)
+	if p.CostPerSolvedUSD != nil {
+		fmt.Fprintf(&b, "Custo por tarefa resolvida: US$ %.6f.\n\n", *p.CostPerSolvedUSD)
+	}
 	raw, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("serializar relatório: %w", err)

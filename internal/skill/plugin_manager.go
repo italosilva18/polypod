@@ -24,6 +24,8 @@ type PluginInfo struct {
 	Path         string   `json:"path"`
 	Enabled      bool     `json:"enabled"`
 	SkillFiles   []string `json:"skill_files"`
+	HookFiles    []string `json:"hook_files,omitempty"`
+	MCPFiles     []string `json:"mcp_files,omitempty"`
 	LoadedSkills []string `json:"loaded_skills"`
 }
 
@@ -131,7 +133,7 @@ func (pm *PluginManager) fingerprint() [32]byte {
 			if json.Unmarshal(manifestData, &manifest) != nil {
 				continue
 			}
-			for _, relPath := range manifest.Skills {
+			for _, relPath := range append(append(append([]string{}, manifest.Skills...), manifest.Hooks...), manifest.MCPServers...) {
 				_, _ = h.Write([]byte("skill:" + relPath + "\n"))
 				path, err := pm.loader.resolveSkillPath(dir, relPath)
 				if err != nil {
@@ -377,7 +379,8 @@ func (pm *PluginManager) infoLocked(manifest PluginManifest) PluginInfo {
 	return PluginInfo{
 		ID: pluginID(manifest.dir), Name: manifest.Name, Version: manifest.Version,
 		Author: manifest.Author, Path: manifest.dir, Enabled: manifest.Enabled,
-		SkillFiles: append([]string(nil), manifest.Skills...), LoadedSkills: loaded,
+		SkillFiles: append([]string(nil), manifest.Skills...), HookFiles: append([]string(nil), manifest.Hooks...),
+		MCPFiles: append([]string(nil), manifest.MCPServers...), LoadedSkills: loaded,
 	}
 }
 

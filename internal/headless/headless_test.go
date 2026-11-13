@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/costa/polypod/internal/adapter"
+	"github.com/costa/polypod/internal/session"
 )
 
 // captureStdout redirects os.Stdout while fn runs and returns what was written.
@@ -223,6 +224,27 @@ func TestRunJSONFormat(t *testing.T) {
 	}
 }
 
+func TestRunJSONFormatCarriesMeasuredUsage(t *testing.T) {
+	zero := 0.0
+	handler := func(context.Context, adapter.InMessage) (adapter.OutMessage, error) {
+		return adapter.OutMessage{Text: "OK", Usage: &adapter.Usage{Provider: "ollama", Model: "qwen2.5-coder:3b",
+			PromptTokens: 12, CompletionTokens: 4, TotalTokens: 16, CostUSD: &zero, Steps: 2, ToolFailures: 1}}, nil
+	}
+	out := captureStdout(t, func() {
+		if err := Run(context.Background(), Config{Prompt: "responda", OutputFormat: FormatJSON}, handler, nil, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	})
+	var result Result
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Provider != "ollama" || result.Model != "qwen2.5-coder:3b" || !result.CostMeasured || result.CostUSD != 0 ||
+		result.Tokens.Total != 16 || result.Steps != 2 || result.ToolFailures != 1 {
+		t.Fatalf("usage lost: %+v", result)
+	}
+}
+
 func TestRunJSONFormatHandlerError(t *testing.T) {
 	cfg := Config{Prompt: "hi", OutputFormat: FormatJSON}
 	boom := &stubError{"boom"}
@@ -306,11 +328,50 @@ func TestRunStreamJSONPropagatesError(t *testing.T) {
 	}
 
 	var err error
-	_ = captureStdout(t, func() {
+	out := captureStdout(t, func() {
 		err = Run(context.Background(), cfg, handler, streamHandler, nil, nil)
 	})
 	if err == nil || err.Error() != "stream-fail" {
 		t.Errorf("want stream-fail error, got %v", err)
+	}
+	var event map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &event); err != nil {
+		t.Fatalf("decode error event: %v", err)
+	}
+	if event["type"] != "error" || event["error"] != "stream-fail" {
+		t.Fatalf("unexpected error event: %+v", event)
+	}
+}
+
+func TestRunStreamJSONIncludesToolLifecycleAndSequence(t *testing.T) {
+	cfg := Config{Prompt: "programar", OutputFormat: FormatStreamJSON}
+	streamHandler := func(_ context.Context, _ adapter.InMessage, chunks chan<- adapter.StreamChunk) {
+		defer close(chunks)
+		chunks <- adapter.StreamChunk{ToolEvent: &adapter.ToolEventInfo{Type: adapter.ToolEventStart, ToolName: "file_edit", ToolID: "call-1"}}
+		chunks <- adapter.StreamChunk{ToolEvent: &adapter.ToolEventInfo{Type: adapter.ToolEventComplete, ToolName: "file_edit", ToolID: "call-1", Elapsed: 25 * time.Millisecond}}
+		chunks <- adapter.StreamChunk{Delta: "feito"}
+		chunks <- adapter.StreamChunk{Done: true}
+	}
+	out := captureStdout(t, func() {
+		if err := Run(context.Background(), cfg, nil, streamHandler, nil, nil); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	})
+	lines := splitNonEmpty(out)
+	if len(lines) != 4 {
+		t.Fatalf("want four events, got %d: %q", len(lines), out)
+	}
+	for i, line := range lines {
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("event %d: %v", i, err)
+		}
+		if event["version"] != float64(1) || event["sequence"] != float64(i+1) {
+			t.Fatalf("event %d has wrong protocol metadata: %+v", i, event)
+		}
+		if i < 2 && (event["type"] != "tool" || event["tool_name"] != "file_edit" || event["tool_id"] != "call-1") {
+			t.Fatalf("event %d has wrong tool identity: %+v", i, event)
+		}
 	}
 }
 
@@ -383,6 +444,55 @@ func TestRunPassesTimestamp(t *testing.T) {
 	after := time.Now()
 	if gotTs.Before(before) || gotTs.After(after) {
 		t.Errorf("timestamp %v not in [%v,%v]", gotTs, before, after)
+	}
+}
+
+func TestRunStreamJSONReplaysMissedSessionEventsAndContinuesSequence(t *testing.T) {
+	journal := session.NewEventJournal(t.TempDir())
+	for i := 0; i < 3; i++ {
+		if _, err := journal.AppendTurnEvent("sess-shared", "cli", "turn-1", map[string]any{
+			"sessionUpdate": "agent_message_chunk",
+			"index":         i,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var out strings.Builder
+	cfg := Config{
+		Prompt:        "continuar",
+		OutputFormat:  FormatStreamJSON,
+		SessionID:     "sess-shared",
+		TurnID:        "turn-2",
+		AfterSequence: 1,
+		EventJournal:  journal,
+		Stdout:        &out,
+	}
+	streamHandler := func(_ context.Context, msg adapter.InMessage, chunks chan<- adapter.StreamChunk) {
+		defer close(chunks)
+		if msg.Metadata["polypod_session_id"] != "sess-shared" || msg.Metadata["polypod_turn_id"] != "turn-2" {
+			t.Errorf("unexpected metadata: %+v", msg.Metadata)
+		}
+		ev1, _ := journal.AppendTurnEvent("sess-shared", "headless", "turn-2", map[string]any{"sessionUpdate": "agent_message_chunk"})
+		chunks <- adapter.StreamChunk{Delta: "ok", EventVersion: ev1.Version, EventSequence: ev1.Sequence}
+		ev2, _ := journal.AppendTurnEvent("sess-shared", "headless", "turn-2", map[string]any{"sessionUpdate": "turn_complete"})
+		chunks <- adapter.StreamChunk{Done: true, EventVersion: ev2.Version, EventSequence: ev2.Sequence}
+	}
+	if err := Run(context.Background(), cfg, nil, streamHandler, nil, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	lines := splitNonEmpty(out.String())
+	if len(lines) != 4 {
+		t.Fatalf("expected 4 lines (2 replayed + delta + done), got %d: %s", len(lines), out.String())
+	}
+	wantSeq := []float64{2, 3, 4, 5}
+	for i, line := range lines {
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(line), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["sequence"] != wantSeq[i] {
+			t.Fatalf("line %d sequence = %v, want %v (%s)", i, payload["sequence"], wantSeq[i], line)
+		}
 	}
 }
 

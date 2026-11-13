@@ -186,7 +186,7 @@ func (m *quickOpenModel) View() string {
 	var b strings.Builder
 
 	// Header line: emoji + label + query + cursor.
-	header := fmt.Sprintf("📁 Quick Open: %s", m.query)
+	header := fmt.Sprintf("Buscar arquivo: %s", m.query)
 	b.WriteString(quickOpenHeaderStyle.Render(header))
 	b.WriteString(quickOpenCursorStyle.Render("▍"))
 	b.WriteString("\n")
@@ -196,7 +196,7 @@ func (m *quickOpenModel) View() string {
 	// Match list.
 	if len(m.matches) == 0 {
 		b.WriteString("\n  ")
-		b.WriteString(quickOpenDimStyle.Render("(no matches)"))
+		b.WriteString(quickOpenDimStyle.Render("(nenhum arquivo encontrado)"))
 		b.WriteString("\n")
 	} else {
 		shown := len(m.matches)
@@ -214,10 +214,10 @@ func (m *quickOpenModel) View() string {
 	// Footer.
 	b.WriteString("\n")
 	b.WriteString(quickOpenFooterStyle.Render(
-		fmt.Sprintf("  %d of %d files", len(m.matches), m.totalFiles)))
+		fmt.Sprintf("  %d de %d arquivos", len(m.matches), m.totalFiles)))
 	b.WriteString("\n")
 	b.WriteString(quickOpenFooterStyle.Render(
-		"  ↑↓ navigate  Enter open  Esc cancel"))
+		"  ↑↓ navegar  Enter inserir  Esc cancelar"))
 
 	return quickOpenBoxStyle.Width(boxWidth).Render(b.String())
 }

@@ -1,0 +1,12 @@
+{
+  "cases": [
+    {"query": "resume a disconnected editor chat without re-running tools", "relevant": ["internal/acp/server.go"]},
+    {"query": "find the Go source snippet closest to a question using vectors", "relevant": ["internal/codesearch/search.go", "internal/codesearch/hybrid.go"]},
+    {"query": "check whether an autonomous coding task passed an external verifier", "relevant": ["internal/evaluation/runner.go", "internal/evaluation/command.go"]},
+    {"query": "install a versioned plugin from a local directory and roll it back on failure", "relevant": ["internal/skill/plugin_install.go"]},
+    {"query": "read inline pull request review comments from GitHub", "relevant": ["internal/commands/pr_comments_native.go"]},
+    {"query": "show simultaneous worktrees and files edited in multiple branches", "relevant": ["internal/commands/work_overview.go"]},
+    {"query": "encode headless agent output as a sequence of JSON events", "relevant": ["internal/headless/headless.go"]},
+    {"query": "connect to a remote MCP server and list its tools", "relevant": ["internal/mcp/client.go"]}
+  ]
+}

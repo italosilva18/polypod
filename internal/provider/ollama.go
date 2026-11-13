@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Ollama provides local model inference via the Ollama API.
@@ -111,11 +114,17 @@ func (o *Ollama) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		TotalTokens:      oResp.PromptEvalCount + oResp.EvalCount,
 	}
 	for _, tc := range oResp.Message.ToolCalls {
-		argsJSON, _ := json.Marshal(tc.Function.Arguments)
-		cr.ToolCalls = append(cr.ToolCalls, ToolCall{
-			Name:      tc.Function.Name,
-			Arguments: string(argsJSON),
-		})
+		call, err := decodeOllamaToolCall(tc)
+		if err != nil {
+			return nil, err
+		}
+		cr.ToolCalls = append(cr.ToolCalls, call)
+	}
+	if len(cr.ToolCalls) == 0 {
+		if call, ok := decodeOllamaTextToolCall(cr.Content, req.Tools); ok {
+			cr.Content = ""
+			cr.ToolCalls = append(cr.ToolCalls, call)
+		}
 	}
 	return cr, nil
 }
@@ -145,7 +154,9 @@ func (o *Ollama) ChatStream(ctx context.Context, req ChatRequest, callback Strea
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64<<10), 16<<20)
 	var content string
+	var calls []ToolCall
 	var totalPrompt, totalCompletion int
 
 	for scanner.Scan() {
@@ -155,7 +166,7 @@ func (o *Ollama) ChatStream(ctx context.Context, req ChatRequest, callback Strea
 		}
 		var chunk ollamaChatResp
 		if err := json.Unmarshal(line, &chunk); err != nil {
-			continue
+			return nil, fmt.Errorf("ollama: bloco JSON inválido: %w", err)
 		}
 		if chunk.Message.Content != "" {
 			content += chunk.Message.Content
@@ -163,9 +174,28 @@ func (o *Ollama) ChatStream(ctx context.Context, req ChatRequest, callback Strea
 				callback(StreamDelta{Content: chunk.Message.Content})
 			}
 		}
+		for _, native := range chunk.Message.ToolCalls {
+			call, err := decodeOllamaToolCall(native)
+			if err != nil {
+				return nil, err
+			}
+			calls = append(calls, call)
+			if callback != nil {
+				callback(StreamDelta{ToolCalls: []ToolCall{call}})
+			}
+		}
 		if chunk.Done {
 			totalPrompt = chunk.PromptEvalCount
 			totalCompletion = chunk.EvalCount
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("ollama stream: %w", err)
+	}
+	if len(calls) == 0 {
+		if call, ok := decodeOllamaTextToolCall(content, req.Tools); ok {
+			content = ""
+			calls = append(calls, call)
 		}
 	}
 
@@ -175,6 +205,7 @@ func (o *Ollama) ChatStream(ctx context.Context, req ChatRequest, callback Strea
 
 	return &ChatResponse{
 		Content:          content,
+		ToolCalls:        calls,
 		PromptTokens:     totalPrompt,
 		CompletionTokens: totalCompletion,
 		TotalTokens:      totalPrompt + totalCompletion,
@@ -193,6 +224,15 @@ func (o *Ollama) buildRequest(req ChatRequest, stream bool) ollamaChatReq {
 
 	for _, m := range req.Messages {
 		om := ollamaMsg{Role: m.Role, Content: m.Content}
+		for _, call := range m.ToolCalls {
+			var args map[string]any
+			if err := json.Unmarshal([]byte(call.Arguments), &args); err == nil {
+				var native ollamaToolCall
+				native.Function.Name = call.Name
+				native.Function.Arguments = args
+				om.ToolCalls = append(om.ToolCalls, native)
+			}
+		}
 		for _, p := range m.Parts {
 			switch p.Type {
 			case "image_base64":
@@ -222,4 +262,39 @@ func (o *Ollama) buildRequest(req ChatRequest, stream bool) ollamaChatReq {
 	}
 
 	return oReq
+}
+
+func decodeOllamaToolCall(native ollamaToolCall) (ToolCall, error) {
+	if strings.TrimSpace(native.Function.Name) == "" {
+		return ToolCall{}, fmt.Errorf("ollama: tool sem nome")
+	}
+	args, err := json.Marshal(native.Function.Arguments)
+	if err != nil {
+		return ToolCall{}, fmt.Errorf("ollama: argumentos de tool: %w", err)
+	}
+	return ToolCall{ID: uuid.NewString(), Name: native.Function.Name, Arguments: string(args)}, nil
+}
+
+// Some local models emit a complete function call as JSON text instead of
+// Ollama's structured tool_calls field. Accept only an exact object naming a
+// tool that was actually advertised in this request.
+func decodeOllamaTextToolCall(content string, offered []Tool) (ToolCall, bool) {
+	var raw struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	trimmed := strings.TrimSpace(content)
+	if !strings.HasPrefix(trimmed, "{") || json.Unmarshal([]byte(trimmed), &raw) != nil || raw.Name == "" || len(raw.Arguments) == 0 {
+		return ToolCall{}, false
+	}
+	for _, tool := range offered {
+		if tool.Name == raw.Name {
+			var args map[string]any
+			if json.Unmarshal(raw.Arguments, &args) != nil || args == nil {
+				return ToolCall{}, false
+			}
+			return ToolCall{ID: uuid.NewString(), Name: raw.Name, Arguments: string(raw.Arguments)}, true
+		}
+	}
+	return ToolCall{}, false
 }

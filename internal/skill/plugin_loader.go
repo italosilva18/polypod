@@ -17,6 +17,8 @@ import (
 // plugin directory. The Skills field lists paths to skill YAML files relative
 // to the directory that contains plugin.json.
 type PluginManifest struct {
+	// SchemaVersion is the manifest compatibility contract. Omitted means v1.
+	SchemaVersion int `json:"schema_version,omitempty"`
 	// Name is the human-readable display name of the plugin.
 	Name string `json:"name"`
 	// Version is an opaque version string (semver encouraged).
@@ -26,6 +28,9 @@ type PluginManifest struct {
 	// Skills lists skill files provided by this plugin, as paths relative to
 	// the directory that contains plugin.json.
 	Skills []string `json:"skills"`
+	// Hooks and MCPServers list configuration files relative to the plugin.
+	Hooks      []string `json:"hooks,omitempty"`
+	MCPServers []string `json:"mcp_servers,omitempty"`
 	// Enabled controls whether the plugin is loaded. Discover() skips
 	// manifests whose Enabled field is false.
 	Enabled bool `json:"enabled"`
@@ -129,6 +134,10 @@ func (pl *PluginLoader) discover(includeDisabled bool) ([]PluginManifest, error)
 					slog.String("path", manifestPath),
 					slog.String("err", err.Error()))
 				errs = append(errs, fmt.Errorf("invalid plugin manifest %s", manifestPath))
+				continue
+			}
+			if m.SchemaVersion != 0 && m.SchemaVersion != 1 {
+				errs = append(errs, fmt.Errorf("plugin %s usa schema_version incompatível", pluginDir))
 				continue
 			}
 

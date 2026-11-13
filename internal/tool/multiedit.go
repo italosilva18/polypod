@@ -22,7 +22,11 @@ type EditOp struct {
 // atomically: all edits are applied in memory in order, and the file is only
 // written if every edit succeeds. If any edit fails (old_string not found,
 // or non-unique without replace_all), the file is left untouched.
-func NewMultiEditTool() types.ToolDef {
+func NewMultiEditTool(regs ...*Registry) types.ToolDef {
+	var reg *Registry
+	if len(regs) > 0 {
+		reg = regs[0]
+	}
 	return types.ToolDef{
 		NameFn: func() string { return "multi_edit" },
 		DescriptionFn: func() string {
@@ -170,6 +174,11 @@ func NewMultiEditTool() types.ToolDef {
 			if stat, statErr := os.Stat(path); statErr == nil {
 				mode = stat.Mode()
 			}
+			if reg != nil {
+				if err := reg.runBeforeFileWrite(ctx, path, original, true); err != nil {
+					return beforeFileWriteError(err), nil
+				}
+			}
 			if err := os.WriteFile(path, []byte(content), mode); err != nil {
 				return types.ToolResult{
 					IsError: true,
@@ -184,7 +193,11 @@ func NewMultiEditTool() types.ToolDef {
 				summary.WriteString(r)
 				summary.WriteString("\n")
 			}
-			return types.ToolResult{Content: summary.String()}, nil
+			res := types.ToolResult{Content: summary.String()}
+			if reg != nil {
+				return reg.afterFileWrite(ctx, path, content, res), nil
+			}
+			return res, nil
 		},
 	}
 }
@@ -202,5 +215,5 @@ func multiEditPreview(s string) string {
 
 // RegisterMultiEditTool registers the multi_edit tool with the given registry.
 func RegisterMultiEditTool(reg *Registry) {
-	reg.RegisterDef(NewMultiEditTool())
+	reg.RegisterDef(NewMultiEditTool(reg))
 }

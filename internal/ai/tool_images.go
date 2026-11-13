@@ -2,18 +2,39 @@ package ai
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	openai "github.com/sashabaranov/go-openai"
 
 	"github.com/costa/polypod/internal/evolution"
 	"github.com/costa/polypod/internal/provider"
+	"github.com/costa/polypod/internal/tool"
 	"github.com/costa/polypod/internal/types"
+	"github.com/costa/polypod/internal/workdir"
 )
 
 // executeSkillResult keeps legacy skill registries usable without discarding
 // structured results from registries that support images.
 func executeSkillResult(ctx context.Context, reg SkillRegistry, name, args string) (types.ToolResult, error) {
+	if _, isAdapter := reg.(*ToolRegistryAdapter); !isAdapter {
+		if st, ok := tool.SessionToolFromContext(ctx, name); ok {
+			var parsed map[string]any
+			if args != "" {
+				if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+					return types.ToolResult{}, fmt.Errorf("parsing tool args: %w", err)
+				}
+			}
+			if vr := st.ValidateInput(parsed); !vr.Valid {
+				return types.ToolResult{Content: fmt.Sprintf("entrada invalida: %s", vr.Message), IsError: true}, nil
+			}
+			res, err := st.Execute(types.ToolContext{Context: ctx, WorkingDir: workdir.Dir(ctx, ".")}, parsed)
+			if err == nil && !res.IsError {
+				evolution.ObserveTool(ctx, name)
+			}
+			return res, err
+		}
+	}
 	var result types.ToolResult
 	var err error
 	if rich, ok := reg.(interface {

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/costa/polypod/internal/accountauth"
 	"github.com/costa/polypod/internal/config"
 )
 
@@ -43,7 +44,10 @@ func needsAPIKey(cfg *config.Config) bool {
 	// ChatGPT uses the encrypted OAuth credential store. Asking for a legacy
 	// API key here would deadlock unattended service startup before the OAuth
 	// provider has a chance to refresh or report its own actionable error.
-	if strings.EqualFold(cfg.AI.Provider, "chatgpt") {
+	if strings.EqualFold(cfg.AI.Provider, "chatgpt") || strings.EqualFold(cfg.AI.Provider, "ollama") {
+		return false
+	}
+	if accountauth.IsOAuthProvider(cfg.AI.Provider) && accountauth.NewManager(nil).HasActiveAccount(cfg.AI.Provider) {
 		return false
 	}
 	if cfg.AI.APIKey == "" {
@@ -66,10 +70,7 @@ func needsAPIKey(cfg *config.Config) bool {
 // provider and enter a valid key.
 func CheckAPIKey(cfg *config.Config, configPath string) error {
 	if strings.EqualFold(cfg.AI.Provider, "nvidia") {
-		if strings.TrimSpace(cfg.AI.APIKey) == "" {
-			cfg.AI.APIKey = strings.TrimSpace(os.Getenv("NVIDIA_API_KEY"))
-		}
-		if cfg.AI.APIKey == "" {
+		if strings.TrimSpace(cfg.AI.APIKey) == "" && strings.TrimSpace(os.Getenv("NVIDIA_API_KEY")) == "" {
 			return fmt.Errorf("NVIDIA NIM: defina NVIDIA_API_KEY no .env privado antes de iniciar")
 		}
 		// NVIDIA keys stay in the environment. The legacy interactive path below

@@ -21,6 +21,8 @@ func (a *Adapter) currentSessionMetadata(existing session.SessionMetadata) sessi
 	}
 	if a.aiSvc != nil {
 		metadata.AgentName = a.aiSvc.ActiveAgent()
+		metadata.Provider = a.aiSvc.CurrentProvider()
+		metadata.Model = a.aiSvc.CurrentModel()
 	}
 	if a.modeState != nil {
 		metadata.Mode = string(a.modeState.Current)
@@ -33,6 +35,15 @@ func (a *Adapter) currentSessionMetadata(existing session.SessionMetadata) sessi
 // working directory here would also redirect unrelated remote channels.
 func (a *Adapter) restoreSessionMetadata(metadata session.SessionMetadata) []string {
 	var warnings []string
+	providerName, modelName := metadata.Provider, metadata.Model
+	if providerName == "" && a.cfg != nil {
+		providerName, modelName = a.cfg.AI.Provider, a.cfg.AI.Model
+	}
+	if providerName != "" && modelName != "" && a.aiSvc != nil {
+		if err := a.switchProviderRuntime(providerName, modelName); err != nil {
+			warnings = append(warnings, fmt.Sprintf("provedor/modelo da sessão indisponível: %v", err))
+		}
+	}
 	if metadata.AgentName != "" && a.aiSvc != nil {
 		if a.agents != nil && a.agents.Has(metadata.AgentName) {
 			a.aiSvc.SetAgent(metadata.AgentName)

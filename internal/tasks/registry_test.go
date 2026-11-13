@@ -250,6 +250,24 @@ func TestTaskRegistry_RunningCount(t *testing.T) {
 	}
 }
 
+func TestUpdateAgentProgressCopiesMeasuredCost(t *testing.T) {
+	r := NewTaskRegistry()
+	state := NewTaskState(TaskTypeAgent, "corrigir")
+	state.Status = StatusRunning
+	r.Register(state)
+	cost := 0.125
+	UpdateAgentProgress(r, state.ID, AgentProgress{ToolUseCount: 2, TokenCount: 40, CostUSD: &cost})
+	got, ok := r.Get(state.ID)
+	if !ok || got.CostUSD == nil || *got.CostUSD != cost {
+		t.Fatalf("task cost = %+v", got)
+	}
+	UpdateAgentProgress(r, state.ID, AgentProgress{ToolUseCount: 3, TokenCount: 50})
+	got, _ = r.Get(state.ID)
+	if got.CostUSD == nil || *got.CostUSD != cost {
+		t.Fatalf("later progress cleared cost: %+v", got.CostUSD)
+	}
+}
+
 func TestTaskRegistry_Kill_NoKiller(t *testing.T) {
 	r := NewTaskRegistry()
 	ts := NewTaskState(TaskTypeShell, "no killer")

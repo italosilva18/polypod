@@ -63,6 +63,16 @@ func DefaultKeyBindings() []KeyBinding {
 			Handler:     handleKeyCtrlP,
 		},
 		{
+			Key:         tea.KeyCtrlK,
+			Label:       "Ctrl+K",
+			Description: "abrir paleta de comandos e skills",
+		},
+		{
+			Key:         tea.KeyCtrlE,
+			Label:       "Ctrl+E",
+			Description: "editar rascunho no editor externo",
+		},
+		{
 			Key:         tea.KeyCtrlY,
 			Label:       "Ctrl+Y",
 			Description: "abrir picker de modelos",
@@ -349,6 +359,6 @@ func handleKeyCtrlY(m *model) (model, tea.Cmd) {
 	if m.state != stateIdle {
 		return *m, nil
 	}
-	m.openModelPicker()
-	return *m, nil
+	cmd := m.openModelPicker()
+	return *m, cmd
 }

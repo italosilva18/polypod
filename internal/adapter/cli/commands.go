@@ -14,12 +14,16 @@ import (
 	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/costa/polypod/internal/accountauth"
+	"github.com/costa/polypod/internal/codesearch"
 	"github.com/costa/polypod/internal/command"
 	"github.com/costa/polypod/internal/commitai"
 	"github.com/costa/polypod/internal/config"
 	pgit "github.com/costa/polypod/internal/git"
 	"github.com/costa/polypod/internal/initcmd"
+	"github.com/costa/polypod/internal/projectchecks"
 	"github.com/costa/polypod/internal/tracking"
+	"github.com/costa/polypod/internal/turncheckpoint"
 )
 
 // commandResult holds the output of a local slash command.
@@ -46,7 +50,13 @@ type commandResult struct {
 	// openModelPicker, when true, signals the Bubbletea model loop to
 	// open the interactive model picker overlay. Used by /model so the
 	// command both reports a status and brings up the picker.
-	openModelPicker bool
+	openModelPicker   bool
+	openConnectPicker bool
+	openEditor        bool
+	openDiff          bool
+	sideQuestion      string
+	semanticQuery     string
+	verifyRequest     bool
 }
 
 type sessionLoad struct {
@@ -102,8 +112,66 @@ func processCommand(input string, deps commandDeps, messages []chatEntry) comman
 	case "/memory":
 		return handleMemory(parts, deps)
 
-	case "/model":
+	case "/model", "/provider":
+		if len(parts) >= 2 && strings.EqualFold(parts[1], "--vision") {
+			return handleVisionModelCmd(parts[2:], deps)
+		}
+		if len(parts) >= 3 && deps.switchProvider != nil {
+			name, model := strings.ToLower(parts[1]), strings.Join(parts[2:], " ")
+			if err := deps.switchProvider(name, model); err != nil {
+				return commandResult{output: "Erro ao trocar provedor: " + err.Error(), handled: true}
+			}
+			return commandResult{output: fmt.Sprintf("Provedor: %s · modelo: %s", name, model), handled: true}
+		}
+		if len(parts) == 2 {
+			return commandResult{output: "Uso: /provider <provedor> <modelo>  (ou /model --vision [auto | <modelo> | <provedor> <modelo>])", handled: true}
+		}
 		return handleModel(deps)
+
+	case "/waterfall":
+		if deps.latestWaterfall == nil {
+			return commandResult{output: "Cascata de execução (/waterfall) indisponível.", handled: true}
+		}
+		return commandResult{output: deps.latestWaterfall(), handled: true}
+
+	case "/questions":
+		if deps.listChildQuestions == nil {
+			return commandResult{output: "Fila concorrente de subagentes (/questions) indisponível.", handled: true}
+		}
+		return commandResult{output: deps.listChildQuestions(), handled: true}
+
+	case "/answer":
+		return handleAnswerChildQuestion(input, parts, deps)
+
+	case "/connect":
+		return commandResult{handled: true, openConnectPicker: true}
+
+	case "/auth":
+		return handleAuthCommand(parts)
+
+	case "/editor":
+		return commandResult{handled: true, openEditor: true}
+
+	case "/btw":
+		question := strings.TrimSpace(strings.TrimPrefix(input, parts[0]))
+		if question == "" {
+			return commandResult{output: "Uso: /btw <pergunta>", handled: true}
+		}
+		return commandResult{handled: true, sideQuestion: question}
+	case "/index":
+		return handleCodeIndex(parts, deps)
+	case "/semantic":
+		if len(parts) < 2 {
+			return commandResult{output: "Uso: /semantic <descrição do código>", handled: true}
+		}
+		if deps.semanticSearch == nil {
+			return commandResult{output: "Busca semântica indisponível. Configure embeddings no /config e use /index on.", handled: true}
+		}
+		return commandResult{semanticQuery: strings.TrimSpace(strings.TrimPrefix(input, parts[0])), handled: true}
+	case "/verify":
+		return commandResult{verifyRequest: true, handled: true}
+	case "/queue":
+		return commandResult{output: "Use /queue <mensagem> enquanto uma resposta está sendo gerada.", handled: true}
 
 	case "/session":
 		return handleSession(deps)
@@ -195,6 +263,9 @@ func processCommand(input string, deps commandDeps, messages []chatEntry) comman
 		return handleCommit(deps, userMsg)
 
 	case "/diff":
+		if len(parts) == 1 {
+			return commandResult{handled: true, openDiff: true}
+		}
 		return handleDiff(parts, deps)
 
 	case "/review":
@@ -247,6 +318,12 @@ func processCommand(input string, deps commandDeps, messages []chatEntry) comman
 	case "/effort":
 		return handleEffort(parts, deps)
 
+	case "/architect":
+		return handleArchitectCmd(input, parts)
+
+	case "/bestof":
+		return handleBestOfCmd(input, parts)
+
 	case "/branch":
 		return handleBranch(parts, deps, messages)
 
@@ -257,6 +334,15 @@ func processCommand(input string, deps commandDeps, messages []chatEntry) comman
 		return handleInitVerifiers(parts)
 
 	default:
+		if strings.HasSuffix(cmd, ":skill") && deps.listSkills != nil {
+			name := strings.TrimSuffix(strings.TrimPrefix(cmd, "/"), ":skill")
+			for _, available := range deps.listSkills() {
+				if name == strings.ToLower(available) {
+					request := strings.TrimSpace(strings.TrimPrefix(input, parts[0]))
+					return commandResult{modelInput: "Use a skill " + available + " para " + request, handled: false}
+				}
+			}
+		}
 		if deps.commandRegistry != nil {
 			name := strings.TrimPrefix(cmd, "/")
 			if registered, ok := deps.commandRegistry.Get(name); ok {
@@ -303,51 +389,65 @@ func helpText() string {
 		desc string
 	}{
 		{"/help", "lista comandos"},
-		{"/clear", "limpa tela e historico da sessao"},
-		{"/agents", "lista agentes disponiveis"},
+		{"/clear", "limpa a tela e o histórico da sessão"},
+		{"/agents", "lista os agentes disponíveis"},
 		{"/agent switch <nome>", "troca de agente ativo"},
 		{"/skills", "lista skills do agente atual"},
-		{"/memory list", "lista memorias salvas"},
-		{"/memory search <q>", "busca memorias"},
-		{"/model", "mostra agente/modelo atual"},
-		{"/session", "info da sessao"},
+		{"/memory list", "lista memórias salvas"},
+		{"/memory search <q>", "busca memórias"},
+		{"/model", "escolhe provedor e modelo (ou /model --vision [auto|<modelo>])"},
+		{"/provider", "escolhe provedor e modelo"},
+		{"/waterfall", "mostra a cascata visual de execução (tempos de modelo e tools)"},
+		{"/questions", "lista perguntas simultâneas pendentes de subagentes"},
+		{"/answer <id> <resp>", "responde a uma pergunta de subagente sem perder rascunhos"},
+		{"/connect", "conecta uma conta ou chave de API"},
+		{"/auth [status|accounts|use|logout]", "gerencia multiplas contas OAuth por provedor"},
+		{"/editor", "edita o rascunho no editor externo"},
+		{"/btw <pergunta>", "pergunta rápida sem adicionar à conversa"},
+		{"/session", "mostra a sessão atual"},
 		{"/copy [numero|list|all]", "copia uma resposta, lista respostas ou copia as respostas carregadas"},
-		{"/voice [segundos|stop]", "grava ate Ctrl+G ou /voice stop; segundos sao opcionais"},
-		{"Ctrl+G", "inicia ou para a gravacao de voz"},
+		{"/voice [segundos|stop]", "grava até Ctrl+G ou /voice stop; segundos são opcionais"},
+		{"Ctrl+G", "inicia ou para a gravação de voz"},
 		{"/bg <objetivo>", "cria tarefa durável separada; list/status/retry/cancel para acompanhar"},
 		{"/bg detach", "destaca o turno ativo; mensagens novas viram tarefas separadas"},
 		{"/run <cmd>  ou  !<cmd>", "executa comando shell inline"},
-		{"/file <path>", "mostra conteudo de arquivo"},
+		{"/file <path>", "mostra o conteúdo de um arquivo"},
 		{"/search <pattern>", "busca texto no projeto (grep)"},
-		{"/git [status|log|diff|branch]", "operacoes git comuns"},
-		{"/project", "mostra arvore do projeto"},
-		{"/export [file]", "exporta conversa pra markdown"},
-		{"/context", "mostra info do contexto atual"},
-		{"/cost", "mostra custo detalhado da sessao"},
-		{"/sessions [search <q>|live]", "busca sessoes salvas ou mostra instancias ativas"},
-		{"/suggest", "sugere proximas acoes a partir da conversa"},
-		{"/resume [id]", "lista ou carrega uma sessao persistida"},
+		{"/git [status|log|diff|branch]", "operações comuns do Git"},
+		{"/project", "mostra a árvore do projeto"},
+		{"/export [file]", "exporta a conversa para Markdown"},
+		{"/context", "mostra o contexto atual"},
+		{"/cost", "mostra o custo detalhado da sessão"},
+		{"/sessions [search <q>|live]", "busca sessões salvas ou mostra instâncias ativas"},
+		{"/suggest", "sugere próximas ações a partir da conversa"},
+		{"/resume [id]", "lista ou carrega uma sessão persistida"},
 		{"/recover", "retoma um ponto seguro; /recover discard abandona turno incerto"},
 		{"/rewind [n] [--conversation|--files]", "restaura turnos, arquivos e conversa"},
-		{"/permissions [sub]", "gerencia regras de permissoes"},
-		{"/plan [on|off|show|execute]", "alterna/gerencia plan mode"},
-		{"/init [--force]", "bootstrap .polypod.md e estrutura do projeto"},
-		{"/commit [msg]", "commit git com mensagem AI-assistida"},
-		{"/diff [--staged|<file>]", "mostra diff git com cores"},
-		{"/review [target]", "code review AI (--staged, ranges, arquivo, --pr)"},
-		{"/security-review [target]", "review focado em seguranca (--staged, --full, arquivo)"},
-		{"/compact", "compacta historico da conversa via AI"},
-		{"/retry", "reenvia a ultima mensagem que falhou"},
-		{"/doctor", "relatorio de diagnostico do sistema"},
+		{"/permissions [sub]", "gerencia regras de permissões"},
+		{"/plan [on|off|show|execute]", "gerencia o modo de planejamento"},
+		{"/init [--force]", "cria .polypod.md e a estrutura do projeto"},
+		{"/commit [msg]", "cria commit com mensagem gerada por IA"},
+		{"/diff [--staged|<arquivo>]", "abre o diff navegável; com argumentos mostra o diff em texto"},
+		{"/review [target]", "revisa código com IA (--staged, intervalo, arquivo, --pr)"},
+		{"/security-review [target]", "revisa a segurança (--staged, --full, arquivo)"},
+		{"/compact", "compacta o histórico da conversa com IA"},
+		{"/retry", "reenvia a última mensagem que falhou"},
+		{"/doctor", "mostra o diagnóstico do sistema"},
 		{"/mcp [sub]", "gerencia servidores MCP (list|status|tools|reconnect)"},
 		{"/hooks [sub]", "gerencia hooks (list|enable|disable|show)"},
 		{"/files", "arquivos no contexto atual"},
-		{"/add-dir <path>", "adiciona diretorio de trabalho extra"},
-		{"/config [get|set|save|reload]", "ver/editar config (sem args abre form)"},
-		{"/effort [low|med|high|max]", "ajusta nivel de raciocinio da AI"},
-		{"/branch [sub] [name]", "gerencia branches da conversa (new|switch|delete|tree)"},
-		{"/usage [model]", "mostra limites de uso e consumo por provider"},
+		{"/add-dir <path>", "adiciona um diretório de trabalho"},
+		{"/config [get|set|save|reload]", "vê ou edita a configuração; sem argumentos abre o formulário"},
+		{"/effort [low|med|high|max]", "ajusta o nível de raciocínio da IA"},
+		{"/architect <tarefa>", "planeja com Arquiteto (alto raciocínio) e aplica com Editor"},
+		{"/bestof <tarefa>", "executa Best-of-N paralelo em worktrees isoladas verificadas"},
+		{"/branch [sub] [name]", "gerencia ramificações da conversa (new|switch|delete|tree)"},
+		{"/usage [model]", "mostra limites e consumo por provedor"},
 		{"/init-verifiers", "detecta e configura comandos de teste/lint do projeto"},
+		{"/verify", "executa os verificadores configurados agora"},
+		{"/index [on|off|status]", "ativa busca semântica de código neste projeto"},
+		{"/semantic <descrição>", "busca código por significado e mostra linhas"},
+		{"/queue <mensagem>", "enfileira mensagem durante uma resposta"},
 		{"/quit", "sai do programa"},
 	}
 
@@ -1144,8 +1244,10 @@ type rewindOutcome struct {
 
 // commandDeps holds function callbacks for slash commands.
 type commandDeps struct {
-	workingDir   func() string
-	captureVoice func(context.Context, context.Context, time.Duration, func(string)) (string, error)
+	workingDir     func() string
+	semanticSearch func(context.Context, string) (string, error)
+	turnDiff       func() ([]turncheckpoint.FileDiff, error)
+	captureVoice   func(context.Context, context.Context, time.Duration, func(string)) (string, error)
 	// bindBranches connects /branch to persisted transcripts and the active
 	// conversation. The CLI state binds lazily on the first /branch command.
 	bindBranches             func(*cliSessionState) error
@@ -1184,14 +1286,28 @@ type commandDeps struct {
 	// setModel switches the underlying AI client's model. Optional;
 	// when nil, the /model command falls back to a read-only display
 	// and the model picker overlay is disabled.
-	setModel func(model string)
+	setModel            func(model string)
+	setEffort           func(effort string)
+	currentProvider     func() string
+	setVisionModel      func(providerName, model string) error
+	visionConfig        func() (explicitProvider, explicitModel, effectiveAutoModel string)
+	latestWaterfall     func() string
+	listChildQuestions  func() string
+	answerChildQuestion func(id, answer string) error
+	saveChildDraft      func(id, draft string) error
+	listProviders   func() []ProviderOption
+	switchProvider  func(name, model string) error
+	connectProvider func(name, key string) error
+	connectChatGPT  func(context.Context) error
+	connectOAuth    func(context.Context, string) error
 	// generateCommitMsg calls the AI to produce a Conventional-Commits
 	// message from a staged diff prompt. Returns the raw message.
 	generateCommitMsg func(prompt string) (string, error)
 	// generateText runs a one-shot, history-less AI prompt and returns
 	// the raw response text. Used by /review and /security-review for
 	// non-streaming AI calls outside of the chat conversation.
-	generateText func(prompt string) (string, error)
+	generateText     func(prompt string) (string, error)
+	generateSideText func(prompt string) (string, error)
 	// compactAvailable reports whether the compact service is wired in.
 	compactAvailable func() bool
 	// compactHistory summarizes and persists the active session, then returns
@@ -1437,6 +1553,17 @@ func handleCommit(deps commandDeps, userMsg string) commandResult {
 			handled: true,
 		}
 	}
+	checkCtx, cancelChecks := context.WithTimeout(context.Background(), 5*time.Minute)
+	results, checkErr := projectchecks.Run(checkCtx, dir, "commit")
+	cancelChecks()
+	if checkErr != nil {
+		return commandResult{output: errorStyle.Render("erro nos verificadores: " + checkErr.Error()), handled: true}
+	}
+	for _, result := range results {
+		if result.Err != nil {
+			return commandResult{output: errorStyle.Render("commit bloqueado por falha na verificação\n") + projectchecks.FormatResults(results), handled: true}
+		}
+	}
 
 	// If nothing staged, auto-stage everything so we have something to commit.
 	autoStaged := false
@@ -1531,6 +1658,40 @@ func handleCommit(deps commandDeps, userMsg string) commandResult {
 	}
 
 	return commandResult{output: b.String(), handled: true}
+}
+
+func handleCodeIndex(parts []string, deps commandDeps) commandResult {
+	root := commandWorkingDir(deps)
+	mode := "status"
+	if len(parts) > 1 {
+		mode = parts[1]
+	}
+	switch mode {
+	case "on", "ativar":
+		if deps.semanticSearch == nil {
+			return commandResult{output: "Configure um provedor de embeddings no /config antes de ativar o índice.", handled: true}
+		}
+		if err := codesearch.SetEnabled(root, true); err != nil {
+			return commandResult{output: errorStyle.Render(err.Error()), handled: true}
+		}
+		return commandResult{output: "Busca semântica ativada neste projeto. Use /semantic <descrição>.", handled: true}
+	case "off", "desativar":
+		if err := codesearch.SetEnabled(root, false); err != nil {
+			return commandResult{output: errorStyle.Render(err.Error()), handled: true}
+		}
+		return commandResult{output: "Busca semântica desativada neste projeto.", handled: true}
+	case "status", "estado":
+		cfg, err := codesearch.LoadConfig(root)
+		if err != nil {
+			return commandResult{output: errorStyle.Render(err.Error()), handled: true}
+		}
+		if cfg.Enabled {
+			return commandResult{output: "Índice semântico ativo. Limites: " + strconv.Itoa(cfg.MaxFiles) + " arquivos, " + strconv.Itoa(cfg.MaxChunks) + " trechos.", handled: true}
+		}
+		return commandResult{output: "Índice semântico desativado. Use /index on para ativar.", handled: true}
+	default:
+		return commandResult{output: "Uso: /index [on|off|status]", handled: true}
+	}
 }
 
 // handleDiff shows uncommitted diffs with ANSI color highlighting.
@@ -2333,7 +2494,7 @@ func handlePermissionsList(deps commandDeps) commandResult {
 func handlePlan(deps commandDeps, sub string) commandResult {
 	if deps.planCurrent == nil {
 		return commandResult{
-			output:  cmdLabelStyle.Render("plan mode nao disponivel"),
+			output:  cmdLabelStyle.Render("modo de planejamento indisponível"),
 			handled: true,
 		}
 	}
@@ -2357,7 +2518,7 @@ func handlePlan(deps commandDeps, sub string) commandResult {
 			}
 		}
 		return commandResult{
-			output: notifySuccessStyle.Render("plan mode: ON") + "\n  " +
+			output: notifySuccessStyle.Render("modo de planejamento: ATIVADO") + "\n  " +
 				cmdLabelStyle.Render(stripMarkdown(desc)),
 			handled: true,
 		}
@@ -2377,7 +2538,7 @@ func handlePlan(deps commandDeps, sub string) commandResult {
 			}
 		}
 		return commandResult{
-			output: notifySuccessStyle.Render("plan mode: OFF") + "\n  " +
+			output: notifySuccessStyle.Render("modo de planejamento: DESATIVADO") + "\n  " +
 				cmdLabelStyle.Render(stripMarkdown(desc)),
 			handled: true,
 		}
@@ -2418,7 +2579,7 @@ func handlePlan(deps commandDeps, sub string) commandResult {
 			}
 		}
 		var b strings.Builder
-		b.WriteString(notifySuccessStyle.Render("plan mode: executando"))
+		b.WriteString(notifySuccessStyle.Render("modo de planejamento: executando"))
 		b.WriteString("\n\n")
 		if strings.TrimSpace(summary) != "" {
 			for _, line := range strings.Split(summary, "\n") {
@@ -2605,4 +2766,190 @@ func handleConfig(parts []string, rawInput string, deps commandDeps) commandResu
 			cmdValueStyle.Render("/config [get|set|save|reload] [...]"),
 		handled: true,
 	}
+}
+
+func handleAuthCommand(parts []string) commandResult {
+	mgr := accountauth.NewManager(nil)
+	if len(parts) == 1 || strings.EqualFold(parts[1], "status") || strings.EqualFold(parts[1], "list") {
+		return commandResult{output: strings.TrimRight(accountauth.FormatOverview(mgr), "\n"), handled: true}
+	}
+
+	sub := strings.ToLower(parts[1])
+	switch sub {
+	case "accounts":
+		if len(parts) < 3 {
+			return commandResult{output: strings.TrimRight(accountauth.FormatOverview(mgr), "\n"), handled: true}
+		}
+		var sb strings.Builder
+		if err := accountauth.RunCLI(context.Background(), mgr, []string{parts[2], "accounts"}, &sb, &sb); err != nil {
+			return commandResult{output: errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()), handled: true}
+		}
+		return commandResult{output: strings.TrimRight(sb.String(), "\n"), handled: true}
+
+	case "use", "switch":
+		if len(parts) < 4 {
+			return commandResult{output: cmdLabelStyle.Render("uso: ") + cmdValueStyle.Render("/auth use <provedor> <conta>"), handled: true}
+		}
+		var sb strings.Builder
+		if err := accountauth.RunCLI(context.Background(), mgr, []string{parts[2], "use", parts[3]}, &sb, &sb); err != nil {
+			return commandResult{output: errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()), handled: true}
+		}
+		return commandResult{output: notifySuccessStyle.Render(strings.TrimSpace(sb.String())), handled: true}
+
+	case "logout":
+		if len(parts) < 3 {
+			return commandResult{output: cmdLabelStyle.Render("uso: ") + cmdValueStyle.Render("/auth logout <provedor> [conta|--all]"), handled: true}
+		}
+		cliArgs := []string{parts[2], "logout"}
+		if len(parts) >= 4 {
+			cliArgs = append(cliArgs, parts[3])
+		}
+		var sb strings.Builder
+		if err := accountauth.RunCLI(context.Background(), mgr, cliArgs, &sb, &sb); err != nil {
+			return commandResult{output: errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()), handled: true}
+		}
+		return commandResult{output: notifySuccessStyle.Render(strings.TrimSpace(sb.String())), handled: true}
+
+	case "login":
+		prov := "<provedor>"
+		if len(parts) >= 3 {
+			prov = strings.ToLower(parts[2])
+		}
+		return commandResult{
+			output: fmt.Sprintf("Para conectar uma nova conta OAuth, use /connect (Ctrl+O no provedor) ou execute no terminal:\n  polypod auth %s login --account <apelido>", prov),
+			handled: true,
+		}
+	}
+
+	// Support `/auth <provedor> [status|accounts|use|logout ...]` mirroring the CLI syntax!
+	if accountauth.IsOAuthProvider(sub) {
+		if len(parts) >= 3 && strings.EqualFold(parts[2], "login") {
+			return commandResult{
+				output: fmt.Sprintf("Use /connect (Ctrl+O) ou execute no terminal:\n  polypod auth %s login --account <apelido>", sub),
+				handled: true,
+			}
+		}
+		var sb strings.Builder
+		if err := accountauth.RunCLI(context.Background(), mgr, parts[1:], &sb, &sb); err != nil {
+			return commandResult{output: errorStyle.Render("erro: ") + cmdLabelStyle.Render(err.Error()), handled: true}
+		}
+		return commandResult{output: strings.TrimRight(sb.String(), "\n"), handled: true}
+	}
+
+	return commandResult{
+		output: cmdLabelStyle.Render("uso: ") +
+			cmdValueStyle.Render("/auth [status | accounts <provedor> | use <provedor> <conta> | logout <provedor> [conta|--all]]"),
+		handled: true,
+	}
+}
+
+func handleArchitectCmd(input string, parts []string) commandResult {
+	if len(parts) < 2 {
+		return commandResult{
+			output: cmdLabelStyle.Render("uso: ") +
+				cmdValueStyle.Render("/architect <descrição da arquitetura, refatoração ou correção complexa>"),
+			handled: true,
+		}
+	}
+	task := strings.TrimSpace(strings.TrimPrefix(input, parts[0]))
+	prompt := fmt.Sprintf("Execute o fluxo Architect → Editor para a tarefa abaixo:\n1. Inspecione os arquivos e o raio de impacto (`code_impact` quando aplicável).\n2. Chame `architect_plan` com plan_only=true para formular o plano cirúrgico de engenharia.\n3. Aplique as edições exatas e valide compilação/testes antes de concluir.\n\nTAREFA: %s", task)
+	return commandResult{modelInput: prompt, handled: false}
+}
+
+func handleBestOfCmd(input string, parts []string) commandResult {
+	if len(parts) < 2 {
+		return commandResult{
+			output: cmdLabelStyle.Render("uso: ") +
+				cmdValueStyle.Render("/bestof <tarefa difícil para resolver e verificar em worktrees paralelas>"),
+			handled: true,
+		}
+	}
+	task := strings.TrimSpace(strings.TrimPrefix(input, parts[0]))
+	prompt := fmt.Sprintf("Use a ferramenta `parallel_best_of_n` (candidates=2, apply_winner=true) para resolver e verificar em git worktrees paralelas isoladas a seguinte tarefa, e apresente o resumo comparativo e o resultado verificado:\n\n%s", task)
+	return commandResult{modelInput: prompt, handled: false}
+}
+
+func handleVisionModelCmd(args []string, deps commandDeps) commandResult {
+	if len(args) == 0 {
+		if deps.visionConfig == nil {
+			return commandResult{output: "Roteador multimodal (/model --vision) indisponível.", handled: true}
+		}
+		expProv, expModel, autoModel := deps.visionConfig()
+		if expModel != "" {
+			provLabel := expProv
+			if provLabel == "" && deps.currentProvider != nil {
+				provLabel = deps.currentProvider()
+			}
+			return commandResult{
+				output: fmt.Sprintf("Modelo de visão explícito: %s/%s  (use `/model --vision auto` para voltar ao modo automático)", provLabel, expModel),
+				handled: true,
+			}
+		}
+		if autoModel == "" {
+			autoModel = "(modelo ativo já suporta visão ou nenhum fallback multimodal disponível)"
+		}
+		return commandResult{
+			output: fmt.Sprintf("Modo de visão: automático · fallback multimodal: %s\nUso: /model --vision [auto | <modelo> | <provedor> <modelo>]", autoModel),
+			handled: true,
+		}
+	}
+	if deps.setVisionModel == nil {
+		return commandResult{output: "Configuração de modelo de visão indisponível.", handled: true}
+	}
+	if len(args) == 1 {
+		target := strings.TrimSpace(args[0])
+		if strings.EqualFold(target, "auto") || strings.EqualFold(target, "clear") || strings.EqualFold(target, "reset") {
+			if err := deps.setVisionModel("", "auto"); err != nil {
+				return commandResult{output: "Erro limpando override de visão: " + err.Error(), handled: true}
+			}
+			return commandResult{output: "Roteamento de visão restaurado para modo automático.", handled: true}
+		}
+		// Support `<provedor>/<modelo>` or `<modelo>` on active provider
+		prov := ""
+		mod := target
+		if p, m, ok := strings.Cut(target, "/"); ok && accountauth.IsOAuthProvider(strings.ToLower(p)) {
+			prov = strings.ToLower(p)
+			mod = m
+		}
+		if err := deps.setVisionModel(prov, mod); err != nil {
+			return commandResult{output: "Erro configurando modelo de visão: " + err.Error(), handled: true}
+		}
+		return commandResult{output: fmt.Sprintf("Modelo multimodal de visão configurado: %s", target), handled: true}
+	}
+	prov := strings.ToLower(strings.TrimSpace(args[0]))
+	mod := strings.TrimSpace(strings.Join(args[1:], " "))
+	if err := deps.setVisionModel(prov, mod); err != nil {
+		return commandResult{output: "Erro configurando modelo de visão: " + err.Error(), handled: true}
+	}
+	return commandResult{output: fmt.Sprintf("Modelo multimodal de visão configurado: %s/%s", prov, mod), handled: true}
+}
+
+func handleAnswerChildQuestion(input string, parts []string, deps commandDeps) commandResult {
+	if len(parts) < 3 {
+		return commandResult{
+			output: "Uso: /answer <id> <resposta>  (ou /answer draft <id> <rascunho>)",
+			handled: true,
+		}
+	}
+	if strings.EqualFold(parts[1], "draft") {
+		if len(parts) < 4 || deps.saveChildDraft == nil {
+			return commandResult{output: "Uso: /answer draft <id> <rascunho>", handled: true}
+		}
+		id := parts[2]
+		draft := strings.TrimSpace(strings.TrimPrefix(input, parts[0]+" "+parts[1]+" "+parts[2]))
+		if err := deps.saveChildDraft(id, draft); err != nil {
+			return commandResult{output: "Erro salvando rascunho: " + err.Error(), handled: true}
+		}
+		return commandResult{output: fmt.Sprintf("Rascunho salvo para a pergunta [%s].", id), handled: true}
+	}
+	if deps.answerChildQuestion == nil {
+		return commandResult{output: "Fila concorrente de subagentes indisponível.", handled: true}
+	}
+	id := parts[1]
+	rest := strings.TrimSpace(strings.TrimPrefix(input, parts[0]))
+	ans := strings.TrimSpace(strings.TrimPrefix(rest, id))
+	if err := deps.answerChildQuestion(id, ans); err != nil {
+		return commandResult{output: "Erro respondendo subagente: " + err.Error(), handled: true}
+	}
+	return commandResult{output: fmt.Sprintf("Resposta entregue à sub-tarefa [%s].", id), handled: true}
 }

@@ -10,6 +10,24 @@ import (
 	providerapi "github.com/costa/polypod/internal/provider"
 )
 
+const toolLimitSummaryPrompt = "O limite de chamadas de ferramentas foi atingido. Resuma o resultado atual sem solicitar mais ferramentas; informe se algum teste ou edição falhou."
+
+func (c *Client) finalProviderSummary(ctx context.Context, req providerapi.ChatRequest, callback StreamCallback) (*providerapi.ChatResponse, error) {
+	req.Tools = nil
+	if len(req.Messages) == 0 || req.Messages[len(req.Messages)-1].Role != "user" || req.Messages[len(req.Messages)-1].Content != toolLimitSummaryPrompt {
+		req.Messages = append(req.Messages, providerapi.Message{Role: "user", Content: toolLimitSummaryPrompt})
+	}
+	prov := c.activeResponseProviderFor(ctx)
+	if callback == nil {
+		return prov.Chat(ctx, req)
+	}
+	return prov.ChatStream(ctx, req, func(delta providerapi.StreamDelta) {
+		if delta.Content != "" {
+			callback(delta.Content)
+		}
+	})
+}
+
 func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatMessage, callback StreamCallback, logger *slog.Logger) (*ChatResponse, error) {
 	model := c.modelFor(ctx)
 	req := providerapi.ChatRequest{Model: model, MaxTokens: c.maxTok, Temperature: c.temp}
@@ -24,29 +42,39 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 
 	var totalPrompt, totalCompletion int
 	maxIterations := c.toolIterationLimit()
+	guard := newCognitiveGuard()
 	for iter := 0; maxIterations < 0 || iter < maxIterations; iter++ {
+		for _, guidance := range takeSteering(ctx) {
+			req.Messages = append(req.Messages, providerapi.Message{Role: "user", Content: guidance})
+		}
+		req.Model = model
+		c.applyReasoningToProviderReq(ctx, &req, guard.boostedReasoning)
+		prov := c.activeResponseProviderFor(ctx)
 		var resp *providerapi.ChatResponse
 		var err error
 		var early *earlyResponseTools
+		started := time.Now()
 		if callback == nil {
-			resp, err = c.responseProvider.Chat(ctx, req)
+			resp, err = prov.Chat(ctx, req)
 		} else {
 			streamCallback := func(delta providerapi.StreamDelta) {
 				if delta.Content != "" {
 					callback(delta.Content)
 				}
 			}
-			if streamer, ok := c.responseProvider.(completedCallStreamer); ok && c.streamingToolMgr != nil {
+			if streamer, ok := prov.(completedCallStreamer); ok && c.streamingToolMgr != nil {
 				early = newEarlyResponseTools(ctx, c)
 				resp, err = streamer.ChatStreamWithCompletedCalls(ctx, req, streamCallback, early.itemReady)
 				early.finish(err != nil)
 			} else {
-				resp, err = c.responseProvider.ChatStream(ctx, req, streamCallback)
+				resp, err = prov.ChatStream(ctx, req, streamCallback)
 			}
 		}
 		if err != nil {
+			c.Waterfall().RecordModelSpan(model, started, time.Since(started), 0, 0, true)
 			return nil, err
 		}
+		c.Waterfall().RecordModelSpan(model, started, time.Since(started), resp.PromptTokens, resp.CompletionTokens, false)
 		if early != nil {
 			if err := early.validateFinal(resp.ToolCalls); err != nil {
 				return nil, err
@@ -56,6 +84,26 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 		totalCompletion += resp.CompletionTokens
 		c.recordProviderUsage(resp, model)
 		if len(resp.ToolCalls) == 0 {
+			var guidance []string
+			if maxIterations < 0 || iter+1 < maxIterations {
+				guidance = takeSteering(ctx)
+				if len(guidance) == 0 {
+					if gate := guard.checkCompletionGate(ctx); gate != "" {
+						guidance = append(guidance, gate)
+					}
+				}
+			}
+			if len(guidance) > 0 {
+				req.Messages = append(req.Messages, providerapi.Message{Role: "assistant", Content: resp.Content})
+				for _, message := range guidance {
+					req.Messages = append(req.Messages, providerapi.Message{Role: "user", Content: message})
+				}
+				if callback != nil {
+					callback("\n")
+				}
+				continue
+			}
+			c.recordTurnPlaybook(ctx, guard, resp.Content)
 			return &ChatResponse{Content: resp.Content, PromptTokens: totalPrompt, CompletionTokens: totalCompletion, TotalTokens: totalPrompt + totalCompletion}, nil
 		}
 
@@ -123,18 +171,42 @@ func (c *Client) completeWithResponseTools(ctx context.Context, messages []ChatM
 				req.Messages = append(req.Messages, providerapi.Message{Role: "tool", Content: result, ToolCallID: tc.ID, Name: tc.Name})
 			}
 		}
-		if c.responseProvider.SupportsVision() {
+		if observationsContainImages(observations) && !c.modelSupportsVision(ctx, model) {
+			if visProv, visModel := c.resolveAutoVisionFallback(model); visModel != "" {
+				model = visModel
+				ctx = withRequestModel(ctx, visModel)
+				if visProv != nil {
+					ctx = withRequestProvider(ctx, visProv)
+				}
+			}
+		}
+		if c.activeResponseProviderFor(ctx).SupportsVision() {
 			req.Messages = append(req.Messages, imageObservations(observations)...)
 		}
 		if catalog != nil {
 			catalog.observe(observations)
 			req.Tools = catalog.providerDefinitions()
 		}
+		gCalls := make([]guardedCall, 0, len(resp.ToolCalls))
+		for _, tc := range resp.ToolCalls {
+			gCalls = append(gCalls, guardedCall{Name: tc.Name, Arguments: tc.Arguments})
+		}
+		if replan, _ := guard.observe(ctx, gCalls, observations); replan != "" && (maxIterations < 0 || iter+1 < maxIterations) {
+			req.Messages = append(req.Messages, providerapi.Message{Role: "user", Content: replan})
+		}
 		if callback != nil {
 			callback("\n")
 		}
 	}
-	return nil, fmt.Errorf("chamadas de ferramentas atingiram ai.max_tool_iterations (%d)", maxIterations)
+	logger.Debug("provider tool loop reached limit", "iterations", maxIterations)
+	resp, err := c.finalProviderSummary(ctx, req, callback)
+	if err != nil {
+		return nil, err
+	}
+	totalPrompt += resp.PromptTokens
+	totalCompletion += resp.CompletionTokens
+	c.recordProviderUsage(resp, model)
+	return &ChatResponse{Content: resp.Content, PromptTokens: totalPrompt, CompletionTokens: totalCompletion, TotalTokens: totalPrompt + totalCompletion}, nil
 }
 
 func (c *Client) fireResponseToolStart(ctx context.Context, tc providerapi.ToolCall) {

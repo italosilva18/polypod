@@ -13,12 +13,15 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/sashabaranov/go-openai/jsonschema"
 	"gopkg.in/yaml.v3"
 
+	"github.com/costa/polypod/internal/accountauth"
+	"github.com/costa/polypod/internal/acp"
 	"github.com/costa/polypod/internal/adapter"
 	cliAdapter "github.com/costa/polypod/internal/adapter/cli"
 	"github.com/costa/polypod/internal/agent"
@@ -31,6 +34,7 @@ import (
 	"github.com/costa/polypod/internal/autoupdate"
 	"github.com/costa/polypod/internal/chatgptauth"
 	"github.com/costa/polypod/internal/codemap"
+	"github.com/costa/polypod/internal/codesearch"
 	"github.com/costa/polypod/internal/commands"
 	"github.com/costa/polypod/internal/compact"
 	"github.com/costa/polypod/internal/completion"
@@ -58,13 +62,16 @@ import (
 	"github.com/costa/polypod/internal/mcp"
 	"github.com/costa/polypod/internal/memory"
 	"github.com/costa/polypod/internal/migrate"
+	"github.com/costa/polypod/internal/models"
 	"github.com/costa/polypod/internal/multiread"
 	"github.com/costa/polypod/internal/notifier"
 	"github.com/costa/polypod/internal/observability"
 	"github.com/costa/polypod/internal/openapitools"
 	"github.com/costa/polypod/internal/permissions"
+	"github.com/costa/polypod/internal/pluginruntime"
 	"github.com/costa/polypod/internal/profiling"
 	"github.com/costa/polypod/internal/project"
+	"github.com/costa/polypod/internal/projectchecks"
 	"github.com/costa/polypod/internal/provider"
 	"github.com/costa/polypod/internal/prstatus"
 	"github.com/costa/polypod/internal/remote"
@@ -102,6 +109,10 @@ import (
 const defaultConfigPath = "config.yaml"
 
 func main() {
+	acpMode := len(os.Args) > 1 && os.Args[1] == "acp"
+	if acpMode {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+	}
 	if handled := handleSubcommand(); handled {
 		return
 	}
@@ -117,6 +128,9 @@ func main() {
 
 	// Load .env files BEFORE config (so env vars are available for ${} substitution)
 	dotenv.Load(".")
+	if envDir := os.Getenv("POLYPOD_ENV_DIR"); envDir != "" {
+		dotenv.Load(envDir)
+	}
 	for _, w := range dotenv.CheckSecurity(".") {
 		fmt.Fprintln(os.Stderr, w)
 	}
@@ -137,7 +151,7 @@ func main() {
 	multiAuth := auth.NewMultiProviderAuth(keyStore)
 	seedKeyStore(keyStore, cfg)
 
-	if headlessPrompt == "" {
+	if headlessPrompt == "" && !acpMode {
 		if err := setup.CheckAPIKey(cfg, configPath); err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.Exit(1)
@@ -147,6 +161,11 @@ func main() {
 	logger := buildLogger(cfg, headlessPrompt)
 	slog.SetDefault(logger)
 	logger.Info("polypod starting", "version", autoupdate.CurrentVersion())
+
+	// Hydrate cached/remote models.dev capabilities asynchronously (non-blocking)
+	go func() {
+		_, _ = models.RefreshFromModelsDev(context.Background(), cfg.Data.Dir, "")
+	}()
 
 	// Check for updates (async, non-blocking)
 	go func() {
@@ -176,7 +195,7 @@ func main() {
 		}
 	}
 
-	if err := run(ctx, cfg, configPath, sqliteDB, logger, headlessPrompt, headlessFormat, continueSession, resumeSessionID, multiAuth); err != nil {
+	if err := run(ctx, cfg, configPath, sqliteDB, logger, headlessPrompt, headlessFormat, continueSession, resumeSessionID, multiAuth, acpMode); err != nil {
 		logger.Error("fatal error", "error", err)
 		os.Exit(1)
 	}
@@ -193,7 +212,25 @@ func handleSubcommand() bool {
 	if handleRemoteClientSubcommand() {
 		return true
 	}
+	if handled, continueTUI := handleServeAndAttachSubcommands(); handled {
+		return true
+	} else if continueTUI {
+		return false
+	}
 	switch os.Args[1] {
+	case "--help", "-h", "help":
+		fmt.Print("Uso: polypod [config.yaml] [opções]\n\n" +
+			"Opções:\n" +
+			"  -p <pedido>             Executa um pedido sem abrir a interface\n" +
+			"  --output-format <tipo>  Formato da saída: text, json ou stream-json\n" +
+			"  -c, --continue          Continua a última sessão\n" +
+			"  -r, --resume [id]       Retoma uma sessão\n" +
+			"  --setup                 Abre a configuração inicial\n" +
+			"  -v, --version           Mostra a versão\n" +
+			"  -h, --help              Mostra esta ajuda\n\n" +
+			"Comandos: serve, attach, doctor, init, completion, hook, auth, backup, remote, acp\n" +
+			"Na interface, digite /help para ver os comandos disponíveis.\n")
+		return true
 	case "backup":
 		if err := statebackup.RunCLI(context.Background(), os.Args[2:], os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "erro no backup: %v\n", err)
@@ -202,6 +239,9 @@ func handleSubcommand() bool {
 		return true
 	case "doctor":
 		dotenv.Load(".")
+		if envDir := os.Getenv("POLYPOD_ENV_DIR"); envDir != "" {
+			dotenv.Load(envDir)
+		}
 		configPath, live := defaultConfigPath, false
 		for _, arg := range os.Args[2:] {
 			if arg == "--live" {
@@ -269,49 +309,13 @@ func handleSubcommand() bool {
 		}
 		return true
 	case "auth":
-		if len(os.Args) < 4 || os.Args[2] != "chatgpt" {
-			fmt.Println("uso: polypod auth chatgpt <login|status|models|logout>")
-			return true
+		dotenv.Load(".")
+		if envDir := os.Getenv("POLYPOD_ENV_DIR"); envDir != "" {
+			dotenv.Load(envDir)
 		}
-		manager := chatgptauth.NewManager(chatgptauth.DefaultCredentialPath())
-		switch os.Args[3] {
-		case "login":
-			ctx, cancel := context.WithTimeout(context.Background(), 11*time.Minute)
-			defer cancel()
-			cred, err := manager.Login(ctx)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "erro conectando ChatGPT: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Printf("ChatGPT conectado ao Polypod: %s\n", cred.Email)
-		case "status":
-			cred, err := manager.Status()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "erro lendo sessao ChatGPT: %v\n", err)
-				os.Exit(1)
-			}
-			if cred == nil {
-				fmt.Println("ChatGPT: nao conectado")
-			} else {
-				fmt.Printf("ChatGPT: conectado (%s), expira em %s\n", cred.Email, cred.ExpiresAt.Local().Format(time.RFC3339))
-			}
-		case "models":
-			models, err := manager.Models(context.Background())
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "erro listando modelos: %v\n", err)
-				os.Exit(1)
-			}
-			for _, model := range models {
-				fmt.Println(model.Name())
-			}
-		case "logout":
-			if err := manager.Logout(); err != nil {
-				fmt.Fprintf(os.Stderr, "erro desconectando ChatGPT: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Println("Sessao ChatGPT removida do Polypod.")
-		default:
-			fmt.Println("uso: polypod auth chatgpt <login|status|models|logout>")
+		if err := accountauth.RunCLI(context.Background(), nil, os.Args[2:], os.Stdout, os.Stderr); err != nil {
+			fmt.Fprintf(os.Stderr, "erro: %v\n", err)
+			os.Exit(1)
 		}
 		return true
 	case "--version", "-v":
@@ -531,9 +535,10 @@ RESUMO:`
 	}, logger)
 }
 
-// buildProviderRegistry creates the provider.Registry, resolving keys via multiAuth.
+// buildProviderRegistry creates the provider.Registry, resolving keys via multiAuth and OAuth accounts.
 func buildProviderRegistry(cfg *config.Config, multiAuth *auth.MultiProviderAuth) (*provider.Registry, []provider.Provider) {
 	reg := provider.NewRegistry()
+	acctMgr := accountauth.NewManager(nil)
 
 	if cfg.AI.Provider == "chatgpt" {
 		manager := chatgptauth.NewManager(chatgptauth.DefaultCredentialPath())
@@ -543,13 +548,29 @@ func buildProviderRegistry(cfg *config.Config, multiAuth *auth.MultiProviderAuth
 		if cred, err := multiAuth.GetCredentials(cfg.AI.Provider); err == nil {
 			primaryKey = cred.Token()
 		}
-		reg.Register(provider.NewOpenAICompat(cfg.AI.Provider, primaryKey, cfg.AI.BaseURL))
+		if primaryKey == "" && accountauth.IsOAuthProvider(cfg.AI.Provider) && acctMgr.HasActiveAccount(cfg.AI.Provider) {
+			baseURL := cfg.AI.BaseURL
+			if baseURL == "" {
+				baseURL = acctMgr.ActiveBaseURL(cfg.AI.Provider)
+			}
+			reg.Register(provider.ProviderFactoryWithTokenSource(cfg.AI.Provider, acctMgr.TokenSource(cfg.AI.Provider), baseURL))
+		} else {
+			reg.Register(provider.NewOpenAICompat(cfg.AI.Provider, primaryKey, cfg.AI.BaseURL))
+		}
 	}
 
 	for _, p := range cfg.Providers {
 		key := p.APIKey
 		if cred, err := multiAuth.GetCredentials(p.Name); err == nil && cred.Token() != "" {
 			key = cred.Token()
+		}
+		if key == "" && accountauth.IsOAuthProvider(p.Name) && acctMgr.HasActiveAccount(p.Name) {
+			baseURL := p.BaseURL
+			if baseURL == "" {
+				baseURL = acctMgr.ActiveBaseURL(p.Name)
+			}
+			reg.Register(provider.ProviderFactoryWithTokenSource(p.Name, acctMgr.TokenSource(p.Name), baseURL))
+			continue
 		}
 		switch p.Name {
 		case "ollama":
@@ -562,6 +583,15 @@ func buildProviderRegistry(cfg *config.Config, multiAuth *auth.MultiProviderAuth
 			reg.Register(provider.NewOpenAICompat("openai", key, p.BaseURL))
 		default:
 			reg.Register(provider.ProviderFactory(p.Name, key, p.BaseURL))
+		}
+	}
+
+	for _, oauthProv := range accountauth.SupportedProviders() {
+		if _, exists := reg.Get(oauthProv); exists {
+			continue
+		}
+		if acctMgr.HasActiveAccount(oauthProv) {
+			reg.Register(provider.ProviderFactoryWithTokenSource(oauthProv, acctMgr.TokenSource(oauthProv), acctMgr.ActiveBaseURL(oauthProv)))
 		}
 	}
 
@@ -594,12 +624,63 @@ func prepareSessionHistory(ctx context.Context, convMgr *conversation.Manager, a
 
 // makeHandler builds the inline message handler that replaces router.Handler.
 func sessionMemoryScope(msg adapter.InMessage, sess *conversation.Session) string {
-	if msg.Channel == "cli" && msg.Metadata != nil {
+	if (msg.Channel == "cli" || msg.Channel == "headless") && msg.Metadata != nil {
 		if id := msg.Metadata["polypod_session_id"]; id != "" {
 			return id
 		}
 	}
 	return sess.ID
+}
+
+func sessionEventScope(msg adapter.InMessage, sess *conversation.Session) string {
+	if msg.Metadata != nil {
+		if id := strings.TrimSpace(msg.Metadata["polypod_session_id"]); id != "" {
+			return id
+		}
+	}
+	if msg.Channel == "acp" && strings.TrimSpace(msg.UserID) != "" {
+		return strings.TrimSpace(msg.UserID)
+	}
+	if sess != nil && sess.ID != "" {
+		return sess.ID
+	}
+	return msg.Channel + ":" + msg.UserID
+}
+
+func toolEventJournalPayload(ev ai.ToolEvent) map[string]any {
+	toolID := ev.ToolID
+	body := map[string]any{"toolCallId": toolID}
+	switch ev.Type {
+	case ai.ToolEventStart:
+		body["sessionUpdate"] = "tool_call"
+		body["title"] = ev.ToolName
+		body["name"] = ev.ToolName
+		body["status"] = "in_progress"
+		if ev.Args != nil {
+			body["rawInput"] = ev.Args
+		}
+	case ai.ToolEventComplete:
+		body["sessionUpdate"] = "tool_call_update"
+		body["status"] = "completed"
+		if ev.Result != "" {
+			body["rawOutput"] = ev.Result
+		}
+	case ai.ToolEventError:
+		body["sessionUpdate"] = "tool_call_update"
+		body["status"] = "failed"
+		if ev.Error != "" {
+			body["rawOutput"] = ev.Error
+		}
+	case ai.ToolEventProgress:
+		body["sessionUpdate"] = "tool_call_update"
+		body["status"] = "in_progress"
+		if ev.Result != "" {
+			body["rawOutput"] = ev.Result
+		}
+	default:
+		return nil
+	}
+	return body
 }
 
 func appendToolTrace(store *session.ToolTranscriptStore, scope, turnID string, event ai.ToolEvent, logger *slog.Logger) {
@@ -640,6 +721,14 @@ func toolTranscriptSummary(store *session.ToolTranscriptStore, scope string, log
 }
 
 func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionmem.FileStore, trace *session.ToolTranscriptStore, turns *turncheckpoint.Manager, logger *slog.Logger, cliStorage ...session.SessionStorage) adapter.MessageHandler {
+	return makeHandlerWithEvents(convMgr, aiSvc, mem, trace, turns, nil, logger, cliStorage...)
+}
+
+func makeHandlerWithEvents(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionmem.FileStore, trace *session.ToolTranscriptStore, turns *turncheckpoint.Manager, events *session.EventJournal, logger *slog.Logger, cliStorage ...session.SessionStorage) adapter.MessageHandler {
+	return makeHandlerWithChecks(convMgr, aiSvc, mem, trace, turns, events, logger, nil, cliStorage...)
+}
+
+func makeHandlerWithChecks(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionmem.FileStore, trace *session.ToolTranscriptStore, turns *turncheckpoint.Manager, events *session.EventJournal, logger *slog.Logger, turnCheck func(context.Context, string, string) (string, bool, error), cliStorage ...session.SessionStorage) adapter.MessageHandler {
 	return func(ctx context.Context, msg adapter.InMessage) (adapter.OutMessage, error) {
 		var storage session.SessionStorage
 		if len(cliStorage) > 0 {
@@ -666,32 +755,119 @@ func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionm
 			}
 		}
 		scope := sessionMemoryScope(msg, sess)
+		eventScope := sessionEventScope(msg, sess)
+		acpManaged := msg.Metadata != nil && msg.Metadata["polypod_acp_managed_events"] == "1"
+		turnKey := ""
+		if msg.Metadata != nil {
+			turnKey = strings.TrimSpace(msg.Metadata["polypod_turn_id"])
+		}
+		var claimedTurn bool
+		finishReceipt := func(reason, content, errMsg string) {
+			if claimedTurn && events != nil {
+				if completeErr := events.CompleteTurn(eventScope, turnKey, msg.Text, reason, content, errMsg); completeErr != nil {
+					logger.Warn("session turn receipt completion failed", "session", eventScope, "turn_key", turnKey, "error", completeErr)
+				}
+				claimedTurn = false
+			}
+		}
+		if events != nil && !acpManaged && turnKey != "" {
+			receipt, fresh, claimErr := events.ClaimTurn(eventScope, turnKey, msg.Text)
+			if claimErr != nil {
+				return adapter.OutMessage{Text: claimErr.Error()}, claimErr
+			}
+			if !fresh {
+				if receipt.Error != "" {
+					err := errors.New(receipt.Error)
+					return adapter.OutMessage{Text: receipt.Error}, err
+				}
+				return adapter.OutMessage{
+					Text:          receipt.Content,
+					Channel:       msg.Channel,
+					UserID:        msg.UserID,
+					ReplyTo:       msg.ID,
+					EventVersion:  session.EventProtocolVersion,
+					EventSequence: receipt.LastSequence,
+				}, nil
+			}
+			claimedTurn = true
+		}
+		if events != nil {
+			var releaseCancel func()
+			ctx, releaseCancel = events.BeginTurnContext(ctx, eventScope)
+			defer releaseCancel()
+		}
+		projectDir := aiSvc.WorkingDir(msg.Channel, msg.UserID, scope, ".")
+		ctx = projectchecks.WithConfigSnapshot(ctx, projectDir)
 		ctx = conversation.WithJournalScope(ctx, msg.Channel, msg.UserID, scope, aiSvc.ActiveAgent())
 		if msg.Channel == "cli" {
 			if err := ensureCLINextTurnResolved(turns, scope, sess); err != nil {
+				finishReceipt("", "", err.Error())
 				return adapter.OutMessage{Text: err.Error()}, err
 			}
 		}
 		history, err := prepareSessionHistory(ctx, convMgr, aiSvc, mem, scope, sess)
 		if err != nil {
+			finishReceipt("", "", err.Error())
 			return adapter.OutMessage{Text: "Erro ao preparar o contexto"}, err
 		}
 		userMessage, err := convMgr.AddUserMessageDurable(ctx, sess, msg.Text)
 		if err != nil {
+			finishReceipt("", "", err.Error())
 			return adapter.OutMessage{Text: "Erro ao salvar mensagem"}, err
 		}
+		journalTurnID := userMessage.ID
+		if turnKey != "" {
+			journalTurnID = turnKey
+		}
+		var lastSeq atomic.Uint64
+		recordEvent := func(update map[string]any) uint64 {
+			if events == nil || acpManaged || update == nil {
+				return 0
+			}
+			published, pubErr := events.AppendTurnEvent(eventScope, msg.Channel, journalTurnID, update)
+			if pubErr != nil {
+				logger.Warn("session event append failed", "session", eventScope, "error", pubErr)
+				return 0
+			}
+			lastSeq.Store(published.Sequence)
+			return published.Sequence
+		}
+		recordEvent(map[string]any{
+			"sessionUpdate": "user_message_chunk",
+			"messageId":     userMessage.ID,
+			"content":       map[string]string{"type": "text", "text": msg.Text},
+		})
 		turnCtx := turns.BeginTurn(ctx, sess.ID, userMessage.ID)
 		if msg.Channel == "cli" {
 			turnCtx = ai.WithTurnCheckpoint(turnCtx, turns, scope, userMessage.ID)
 		}
+		var toolSteps, toolFailures atomic.Int64
 		turnCtx = ai.WithToolEventCallback(turnCtx, func(event ai.ToolEvent) {
+			if event.Type == ai.ToolEventStart {
+				toolSteps.Add(1)
+			}
+			if event.Type == ai.ToolEventError {
+				toolFailures.Add(1)
+			}
 			appendToolTrace(trace, scope, userMessage.ID, event, logger)
+			recordEvent(toolEventJournalPayload(event))
 		})
 		defer func() {
 			if err := turns.FinishTurn(turnCtx); err != nil {
 				logger.Warn("turn checkpoint finalization failed", "turn_id", userMessage.ID, "error", err)
 			}
 		}()
+		forceChecks := isAutofixPRPrompt(msg.Text)
+		autofixTurnIDs := []string{userMessage.ID}
+		autofixGateHandled := false
+		if forceChecks {
+			defer func() {
+				if !autofixGateHandled {
+					_ = turns.FinishTurn(turnCtx)
+					finalizeAutofixPRGate(ctx, turns, sess.ID, autofixTurnIDs, projectDir, false, "turno interrompido antes da verificação concluída")
+				}
+			}()
+		}
 		resp, err := aiSvc.Answer(turnCtx, ai.AnswerRequest{
 			Channel:               msg.Channel,
 			UserID:                msg.UserID,
@@ -703,27 +879,183 @@ func makeHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionm
 			HistoryPrepared:       true,
 		})
 		if err != nil {
+			reason := ""
+			errMsg := err.Error()
+			if ctx.Err() != nil {
+				reason = "cancelled"
+			}
+			recordEvent(map[string]any{"sessionUpdate": "turn_complete", "stopReason": reason, "error": errMsg})
+			finishReceipt(reason, "", errMsg)
 			return adapter.OutMessage{Text: "Erro ao processar: " + err.Error()}, err
 		}
+		promptTokens, completionTokens := resp.PromptTokens, resp.CompletionTokens
+		autofixVerified := false
+		autofixReason := ""
+		if forceChecks && turnCheck == nil {
+			autofixReason = "verificadores indisponíveis neste runtime"
+		}
+		for attempt := 0; turnCheck != nil && attempt < 2; attempt++ {
+			if attempt == 0 && !turns.HasFiles(turnCtx) && !forceChecks {
+				break
+			}
+			if projectchecks.ConfigChanged(ctx, projectDir) {
+				autofixReason = "configuração .polypod/verifiers.yaml alterada durante o turno"
+				resp.Content += "\n\nConfiguração de verificadores alterada durante o turno. Revise o arquivo e use /verify para executar os comandos."
+				break
+			}
+			event := "turn"
+			if forceChecks {
+				event = "manual"
+			}
+			report, failed, checkErr := turnCheck(ctx, projectDir, event)
+			if checkErr != nil {
+				autofixReason = "erro ao executar verificadores: " + checkErr.Error()
+				report = "Verificação do projeto indisponível: " + checkErr.Error()
+				failed = false
+			} else if report == "" && forceChecks {
+				autofixReason = "nenhum verificador configurado em .polypod/verifiers.yaml"
+				report = "Nenhum verificador configurado para /autofix-pr. Configure .polypod/verifiers.yaml e execute /verify; a correção não foi validada automaticamente."
+			} else if forceChecks && !failed {
+				autofixVerified = true
+			} else if forceChecks && failed {
+				autofixReason = "verificadores falharam após tentativa automática"
+			}
+			if report == "" {
+				break
+			}
+			resp.Content += "\n\n" + report
+			if !failed || attempt == 1 {
+				break
+			}
+			if err := convMgr.AddAssistantMessage(ctx, sess, resp.Content); err != nil {
+				finishReceipt("", resp.Content, err.Error())
+				return adapter.OutMessage{Text: resp.Content}, err
+			}
+			if err := turns.FinishTurn(turnCtx); err != nil {
+				finishReceipt("", resp.Content, err.Error())
+				return adapter.OutMessage{Text: resp.Content}, err
+			}
+			repairHistory, err := prepareSessionHistory(ctx, convMgr, aiSvc, mem, scope, sess)
+			if err != nil {
+				finishReceipt("", resp.Content, err.Error())
+				return adapter.OutMessage{Text: resp.Content}, err
+			}
+			repairPrompt := "As verificações automáticas falharam após sua alteração. Corrija as falhas e verifique novamente. Saída:\n\n" + report
+			userMessage, err = convMgr.AddUserMessageDurable(ctx, sess, repairPrompt)
+			if err != nil {
+				finishReceipt("", resp.Content, err.Error())
+				return adapter.OutMessage{Text: resp.Content}, err
+			}
+			autofixTurnIDs = append(autofixTurnIDs, userMessage.ID)
+			turnCtx = turns.BeginTurn(ctx, sess.ID, userMessage.ID)
+			if msg.Channel == "cli" {
+				turnCtx = ai.WithTurnCheckpoint(turnCtx, turns, scope, userMessage.ID)
+			}
+			turnCtx = ai.WithToolEventCallback(turnCtx, func(event ai.ToolEvent) {
+				if event.Type == ai.ToolEventStart {
+					toolSteps.Add(1)
+				}
+				if event.Type == ai.ToolEventError {
+					toolFailures.Add(1)
+				}
+				appendToolTrace(trace, scope, userMessage.ID, event, logger)
+				recordEvent(toolEventJournalPayload(event))
+			})
+			resp, err = aiSvc.Answer(turnCtx, ai.AnswerRequest{
+				Channel: msg.Channel, UserID: msg.UserID, Query: repairPrompt,
+				CurrentMessageID: userMessage.ID, SessionMemoryScope: scope,
+				ToolTranscriptSummary: toolTranscriptSummary(trace, scope, logger),
+				History:               repairHistory, HistoryPrepared: true,
+			})
+			if err != nil {
+				reason := ""
+				errMsg := err.Error()
+				if ctx.Err() != nil {
+					reason = "cancelled"
+				}
+				recordEvent(map[string]any{"sessionUpdate": "turn_complete", "stopReason": reason, "error": errMsg})
+				finishReceipt(reason, "", errMsg)
+				return adapter.OutMessage{Text: "Erro ao processar: " + err.Error()}, err
+			}
+			promptTokens += resp.PromptTokens
+			completionTokens += resp.CompletionTokens
+		}
+		if err := turns.FinishTurn(turnCtx); err != nil {
+			finishReceipt("", resp.Content, err.Error())
+			return adapter.OutMessage{Text: resp.Content}, err
+		}
+		if forceChecks {
+			autofixGateHandled = true
+			resp.Content += finalizeAutofixPRGate(ctx, turns, sess.ID, autofixTurnIDs, projectDir, autofixVerified, autofixReason)
+		}
 		if err := convMgr.AddAssistantMessage(ctx, sess, resp.Content); err != nil {
+			finishReceipt("", resp.Content, err.Error())
 			return adapter.OutMessage{Text: resp.Content}, err
 		}
 		if guard != nil {
 			if _, err := guard.PublishSnapshot(sess, aiSvc.ActiveAgent()); err != nil {
+				finishReceipt("", resp.Content, err.Error())
 				return adapter.OutMessage{Text: resp.Content}, err
 			}
 		}
+		recordEvent(map[string]any{
+			"sessionUpdate": "agent_message_chunk",
+			"content":       map[string]string{"type": "text", "text": resp.Content},
+		})
+		recordEvent(map[string]any{"sessionUpdate": "turn_complete", "stopReason": "end_turn"})
+		finishReceipt("end_turn", resp.Content, "")
+		evVer := 0
+		if lastSeq.Load() > 0 {
+			evVer = session.EventProtocolVersion
+		}
 		return adapter.OutMessage{
-			Text:    resp.Content,
-			Channel: msg.Channel,
-			UserID:  msg.UserID,
-			ReplyTo: msg.ID,
+			Text:          resp.Content,
+			Channel:       msg.Channel,
+			UserID:        msg.UserID,
+			ReplyTo:       msg.ID,
+			EventVersion:  evVer,
+			EventSequence: lastSeq.Load(),
+			Usage:         turnUsage(aiSvc, promptTokens, completionTokens, int(toolSteps.Load()), int(toolFailures.Load())),
 		}, nil
 	}
 }
 
+func turnUsage(aiSvc *ai.Service, prompt, completion, steps, failures int) *adapter.Usage {
+	usage := &adapter.Usage{Provider: aiSvc.CurrentProvider(), Model: aiSvc.CurrentModel(), PromptTokens: prompt,
+		CompletionTokens: completion, TotalTokens: prompt + completion, Steps: steps, ToolFailures: failures}
+	if cost, ok := tracking.MeasuredCost(usage.Provider, usage.Model, prompt, completion); ok {
+		usage.CostUSD = &cost
+	}
+	return usage
+}
+
+// bindDurableTurn puts a channel or task delivery on the shared session journal.
+// The inbox message ID is the idempotency key, so a redelivery does not run tools again.
+func bindDurableTurn(msg adapter.InMessage) adapter.InMessage {
+	if msg.Metadata == nil {
+		msg.Metadata = map[string]string{}
+	}
+	if strings.TrimSpace(msg.Metadata["polypod_session_id"]) == "" {
+		sessionID := strings.TrimSpace(msg.Channel) + ":" + strings.TrimSpace(msg.UserID)
+		if sessionID != ":" {
+			msg.Metadata["polypod_session_id"] = sessionID
+		}
+	}
+	if strings.TrimSpace(msg.Metadata["polypod_turn_id"]) == "" {
+		turnID := strings.TrimSpace(msg.ID)
+		if turnID != "" && len(turnID) <= 128 {
+			msg.Metadata["polypod_turn_id"] = turnID
+		}
+	}
+	return msg
+}
+
 // makeStreamHandler builds the inline stream handler that replaces router.StreamHandler.
-func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionmem.FileStore, trace *session.ToolTranscriptStore, turns *turncheckpoint.Manager, logger *slog.Logger, cliStorage ...session.SessionStorage) adapter.StreamHandler {
+func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionmem.FileStore, trace *session.ToolTranscriptStore, turns *turncheckpoint.Manager, logger *slog.Logger, turnCheck func(context.Context, string, string) (string, bool, error), cliStorage ...session.SessionStorage) adapter.StreamHandler {
+	return makeStreamHandlerWithEvents(convMgr, aiSvc, mem, trace, turns, nil, logger, turnCheck, cliStorage...)
+}
+
+func makeStreamHandlerWithEvents(convMgr *conversation.Manager, aiSvc *ai.Service, mem *sessionmem.FileStore, trace *session.ToolTranscriptStore, turns *turncheckpoint.Manager, events *session.EventJournal, logger *slog.Logger, turnCheck func(context.Context, string, string) (string, bool, error), cliStorage ...session.SessionStorage) adapter.StreamHandler {
 	return func(ctx context.Context, msg adapter.InMessage, chunks chan<- adapter.StreamChunk) {
 		defer close(chunks)
 		var storage session.SessionStorage
@@ -755,6 +1087,51 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *se
 			}
 		}
 		scope := sessionMemoryScope(msg, sess)
+		eventScope := sessionEventScope(msg, sess)
+		acpManaged := msg.Metadata != nil && msg.Metadata["polypod_acp_managed_events"] == "1"
+		turnKey := ""
+		if msg.Metadata != nil {
+			turnKey = strings.TrimSpace(msg.Metadata["polypod_turn_id"])
+		}
+		var claimedTurn bool
+		var streamedText strings.Builder
+		finishReceipt := func(reason, content, errMsg string) {
+			if claimedTurn && events != nil {
+				if completeErr := events.CompleteTurn(eventScope, turnKey, msg.Text, reason, content, errMsg); completeErr != nil {
+					logger.Warn("session turn receipt completion failed", "session", eventScope, "turn_key", turnKey, "error", completeErr)
+				}
+				claimedTurn = false
+			}
+		}
+		if events != nil && !acpManaged && turnKey != "" {
+			receipt, fresh, claimErr := events.ClaimTurn(eventScope, turnKey, msg.Text)
+			if claimErr != nil {
+				chunks <- adapter.StreamChunk{Error: claimErr, Done: true}
+				return
+			}
+			if !fresh {
+				if receipt.Error != "" {
+					chunks <- adapter.StreamChunk{Error: errors.New(receipt.Error), Done: true,
+						EventVersion: session.EventProtocolVersion, EventSequence: receipt.LastSequence}
+					return
+				}
+				if receipt.Content != "" {
+					chunks <- adapter.StreamChunk{Delta: receipt.Content,
+						EventVersion: session.EventProtocolVersion, EventSequence: receipt.LastSequence}
+				}
+				chunks <- adapter.StreamChunk{Done: true,
+					EventVersion: session.EventProtocolVersion, EventSequence: receipt.LastSequence}
+				return
+			}
+			claimedTurn = true
+		}
+		if events != nil {
+			var releaseCancel func()
+			ctx, releaseCancel = events.BeginTurnContext(ctx, eventScope)
+			defer releaseCancel()
+		}
+		projectDir := aiSvc.WorkingDir(msg.Channel, msg.UserID, scope, ".")
+		ctx = projectchecks.WithConfigSnapshot(ctx, projectDir)
 		ctx = conversation.WithJournalScope(ctx, msg.Channel, msg.UserID, scope, aiSvc.ActiveAgent())
 		resumeTurnID := ""
 		if msg.Metadata != nil {
@@ -762,6 +1139,7 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *se
 		}
 		if msg.Channel == "cli" && resumeTurnID == "" {
 			if err := ensureCLINextTurnResolved(turns, scope, sess); err != nil {
+				finishReceipt("", "", err.Error())
 				chunks <- adapter.StreamChunk{Error: err, Done: true}
 				return
 			}
@@ -774,7 +1152,9 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *se
 			if msg.Channel != "cli" || msg.UserID != "local" || len(sess.Messages) == 0 ||
 				sess.Messages[len(sess.Messages)-1].Role != conversation.RoleUser ||
 				sess.Messages[len(sess.Messages)-1].ID != resumeTurnID {
-				chunks <- adapter.StreamChunk{Error: fmt.Errorf("turno de retomada nao corresponde a ultima mensagem do CLI"), Done: true}
+				err := fmt.Errorf("turno de retomada nao corresponde a ultima mensagem do CLI")
+				finishReceipt("", "", err.Error())
+				chunks <- adapter.StreamChunk{Error: err, Done: true}
 				return
 			}
 			userMessage = sess.Messages[len(sess.Messages)-1]
@@ -783,11 +1163,14 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *se
 				err = resumeCheckpoint.ValidateResume()
 			}
 			if err != nil {
-				chunks <- adapter.StreamChunk{Error: fmt.Errorf("retomada bloqueada: %w", err), Done: true}
+				wrapped := fmt.Errorf("retomada bloqueada: %w", err)
+				finishReceipt("", "", wrapped.Error())
+				chunks <- adapter.StreamChunk{Error: wrapped, Done: true}
 				return
 			}
 			turnCtx, err = turns.ResumeTurn(ctx, sess.ID, userMessage.ID)
 			if err != nil {
+				finishReceipt("", "", err.Error())
 				chunks <- adapter.StreamChunk{Error: err, Done: true}
 				return
 			}
@@ -795,11 +1178,13 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *se
 		} else {
 			history, err = prepareSessionHistory(ctx, convMgr, aiSvc, mem, scope, sess)
 			if err != nil {
+				finishReceipt("", "", err.Error())
 				chunks <- adapter.StreamChunk{Error: err, Done: true}
 				return
 			}
 			userMessage, err = convMgr.AddUserMessageDurable(ctx, sess, msg.Text)
 			if err != nil {
+				finishReceipt("", "", err.Error())
 				chunks <- adapter.StreamChunk{Error: err, Done: true}
 				return
 			}
@@ -808,9 +1193,41 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *se
 				turnCtx = ai.WithTurnCheckpoint(turnCtx, turns, scope, userMessage.ID)
 			}
 		}
+		journalTurnID := userMessage.ID
+		if turnKey != "" {
+			journalTurnID = turnKey
+		}
+		recordEvent := func(update map[string]any) (int, uint64) {
+			if events == nil || acpManaged || update == nil {
+				return 0, 0
+			}
+			published, pubErr := events.AppendTurnEvent(eventScope, msg.Channel, journalTurnID, update)
+			if pubErr != nil {
+				logger.Warn("session event append failed", "session", eventScope, "error", pubErr)
+				return 0, 0
+			}
+			return published.Version, published.Sequence
+		}
+		if resumeTurnID == "" {
+			recordEvent(map[string]any{
+				"sessionUpdate": "user_message_chunk",
+				"messageId":     userMessage.ID,
+				"content":       map[string]string{"type": "text", "text": msg.Text},
+			})
+		}
+		var toolSteps, toolFailures atomic.Int64
 		turnCtx = ai.WithToolEventCallback(turnCtx, func(ev ai.ToolEvent) {
+			if ev.Type == ai.ToolEventStart {
+				toolSteps.Add(1)
+			}
+			if ev.Type == ai.ToolEventError {
+				toolFailures.Add(1)
+			}
 			appendToolTrace(trace, scope, userMessage.ID, ev, logger)
+			ver, seq := recordEvent(toolEventJournalPayload(ev))
 			chunks <- adapter.StreamChunk{
+				EventVersion:  ver,
+				EventSequence: seq,
 				ToolEvent: &adapter.ToolEventInfo{
 					Type:     adapter.ToolEventType(ev.Type),
 					ToolName: ev.ToolName,
@@ -838,8 +1255,43 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *se
 			History:               history,
 			HistoryPrepared:       true,
 		}
+		emitDelta := func(delta string) {
+			if delta == "" {
+				return
+			}
+			streamedText.WriteString(delta)
+			ver, seq := recordEvent(map[string]any{
+				"sessionUpdate": "agent_message_chunk",
+				"content":       map[string]string{"type": "text", "text": delta},
+			})
+			chunks <- adapter.StreamChunk{Delta: delta, EventVersion: ver, EventSequence: seq}
+		}
 		streamCallback := func(delta string) {
-			chunks <- adapter.StreamChunk{Delta: delta}
+			emitDelta(delta)
+		}
+		var steeringMessages []string
+		turnCtx = ai.WithSteeringObserver(turnCtx, func(message string) {
+			steeringMessages = append(steeringMessages, message)
+		})
+		flushSteering := func() error {
+			for _, guidance := range steeringMessages {
+				if _, err := convMgr.AddUserMessageDurable(ctx, sess, guidance); err != nil {
+					return err
+				}
+			}
+			steeringMessages = nil
+			return nil
+		}
+		forceChecks := isAutofixPRPrompt(msg.Text)
+		autofixTurnIDs := []string{userMessage.ID}
+		autofixGateHandled := false
+		if forceChecks {
+			defer func() {
+				if !autofixGateHandled {
+					_ = turns.FinishTurn(turnCtx)
+					finalizeAutofixPRGate(ctx, turns, sess.ID, autofixTurnIDs, projectDir, false, "turno interrompido antes da verificação concluída")
+				}
+			}()
 		}
 		var resp *ai.AnswerResponse
 		if resumeCheckpoint != nil {
@@ -848,10 +1300,148 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *se
 			resp, err = aiSvc.AnswerStream(turnCtx, answerReq, streamCallback)
 		}
 		if err != nil {
+			reason := ""
+			if ctx.Err() != nil {
+				reason = "cancelled"
+			}
+			ver, seq := recordEvent(map[string]any{"sessionUpdate": "turn_complete", "stopReason": reason, "error": err.Error()})
+			finishReceipt(reason, streamedText.String(), err.Error())
+			chunks <- adapter.StreamChunk{Error: err, Done: true, EventVersion: ver, EventSequence: seq}
+			return
+		}
+		promptTokens, completionTokens := resp.PromptTokens, resp.CompletionTokens
+		autofixVerified := false
+		autofixReason := ""
+		if forceChecks && turnCheck == nil {
+			autofixReason = "verificadores indisponíveis neste runtime"
+		}
+		for attempt := 0; turnCheck != nil && attempt < 2; attempt++ {
+			if attempt == 0 && !turns.HasFiles(turnCtx) && !forceChecks {
+				break
+			}
+			if projectchecks.ConfigChanged(ctx, projectDir) {
+				autofixReason = "configuração .polypod/verifiers.yaml alterada durante o turno"
+				report := "\n\nConfiguração de verificadores alterada durante o turno. Revise o arquivo e use /verify para executar os comandos."
+				resp.Content += report
+				emitDelta(report)
+				break
+			}
+			event := "turn"
+			if forceChecks {
+				event = "manual"
+			}
+			report, failed, checkErr := turnCheck(ctx, projectDir, event)
+			if checkErr != nil {
+				autofixReason = "erro ao executar verificadores: " + checkErr.Error()
+				report = "Verificação do projeto indisponível: " + checkErr.Error()
+				failed = false
+			} else if report == "" && forceChecks {
+				autofixReason = "nenhum verificador configurado em .polypod/verifiers.yaml"
+				report = "Nenhum verificador configurado para /autofix-pr. Configure .polypod/verifiers.yaml e execute /verify; a correção não foi validada automaticamente."
+			} else if forceChecks && !failed {
+				autofixVerified = true
+			} else if forceChecks && failed {
+				autofixReason = "verificadores falharam após tentativa automática"
+			}
+			if report == "" {
+				break
+			}
+			report = "\n\n" + report
+			resp.Content += report
+			emitDelta(report)
+			if !failed || attempt == 1 {
+				break
+			}
+			if err := flushSteering(); err != nil {
+				finishReceipt("", resp.Content, err.Error())
+				chunks <- adapter.StreamChunk{Error: err, Done: true}
+				return
+			}
+			if err := convMgr.AddAssistantMessage(ctx, sess, resp.Content); err != nil {
+				finishReceipt("", resp.Content, err.Error())
+				chunks <- adapter.StreamChunk{Error: err, Done: true}
+				return
+			}
+			if err := turns.FinishTurn(turnCtx); err != nil {
+				finishReceipt("", resp.Content, err.Error())
+				chunks <- adapter.StreamChunk{Error: err, Done: true}
+				return
+			}
+			repairHistory, err := prepareSessionHistory(ctx, convMgr, aiSvc, mem, scope, sess)
+			if err != nil {
+				finishReceipt("", resp.Content, err.Error())
+				chunks <- adapter.StreamChunk{Error: err, Done: true}
+				return
+			}
+			repairPrompt := "As verificações automáticas falharam após sua alteração. Corrija as falhas e verifique novamente. Saída:\n" + report
+			userMessage, err = convMgr.AddUserMessageDurable(ctx, sess, repairPrompt)
+			if err != nil {
+				finishReceipt("", resp.Content, err.Error())
+				chunks <- adapter.StreamChunk{Error: err, Done: true}
+				return
+			}
+			autofixTurnIDs = append(autofixTurnIDs, userMessage.ID)
+			turnCtx = turns.BeginTurn(ctx, sess.ID, userMessage.ID)
+			if msg.Channel == "cli" {
+				turnCtx = ai.WithTurnCheckpoint(turnCtx, turns, scope, userMessage.ID)
+			}
+			turnCtx = ai.WithToolEventCallback(turnCtx, func(ev ai.ToolEvent) {
+				if ev.Type == ai.ToolEventStart {
+					toolSteps.Add(1)
+				}
+				if ev.Type == ai.ToolEventError {
+					toolFailures.Add(1)
+				}
+				appendToolTrace(trace, scope, userMessage.ID, ev, logger)
+				ver, seq := recordEvent(toolEventJournalPayload(ev))
+				chunks <- adapter.StreamChunk{EventVersion: ver, EventSequence: seq, ToolEvent: &adapter.ToolEventInfo{
+					Type: adapter.ToolEventType(ev.Type), ToolName: ev.ToolName, ToolID: ev.ToolID,
+					Args: ev.Args, Result: ev.Result, Error: ev.Error, Elapsed: ev.Elapsed,
+				}}
+			})
+			turnCtx = ai.WithSteeringObserver(turnCtx, func(message string) {
+				steeringMessages = append(steeringMessages, message)
+			})
+			emitDelta("\n\nVerificações falharam. Tentando corrigir automaticamente...\n")
+			resp, err = aiSvc.AnswerStream(turnCtx, ai.AnswerRequest{
+				Channel: msg.Channel, UserID: msg.UserID, Query: repairPrompt,
+				CurrentMessageID: userMessage.ID, SessionMemoryScope: scope,
+				ToolTranscriptSummary: toolTranscriptSummary(trace, scope, logger),
+				History:               repairHistory, HistoryPrepared: true,
+			}, streamCallback)
+			if err != nil {
+				reason := ""
+				if ctx.Err() != nil {
+					reason = "cancelled"
+				}
+				ver, seq := recordEvent(map[string]any{"sessionUpdate": "turn_complete", "stopReason": reason, "error": err.Error()})
+				finishReceipt(reason, streamedText.String(), err.Error())
+				chunks <- adapter.StreamChunk{Error: err, Done: true, EventVersion: ver, EventSequence: seq}
+				return
+			}
+			promptTokens += resp.PromptTokens
+			completionTokens += resp.CompletionTokens
+		}
+		if err := flushSteering(); err != nil {
+			finishReceipt("", resp.Content, err.Error())
 			chunks <- adapter.StreamChunk{Error: err, Done: true}
 			return
 		}
+		// Finalize checkpoint before running the /autofix-pr rollback gate and
+		// before publishing the conversation snapshot.
+		if err := turns.FinishTurn(turnCtx); err != nil {
+			finishReceipt("", resp.Content, err.Error())
+			chunks <- adapter.StreamChunk{Error: err, Done: true}
+			return
+		}
+		if forceChecks {
+			autofixGateHandled = true
+			gateNote := finalizeAutofixPRGate(ctx, turns, sess.ID, autofixTurnIDs, projectDir, autofixVerified, autofixReason)
+			resp.Content += gateNote
+			emitDelta(gateNote)
+		}
 		if err := convMgr.AddAssistantMessage(ctx, sess, resp.Content); err != nil {
+			finishReceipt("", resp.Content, err.Error())
 			chunks <- adapter.StreamChunk{Error: err, Done: true}
 			return
 		}
@@ -859,6 +1449,7 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *se
 		if guard != nil {
 			revision, err = guard.PublishSnapshot(sess, aiSvc.ActiveAgent())
 			if err != nil {
+				finishReceipt("", resp.Content, err.Error())
 				chunks <- adapter.StreamChunk{Error: err, Done: true}
 				return
 			}
@@ -867,11 +1458,19 @@ func makeStreamHandler(convMgr *conversation.Manager, aiSvc *ai.Service, mem *se
 			closeErr := guard.Close()
 			guard = nil
 			if closeErr != nil {
+				finishReceipt("", resp.Content, closeErr.Error())
 				chunks <- adapter.StreamChunk{Error: closeErr, Done: true}
 				return
 			}
 		}
-		chunks <- adapter.StreamChunk{Done: true, SessionRevision: revision}
+		finalText := streamedText.String()
+		if finalText == "" {
+			finalText = resp.Content
+		}
+		doneVer, doneSeq := recordEvent(map[string]any{"sessionUpdate": "turn_complete", "stopReason": "end_turn"})
+		finishReceipt("end_turn", finalText, "")
+		chunks <- adapter.StreamChunk{Done: true, EventVersion: doneVer, EventSequence: doneSeq, SessionRevision: revision,
+			Usage: turnUsage(aiSvc, promptTokens, completionTokens, int(toolSteps.Load()), int(toolFailures.Load()))}
 	}
 }
 
@@ -1019,7 +1618,7 @@ func autoSaveSession(convMgr *conversation.Manager, sessStorage session.SessionS
 	})
 }
 
-func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *database.SQLiteDB, logger *slog.Logger, headlessPrompt, headlessFormat string, continueSession bool, resumeSessionID string, multiAuth *auth.MultiProviderAuth) error {
+func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *database.SQLiteDB, logger *slog.Logger, headlessPrompt, headlessFormat string, continueSession bool, resumeSessionID string, multiAuth *auth.MultiProviderAuth, acpMode bool) error {
 	var sqlDB *sql.DB
 	if sqliteDB != nil {
 		sqlDB = sqliteDB.DB
@@ -1109,6 +1708,10 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		}
 		logger.Info("semantic memory enabled", "backend", backend)
 	}
+	var codeSearch *codesearch.Engine
+	if embedder != nil {
+		codeSearch = codesearch.New(embedder)
+	}
 	documentIndex, err := document.OpenIndex(filepath.Join(cfg.Data.Dir, "document-index.db"), embedder)
 	if err != nil {
 		return fmt.Errorf("opening document knowledge index: %w", err)
@@ -1136,6 +1739,24 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	lspMgr := lsp.NewLSPServerManager(".")
 	lspMgr.InitializeDefaults()
 	sys.ToolRegistry.AttachLSP(lspMgr)
+	sys.ToolRegistry.SetAfterFileWrite(func(writeCtx context.Context, path string) (string, error) {
+		if projectchecks.ConfigChanged(writeCtx, filepath.Dir(path)) {
+			return "Configuração de verificadores alterada neste turno; execução automática suspensa. Use /verify após revisar o arquivo.", nil
+		}
+		formatter, err := projectchecks.Format(writeCtx, path)
+		if err != nil {
+			return "", err
+		}
+		results, err := projectchecks.Run(writeCtx, filepath.Dir(path), "save")
+		if err != nil {
+			return "", err
+		}
+		message := projectchecks.FormatResults(results)
+		if formatter != "" {
+			message = "Formatado com " + formatter + ".\n" + message
+		}
+		return strings.TrimSpace(message), nil
+	})
 	defer func() {
 		if err := lspMgr.Shutdown(); err != nil {
 			logger.Warn("LSP shutdown failed", "error", err)
@@ -1165,6 +1786,9 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	tool.RegisterPlanTaskTools(sys.ToolRegistry, planStore, taskQueue)
 
 	tool.RegisterAdvancedTools(sys.ToolRegistry, ".")
+	tool.RegisterCodeSearchTool(sys.ToolRegistry, codeSearch, ".")
+	tool.RegisterProjectChecksTool(sys.ToolRegistry, ".")
+	tool.RegisterImpactTool(sys.ToolRegistry, ".")
 	tool.RegisterHardwareTools(sys.ToolRegistry)
 	tool.RegisterSerialHardwareTools(sys.ToolRegistry)
 	computerUseTools := computeruse.RegisterComputerUseTools(sys.ToolRegistry)
@@ -1183,6 +1807,9 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	agents := sys.Agents
 	if err := agents.LoadDir(cfg.Data.AgentsDir); err != nil {
 		return fmt.Errorf("loading agent definitions: %w", err)
+	}
+	for _, coreTool := range []string{"run_project_checks", "code_context_search", "code_semantic_search"} {
+		agents.AddSkill("default", coreTool)
 	}
 	// Resolve the checked-in catalog from the config location so a CLI started
 	// in another project still finds the PolyClaw reference skills. Installs
@@ -1551,6 +2178,11 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 			Timeout: h.Timeout, Enabled: h.Enabled,
 		})
 	}
+	pluginAssets := pluginruntime.New(pluginManager, hookMgr, mcpMgr)
+	if err := pluginAssets.Sync(ctx); err != nil {
+		logger.Warn("plugin hooks/MCP unavailable", "error", err)
+	}
+	go pluginAssets.Watch(ctx, func(err error) { logger.Warn("plugin hooks/MCP reconciliation failed", "error", err) })
 
 	// Permissions + Modes
 	permMgr := sys.Permissions
@@ -1578,7 +2210,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	// owning the terminal.
 	var askFn permissions.AskApprovalFn
 	var bubbleApproval *cliAdapter.BubbleteaApprovalHandler
-	if headlessPrompt != "" {
+	if headlessPrompt != "" || acpMode {
 		askFn = approval.NewHeadlessApprovalHandler(approval.HeadlessPolicy{}).AskApproval
 	} else {
 		bubbleApproval = cliAdapter.NewBubbleteaApprovalHandler()
@@ -1623,6 +2255,9 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		Threshold:      0.70,
 	})
 
+	// External workspace change buffer (real-time FileChanged hook + prompt context)
+	externalChanges := watcher.NewExternalChangeBuffer(64)
+
 	// Wire all extra subsystems
 	active := wiring.WireSubsystems(wiring.SubsystemConfig{
 		Logger:      logger,
@@ -1633,6 +2268,14 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		SkillExecFn: skills.Execute,
 		CompactSvc:  compactSvc,
 		AutoMem:     autoMem,
+		OnFileEvent: func(ev watcher.FileChangeEvent) {
+			externalChanges.Record(ev.Path, ev.Op)
+			hookMgr.Fire(ctx, hooks.HookPayload{
+				Event:     hooks.EventFileChanged,
+				Message:   fmt.Sprintf("%s:%s", ev.Op, ev.Path),
+				Timestamp: ev.Timestamp.Format(time.RFC3339),
+			})
+		},
 		ActionTrigger: func(triggerCtx context.Context, trigger watcher.Trigger) {
 			prompt := fmt.Sprintf("Execute a instrução AI! no arquivo %s, linha %d: %s\n\nContexto do código:\n%s", trigger.File, trigger.Line, trigger.Prompt, trigger.Content)
 			state, spawnErr := tasks.SpawnAgentTask(triggerCtx, sys.TaskRegistry,
@@ -1683,7 +2326,10 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	commands.RegisterBatch28Skills(sys.Commands)
 	commands.RegisterBatch29Voice(sys.Commands)
 	commands.RegisterAutonomousCommands(sys.Commands)
+	commands.RegisterNativePRCommands(sys.Commands)
+	commands.BindPluginRuntime(sys.Commands, pluginManager)
 	commands.BindTaskRuntime(sys.Commands, sys.TaskRegistry, sched, logger)
+	commands.BindWorkOverview(sys.Commands, sys.TaskRegistry)
 	commands.RegisterPromptReview(sys.PromptCommands)
 	commands.RegisterPromptCommit(sys.PromptCommands)
 
@@ -1708,11 +2354,58 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	logger.Info("agent active", "name", activeAgent.Name, "skills", len(activeAgent.Skills))
 
 	// Retrieve cited, scope-limited document chunks before each AI turn.
-	aiClient = ai.NewClient(cfg.AI, sys.ToolAdapter)
+	clientAI := cfg.AI
+	if clientAI.Provider != "chatgpt" && clientAI.APIKey == "" {
+		if cred, err := multiAuth.GetCredentials(clientAI.Provider); err == nil {
+			clientAI.APIKey = cred.Token()
+		}
+	}
+	provider.SetAccountRotator(accountauth.NewManager(nil).RotateActiveOnRateLimit)
+	aiClient = ai.NewClient(clientAI, sys.ToolAdapter)
 	aiSvc := ai.NewService(aiClient, ai.NewDocumentKnowledgeSearcher(documentIndex, cfg.WhatsApp.OwnerChat),
 		agents, "default", memStore, logger)
 	aiSvc.SetConversationStore(store)
 	aiSvc.SetExperienceSearcher(evolutionStore, cfg.WhatsApp.OwnerChat)
+	aiSvc.SetRepoPlaybook(ai.NewRepoPlaybookStore(cfg.Data.Dir))
+	aiSvc.SetExternalChangeBuffer(externalChanges)
+	childQuestions := humanloop.NewMultiChildQuestionQueue()
+	tool.RegisterMultiChildQuestionTool(sys.ToolRegistry, childQuestions)
+	agents.AddSkill("default", "ask_parent_question")
+	tool.RegisterCognitiveTools(sys.ToolRegistry, ".", tool.CognitiveToolDeps{
+		ArchitectExec: func(pCtx context.Context, workDir, prompt string) (string, error) {
+			scopedCtx := ai.WithEffort(workdir.WithFixedDir(pCtx, workDir), "high")
+			resp, runErr := aiClient.Complete(scopedCtx, []ai.ChatMessage{
+				{Role: "system", Content: "Você é o Arquiteto Principal da Polypod. Produza um plano cirúrgico, exato e verificável."},
+				{Role: "user", Content: prompt},
+			})
+			if runErr != nil {
+				return "", runErr
+			}
+			return resp.Content, nil
+		},
+		EditorExec: func(eCtx context.Context, workDir, prompt string) (string, error) {
+			scopedCtx := workdir.WithFixedDir(eCtx, workDir)
+			resp, runErr := aiClient.CompleteWithTools(scopedCtx, []ai.ChatMessage{
+				{Role: "user", Content: prompt},
+			}, logger)
+			if runErr != nil {
+				return "", runErr
+			}
+			return resp.Content, nil
+		},
+		WorktreeCandidateExec: func(wCtx context.Context, worktreeDir, task, strategy string) (string, error) {
+			scopedCtx := ai.WithEffort(workdir.WithFixedDir(wCtx, worktreeDir), "high")
+			prompt := fmt.Sprintf("TAREFA DE ENGENHARIA (executando em worktree isolada %s):\n%s\n\nDIRETRIZ DE ESTRATÉGIA:\n%s\n\nEdite apenas arquivos dentro desta worktree, verifique a compilação/testes e resuma objetivamente a mudança aplicada.",
+				worktreeDir, task, strategy)
+			resp, runErr := aiClient.CompleteWithTools(scopedCtx, []ai.ChatMessage{
+				{Role: "user", Content: prompt},
+			}, logger)
+			if runErr != nil {
+				return "", runErr
+			}
+			return resp.Content, nil
+		},
+	})
 	if cfg.AI.RoutingPolicyFile != "" {
 		policy, err := smartroute.ReadPolicy(cfg.AI.RoutingPolicyFile)
 		if err != nil {
@@ -1738,6 +2431,7 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	if err != nil {
 		return fmt.Errorf("opening tool transcript: %w", err)
 	}
+	eventJournal := session.NewEventJournal(filepath.Join(cfg.Data.Dir, "session-events"))
 
 	// Cost engine
 	costEngine := tracking.NewCostEngine(logger)
@@ -1759,8 +2453,24 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	}
 
 	// Inline handlers (replace router)
-	handler := makeHandler(convMgr, aiSvc, sessionMemory, toolTranscript, turnCheckpoint, logger, sessStorage)
-	streamHandler := makeStreamHandler(convMgr, aiSvc, sessionMemory, toolTranscript, turnCheckpoint, logger, sessStorage)
+	runTurnChecks := func(checkCtx context.Context, projectDir, event string) (string, bool, error) {
+		results, err := projectchecks.Run(checkCtx, projectDir, event)
+		failed := false
+		for _, result := range results {
+			if result.Err != nil {
+				failed = true
+			}
+		}
+		return projectchecks.FormatResults(results), failed, err
+	}
+	handler := makeHandlerWithChecks(convMgr, aiSvc, sessionMemory, toolTranscript, turnCheckpoint, eventJournal, logger, runTurnChecks, sessStorage)
+	streamHandler := makeStreamHandlerWithEvents(convMgr, aiSvc, sessionMemory, toolTranscript, turnCheckpoint, eventJournal, logger, runTurnChecks, sessStorage)
+	if acpMode {
+		server := acp.New(streamHandler, convMgr, store, workspaceStore, autoupdate.CurrentVersion())
+		server.Journal = eventJournal
+		server.EventDir = eventJournal.Root()
+		return server.Serve(ctx, os.Stdin, os.Stdout)
+	}
 	// Background routines and one-off tasks share the same operational state.
 	// Serialize their full agent turns while leaving interactive messages free.
 	backgroundAgentGate := make(chan struct{}, 1)
@@ -1778,15 +2488,83 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 		}
 		prompt := fmt.Sprintf("TAREFA PONTUAL: %s\nID: %s\nTentativa: %d\nObjetivo:\n%s\n\nExecute o objetivo completo e confira o resultado. Em uma retomada, confira primeiro se a tentativa anterior ja produziu o efeito desejado antes de repetir a acao.",
 			task.Title, task.ID, task.Attempts, task.Prompt)
+		if sys.TaskRegistry != nil {
+			taskWD := aiSvc.WorkingDir("task_queue", task.ID, task.ID, ".")
+			if absWD, absErr := filepath.Abs(taskWD); absErr == nil {
+				taskWD = absWD
+			}
+			if _, exists := sys.TaskRegistry.Get(task.ID); !exists {
+				sys.TaskRegistry.Register(&tasks.TaskState{
+					ID:          task.ID,
+					Type:        tasks.TaskTypeWorkflow,
+					Status:      tasks.StatusRunning,
+					Description: task.Title,
+					StartTime:   time.Now(),
+					AgentName:   aiSvc.ActiveAgent(),
+					Workspace:   taskWD,
+					Attempt:     task.Attempts,
+				})
+			} else {
+				sys.TaskRegistry.Update(task.ID, func(state *tasks.TaskState) {
+					state.Status = tasks.StatusRunning
+					state.Attempt = task.Attempts
+					state.Workspace = taskWD
+					state.Error = ""
+				})
+			}
+		}
 		turnCtx, toolTrace := evolution.WithToolTrace(taskCtx)
 		turnCtx = tool.WithRemoteDocumentScope(turnCtx, "task_queue", task.ID)
-		out, err := handler(turnCtx, adapter.InMessage{
+		out, err := handler(turnCtx, bindDurableTurn(adapter.InMessage{
 			ID:        fmt.Sprintf("task-%s-%d", task.ID, task.Attempts),
 			Channel:   "task_queue",
 			UserID:    task.ID,
 			Text:      prompt,
 			Timestamp: time.Now(),
-		})
+		}))
+		if sys.TaskRegistry != nil {
+			now := time.Now()
+			sys.TaskRegistry.Update(task.ID, func(state *tasks.TaskState) {
+				if out.Usage != nil {
+					prevTools, prevTokens := 0, 0
+					if state.Progress != nil {
+						prevTools = state.Progress.ToolUseCount
+						prevTokens = state.Progress.TokenCount
+					}
+					progress := tasks.AgentProgress{
+						ToolUseCount: prevTools + out.Usage.Steps,
+						TokenCount:   prevTokens + out.Usage.TotalTokens,
+					}
+					if out.Usage.CostUSD != nil {
+						total := *out.Usage.CostUSD
+						if state.CostUSD != nil {
+							total += *state.CostUSD
+						}
+						state.CostUSD = &total
+						costCopy := total
+						progress.CostUSD = &costCopy
+					} else if state.CostUSD != nil {
+						costCopy := *state.CostUSD
+						progress.CostUSD = &costCopy
+					}
+					state.Progress = &progress
+				}
+				if err != nil {
+					state.Error = err.Error()
+					if task.Attempts >= task.MaxAttempts {
+						state.Status = tasks.StatusFailed
+						state.EndTime = &now
+					} else {
+						state.Status = tasks.StatusPending
+					}
+				} else {
+					state.Status = tasks.StatusCompleted
+					state.EndTime = &now
+					state.Result = out.Text
+					state.Error = ""
+				}
+			})
+		}
 		if planned && (err == nil || task.Attempts >= task.MaxAttempts) {
 			// Capture the postcondition now. A delayed notification must never
 			// inspect a file that another run has since changed.
@@ -2029,13 +2807,13 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 					return "", fmt.Errorf("interpreting whatsapp media: %w", decodeErr)
 				}
 			}
-			out, processErr := handler(processCtx, adapter.InMessage{
+			out, processErr := handler(processCtx, bindDurableTurn(adapter.InMessage{
 				ID:        msg.ID,
 				Channel:   msg.Channel,
 				UserID:    msg.UserID,
 				Text:      messageText,
 				Timestamp: msg.CreatedAt,
-			})
+			}))
 			if whatsappQuestions != nil && whatsappQuestions.ShouldDeferUnavailable(askStatus) {
 				return "", humanloop.ErrRemoteUnavailable
 			}
@@ -2395,10 +3173,39 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 
 	// Headless mode
 	if headlessPrompt != "" {
+		if restoredSession != nil {
+			if hs, hsErr := convMgr.GetSession(ctx, "headless", "cli"); hsErr == nil {
+				msgs := make([]conversation.Message, 0, len(restoredSession.Messages))
+				for i, m := range restoredSession.Messages {
+					id := m.ID
+					if id == "" {
+						id = fmt.Sprintf("restored:%s:%d", restoredSession.ID, i)
+					}
+					msgs = append(msgs, conversation.Message{
+						ID: id, Role: conversation.Role(m.Role), Content: m.Content, Timestamp: m.Timestamp,
+					})
+				}
+				_ = convMgr.ReplaceMessages(ctx, hs, msgs)
+			}
+		}
+		expandedPrompt, localDisplay, handledLocal, slashErr := resolveHeadlessSlashCommand(sys.Commands, ".", currentSessionID, headlessPrompt)
+		if slashErr != nil {
+			return slashErr
+		}
+		runMsgHandler, runStreamHandler := handler, streamHandler
+		if handledLocal {
+			runMsgHandler, runStreamHandler = makeStaticLocalHandlers(localDisplay)
+		} else {
+			headlessPrompt = expandedPrompt
+		}
 		return headless.Run(ctx, headless.Config{
 			Prompt:       headlessPrompt,
 			OutputFormat: headless.OutputFormat(headlessFormat),
-		}, handler, streamHandler, convMgr, aiSvc)
+			SessionID:    currentSessionID,
+			Continue:     continueSession,
+			TurnID:       os.Getenv("POLYPOD_TURN_ID"),
+			EventJournal: eventJournal,
+		}, runMsgHandler, runStreamHandler, convMgr, aiSvc)
 	}
 
 	// CLI channel
@@ -2418,8 +3225,11 @@ func run(ctx context.Context, cfg *config.Config, configPath string, sqliteDB *d
 	cliCh.SetTaskRegistry(sys.TaskRegistry)
 	cliCh.SetTaskQueue(taskQueue)
 	cliCh.SetSessionEmbedder(embedder)
+	cliCh.SetCodeSearch(codeSearch)
 	cliCh.SetSessionMemory(sessionMemory)
 	cliCh.SetToolTranscriptStore(toolTranscript)
+	cliCh.SetEventJournal(eventJournal)
+	cliCh.SetChildQuestionQueue(childQuestions)
 	if restoredSession != nil {
 		cliCh.SetActiveSessionSnapshot(currentSessionID, restoredSession.Revision)
 	} else {

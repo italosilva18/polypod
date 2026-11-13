@@ -10,7 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/costa/polypod/internal/accountauth"
 	"github.com/costa/polypod/internal/audio"
+	"github.com/costa/polypod/internal/auth"
 	"github.com/costa/polypod/internal/config"
 	"github.com/costa/polypod/internal/memory"
 	"github.com/costa/polypod/internal/whatsappgateway"
@@ -34,16 +36,49 @@ func runBasicDiagnostics(cfg *config.Config) []Check {
 	checks = append(checks, checkWhatsApp(cfg.WhatsApp, cfg.Data.Dir))
 
 	// 1. Go version
-	checks = append(checks, checkCommand("Go", "go", "version"))
+	goCmd := "go"
+	if _, err := exec.LookPath(goCmd); err != nil {
+		if _, statErr := os.Stat("/usr/local/go/bin/go"); statErr == nil {
+			goCmd = "/usr/local/go/bin/go"
+		}
+	}
+	checks = append(checks, checkCommand("Go", goCmd, "version"))
 
 	// 2. Git
 	checks = append(checks, checkCommand("Git", "git", "--version"))
 
 	// 3. AI provider connectivity
-	if cfg.AI.Provider == "chatgpt" {
+	prov := strings.ToLower(strings.TrimSpace(cfg.AI.Provider))
+	acctMgr := accountauth.NewManager(nil)
+	switch prov {
+	case "chatgpt":
 		checks = append(checks, Check{Name: "AI Provider", Status: "ok", Message: "ChatGPT selecionado; autenticacao verificada separadamente"})
-	} else {
-		checks = append(checks, checkAPIKey("AI Provider", cfg.AI.APIKey, cfg.AI.BaseURL))
+	case "ollama":
+		checks = append(checks, Check{Name: "AI Provider", Status: "ok", Message: "Ollama local selecionado; sem API key necessaria"})
+	case "nvidia":
+		key := strings.TrimSpace(cfg.AI.APIKey)
+		if key == "" {
+			key = strings.TrimSpace(os.Getenv("NVIDIA_API_KEY"))
+		}
+		checks = append(checks, checkAPIKey("AI Provider", key, cfg.AI.BaseURL))
+	default:
+		if accountauth.IsOAuthProvider(prov) && acctMgr.HasActiveAccount(prov) {
+			activeID, _ := acctMgr.Store().ActiveAccountID(prov)
+			accounts, _ := acctMgr.Store().ListAccounts(prov)
+			checks = append(checks, Check{
+				Name:    "AI Provider",
+				Status:  "ok",
+				Message: fmt.Sprintf("OAuth conectado (%s, %d conta(s); token omitido)", activeID, len(accounts)),
+			})
+		} else {
+			key := strings.TrimSpace(cfg.AI.APIKey)
+			if key == "" {
+				if envVar := auth.ProviderEnvVarMap[prov]; envVar != "" {
+					key = strings.TrimSpace(os.Getenv(envVar))
+				}
+			}
+			checks = append(checks, checkAPIKey("AI Provider", key, cfg.AI.BaseURL))
+		}
 	}
 
 	// 4. Database
@@ -73,6 +108,7 @@ func runBasicDiagnostics(cfg *config.Config) []Check {
 	checks = append(checks, checkDir("Data dir", cfg.Data.Dir))
 	checks = append(checks, checkDir("Agents dir", cfg.Data.AgentsDir))
 	checks = append(checks, checkDreamMemory(filepath.Join(cfg.Data.Dir, "dream-state.json")))
+	checks = append(checks, checkRepoPlaybooks(filepath.Join(cfg.Data.Dir, "repo-playbooks")))
 
 	// 8. Templates
 	checks = append(checks, checkDir("Templates", cfg.Templates.Dir))
@@ -289,6 +325,38 @@ func checkDreamMemory(path string) Check {
 	c.Status = "ok"
 	c.Message = fmt.Sprintf("%d execuções; %d concluídas; %d memórias salvas", state.Stats.Runs,
 		state.Stats.SuccessfulRuns, state.Stats.MemoriesAdded)
+	return c
+}
+
+func checkRepoPlaybooks(dir string) Check {
+	c := Check{Name: "Repo Playbook", Status: "ok", Message: "pronto (aprende automaticamente episódios de erro→solução verificados)"}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return c
+		}
+		c.Status = "warn"
+		c.Message = fmt.Sprintf("não foi possível inspecionar %s: %v", dir, err)
+		return c
+	}
+	repos, lessons := 0, 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		data, readErr := os.ReadFile(filepath.Join(dir, e.Name()))
+		if readErr != nil || len(data) == 0 {
+			continue
+		}
+		var items []map[string]any
+		if json.Unmarshal(data, &items) == nil && len(items) > 0 {
+			repos++
+			lessons += len(items)
+		}
+	}
+	if repos > 0 {
+		c.Message = fmt.Sprintf("%d lição(ões) verificada(s) em %d repositório(s)", lessons, repos)
+	}
 	return c
 }
 

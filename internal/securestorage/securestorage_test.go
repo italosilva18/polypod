@@ -414,6 +414,25 @@ func TestFallbackStorage_GetFallsThroughOnEmptyPrimary(t *testing.T) {
 	}
 }
 
+func TestFallbackStorageListsBothBackends(t *testing.T) {
+	primary, _ := newTestFileStorage(t)
+	secondary, _ := newTestFileStorage(t)
+	if err := primary.Set("apikey:openai", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := secondary.Set("apikey:nvidia", "b"); err != nil {
+		t.Fatal(err)
+	}
+	fs := &FallbackStorage{Primary: primary, Secondary: secondary}
+	keys, err := fs.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 2 || keys[0] != "apikey:nvidia" || keys[1] != "apikey:openai" {
+		t.Fatalf("chaves de ambos os armazenamentos não listadas: %v", keys)
+	}
+}
+
 func TestFallbackStorage_DeletePropagatesToBoth(t *testing.T) {
 	primary, _ := newTestFileStorage(t)
 	secondary, _ := newTestFileStorage(t)

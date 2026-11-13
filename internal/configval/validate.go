@@ -2,6 +2,7 @@ package configval
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/costa/polypod/internal/config"
@@ -28,10 +29,11 @@ func Validate(cfg *config.Config) []ConfigError {
 	var errs []ConfigError
 
 	// AI config
-	if cfg.AI.Provider != "chatgpt" && (cfg.AI.APIKey == "" || strings.HasPrefix(cfg.AI.APIKey, "sk-your") || cfg.AI.APIKey == "${DEEPSEEK_API_KEY}") {
+	nvidiaEnvKey := cfg.AI.Provider == "nvidia" && strings.TrimSpace(os.Getenv("NVIDIA_API_KEY")) != ""
+	if cfg.AI.Provider != "chatgpt" && cfg.AI.Provider != "ollama" && !nvidiaEnvKey && (cfg.AI.APIKey == "" || strings.HasPrefix(cfg.AI.APIKey, "sk-your") || cfg.AI.APIKey == "${DEEPSEEK_API_KEY}") {
 		suggestion := "defina DEEPSEEK_API_KEY no ambiente ou configure ai.api_key"
 		if cfg.AI.Provider == "nvidia" {
-			suggestion = "defina NVIDIA_API_KEY no .env privado e use ai.api_key: ${NVIDIA_API_KEY:}"
+			suggestion = "defina NVIDIA_API_KEY no .env privado"
 		}
 		errs = append(errs, ConfigError{
 			Field:      "ai.api_key",

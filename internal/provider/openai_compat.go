@@ -7,15 +7,41 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strings"
 	"time"
 
 	openai "github.com/sashabaranov/go-openai"
 )
 
-// OpenAICompat works with any OpenAI-compatible API (DeepSeek, Groq, Together, etc.).
+func supportsOpenAIReasoningEffort(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	for _, prefix := range []string{"o1", "o3", "o4", "gpt-5", "gpt-6", "openai/o1", "openai/o3", "openai/o4", "openai/gpt-5"} {
+		if strings.HasPrefix(m, prefix) {
+			return true
+		}
+	}
+	return strings.Contains(m, "reasoner") || strings.Contains(m, "qwq") || strings.Contains(m, "deepseek-r1")
+}
+
+func normalizeOpenAIEffort(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "low":
+		return "low"
+	case "medium":
+		return "medium"
+	case "high", "max":
+		return "high"
+	default:
+		return ""
+	}
+}
+
+// OpenAICompat works with any OpenAI-compatible API (DeepSeek, Groq, Together, OpenRouter, Qwen, GitHub, etc.).
 type OpenAICompat struct {
-	name   string
-	client *openai.Client
+	name        string
+	baseURL     string
+	tokenSource TokenSource
+	client      *openai.Client
 }
 
 // NewOpenAICompat creates a provider for an OpenAI-compatible endpoint.
@@ -24,7 +50,27 @@ func NewOpenAICompat(name, apiKey, baseURL string) *OpenAICompat {
 	if baseURL != "" {
 		cfg.BaseURL = baseURL
 	}
-	return &OpenAICompat{name: name, client: openai.NewClientWithConfig(cfg)}
+	return &OpenAICompat{name: name, baseURL: baseURL, client: openai.NewClientWithConfig(cfg)}
+}
+
+// NewOpenAICompatWithTokenSource creates an OpenAI-compatible provider backed by a rotating OAuth TokenSource.
+func NewOpenAICompatWithTokenSource(name string, tokenSource TokenSource, baseURL string) *OpenAICompat {
+	return &OpenAICompat{name: name, baseURL: baseURL, tokenSource: tokenSource}
+}
+
+func (o *OpenAICompat) resolveClient(ctx context.Context) (*openai.Client, error) {
+	if o.tokenSource == nil {
+		return o.client, nil
+	}
+	token, err := o.tokenSource(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%s oauth: %w", o.name, err)
+	}
+	cfg := openai.DefaultConfig(token)
+	if o.baseURL != "" {
+		cfg.BaseURL = o.baseURL
+	}
+	return openai.NewClientWithConfig(cfg), nil
 }
 
 func (o *OpenAICompat) Name() string                   { return o.name }
@@ -51,16 +97,31 @@ func (o *OpenAICompat) Chat(ctx context.Context, req ChatRequest) (*ChatResponse
 	if len(req.Stop) > 0 {
 		oReq.Stop = req.Stop
 	}
+	if eff := normalizeOpenAIEffort(req.ReasoningEffort); eff != "" && supportsOpenAIReasoningEffort(req.Model) {
+		oReq.ReasoningEffort = eff
+	}
+
+	client, err := o.resolveClient(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	var resp openai.ChatCompletionResponse
-	var err error
 	for attempt := 0; attempt < 3; attempt++ {
-		resp, err = o.client.CreateChatCompletion(ctx, oReq)
+		resp, err = client.CreateChatCompletion(ctx, oReq)
 		if err == nil {
 			break
 		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
+		}
+		if o.tokenSource != nil && IsRateLimitError(err) {
+			if _, rotated := tryRotateAccount(o.name); rotated {
+				if nextClient, rotErr := o.resolveClient(ctx); rotErr == nil {
+					client = nextClient
+					continue
+				}
+			}
 		}
 		if !IsFailoverError(err) || attempt == 2 {
 			break
@@ -111,8 +172,23 @@ func (o *OpenAICompat) ChatStream(ctx context.Context, req ChatRequest, callback
 	if req.ResponseFormat != nil {
 		oReq.ResponseFormat = convertResponseFormat(req.ResponseFormat)
 	}
+	if eff := normalizeOpenAIEffort(req.ReasoningEffort); eff != "" && supportsOpenAIReasoningEffort(req.Model) {
+		oReq.ReasoningEffort = eff
+	}
 
-	stream, err := o.client.CreateChatCompletionStream(ctx, oReq)
+	client, err := o.resolveClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	stream, err := client.CreateChatCompletionStream(ctx, oReq)
+	if err != nil && o.tokenSource != nil && IsRateLimitError(err) {
+		if _, rotated := tryRotateAccount(o.name); rotated {
+			if nextClient, rotErr := o.resolveClient(ctx); rotErr == nil {
+				stream, err = nextClient.CreateChatCompletionStream(ctx, oReq)
+			}
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("openai stream: %w", err)
 	}

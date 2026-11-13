@@ -232,7 +232,7 @@ func (m *historySearchModel) View() string {
 	var b strings.Builder
 
 	// Header with cursor.
-	b.WriteString(historySearchHeaderStyle.Render("🔍 Buscar historico: "))
+	b.WriteString(historySearchHeaderStyle.Render("Buscar histórico: "))
 	b.WriteString(historySearchQueryStyle.Render(m.query + "▏"))
 	b.WriteString("\n")
 	b.WriteString(separatorStyle.Render(strings.Repeat("─", historySearchBoxWidth-4)))

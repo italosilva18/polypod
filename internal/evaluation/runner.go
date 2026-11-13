@@ -13,10 +13,13 @@ import (
 // available to a verifier but is not copied into the results artifact, because
 // it can contain private user data or secrets.
 type Execution struct {
-	Response string
-	CostUSD  *float64
-	Steps    *int
-	Trace    string
+	Response      string
+	CostUSD       *float64
+	Steps         *int
+	Tokens        *int
+	ToolFailures  *int
+	AgentExitCode *int
+	Trace         string
 }
 
 // Executor runs a task in an isolated test environment. It must honor ctx:
@@ -106,6 +109,7 @@ func Run(ctx context.Context, manifest Manifest, metadata Metadata, opts RunOpti
 		outcome := Outcome{TaskID: task.ID, LatencyMS: &latency}
 		if validExecution(execution) {
 			outcome.CostUSD, outcome.Steps, outcome.Trace = execution.CostUSD, execution.Steps, execution.Trace
+			outcome.TokenCount, outcome.ToolFailures = execution.Tokens, execution.ToolFailures
 		}
 		if err := ctx.Err(); err != nil {
 			cancel()
@@ -170,7 +174,8 @@ func secondsToDuration(seconds float64) (time.Duration, error) {
 }
 
 func validExecution(result Execution) bool {
-	return validNumber(result.CostUSD) && (result.Steps == nil || *result.Steps >= 0)
+	return validNumber(result.CostUSD) && (result.Steps == nil || *result.Steps >= 0) &&
+		(result.Tokens == nil || *result.Tokens >= 0) && (result.ToolFailures == nil || *result.ToolFailures >= 0)
 }
 
 func validateVerification(task Task, verification Verification) error {

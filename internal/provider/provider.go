@@ -17,13 +17,41 @@ type Provider interface {
 
 // ChatRequest holds everything needed for a completion call.
 type ChatRequest struct {
-	Model          string
-	Messages       []Message
-	Tools          []Tool
-	MaxTokens      int
-	Temperature    float32
-	ResponseFormat *ResponseFormat
-	Stop           []string
+	Model           string
+	Messages        []Message
+	Tools           []Tool
+	MaxTokens       int
+	Temperature     float32
+	ResponseFormat  *ResponseFormat
+	Stop            []string
+	ReasoningEffort string // "", "low", "medium", "high"
+	ThinkingBudget  int    // optional token budget for native extended thinking (Gemini 2.5+/3, Claude 3.7+/4)
+}
+
+// AccountRotator switches the active OAuth account for a provider when a
+// quota/rate-limit (HTTP 429) occurs and multiple accounts are configured.
+type AccountRotator func(providerName string) (nextAccount string, rotated bool)
+
+var (
+	accountRotatorMu sync.RWMutex
+	accountRotator   AccountRotator
+)
+
+// SetAccountRotator registers an optional multi-account OAuth quota rotator.
+func SetAccountRotator(fn AccountRotator) {
+	accountRotatorMu.Lock()
+	accountRotator = fn
+	accountRotatorMu.Unlock()
+}
+
+func tryRotateAccount(providerName string) (string, bool) {
+	accountRotatorMu.RLock()
+	fn := accountRotator
+	accountRotatorMu.RUnlock()
+	if fn == nil {
+		return "", false
+	}
+	return fn(providerName)
 }
 
 // Message represents a single chat message with optional multimodal parts.

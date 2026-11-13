@@ -43,6 +43,8 @@ type SubsystemConfig struct {
 	AutoMem *automemory.Store
 	// ActionTrigger runs a full agent task for an AI! comment in a changed file.
 	ActionTrigger func(context.Context, watcher.Trigger)
+	// OnFileEvent receives Added/Modified/Removed workspace file events in real time.
+	OnFileEvent func(watcher.FileChangeEvent)
 }
 
 // ActiveSubsystems holds all the previously-discarded subsystems, now properly
@@ -66,6 +68,7 @@ type ActiveSubsystems struct {
 	FileIndex     *mentions.FileIndex
 	CompactSvc    *compact.CompactService
 	ActionTrigger func(context.Context, watcher.Trigger)
+	OnFileEvent   func(watcher.FileChangeEvent)
 
 	// fileWatcher is the active watcher instance (started on Start).
 	fileWatcher   *watcher.Watcher
@@ -178,6 +181,7 @@ func WireSubsystems(cfg SubsystemConfig) *ActiveSubsystems {
 		FileIndex:     fileIndex,
 		CompactSvc:    cfg.CompactSvc,
 		ActionTrigger: cfg.ActionTrigger,
+		OnFileEvent:   cfg.OnFileEvent,
 		providerCount: len(cfg.Providers),
 		logger:        logger,
 	}
@@ -187,6 +191,9 @@ func WireSubsystems(cfg SubsystemConfig) *ActiveSubsystems {
 func (a *ActiveSubsystems) Start(ctx context.Context) {
 	// Start file watcher in background
 	w := watcher.New(a.WatcherCfg, a.logger)
+	if a.OnFileEvent != nil {
+		w.OnEvent(a.OnFileEvent)
+	}
 	w.OnChange(func(path string) {
 		a.logger.Debug("file changed", "path", path)
 		// Rebuild file index on changes for up-to-date autocomplete

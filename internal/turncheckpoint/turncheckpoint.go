@@ -89,6 +89,18 @@ func (m *Manager) BeginTurn(ctx context.Context, sessionID, turnID string) conte
 	return context.WithValue(ctx, turnKey{}, id)
 }
 
+// HasFiles reports whether a registered file tool captured a write in this turn.
+func (m *Manager) HasFiles(ctx context.Context) bool {
+	id, ok := ctx.Value(turnKey{}).(identity)
+	if !ok {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	record := m.active[id]
+	return record != nil && len(record.Files) > 0
+}
+
 // ResumeTurn preserves file snapshots captured before an interrupted turn.
 // A fresh BeginTurn would replace them and make rewind of already executed
 // edits impossible after a safe AI checkpoint is resumed.

@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -10,6 +11,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/costa/polypod/internal/config"
+	"github.com/costa/polypod/internal/provider"
+	"gopkg.in/yaml.v3"
 )
 
 // ── Field types ─────────────────────────────────────────────────────────────
@@ -66,63 +69,53 @@ type configFormModel struct {
 
 // newConfigForm builds a fresh form populated from the given config.
 // cfgPath is the on-disk YAML path used by Save() and reloads.
-func newConfigForm(cfg *config.Config, cfgPath string, agentChoices []string) *configFormModel {
+func newConfigForm(cfg *config.Config, cfgPath string) *configFormModel {
 	m := &configFormModel{
 		cfg:     cfg,
 		cfgPath: cfgPath,
 	}
-	m.rebuildFields(agentChoices)
+	m.rebuildFields()
 	return m
 }
 
 // rebuildFields populates the visible field list from the underlying
 // *config.Config. Called on construction and after a reload.
-func (m *configFormModel) rebuildFields(agentChoices []string) {
+func (m *configFormModel) rebuildFields() {
 	if m.cfg == nil {
 		m.cfg = config.DefaultConfig()
 	}
 
-	providers := []string{"deepseek", "openai", "anthropic", "google", "groq"}
-
-	// Default agent choices come from the registry; fall back to a
-	// minimal common set if none were provided.
-	if len(agentChoices) == 0 {
-		agentChoices = []string{"coder", "default"}
+	providers := append([]string{"chatgpt"}, provider.SupportedProviders()...)
+	seen := make(map[string]bool, len(providers))
+	for _, name := range providers {
+		seen[name] = true
 	}
-	defaultAgent := ""
-	if m.cfg.Data.AgentsDir != "" {
-		// We don't actually persist a "default agent" in the config
-		// struct yet — pick the first registered one as a hint.
-		defaultAgent = agentChoices[0]
+	for _, configured := range m.cfg.Providers {
+		if configured.Name != "" && !seen[configured.Name] {
+			providers = append(providers, configured.Name)
+			seen[configured.Name] = true
+		}
 	}
-
-	autoCompact := false
-	compactThreshold := 80
-	streaming := true
-	costLimit := 0.0
+	if m.cfg.AI.Provider != "" && !seen[m.cfg.AI.Provider] {
+		providers = append(providers, m.cfg.AI.Provider)
+	}
 
 	m.fields = []configField{
 		{
-			Label:   "AI Provider",
+			Label:   "Provedor de IA",
 			Path:    "ai.provider",
 			Value:   m.cfg.AI.Provider,
 			Type:    configFieldChoice,
 			Choices: providers,
 		},
 		{
-			Label: "AI Model",
+			Label: "Modelo de IA",
 			Path:  "ai.model",
 			Value: m.cfg.AI.Model,
 			Type:  configFieldString,
 		},
 		{
-			Label: "API Key",
-			Path:  "ai.api_key",
-			Value: m.cfg.AI.APIKey,
-			Type:  configFieldHidden,
-		},
-		{
-			Label: "Max Tokens",
+			Label: "Máximo de tokens",
 			Path:  "ai.max_tokens",
 			Value: strconv.Itoa(m.cfg.AI.MaxToks),
 			Type:  configFieldInt,
@@ -130,7 +123,7 @@ func (m *configFormModel) rebuildFields(agentChoices []string) {
 			Max:   200000,
 		},
 		{
-			Label: "Temperature",
+			Label: "Temperatura",
 			Path:  "ai.temperature",
 			Value: strconv.FormatFloat(float64(m.cfg.AI.Temp), 'f', 2, 32),
 			Type:  configFieldFloat,
@@ -138,45 +131,10 @@ func (m *configFormModel) rebuildFields(agentChoices []string) {
 			Max:   1,
 		},
 		{
-			Label: "Data Dir",
+			Label: "Diretório de dados",
 			Path:  "data.dir",
 			Value: m.cfg.Data.Dir,
 			Type:  configFieldString,
-		},
-		{
-			Label: "Auto Compact",
-			Path:  "ai.auto_compact",
-			Value: fmt.Sprintf("%v", autoCompact),
-			Type:  configFieldBool,
-		},
-		{
-			Label: "Compact Threshold",
-			Path:  "ai.compact_threshold",
-			Value: strconv.Itoa(compactThreshold),
-			Type:  configFieldInt,
-			Min:   50,
-			Max:   95,
-		},
-		{
-			Label:   "Default Agent",
-			Path:    "agents.default",
-			Value:   defaultAgent,
-			Type:    configFieldChoice,
-			Choices: agentChoices,
-		},
-		{
-			Label: "Streaming",
-			Path:  "ai.streaming",
-			Value: fmt.Sprintf("%v", streaming),
-			Type:  configFieldBool,
-		},
-		{
-			Label: "Cost Limit",
-			Path:  "ai.cost_limit",
-			Value: strconv.FormatFloat(costLimit, 'f', 2, 64),
-			Type:  configFieldFloat,
-			Min:   0,
-			Max:   1000,
 		},
 	}
 }
@@ -236,7 +194,7 @@ func (m *configFormModel) updateNavigating(msg tea.KeyMsg) (*configFormModel, te
 			m.status = "erro ao salvar: " + err.Error()
 			return m, nil, configFormResult{Notify: m.status}
 		}
-		m.status = "salvo em " + m.cfgPath
+		m.status = "salvo em " + m.cfgPath + "; reinicie para aplicar"
 		return m, nil, configFormResult{Saved: true, Notify: m.status}
 	case "r":
 		if err := m.Reload(); err != nil {
@@ -413,7 +371,7 @@ func (m *configFormModel) validateEditValue(field *configField) error {
 // struct. Only fields that map to known struct paths are persisted.
 func (m *configFormModel) Apply(cfg *config.Config) error {
 	if cfg == nil {
-		return fmt.Errorf("config is nil")
+		return fmt.Errorf("configuração indisponível")
 	}
 	for _, f := range m.fields {
 		if err := setConfigByPath(cfg, f.Path, f.Value, f.Type); err != nil {
@@ -423,26 +381,156 @@ func (m *configFormModel) Apply(cfg *config.Config) error {
 	return nil
 }
 
-// Save persists the form values to disk by applying them to the
-// underlying config struct, then writing it as YAML.
+// Save persists only edited fields, preserving comments and environment
+// references in the other YAML nodes.
 func (m *configFormModel) Save() error {
 	if m.cfg == nil {
 		m.cfg = config.DefaultConfig()
 	}
-	if err := m.Apply(m.cfg); err != nil {
+	next := *m.cfg
+	if err := m.Apply(&next); err != nil {
 		return err
+	}
+	if next.AI.Provider != m.cfg.AI.Provider {
+		if next.AI.Model == m.cfg.AI.Model {
+			return fmt.Errorf("escolha um modelo para o novo provedor")
+		}
+		next.AI.APIKey = ""
+		next.AI.BaseURL = ""
+		for _, configured := range next.Providers {
+			if configured.Name == next.AI.Provider {
+				next.AI.BaseURL = configured.BaseURL
+				break
+			}
+		}
 	}
 	if m.cfgPath == "" {
 		return fmt.Errorf("nenhum caminho de config configurado")
 	}
-	data, err := m.cfg.Marshal()
+	updates := make(map[string]configField)
+	for _, field := range m.fields {
+		if field.Value != configFieldValue(m.cfg, field.Path) {
+			updates[field.Path] = field
+		}
+	}
+	if next.AI.Provider != m.cfg.AI.Provider {
+		updates["ai.api_key"] = configField{Path: "ai.api_key", Value: "", Type: configFieldString}
+		updates["ai.base_url"] = configField{Path: "ai.base_url", Value: next.AI.BaseURL, Type: configFieldString}
+	}
+	if len(updates) == 0 {
+		m.dirty = false
+		return nil
+	}
+	original, err := os.ReadFile(m.cfgPath)
 	if err != nil {
+		return fmt.Errorf("ler configuração: %w", err)
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(original, &doc); err != nil {
+		return fmt.Errorf("ler YAML: %w", err)
+	}
+	if len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return fmt.Errorf("configuração YAML inválida")
+	}
+	for _, field := range updates {
+		if err := setConfigYAMLField(doc.Content[0], field); err != nil {
+			return err
+		}
+	}
+	data, err := yaml.Marshal(&doc)
+	if err != nil {
+		return fmt.Errorf("gerar YAML: %w", err)
+	}
+	info, err := os.Stat(m.cfgPath)
+	if err != nil {
+		return fmt.Errorf("verificar configuração: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(m.cfgPath), ".polypod-config-*")
+	if err != nil {
+		return fmt.Errorf("criar configuração temporária: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(info.Mode().Perm()); err != nil {
+		tmp.Close()
 		return err
 	}
-	if err := os.WriteFile(m.cfgPath, data, 0644); err != nil {
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp.Name(), m.cfgPath); err != nil {
+		return err
+	}
+	*m.cfg = next
 	m.dirty = false
+	return nil
+}
+
+func configFieldValue(cfg *config.Config, path string) string {
+	switch path {
+	case "ai.provider":
+		return cfg.AI.Provider
+	case "ai.model":
+		return cfg.AI.Model
+	case "ai.max_tokens":
+		return strconv.Itoa(cfg.AI.MaxToks)
+	case "ai.temperature":
+		return strconv.FormatFloat(float64(cfg.AI.Temp), 'f', 2, 32)
+	case "data.dir":
+		return cfg.Data.Dir
+	default:
+		return ""
+	}
+}
+
+func setConfigYAMLField(root *yaml.Node, field configField) error {
+	parts := strings.Split(field.Path, ".")
+	node := root
+	for _, part := range parts[:len(parts)-1] {
+		var child *yaml.Node
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			if node.Content[i].Value == part {
+				child = node.Content[i+1]
+				break
+			}
+		}
+		if child == nil {
+			child = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+			node.Content = append(node.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: part}, child)
+		}
+		if child.Kind != yaml.MappingNode {
+			return fmt.Errorf("seção %s não é um mapa", part)
+		}
+		node = child
+	}
+	name := parts[len(parts)-1]
+	var scalar *yaml.Node
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == name {
+			scalar = node.Content[i+1]
+			break
+		}
+	}
+	if scalar == nil {
+		scalar = &yaml.Node{}
+		node.Content = append(node.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: name}, scalar)
+	}
+	scalar.Kind, scalar.Value, scalar.Style = yaml.ScalarNode, field.Value, 0
+	switch field.Type {
+	case configFieldInt:
+		scalar.Tag = "!!int"
+	case configFieldFloat:
+		scalar.Tag = "!!float"
+	default:
+		scalar.Tag = "!!str"
+	}
 	return nil
 }
 
@@ -457,21 +545,11 @@ func (m *configFormModel) Reload() error {
 	}
 	m.cfg = cfg
 	m.dirty = false
-	// Preserve agent choices if they were set previously.
-	var agents []string
-	for _, f := range m.fields {
-		if f.Path == "agents.default" {
-			agents = f.Choices
-			break
-		}
-	}
-	m.rebuildFields(agents)
+	m.rebuildFields()
 	return nil
 }
 
-// setConfigByPath updates a single dotted-path field on the config
-// struct. Unknown paths are ignored so the form can carry "virtual"
-// fields (like ai.streaming) that have no current YAML home.
+// setConfigByPath updates a supported dotted-path field on the config struct.
 func setConfigByPath(cfg *config.Config, path, value string, typ configFieldType) error {
 	switch path {
 	case "ai.provider":
@@ -498,13 +576,6 @@ func setConfigByPath(cfg *config.Config, path, value string, typ configFieldType
 		cfg.AI.Temp = float32(f)
 	case "data.dir":
 		cfg.Data.Dir = value
-	case "ai.auto_compact", "ai.compact_threshold",
-		"agents.default", "ai.streaming", "ai.cost_limit":
-		// Virtual fields with no YAML home in the current Config
-		// struct. Saving them is a no-op for now; the form still
-		// renders the value so the UX is consistent and a future
-		// schema bump can pick them up.
-		_ = value
 	default:
 		// Unknown path: ignore.
 	}
@@ -522,10 +593,10 @@ func (m *configFormModel) View() string {
 	var b strings.Builder
 
 	// Header
-	title := configFormTitleStyle.Render("⚙ POLYPOD CONFIG")
+	title := configFormTitleStyle.Render("CONFIGURAÇÃO DA POLY")
 	right := ""
 	if m.dirty {
-		right = configFormDirtyStyle.Render(" [unsaved]")
+		right = configFormDirtyStyle.Render(" [não salvo]")
 	}
 	b.WriteString(title)
 	b.WriteString(right)
@@ -578,12 +649,14 @@ func (m *configFormModel) View() string {
 		case configFieldChoice:
 			hint = "←→ alternar  Enter confirmar  Esc cancelar"
 		case configFieldBool:
-			hint = "Espaco/Enter alternar  Esc cancelar"
+			hint = "Espaço/Enter alternar  Esc cancelar"
 		default:
 			hint = "Digite valor  Enter confirmar  Esc cancelar"
 		}
 	}
 	b.WriteString(configFormHintStyle.Render("  " + hint))
+	b.WriteString("\n")
+	b.WriteString(configFormHintStyle.Render("  Para conectar uma conta ou chave de API: /connect"))
 
 	return configFormBoxStyle.Render(b.String())
 }
@@ -606,9 +679,9 @@ func renderConfigValue(f *configField, editing bool, buf string, choiceIdx int) 
 	case configFieldBool:
 		on := strings.EqualFold(f.Value, "true")
 		if on {
-			return configFormBoolOnStyle.Render("[✓] enabled")
+			return configFormBoolOnStyle.Render("[✓] ativado")
 		}
-		return configFormBoolOffStyle.Render("[ ] disabled")
+		return configFormBoolOffStyle.Render("[ ] desativado")
 
 	case configFieldChoice:
 		if editing {
@@ -630,7 +703,7 @@ func renderConfigValue(f *configField, editing bool, buf string, choiceIdx int) 
 		}
 		val := f.Value
 		if val == "" {
-			val = "(unset)"
+			val = "(não definido)"
 		}
 		return configFormValueStyle.Render("[" + val + " ▼]")
 

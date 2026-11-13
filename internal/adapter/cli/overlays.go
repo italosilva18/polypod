@@ -14,7 +14,7 @@ func (m *model) openConfigForm() {
 	if m.cmdDeps.configSnapshot == nil {
 		m.messages = append(m.messages, chatEntry{
 			role:      "error",
-			content:   "config nao disponivel: configure o adaptador CLI com SetConfig(...) antes de usar /config",
+			content:   "configuração indisponível nesta sessão",
 			timestamp: time.Now(),
 		})
 		return
@@ -23,7 +23,7 @@ func (m *model) openConfigForm() {
 	if cfg == nil {
 		m.messages = append(m.messages, chatEntry{
 			role:      "error",
-			content:   "config nao carregada",
+			content:   "configuração não carregada",
 			timestamp: time.Now(),
 		})
 		return
@@ -32,11 +32,7 @@ func (m *model) openConfigForm() {
 	if m.cmdDeps.configPath != nil {
 		path = m.cmdDeps.configPath()
 	}
-	var agents []string
-	if m.cmdDeps.listAgents != nil {
-		agents = m.cmdDeps.listAgents()
-	}
-	m.configForm = newConfigForm(cfg, path, agents)
+	m.configForm = newConfigForm(cfg, path)
 	m.configForm.SetSize(m.width, m.height)
 }
 

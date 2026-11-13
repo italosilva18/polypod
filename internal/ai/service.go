@@ -3,6 +3,7 @@ package ai
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"github.com/costa/polypod/internal/project"
 	"github.com/costa/polypod/internal/sessionmem"
 	"github.com/costa/polypod/internal/smartroute"
+	"github.com/costa/polypod/internal/watcher"
 	"github.com/costa/polypod/internal/workdir"
 )
 
@@ -28,6 +30,7 @@ type AnswerRequest struct {
 	Channel               string
 	UserID                string
 	RoutingCategory       string // Trusted internal evaluation category; empty uses known channel mapping.
+	Effort                string // Optional reasoning effort override ("low", "medium", "high", "max").
 	Query                 string
 	CurrentMessageID      string // Durable journal ID of Query, when it was saved before this turn.
 	History               []conversation.Message
@@ -63,12 +66,78 @@ type Service struct {
 	experienceMu        sync.RWMutex // protects experienceSearcher and experienceOwnerChat
 	experienceSearcher  ExperienceSearcher
 	experienceOwnerChat string
+	repoPlaybook        *RepoPlaybookStore
+	externalChanges     *watcher.ExternalChangeBuffer
 	// Budget-triggered compaction is retried after a short delay when the
 	// summarizer is unavailable. Each session has its own delay so one failed
 	// summary does not hold back another session. Capacity-triggered compaction
 	// remains active.
 	historyBudgetMu      sync.Mutex
 	historyBudgetRetryAt map[string]time.Time
+}
+
+// SetEffort sets the default reasoning effort ("low", "medium", "high", "max")
+// on the underlying AI client.
+func (s *Service) SetEffort(effort string) {
+	if s.client != nil {
+		s.client.SetEffort(effort)
+	}
+}
+
+// SetRepoPlaybook enables verified repository playbook lesson injection and
+// automatic recovery-episode recording on the underlying client.
+func (s *Service) SetRepoPlaybook(store *RepoPlaybookStore) {
+	s.repoPlaybook = store
+	if s.client != nil {
+		s.client.SetRepoPlaybook(store)
+	}
+}
+
+// SetExternalChangeBuffer attaches the live workspace FileChanged buffer so
+// external edits/deletions are injected into the model's context before the next turn.
+func (s *Service) SetExternalChangeBuffer(buf *watcher.ExternalChangeBuffer) {
+	s.externalChanges = buf
+}
+
+// SetVisionModel configures an explicit multimodal fallback/override model (`/model --vision`).
+func (s *Service) SetVisionModel(providerName, model, apiKey, baseURL string) error {
+	if s.client == nil {
+		return fmt.Errorf("serviço de IA indisponível")
+	}
+	return s.client.SetVisionModel(providerName, model, apiKey, baseURL)
+}
+
+// VisionModelConfig returns any explicit vision override plus the effective auto-picked fallback.
+func (s *Service) VisionModelConfig() (explicitProvider, explicitModel, effectiveAutoModel string) {
+	if s.client == nil {
+		return "", "", ""
+	}
+	return s.client.VisionModelConfig()
+}
+
+// LatestWaterfall formats the active or most recent trajectory waterfall (`/waterfall`).
+func (s *Service) LatestWaterfall() string {
+	if s.client == nil {
+		return "Serviço de IA indisponível."
+	}
+	wf, ok := s.client.Waterfall().Latest()
+	if !ok {
+		return "Nenhum turno registrado na cascata de execução (/waterfall) ainda."
+	}
+	return FormatWaterfall(wf)
+}
+
+// AnswerTextOnly generates a one-shot answer without exposing any tools or
+// adding messages to the persistent conversation.
+func (s *Service) AnswerTextOnly(ctx context.Context, prompt string) (string, error) {
+	if s.client == nil {
+		return "", fmt.Errorf("serviço de IA indisponível")
+	}
+	response, err := s.client.Complete(ctx, []ChatMessage{{Role: "user", Content: prompt}})
+	if err != nil {
+		return "", err
+	}
+	return response.Content, nil
 }
 
 const maxHistoryBudgetCooldowns = 1024
@@ -140,6 +209,31 @@ func (s *Service) CurrentModel() string {
 		return ""
 	}
 	return s.client.Model()
+}
+
+// CurrentProvider returns the selected backend for the interactive CLI.
+func (s *Service) CurrentProvider() string {
+	if s.client == nil {
+		return ""
+	}
+	return s.client.Provider()
+}
+
+// SwitchProvider changes the backend and model for subsequent turns.
+func (s *Service) SwitchProvider(name, model, apiKey, baseURL string) error {
+	if s.client == nil {
+		return fmt.Errorf("serviço de IA indisponível")
+	}
+	if err := s.client.SwitchProvider(name, model, apiKey, baseURL); err != nil {
+		return err
+	}
+	s.routingMu.Lock()
+	s.manualModel = true
+	s.routingMu.Unlock()
+	if s.autoCompact != nil {
+		s.autoCompact.SetModel(model)
+	}
+	return nil
 }
 
 func (s *Service) requestModel(ctx context.Context) string {
@@ -335,11 +429,24 @@ func (s *Service) buildMessages(ctx context.Context, req AnswerRequest) ([]ChatM
 		}
 		memoryCtx += notes
 	}
+	if s.externalChanges != nil && req.Channel == "cli" {
+		if extDiff := s.externalChanges.DrainFormatted(); extDiff != "" {
+			if memoryCtx != "" {
+				memoryCtx += "\n\n"
+			}
+			memoryCtx += extDiff
+		}
+	}
 
 	// Build messages using agent persona
 	systemPrompt := BuildSystemPrompt(ag.Persona, knowledgeCtx, memoryCtx)
 	if experiences := s.relevantExperiences(ctx, req); experiences != "" {
 		systemPrompt += "\n\n" + experiences
+	}
+	if s.repoPlaybook != nil {
+		if lessons := s.repoPlaybook.RelevantLessons(workdir.Dir(ctx, "."), req.Query, 4); lessons != "" {
+			systemPrompt += "\n\n" + lessons
+		}
 	}
 	if req.ToolTranscriptSummary != "" {
 		systemPrompt += "\n\n" + req.ToolTranscriptSummary
@@ -401,6 +508,10 @@ func (s *Service) Answer(ctx context.Context, req AnswerRequest) (*AnswerRespons
 	}
 
 	ctx = withRequestToolSession(ctx, req.Channel, req.UserID, s.agentName, req.SessionMemoryScope)
+	ctx = withRequestQueryHint(ctx, req.Query)
+	if req.Effort != "" {
+		ctx = WithEffort(ctx, req.Effort)
+	}
 	resp, err := s.client.CompleteWithTools(withRequestSkillNames(ctx, names), messages, s.logger)
 	if err != nil {
 		return nil, err
@@ -437,6 +548,10 @@ func (s *Service) AnswerStream(ctx context.Context, req AnswerRequest, callback 
 	}
 
 	ctx = withRequestToolSession(ctx, req.Channel, req.UserID, s.agentName, req.SessionMemoryScope)
+	ctx = withRequestQueryHint(ctx, req.Query)
+	if req.Effort != "" {
+		ctx = WithEffort(ctx, req.Effort)
+	}
 	resp, err := s.client.CompleteWithToolsStream(withRequestSkillNames(ctx, names), messages, callback, s.logger)
 	if err != nil {
 		return nil, err

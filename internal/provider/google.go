@@ -12,11 +12,12 @@ import (
 	"time"
 )
 
-// Google provides access to Gemini models.
+// Google provides access to Gemini models via API key or OAuth Bearer token.
 type Google struct {
-	apiKey     string
-	baseURL    string
-	httpClient *http.Client
+	apiKey      string
+	tokenSource TokenSource
+	baseURL     string
+	httpClient  *http.Client
 }
 
 // NewGoogle creates a Google Gemini provider.
@@ -29,6 +30,36 @@ func NewGoogle(apiKey, baseURL string) *Google {
 		baseURL:    baseURL,
 		httpClient: &http.Client{Timeout: 5 * time.Minute},
 	}
+}
+
+// NewGoogleWithTokenSource creates a Google Gemini provider authenticated via rotating OAuth tokens.
+func NewGoogleWithTokenSource(tokenSource TokenSource, baseURL string) *Google {
+	if baseURL == "" {
+		baseURL = "https://generativelanguage.googleapis.com/v1beta"
+	}
+	return &Google{
+		tokenSource: tokenSource,
+		baseURL:     baseURL,
+		httpClient:  &http.Client{Timeout: 5 * time.Minute},
+	}
+}
+
+func (g *Google) endpointAndBearer(ctx context.Context, model, suffix string) (string, string, error) {
+	if g.tokenSource != nil {
+		token, err := g.tokenSource(ctx)
+		if err != nil {
+			return "", "", fmt.Errorf("google oauth: %w", err)
+		}
+		return fmt.Sprintf("%s/models/%s:%s", g.baseURL, model, suffix), token, nil
+	}
+	if strings.HasPrefix(g.apiKey, "ya29.") {
+		return fmt.Sprintf("%s/models/%s:%s", g.baseURL, model, suffix), g.apiKey, nil
+	}
+	sep := "?"
+	if strings.Contains(suffix, "?") {
+		sep = "&"
+	}
+	return fmt.Sprintf("%s/models/%s:%s%skey=%s", g.baseURL, model, suffix, sep, g.apiKey), "", nil
 }
 
 func (g *Google) Name() string                   { return "google" }
@@ -80,10 +111,15 @@ type geminiFuncDecl struct {
 	Parameters  any    `json:"parameters"`
 }
 
+type geminiThinkingConfig struct {
+	ThinkingBudget int `json:"thinkingBudget,omitempty"`
+}
+
 type geminiGenConfig struct {
-	Temperature      float32 `json:"temperature,omitempty"`
-	MaxOutputTokens  int     `json:"maxOutputTokens,omitempty"`
-	ResponseMimeType string  `json:"responseMimeType,omitempty"`
+	Temperature      float32               `json:"temperature,omitempty"`
+	MaxOutputTokens  int                   `json:"maxOutputTokens,omitempty"`
+	ResponseMimeType string                `json:"responseMimeType,omitempty"`
+	ThinkingConfig   *geminiThinkingConfig `json:"thinkingConfig,omitempty"`
 }
 
 type geminiResp struct {
@@ -103,58 +139,90 @@ type geminiUsage struct {
 }
 
 func (g *Google) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
-	url := fmt.Sprintf("%s/models/%s:generateContent?key=%s", g.baseURL, req.Model, g.apiKey)
 	body := g.buildRequest(req)
 	data, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := g.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("google: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		if failoverStatus(resp.StatusCode) {
-			return nil, fmt.Errorf("google HTTP %d: %w", resp.StatusCode, ErrProviderUnavailable)
+	for attempt := 0; attempt < 2; attempt++ {
+		url, bearer, epErr := g.endpointAndBearer(ctx, req.Model, "generateContent")
+		if epErr != nil {
+			return nil, epErr
 		}
-		return nil, fmt.Errorf("google HTTP %d: %s", resp.StatusCode, string(b))
-	}
+		httpReq, reqErr := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		if bearer != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+bearer)
+		}
 
-	var gResp geminiResp
-	if err := json.NewDecoder(resp.Body).Decode(&gResp); err != nil {
-		return nil, fmt.Errorf("google decode: %w", err)
-	}
+		resp, doErr := g.httpClient.Do(httpReq)
+		if doErr != nil {
+			return nil, fmt.Errorf("google: %w", doErr)
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && attempt == 0 && g.tokenSource != nil {
+			resp.Body.Close()
+			if _, rotated := tryRotateAccount("google"); rotated {
+				continue
+			}
+		}
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if failoverStatus(resp.StatusCode) {
+				return nil, fmt.Errorf("google HTTP %d: %w", resp.StatusCode, ErrProviderUnavailable)
+			}
+			return nil, fmt.Errorf("google HTTP %d: %s", resp.StatusCode, string(b))
+		}
 
-	return g.parseResponse(gResp), nil
+		var gResp geminiResp
+		decErr := json.NewDecoder(resp.Body).Decode(&gResp)
+		resp.Body.Close()
+		if decErr != nil {
+			return nil, fmt.Errorf("google decode: %w", decErr)
+		}
+		return g.parseResponse(gResp), nil
+	}
+	return nil, fmt.Errorf("google: %w", ErrProviderUnavailable)
 }
 
 func (g *Google) ChatStream(ctx context.Context, req ChatRequest, callback StreamCallback) (*ChatResponse, error) {
-	url := fmt.Sprintf("%s/models/%s:streamGenerateContent?alt=sse&key=%s", g.baseURL, req.Model, g.apiKey)
 	body := g.buildRequest(req)
 	data, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := g.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("google stream: %w", err)
+	var resp *http.Response
+	for attempt := 0; attempt < 2; attempt++ {
+		url, bearer, epErr := g.endpointAndBearer(ctx, req.Model, "streamGenerateContent?alt=sse")
+		if epErr != nil {
+			return nil, epErr
+		}
+		httpReq, reqErr := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		if bearer != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		var doErr error
+		resp, doErr = g.httpClient.Do(httpReq)
+		if doErr != nil {
+			return nil, fmt.Errorf("google stream: %w", doErr)
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && attempt == 0 && g.tokenSource != nil {
+			resp.Body.Close()
+			if _, rotated := tryRotateAccount("google"); rotated {
+				continue
+			}
+			return nil, fmt.Errorf("google HTTP 429: %w", ErrProviderUnavailable)
+		}
+		break
 	}
 	defer resp.Body.Close()
 
@@ -225,6 +293,14 @@ func (g *Google) buildRequest(req ChatRequest) geminiReq {
 			Temperature:     req.Temperature,
 			MaxOutputTokens: req.MaxTokens,
 		},
+	}
+	if req.ThinkingBudget > 0 {
+		mLower := strings.ToLower(req.Model)
+		if strings.Contains(mLower, "gemini-2.5") || strings.Contains(mLower, "gemini-3") {
+			gReq.GenerationConfig.ThinkingConfig = &geminiThinkingConfig{
+				ThinkingBudget: req.ThinkingBudget,
+			}
+		}
 	}
 
 	if req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object" {

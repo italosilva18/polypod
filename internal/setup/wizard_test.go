@@ -137,7 +137,7 @@ func TestNVIDIANIMKeyCheckAvoidsLegacyPlaintextFlow(t *testing.T) {
 	}
 	cfg.AI.APIKey = ""
 	t.Setenv("NVIDIA_API_KEY", "synthetic-env-key")
-	if err := CheckAPIKey(cfg, path); err != nil || cfg.AI.APIKey != "synthetic-env-key" {
-		t.Fatalf("environment key not used: %v", err)
+	if err := CheckAPIKey(cfg, path); err != nil || cfg.AI.APIKey != "" {
+		t.Fatalf("environment key should validate without entering config: %v", err)
 	}
 }

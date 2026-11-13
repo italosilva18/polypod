@@ -99,6 +99,40 @@ func TestEmptyCategoryIsUnknown(t *testing.T) {
 		t.Fatal("empty category scored as zero")
 	}
 }
+
+func TestCodingReportIncludesTokenAndToolFailureMetrics(t *testing.T) {
+	m, r := fixture(t)
+	m.Tasks = m.Tasks[:1]
+	r.Outcomes = r.Outcomes[:1]
+	tokens, failures := 200, 1
+	r.Outcomes[0].TokenCount, r.Outcomes[0].ToolFailures = &tokens, &failures
+	report, err := Evaluate(m, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Tokens.Samples != 1 || report.Tokens.Total != 200 || report.ToolFailures.Total != 1 ||
+		report.CostPerSolvedUSD == nil || *report.CostPerSolvedUSD != 0 {
+		t.Fatalf("usage metrics missing: %+v", report)
+	}
+}
+func TestCodingCategoryScoresExternallyVerifiedPatch(t *testing.T) {
+	m, r := fixture(t)
+	m.Tasks = append(m.Tasks, Task{
+		ID: "fix-regression", Category: "coding", Benchmark: "poly-code-v1",
+		Criterion: "testes externos passam após a correção",
+	})
+	r.Outcomes = append(r.Outcomes, Outcome{
+		TaskID: "fix-regression", Status: "success", Evidence: "digest do patch e log de testes",
+		VerifiedBy: "verificador externo",
+	})
+	p, err := Evaluate(m, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Categories["coding"].Total != 1 || p.Categories["coding"].Success != 1 || p.Overall.Total != 6 {
+		t.Fatalf("coding task was not scored: %+v", p.Categories["coding"])
+	}
+}
 func TestDecodeRejectsTyposAndTrailingData(t *testing.T) {
 	for _, s := range []string{`{"schema_versoin":1}`, `{} {}`, `{} garbage`} {
 		var m Manifest

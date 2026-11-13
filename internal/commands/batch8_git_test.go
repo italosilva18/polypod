@@ -61,7 +61,6 @@ func TestRegisterBatch8Git_RegistersAll(t *testing.T) {
 
 	for _, name := range []string{
 		"branch",
-		"pr_comments",
 		"autofix-pr",
 		"security-review",
 		"release-notes",
@@ -69,10 +68,6 @@ func TestRegisterBatch8Git_RegistersAll(t *testing.T) {
 		if _, ok := reg.Get(name); !ok {
 			t.Errorf("comando %q não registrado", name)
 		}
-	}
-	// pr_comments alias
-	if _, ok := reg.Get("pr-comments"); !ok {
-		t.Error("alias 'pr-comments' não registrado para /pr_comments")
 	}
 }
 
@@ -87,7 +82,6 @@ func TestBatch8_Placeholders(t *testing.T) {
 		cmd  *command.Command
 		want string
 	}{
-		{cmdPRCommentsG8(), "PR comments feature pending MCP wiring"},
 		{cmdAutofixPRG8(), "autofix-pr queued for wiring"},
 		{cmdSecurityReviewG8(), "security review command pending wiring"},
 	}

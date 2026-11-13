@@ -30,6 +30,8 @@ type RestoredSession struct {
 // the conversation transcript.
 type SessionMetadata struct {
 	AgentName    string `json:"agent_name,omitempty"`
+	Provider     string `json:"provider,omitempty"`
+	Model        string `json:"model,omitempty"`
 	AgentColor   string `json:"agent_color,omitempty"`
 	AgentSetting string `json:"agent_setting,omitempty"`
 	CustomTitle  string `json:"custom_title,omitempty"`

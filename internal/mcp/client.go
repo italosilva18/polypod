@@ -340,6 +340,21 @@ func (m *Manager) RegisterWrappedTools(reg *skill.Registry, typesReg ToolRegistr
 	return count
 }
 
+// WrappedTools returns native types.Tool wrappers for all connected servers
+// without mutating any global registry (useful for session-scoped MCP servers).
+func (m *Manager) WrappedTools() []types.Tool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []types.Tool
+	for serverName, tools := range m.tools {
+		for _, item := range tools {
+			schema := schemaMap(item.InputSchema)
+			out = append(out, WrapMCPTool(m, serverName, item.Name, item.Description, schema))
+		}
+	}
+	return out
+}
+
 // ListServers returns info about connected servers and their tools.
 func (m *Manager) ListServers() map[string][]string {
 	m.mu.RLock()

@@ -1,8 +1,11 @@
 package provider
 
 const (
-	NVIDIAHostedBaseURL = "https://integrate.api.nvidia.com/v1"
-	NVIDIADefaultModel  = "nvidia/nemotron-3.5-super-vl-120b-a12b"
+	NVIDIAHostedBaseURL     = "https://integrate.api.nvidia.com/v1"
+	NVIDIADefaultModel      = "nvidia/nemotron-3.5-super-vl-120b-a12b"
+	OpenRouterBaseURL       = "https://openrouter.ai/api/v1"
+	QwenDashScopeBaseURL    = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+	GitHubDefaultBaseURL    = "https://api.githubcopilot.com"
 )
 
 // Pre-configured providers using OpenAI-compatible API.
@@ -76,6 +79,22 @@ func NewSambaNova(apiKey string) *OpenAICompat {
 	return NewOpenAICompat("sambanova", apiKey, "https://api.sambanova.ai/v1")
 }
 
+// NewQwen creates an Alibaba Cloud DashScope / Qwen OpenAI-compatible provider.
+func NewQwen(apiKey, baseURL string) *OpenAICompat {
+	if baseURL == "" {
+		baseURL = QwenDashScopeBaseURL
+	}
+	return NewOpenAICompat("qwen", apiKey, baseURL)
+}
+
+// NewGitHub creates a GitHub Copilot / GitHub OAuth OpenAI-compatible provider.
+func NewGitHub(apiKey, baseURL string) *OpenAICompat {
+	if baseURL == "" {
+		baseURL = GitHubDefaultBaseURL
+	}
+	return NewOpenAICompat("github", apiKey, baseURL)
+}
+
 // ProviderFactory creates a provider from name + API key.
 func ProviderFactory(name, apiKey, baseURL string) Provider {
 	switch name {
@@ -92,7 +111,14 @@ func ProviderFactory(name, apiKey, baseURL string) Provider {
 	case "cohere":
 		return NewCohere(apiKey)
 	case "openrouter":
+		if baseURL != "" {
+			return NewOpenAICompat("openrouter", apiKey, baseURL)
+		}
 		return NewOpenRouter(apiKey)
+	case "qwen":
+		return NewQwen(apiKey, baseURL)
+	case "github":
+		return NewGitHub(apiKey, baseURL)
 	case "together":
 		return NewTogether(apiKey)
 	case "perplexity":
@@ -117,12 +143,41 @@ func ProviderFactory(name, apiKey, baseURL string) Provider {
 	}
 }
 
+// ProviderFactoryWithTokenSource creates a provider backed by a rotating OAuth TokenSource.
+func ProviderFactoryWithTokenSource(name string, tokenSource TokenSource, baseURL string) Provider {
+	switch name {
+	case "chatgpt":
+		return NewChatGPT(tokenSource)
+	case "google":
+		return NewGoogleWithTokenSource(tokenSource, baseURL)
+	case "anthropic":
+		return NewAnthropicWithTokenSource(tokenSource, baseURL)
+	case "openrouter":
+		if baseURL == "" {
+			baseURL = OpenRouterBaseURL
+		}
+		return NewOpenAICompatWithTokenSource("openrouter", tokenSource, baseURL)
+	case "qwen":
+		if baseURL == "" {
+			baseURL = QwenDashScopeBaseURL
+		}
+		return NewOpenAICompatWithTokenSource("qwen", tokenSource, baseURL)
+	case "github":
+		if baseURL == "" {
+			baseURL = GitHubDefaultBaseURL
+		}
+		return NewOpenAICompatWithTokenSource("github", tokenSource, baseURL)
+	default:
+		return NewOpenAICompatWithTokenSource(name, tokenSource, baseURL)
+	}
+}
+
 // SupportedProviders returns the list of all supported provider names.
 func SupportedProviders() []string {
 	return []string{
 		"deepseek", "openai", "ollama", "anthropic", "google",
-		"groq", "mistral", "cohere", "openrouter", "together",
-		"perplexity", "fireworks", "deepinfra", "xai", "cerebras",
-		"sambanova", "azure", "nvidia",
+		"groq", "mistral", "cohere", "openrouter", "qwen", "github",
+		"together", "perplexity", "fireworks", "deepinfra", "xai",
+		"cerebras", "sambanova", "azure", "nvidia",
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/costa/polypod/internal/models"
 )
 
 // ModelCost tracks cumulative costs for a single model.
@@ -79,8 +81,31 @@ var CostEnginePricingTable = map[string]ModelPricing{
 	"qwen2.5": {InputPerMillion: 0, OutputPerMillion: 0},
 }
 
-// lookupPricing finds pricing for a model, trying exact match first then prefix.
+// lookupPricing finds pricing for a model, trying exact match first then prefix,
+// and falling back to the unprefixed name when a "provider/model" ID is passed.
 func lookupPricing(model string) (ModelPricing, bool) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return ModelPricing{}, false
+	}
+	if p, ok := lookupPricingSingle(model); ok {
+		return p, true
+	}
+	if _, tail, hasSlash := strings.Cut(model, "/"); hasSlash && tail != "" {
+		if p, ok := lookupPricingSingle(tail); ok {
+			return p, true
+		}
+	}
+	if capEntry := models.GetCapabilities(model); capEntry != nil && (capEntry.InputPricePer1M > 0 || capEntry.OutputPricePer1M > 0) {
+		return ModelPricing{
+			InputPerMillion:  capEntry.InputPricePer1M,
+			OutputPerMillion: capEntry.OutputPricePer1M,
+		}, true
+	}
+	return ModelPricing{}, false
+}
+
+func lookupPricingSingle(model string) (ModelPricing, bool) {
 	if p, ok := CostEnginePricingTable[model]; ok {
 		return p, true
 	}
@@ -106,6 +131,23 @@ func calculateModelCost(model string, promptTokens, completionTokens int) (input
 	inputCost = float64(promptTokens) / 1_000_000 * pricing.InputPerMillion
 	outputCost = float64(completionTokens) / 1_000_000 * pricing.OutputPerMillion
 	return
+}
+
+// MeasuredCost reports a USD amount only when the price is genuinely known.
+// Local Ollama runs are measured as US$0.0000. Non-local providers require a
+// non-zero tariff in CostEnginePricingTable; unpriced remote endpoints (such as
+// free cloud prototyping tiers) return false so callers display "não medido"
+// instead of recording a misleading zero.
+func MeasuredCost(provider, model string, promptTokens, completionTokens int) (float64, bool) {
+	if strings.EqualFold(strings.TrimSpace(provider), "ollama") {
+		return 0, true
+	}
+	pricing, ok := lookupPricing(model)
+	if !ok || (pricing.InputPerMillion <= 0 && pricing.OutputPerMillion <= 0) {
+		return 0, false
+	}
+	in, out := calculateModelCost(model, promptTokens, completionTokens)
+	return in + out, true
 }
 
 // CostEngine provides comprehensive per-session cost tracking with breakdowns

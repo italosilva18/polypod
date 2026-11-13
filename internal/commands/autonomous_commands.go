@@ -24,8 +24,7 @@ var autonomousCommandSpecs = []autonomousCommandSpec{
 	{"break-cache", nil, "Limpar caches relevantes", "Identifique e limpe com seguranca os caches relevantes para o problema descrito, depois valide que foram recriados corretamente."},
 	{"mock-limits", nil, "Ativar limites simulados", "Ative limites simulados para o provider ou subsistema solicitado e valide o comportamento de rate limiting."},
 	{"reset-limits", nil, "Limpar contadores de limites", "Localize e zere os contadores locais de rate limit, preservando configuracoes permanentes, e confirme o novo estado."},
-	{"pr_comments", []string{"pr-comments"}, "Ler e tratar comentarios de pull request", "Localize o pull request indicado, leia todos os comentarios e reviews, agrupe as solicitacoes e aplique as correcoes pertinentes."},
-	{"autofix-pr", nil, "Corrigir automaticamente um pull request", "Analise o pull request indicado, reproduza falhas, aplique correcoes, execute validacoes e deixe a branch pronta para revisao."},
+	{"autofix-pr", nil, "Corrigir automaticamente um pull request", "Use o relatorio paginado de comentarios e revisoes do PR fornecido no contexto (consultando gh/API apenas se o relatorio nao estiver presente), foque nos comentarios marcados como [no diff atual], reproduza a falha pontualmente, aplique correcoes usando exclusivamente as ferramentas nativas de edicao de arquivo (edit_file/write_file/multi_edit, sem editar via bash e sem fazer git commit ou git push automatico) e execute run_project_checks. So declare a correcao verificada quando os verificadores passarem; cite os resultados e deixe a worktree pronta para revisao."},
 	{"secret-scan", nil, "Executar varredura real de segredos", "Execute uma varredura de segredos no caminho informado, sem imprimir valores sensiveis. Classifique os achados e corrija exposicoes locais quando seguro."},
 	{"vuln-check", nil, "Verificar vulnerabilidades", "Audite dependencias e codigo do caminho informado em busca de vulnerabilidades, valide falsos positivos e aplique correcoes compativeis."},
 	{"model-compare", nil, "Comparar modelos lado a lado", "Execute a mesma tarefa nos modelos solicitados, compare qualidade, latencia, custo e uso de ferramentas, e recomende o melhor para este projeto."},
@@ -68,7 +67,13 @@ func RegisterAutonomousCommands(reg *command.Registry) {
 				if request == "" {
 					request = "Use o contexto atual para determinar o alvo e conclua a operacao integralmente."
 				}
-				return fmt.Sprintf("[COMANDO AUTONOMO /%s]\n%s\n\nSolicitacao: %s\nDiretorio de trabalho: %s\nExecute as ferramentas necessarias, valide o resultado e reporte objetivamente.", spec.Name, spec.Instruction, request, ctx.WorkingDir), nil
+				extraContext := ""
+				if spec.Name == "autofix-pr" {
+					if prReport, prErr := FetchPRReport(ctx.WorkingDir, args); prErr == nil && strings.TrimSpace(prReport) != "" {
+						extraContext = "\n\nContexto paginado do PR (/pr_comments):\n" + prReport
+					}
+				}
+				return fmt.Sprintf("[COMANDO AUTONOMO /%s]\n%s\n\nSolicitacao: %s\nDiretorio de trabalho: %s%s\nExecute as ferramentas necessarias, valide o resultado e reporte objetivamente.", spec.Name, spec.Instruction, request, ctx.WorkingDir, extraContext), nil
 			},
 		})
 	}

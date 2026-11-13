@@ -6,11 +6,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
-// MentionPattern matches @path/to/file or @dir/ in text.
-var MentionPattern = regexp.MustCompile(`@([\w./_-]+(?:\.\w+|/))`)
+// MentionPattern matches @path/to/file, @dir/, and optional #start-end lines.
+var MentionPattern = regexp.MustCompile(`@([\w./_-]+(?:\.\w+|/))(?:#([0-9]+)(?:-([0-9]+))?)?`)
 
 // FileIndex is a pre-built index of files for autocomplete.
 type FileIndex struct {
@@ -121,13 +122,28 @@ func ExpandMentions(text string, root string) (string, []string) {
 	if len(matches) == 0 {
 		return text, nil
 	}
+	rootPath, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return text, nil
+	}
 
 	var expanded []string
 	result := text
 
 	for _, match := range matches {
 		path := match[1]
+		if strings.Contains(path, "..") || filepath.IsAbs(path) {
+			continue
+		}
 		fullPath := filepath.Join(root, path)
+		resolved, err := filepath.EvalSymlinks(fullPath)
+		if err != nil {
+			continue
+		}
+		rel, err := filepath.Rel(rootPath, resolved)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
 
 		// Check if it's a directory
 		info, err := os.Stat(fullPath)
@@ -146,7 +162,7 @@ func ExpandMentions(text string, root string) (string, []string) {
 				listing = append(listing, e.Name())
 			}
 			replacement := fmt.Sprintf("[Diretorio %s]\n%s", path, strings.Join(listing, "\n"))
-			result = strings.Replace(result, "@"+path, replacement, 1)
+			result = strings.Replace(result, match[0], replacement, 1)
 			expanded = append(expanded, path)
 		} else {
 			// Read file content
@@ -155,11 +171,27 @@ func ExpandMentions(text string, root string) (string, []string) {
 				continue
 			}
 			content := string(data)
+			label := path
+			if match[2] != "" {
+				start, startErr := strconv.Atoi(match[2])
+				end := start
+				var endErr error
+				if match[3] != "" {
+					end, endErr = strconv.Atoi(match[3])
+				}
+				lines := strings.Split(content, "\n")
+				if startErr != nil || endErr != nil || start < 1 || end < start || start > len(lines) || end > len(lines) || end-start > 499 {
+					result = strings.Replace(result, match[0], fmt.Sprintf("[Intervalo de linhas inválido: %s]", match[0]), 1)
+					continue
+				}
+				content = strings.Join(lines[start-1:end], "\n")
+				label = strings.TrimPrefix(match[0], "@")
+			}
 			if len(content) > 10000 {
 				content = content[:10000] + "\n... [truncado]"
 			}
-			replacement := fmt.Sprintf("[Arquivo %s]\n```\n%s\n```", path, content)
-			result = strings.Replace(result, "@"+path, replacement, 1)
+			replacement := fmt.Sprintf("[Arquivo %s]\n```\n%s\n```", label, content)
+			result = strings.Replace(result, match[0], replacement, 1)
 			expanded = append(expanded, path)
 		}
 	}

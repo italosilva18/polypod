@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -32,7 +33,7 @@ func TestQueuedCLIPromptBlockedBeforeAppendUntilDiscarded(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := ai.NewService(nil, nil, nil, "default", nil, slog.Default())
-	handler := makeStreamHandler(conv, service, nil, nil, turns, slog.Default())
+	handler := makeStreamHandler(conv, service, nil, nil, turns, slog.Default(), nil)
 	chunks := make(chan adapter.StreamChunk, 8)
 	// This is the same handler path used when the composer auto-submits a
 	// queued prompt immediately after a failed stream.
@@ -55,5 +56,32 @@ func TestQueuedCLIPromptBlockedBeforeAppendUntilDiscarded(t *testing.T) {
 	}
 	if err := ensureCLINextTurnResolved(turns, "branch", sess); err != nil {
 		t.Fatalf("explicit discard did not release next turn: %v", err)
+	}
+}
+
+func TestACPSessionTurnUsesProcessLease(t *testing.T) {
+	turns := turncheckpoint.New(t.TempDir(), nil)
+	msg := adapter.InMessage{Channel: "acp", UserID: "session-1"}
+	first, err := beginCLITurnGuard(context.Background(), msg, turns, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second, err := beginCLITurnGuard(context.Background(), msg, turns, nil); !errors.Is(err, turncheckpoint.ErrBranchBusy) {
+		if second != nil {
+			if closeErr := second.Close(); closeErr != nil {
+				t.Fatal(closeErr)
+			}
+		}
+		t.Fatalf("simultaneous ACP turn allowed: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := beginCLITurnGuard(context.Background(), msg, turns, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

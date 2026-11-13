@@ -402,6 +402,31 @@ func TestCalculateModelCost(t *testing.T) {
 	}
 }
 
+func TestMeasuredCostKnownFreeAndUnknown(t *testing.T) {
+	cost, ok := MeasuredCost("ollama", "local-model", 1000, 500)
+	if !ok || cost != 0 {
+		t.Fatalf("ollama cost = %v, %v; want 0, true", cost, ok)
+	}
+	cost, ok = MeasuredCost("  Ollama ", "qwen2.5-coder:7b", 2500, 1200)
+	if !ok || cost != 0 {
+		t.Fatalf("Ollama case-insensitive cost = %v, %v; want 0, true", cost, ok)
+	}
+	cost, ok = MeasuredCost("openai", "gpt-4o", 1_000_000, 0)
+	if !ok || cost != 2.50 {
+		t.Fatalf("gpt-4o cost = %v, %v; want 2.50, true", cost, ok)
+	}
+	cost, ok = MeasuredCost("openrouter", "openai/gpt-4o", 1_000_000, 100_000)
+	if !ok || cost != 3.50 {
+		t.Fatalf("openai/gpt-4o cost = %v, %v; want 3.50, true", cost, ok)
+	}
+	if _, ok = MeasuredCost("nvidia", "nvidia/nemotron-3.5-super-vl-120b-a12b", 1000, 500); ok {
+		t.Fatal("unpriced NVIDIA model must stay unmeasured")
+	}
+	if _, ok = MeasuredCost("together", "qwen2.5-coder-32b", 1000, 500); ok {
+		t.Fatal("zero-tariff entry on non-local provider must stay unmeasured")
+	}
+}
+
 func TestCalculateModelCost_UnknownModel(t *testing.T) {
 	in, out := calculateModelCost("some-unknown-model-xyz", 1000, 500)
 	if in != 0 {

@@ -1,6 +1,6 @@
 // Package commands — batch8_git.go
-// Git-flavored slash commands (batch 8): /branch, /pr_comments,
-// /autofix-pr, /security-review, /release-notes.
+// Git-flavored slash commands (batch 8): /branch, /autofix-pr,
+// /security-review, /release-notes.
 //
 // These wire-level commands replace the batch1 stubs registered earlier
 // with richer behavior backed by `git` via os/exec. All user-facing strings
@@ -27,7 +27,6 @@ import (
 // with the implementations defined in this file.
 func RegisterBatch8Git(reg *command.Registry) {
 	reg.Register(cmdBranchG8())
-	reg.Register(cmdPRCommentsG8())
 	reg.Register(cmdAutofixPRG8())
 	reg.Register(cmdSecurityReviewG8())
 	reg.Register(cmdReleaseNotesG8())
@@ -82,23 +81,6 @@ func cmdBranchG8() *command.Command {
 			}
 			out := fmt.Sprintf("Branch atual: %s\n\nStatus:\n%s", strings.TrimSpace(cur), status)
 			return okResult(out), nil
-		},
-	}
-}
-
-// ---------------------------------------------------------------------------
-// /pr_comments — placeholder, awaiting MCP wiring
-// ---------------------------------------------------------------------------
-
-func cmdPRCommentsG8() *command.Command {
-	return &command.Command{
-		Name:        "pr_comments",
-		Aliases:     []string{"pr-comments"},
-		Description: "Lista comentários de um pull request (pendente de integração MCP)",
-		Type:        command.CommandLocal,
-		Source:      command.SourceBuiltin,
-		Execute: func(args []string, ctx command.CommandContext) (*command.CommandResult, error) {
-			return okResult("PR comments feature pending MCP wiring"), nil
 		},
 	}
 }

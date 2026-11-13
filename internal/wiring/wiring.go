@@ -288,6 +288,13 @@ func WireAIClient(sys *Systems, aiClient *ai.Client, logger *slog.Logger) {
 				TokenCount:   update.PromptTokens + update.CompletionTokens,
 				Summary:      fmt.Sprintf("Turno %d", update.Turn),
 			}
+			modelName := update.Model
+			if modelName == "" {
+				modelName = aiClient.Model()
+			}
+			if cost, ok := tracking.MeasuredCost(aiClient.Provider(), modelName, update.PromptTokens, update.CompletionTokens); ok {
+				progress.CostUSD = &cost
+			}
 			if update.LastTool != "" {
 				activity := tasks.ToolActivity{ToolName: update.LastTool}
 				recent = append(recent, activity)

@@ -57,11 +57,64 @@ Interactive usage:
 ./polypod config.yaml
 ```
 
+### Interface do terminal em português brasileiro
+
+- Digite `/` ou pressione `Ctrl+K` para procurar comandos e skills. A seleção
+  de uma skill prepara um pedido para você completar antes de enviá-lo.
+- Use `/connect` para conectar um provedor. As chaves digitadas no formulário
+  mascarado vão para o armazenamento privado de credenciais. A autorização do
+  ChatGPT abre o navegador; Ollama usa o servidor local sem chave.
+- Use `/model` ou `Ctrl+Y` para escolher provedor e modelo da sessão atual.
+  A escolha volta ao retomar a sessão e não altera o padrão do `config.yaml`.
+  O seletor mostra a lista local imediatamente e atualiza modelos em segundo
+  plano a partir do catálogo público, da conta ChatGPT e do Ollama local quando
+  disponíveis. A lista pública não garante acesso pela conta conectada.
+- Use `Ctrl+E` para editar o rascunho em `VISUAL` ou `EDITOR`. `/editor` abre um
+  rascunho vazio no mesmo editor.
+- Use `/btw <pergunta>` para uma resposta breve em uma janela separada. Ela
+  usa o contexto recente, não executa ferramentas e não entra no histórico da
+  conversa principal.
+- Use `@caminho/arquivo.go#20-45` para incluir somente as linhas indicadas.
+  Uma menção sem intervalo continua incluindo o início do arquivo.
+- Durante uma resposta, Enter envia uma orientação para a próxima etapa do
+  modelo. Use `/queue <mensagem>` para aguardar o fim do turno.
+- `/diff` abre um visualizador com alterações do trabalho, arquivos preparados,
+  ramo e último turno com checkpoint. As teclas 1–4 trocam o escopo; n/p mudam
+  de arquivo; j/k rolam o patch; Esc fecha. `/diff --staged` mantém a saída em texto.
+- `/init-verifiers` detecta testes, análise e build e grava
+  `.polypod/verifiers.yaml`. Alterações feitas pelas ferramentas são formatadas
+  quando há formatador configurado; no fim do turno, as verificações rodam e
+  uma falha inicia uma tentativa automática de correção. `/commit` bloqueia
+  commits se os verificadores configurados falharem. `/verify` executa os
+  verificadores manualmente.
+- Configure embeddings em `config.yaml`, ative `/index on` no projeto e use
+  `/semantic <descrição>` para buscar trechos de código por significado.
+  `/index off` desativa a busca. O índice respeita o Git e os limites locais.
+- `/config` mostra apenas campos persistidos e indica que é preciso reiniciar
+  para aplicar alterações do arquivo. Use `/connect` para credenciais.
+
+Veja [verificação e busca de código](docs/integrations/code-quality-and-search.md)
+para configurar limites, formatadores e a busca semântica.
+Veja também a [auditoria de dez CLIs de programação](docs/audits/cli-coding-agents-2026.md)
+para as próximas etapas de arquitetura, desempenho e avaliação.
+
+Para editores compatíveis com ACP, execute `polypod acp`. O adaptador mantém
+sessões por projeto, replay, cancelamento e eventos de ferramenta. Veja
+[integração ACP](docs/integrations/ide-acp.md) para configurar o processo.
+`/pr_comments` lê comentários e revisões reais do GitHub via `gh`;
+`/plugin` instala, atualiza, ativa e remove pacotes locais;
+`/work` mostra tarefas, worktrees e sobreposição de arquivos.
+
 Headless usage:
 
 ```bash
 ./polypod -p "analyze this repository and fix the failing tests"
 ```
+
+Para automações que precisam acompanhar o trabalho, use
+`./polypod -p "..." --output-format stream-json`. Cada linha é um evento JSON
+com versão, sequência, tipo (`delta`, `tool`, `error` ou `done`) e os dados
+correspondentes. Eventos de ferramenta incluem nome, ID, estado e duração.
 
 The local root systemd deployment is documented in [scripts/README.md](scripts/README.md).
 

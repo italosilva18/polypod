@@ -19,6 +19,48 @@ go vet ./internal/evaluation/...
 
 O comando fica dentro de `internal/` para seguir a convenção do repositório. Para um executável separado: `go build -o /tmp/polypod-eval ./internal/evaluation/cmd`.
 
+## Ensaios com Ollama local ou endpoint NVIDIA
+
+`scripts/eval-local-context.py` cria uma cópia temporária de trechos do código
+da Poly e mede `recall@5` e tokens estimados para busca lexical, mapa,
+semântica e híbrida. A fixture e os arquivos alvo estão em
+`docs/evaluation/context-fixture.v1.json`. Os modos semântico e híbrido usam
+`nomic-embed-text` no Ollama local:
+
+```bash
+ollama pull nomic-embed-text
+python3 scripts/eval-local-context.py
+```
+
+`scripts/eval-coding.py` constrói a Poly num diretório temporário, prepara
+uma tarefa sintética de correção Go e julga o patch com `go test` externo.
+Com Ollama, o modelo escolhido deve estar instalado localmente:
+
+```bash
+ollama pull qwen2.5-coder:3b
+python3 scripts/eval-coding.py --model qwen2.5-coder:3b
+```
+
+Para usar o endpoint gratuito de prototipagem NVIDIA, configure a chave no
+`.env` privado conforme o [guia NIM](../integrations/nvidia-nim.md) e execute:
+
+```bash
+python3 scripts/eval-coding.py --provider nvidia --timeout 240 --max-tool-iterations 8 --max-steps 16
+```
+
+A chave não entra nos artefatos de avaliação. `--max-tool-iterations` limita
+rodadas do modelo, enquanto `--max-steps` limita o orçamento medido de chamadas
+individuais de ferramenta; uma rodada pode executar mais de uma ferramenta.
+O endpoint é remoto; a Poly não
+mede o valor efetivamente faturado pela NVIDIA, portanto `cost_usd` fica
+ausente. O caso de programação pode passar no verificador externo mesmo se o
+processo do agente terminar com erro; nesse caso a evidência registra
+`agent_exit_code`, e tokens e passos podem ficar ausentes. Um sucesso que exceda
+o limite de passos declarado não pontua no agregado. Os scripts gravam
+artefatos em diretórios temporários. Resultados e limites da rodada estão na
+[auditoria de CLIs](../audits/cli-coding-agents-2026.md). Esses casos são
+pequenos e não demonstram qualidade em tarefas reais.
+
 ## Execução real de casos locais
 
 `go run ./internal/evaluation/runcli` agora executa o agente por subprocesso em um diretório preparado para cada tarefa. Ele passa apenas `prompt` ao comando e compara um arquivo produzido com um SHA-256 previamente definido em um plano separado. A resposta do agente não é gravada no resultado. Um caso sem verificador fica `skipped`; uma resposta declarando sucesso não ganha ponto.
@@ -33,7 +75,8 @@ Prepare três JSONs: um manifesto com `prompt` em todas as tarefas, os `Metadata
       "working_dir": "/caminho/absoluto/para/vm/caso-1",
       "command": ["/caminho/absoluto/polypod", "config.yaml", "-p", "{prompt}", "--output-format", "json"],
       "expected_file": "resultado.txt",
-      "expected_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      "expected_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "verify_command": ["/caminho/absoluto/verificador-fixo", "--workspace", "/caminho/absoluto/para/vm/caso-1"]
     }
   ]
 }
@@ -48,7 +91,30 @@ go run ./internal/evaluation/runcli \
 go run ./internal/evaluation/cmd -manifest /caminho/manifesto-real.json -results /caminho/resultados.json
 ```
 
-O runner valida todos os casos antes da primeira execução, rejeita um resultado esperado que já exista no início, limita cada processo pelo prazo da tarefa, captura a saída sem publicá-la e grava resultados com permissão `0600`. O processo deve devolver um único JSON no formato headless contendo `content`. O verificador aceita apenas arquivo regular de até 128 MiB e registra somente o digest observado. Prepare cada diretório a partir de uma fixture conhecida e execute o runner dentro de uma VM ou contêiner descartável: o diretório de trabalho não limita o acesso do agente ao restante do host. Este adaptador não mede custo nem passos; esses campos permanecem ausentes e o relatório não atesta o cumprimento dos respectivos orçamentos. Para GUI, memória, canais e segurança, acrescente verificadores externos específicos ao protocolo antes de interpretar `skipped` como capacidade ausente.
+O runner valida todos os casos antes da primeira execução, rejeita um
+resultado esperado que já exista no início, limita cada processo pelo prazo da
+tarefa, captura a saída sem publicá-la e grava resultados com permissão `0600`.
+O processo deve devolver um único JSON no formato headless contendo `content`
+para que as medições sejam importadas. Se sair com código não zero em um caso
+com verificador externo, o runner ainda julga o estado final do workspace e
+registra o código de saída na evidência; as medições headless ficam ausentes.
+O verificador aceita apenas arquivo regular de até 128 MiB e registra somente
+o digest observado. `verify_command` é opcional: executa um programa de teste
+fixado no plano depois do agente, com executável absoluto e sem inserir o
+prompt; saída zero significa sucesso. Pode ser usado sozinho para julgar
+comportamento do código ou junto com o digest para exigir as duas condições.
+Mantenha testes e verificador fora da área editável pelo agente e registre a
+revisão do verificador. Prepare cada diretório a partir de uma fixture conhecida
+e execute o runner dentro de uma VM ou contêiner descartável: o diretório de
+trabalho não limita o acesso do agente ao restante do host. O adaptador importa
+`steps`, `tool_failures` e `tokens.total` da saída headless. Ele registra custo
+zero como medido apenas quando a Poly usa Ollama local; nos outros provedores
+`cost_measured=false` deixa o custo ausente do resultado, mesmo que o JSON
+headless apresente `cost_usd: 0`. O relatório calcula custo por tarefa resolvida
+somente quando todas as tentativas têm custo medido. O runner ainda não impõe
+orçamentos de tokens, ferramentas ou custo durante a execução. Para GUI, memória, canais e
+segurança, acrescente verificadores externos específicos ao protocolo antes de
+interpretar `skipped` como capacidade ausente.
 
 ## Runner programático
 
@@ -62,7 +128,7 @@ O prazo usa `context.Context` e é cooperativo. Um executor que ignore o cancela
 
 ## Contrato e pontuação
 
-Manifesto: `schema_version=1`, `id`, `version`, lista `tasks` com ID único, `category` (`gui`, `memory`, `routine`, `channels`, `safety`), `benchmark`, critério externo verificável e `recovery` indicando falha injetada planejada. Fixe a lista antes de executar; inclua todas as tarefas do recorte e documente exclusões.
+Manifesto: `schema_version=1`, `id`, `version`, lista `tasks` com ID único, `category` (`gui`, `memory`, `routine`, `channels`, `safety`, `coding`), `benchmark`, critério externo verificável e `recovery` indicando falha injetada planejada. Para `coding`, verifique o patch com testes externos e registre a revisão inicial do repositório. Fixe a lista antes de executar; inclua todas as tarefas do recorte e documente exclusões.
 
 Resultados: `schema_version=1`, `manifest_id`, `manifest_version`, `metadata` e uma lista `outcomes` com no máximo um resultado por tarefa. O exemplo completo está em `internal/evaluation/testdata/results.v1.json`. Status aceitos: `success`, `failure`, `timeout`, `error`, `skipped`. Sucesso exige `evidence` e `verified_by`; esses campos registram a origem do julgamento, não autenticam nem executam o verificador. Use artefatos e verificadores externos confiáveis, nunca a declaração do agente. IDs desconhecidos/duplicados, schemas incompatíveis, campos desconhecidos, números negativos e recuperação inconsistente causam erro.
 

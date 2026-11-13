@@ -9,34 +9,88 @@ import (
 
 	"github.com/costa/polypod/internal/conversation"
 	providerapi "github.com/costa/polypod/internal/provider"
+	"github.com/costa/polypod/internal/tool"
 	openai "github.com/sashabaranov/go-openai"
 )
 
 const (
-	inlineToolLimit = 36
-	inlineToolBytes = 30 * 1024
+	inlineToolLimit = 28
+	inlineToolBytes = 24 * 1024
 	toolSearchName  = "tool_search"
-	selectedLimit   = 16
+	selectedLimit   = 18
 )
 
-// These tools cover the ordinary read, edit, shell, browser and dialogue path.
-// Every other enabled tool remains discoverable through tool_search.
+// Core coding, search, verification, planning and dialogue tools stay inline on
+// every progressive turn. Bulky GUI/browser automation schemas activate
+// automatically when the user prompt indicates web/GUI intent or via tool_search.
 var inlineToolNames = map[string]bool{
 	toolSearchName: true,
 	"bash":         true, "bash_output": true, "tool_output": true,
 	"read_file": true, "read_file_dir": true,
-	"write_file": true, "edit_file": true, "file_write": true, "file_edit": true,
+	"write_file": true, "edit_file": true, "file_write": true, "file_edit": true, "multi_edit": true,
 	"glob": true, "grep": true, "glob_search": true, "grep_search": true,
+	"code_context_search": true, "code_semantic_search": true, "code_impact": true,
+	"run_project_checks": true, "lsp": true,
+	"architect_plan": true, "parallel_best_of_n": true,
 	"web_search": true, "web_fetch": true,
-	"ask_user": true, "ask_user_question": true, "ask_user_structured": true,
+	"ask_user": true, "ask_user_question": true, "ask_user_structured": true, "ask_parent_question": true,
 	"send_user_message": true,
-	"browser_manage":    true, "browser_observe": true, "browser_act": true,
-	"computer_screenshot": true, "computer_click": true, "computer_type": true,
-	"computer_scroll": true, "computer_key_press": true,
-	"task_create": true, "task_get": true, "task_list": true, "task_output": true,
+	"task_create":       true, "task_get": true, "task_list": true, "task_output": true,
 	"agent_run": true, "memory_add": true, "memory_search": true,
 	"history_search": true, "history_recall": true,
 	"send_message": true, "send_message_enqueue": true,
+}
+
+var guiBrowserToolNames = []string{
+	"browser_manage", "browser_observe", "browser_act",
+	"computer_screenshot", "computer_click", "computer_type",
+	"computer_scroll", "computer_key_press",
+}
+
+var gitWorktreeToolNames = []string{
+	"git_status", "git_diff", "git_log", "git_commit",
+	"worktree_create", "worktree_list", "worktree_remove",
+}
+
+type requestQueryHintKey struct{}
+
+func withRequestQueryHint(ctx context.Context, query string) context.Context {
+	if strings.TrimSpace(query) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, requestQueryHintKey{}, query)
+}
+
+func requestQueryHintFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	q, _ := ctx.Value(requestQueryHintKey{}).(string)
+	return q
+}
+
+func intentActivatedTools(query string) []string {
+	if strings.TrimSpace(query) == "" {
+		return nil
+	}
+	lower := strings.ToLower(query)
+	var extra []string
+	for _, kw := range []string{
+		"browser", "navegador", "playwright", "chrome", "pagina", "página",
+		"screenshot", "print da tela", "clique", "click", "gui", "desktop", "http://", "https://",
+	} {
+		if strings.Contains(lower, kw) {
+			extra = append(extra, guiBrowserToolNames...)
+			break
+		}
+	}
+	for _, kw := range []string{"worktree", "commit", "branch", "git ", "pull request", "merge"} {
+		if strings.Contains(lower, kw) {
+			extra = append(extra, gitWorktreeToolNames...)
+			break
+		}
+	}
+	return extra
 }
 
 type requestToolSessionKey struct{}
@@ -76,10 +130,44 @@ type toolCatalog struct {
 }
 
 func (c *Client) catalogFor(ctx context.Context) *toolCatalog {
-	if c.skills == nil {
+	var all []openai.Tool
+	if c.skills != nil {
+		all = append(all, c.skills.ToolDefinitions(c.skillNamesFor(ctx))...)
+	}
+	sessionTools := tool.SessionToolsFromContext(ctx)
+	sessionToolNames := make(map[string]bool, len(sessionTools))
+	for _, st := range sessionTools {
+		if st == nil || !st.IsEnabled() {
+			continue
+		}
+		params := st.InputSchema()
+		if params == nil {
+			params = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		def := openai.Tool{
+			Type: openai.ToolTypeFunction,
+			Function: &openai.FunctionDefinition{
+				Name:        st.Name(),
+				Description: st.Description(),
+				Parameters:  params,
+			},
+		}
+		sessionToolNames[st.Name()] = true
+		replaced := false
+		for i := range all {
+			if all[i].Function != nil && all[i].Function.Name == st.Name() {
+				all[i] = def
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			all = append(all, def)
+		}
+	}
+	if len(all) == 0 {
 		return &toolCatalog{}
 	}
-	all := c.skills.ToolDefinitions(c.skillNamesFor(ctx))
 	catalog := &toolCatalog{all: all, byName: make(map[string]openai.Tool, len(all)), active: make(map[string]bool)}
 	for _, item := range all {
 		if item.Function != nil {
@@ -91,6 +179,14 @@ func (c *Client) catalogFor(ctx context.Context) *toolCatalog {
 	}
 	catalog.progressive = true
 	for name := range inlineToolNames {
+		if catalog.has(name) {
+			catalog.active[name] = true
+		}
+	}
+	for name := range sessionToolNames {
+		catalog.active[name] = true
+	}
+	for _, name := range intentActivatedTools(requestQueryHintFromContext(ctx)) {
 		if catalog.has(name) {
 			catalog.active[name] = true
 		}

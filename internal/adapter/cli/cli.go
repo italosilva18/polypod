@@ -14,11 +14,13 @@ import (
 	"github.com/costa/polypod/internal/adapter"
 	"github.com/costa/polypod/internal/agent"
 	"github.com/costa/polypod/internal/ai"
+	"github.com/costa/polypod/internal/codesearch"
 	"github.com/costa/polypod/internal/command"
 	"github.com/costa/polypod/internal/compact"
 	"github.com/costa/polypod/internal/config"
 	"github.com/costa/polypod/internal/conversation"
 	"github.com/costa/polypod/internal/hooks"
+	"github.com/costa/polypod/internal/humanloop"
 	"github.com/costa/polypod/internal/mcp"
 	"github.com/costa/polypod/internal/memory"
 	"github.com/costa/polypod/internal/mentions"
@@ -61,6 +63,7 @@ type Adapter struct {
 	modeState             *modes.State
 	planSim               *modes.PlanSimulator
 	fileIndex             *mentions.FileIndex
+	codeSearch            *codesearch.Engine
 	approvalHandler       *BubbleteaApprovalHandler
 	cfg                   *config.Config
 	cfgPath               string
@@ -78,6 +81,18 @@ type Adapter struct {
 	sessionEmbedder        session.TextEmbedder
 	sessionMemory          *sessionmem.FileStore
 	toolTranscript         *session.ToolTranscriptStore
+	eventJournal           *session.EventJournal
+	childQuestions         *humanloop.MultiChildQuestionQueue
+}
+
+// SetChildQuestionQueue attaches the concurrent multi-child question queue for /questions and /answer.
+func (a *Adapter) SetChildQuestionQueue(q *humanloop.MultiChildQuestionQueue) {
+	a.childQuestions = q
+}
+
+// SetEventJournal connects the CLI to the shared versioned session event bus.
+func (a *Adapter) SetEventJournal(journal *session.EventJournal) {
+	a.eventJournal = journal
 }
 
 // SetTaskRegistry connects live background-task notices to the CLI.
@@ -224,6 +239,9 @@ func (a *Adapter) SetFileIndex(idx *mentions.FileIndex) {
 	a.fileIndex = idx
 }
 
+// SetCodeSearch enables direct semantic code queries in the CLI.
+func (a *Adapter) SetCodeSearch(engine *codesearch.Engine) { a.codeSearch = engine }
+
 // SetApprovalHandler attaches the Bubbletea-backed approval handler so
 // the TUI can display the permission modal for tool-approval requests.
 // When nil, approval requests fall back to whatever default handler
@@ -299,6 +317,7 @@ func (a *Adapter) Start(ctx context.Context, handler adapter.MessageHandler) err
 	sh = a.trackPeerActivity(sh)
 
 	m := newModel(runCtx, sh, deps, a.dataDir, a.userPromptHandler, a.approvalHandler, a.fileIndex)
+	m.eventJournal = a.eventJournal
 	m.taskQueue = a.taskQueue
 	m.taskRegistry = a.taskRegistry
 	if a.taskRegistry != nil {
@@ -350,6 +369,35 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 		activeSessionRevision:    a.ActiveSessionRevision,
 		setActiveSessionRevision: func(revision string) { a.activeSessionRevision = revision }}
 	deps.checkPendingTurn = a.pendingCheckpointGuard
+	if a.codeSearch != nil {
+		deps.semanticSearch = func(searchCtx context.Context, query string) (string, error) {
+			matches, err := a.codeSearch.Search(searchCtx, commandWorkingDir(deps), query, 8)
+			if err != nil {
+				return "", err
+			}
+			return codesearch.Format(matches), nil
+		}
+	}
+	if a.turnCheckpoint != nil && a.convMgr != nil {
+		deps.turnDiff = func() ([]turncheckpoint.FileDiff, error) {
+			sess, err := a.convMgr.GetSession(ctx, "cli", "local")
+			if err != nil {
+				return nil, err
+			}
+			for i := len(sess.Messages) - 1; i >= 0; i-- {
+				message := sess.Messages[i]
+				if message.Role != conversation.RoleUser {
+					continue
+				}
+				files, err := a.turnCheckpoint.DiffTurn(a.ActiveSessionID(), message.ID)
+				if os.IsNotExist(err) {
+					continue
+				}
+				return files, err
+			}
+			return nil, nil
+		}
+	}
 	deps.discardRecovery = func() (string, error) { return a.discardRecovery(ctx) }
 	if a.convMgr != nil {
 		deps.recoveryState = func() (string, string, string) {
@@ -364,6 +412,9 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 		}
 	}
 	if a.aiSvc != nil {
+		deps.setEffort = func(eff string) {
+			a.aiSvc.SetEffort(eff)
+		}
 		deps.workingDir = func() string {
 			fallback, err := os.Getwd()
 			if err != nil {
@@ -406,6 +457,22 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 		deps.setAgent = a.aiSvc.SetAgent
 		deps.currentModel = a.aiSvc.CurrentModel
 		deps.setModel = a.aiSvc.SetModel
+		deps.currentProvider = a.aiSvc.CurrentProvider
+		deps.setVisionModel = a.setVisionModel
+		deps.visionConfig = a.aiSvc.VisionModelConfig
+		deps.latestWaterfall = a.aiSvc.LatestWaterfall
+		if a.cfg != nil {
+			deps.listProviders = a.providerOptions
+			deps.switchProvider = a.switchProvider
+			deps.connectProvider = a.connectProvider
+			deps.connectChatGPT = a.connectChatGPT
+			deps.connectOAuth = a.connectOAuth
+		}
+	}
+	if a.childQuestions != nil {
+		deps.listChildQuestions = a.childQuestions.FormatPending
+		deps.answerChildQuestion = a.childQuestions.Answer
+		deps.saveChildDraft = a.childQuestions.SaveDraft
 	}
 
 	if a.agents != nil {
@@ -502,6 +569,11 @@ func (a *Adapter) buildCommandDeps(ctx context.Context) commandDeps {
 				return "", err
 			}
 			return resp.Content, nil
+		}
+		deps.generateSideText = func(prompt string) (string, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+			return a.aiSvc.AnswerTextOnly(ctx, prompt)
 		}
 	}
 
@@ -1102,6 +1174,6 @@ func syncToStreamHandler(handler adapter.MessageHandler) adapter.StreamHandler {
 			return
 		}
 		chunks <- adapter.StreamChunk{Delta: out.Text}
-		chunks <- adapter.StreamChunk{Done: true}
+		chunks <- adapter.StreamChunk{Done: true, Usage: out.Usage}
 	}
 }

@@ -54,17 +54,20 @@ func (c *Credentials) Token() string {
 
 // EnvVarProviderMap maps environment variable names to provider names.
 var EnvVarProviderMap = map[string]string{
-	"ANTHROPIC_API_KEY":  "anthropic",
-	"OPENAI_API_KEY":     "openai",
-	"GOOGLE_API_KEY":     "google",
-	"DEEPSEEK_API_KEY":   "deepseek",
-	"GROQ_API_KEY":       "groq",
-	"MISTRAL_API_KEY":    "mistral",
-	"COHERE_API_KEY":     "cohere",
-	"TOGETHER_API_KEY":   "together",
-	"PERPLEXITY_API_KEY": "perplexity",
-	"XAI_API_KEY":        "xai",
-	"NVIDIA_API_KEY":     "nvidia",
+	"ANTHROPIC_API_KEY":    "anthropic",
+	"OPENAI_API_KEY":       "openai",
+	"GOOGLE_API_KEY":       "google",
+	"DEEPSEEK_API_KEY":     "deepseek",
+	"GROQ_API_KEY":         "groq",
+	"MISTRAL_API_KEY":      "mistral",
+	"COHERE_API_KEY":       "cohere",
+	"TOGETHER_API_KEY":     "together",
+	"PERPLEXITY_API_KEY":   "perplexity",
+	"XAI_API_KEY":          "xai",
+	"NVIDIA_API_KEY":       "nvidia",
+	"OPENROUTER_API_KEY":   "openrouter",
+	"DASHSCOPE_API_KEY":    "qwen",
+	"GITHUB_MODELS_TOKEN":  "github",
 }
 
 // ProviderEnvVarMap is the reverse: provider → env var name.
@@ -80,6 +83,9 @@ var ProviderEnvVarMap = map[string]string{
 	"perplexity": "PERPLEXITY_API_KEY",
 	"xai":        "XAI_API_KEY",
 	"nvidia":     "NVIDIA_API_KEY",
+	"openrouter": "OPENROUTER_API_KEY",
+	"qwen":       "DASHSCOPE_API_KEY",
+	"github":     "GITHUB_MODELS_TOKEN",
 }
 
 // ─── KeyStore ───────────────────────────────────────────────────────────────
@@ -411,6 +417,8 @@ func providerBaseURL(provider string) string {
 		"perplexity": "https://api.perplexity.ai",
 		"xai":        "https://api.x.ai/v1",
 		"nvidia":     "https://integrate.api.nvidia.com/v1",
+		"openrouter": "https://openrouter.ai/api/v1",
+		"qwen":       "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
 	}
 	return m[provider]
 }
@@ -428,6 +436,8 @@ func providerDefaultModel(provider string) string {
 		"perplexity": "sonar-small-chat",
 		"xai":        "grok-beta",
 		"nvidia":     "nvidia/nemotron-3.5-super-vl-120b-a12b",
+		"openrouter": "anthropic/claude-sonnet-4",
+		"qwen":       "qwen3-coder-plus",
 	}
 	if v, ok := m[provider]; ok {
 		return v

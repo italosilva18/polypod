@@ -27,6 +27,16 @@ type cliTurnGuard struct {
 // startup restoration and /recover discard, so another CLI cannot execute a
 // tool from an older in-memory transcript while this turn is in progress.
 func beginCLITurnGuard(ctx context.Context, msg adapter.InMessage, turns *turncheckpoint.Manager, storage session.SessionStorage) (*cliTurnGuard, error) {
+	if msg.Channel == "acp" {
+		if msg.UserID == "" || turns == nil {
+			return nil, errors.New("sessão ACP ou gerenciador de turnos indisponível")
+		}
+		release, err := turns.AcquireBranchLease(ctx, "acp:"+msg.UserID)
+		if err != nil {
+			return nil, err
+		}
+		return &cliTurnGuard{release: release}, nil
+	}
 	if msg.Channel != "cli" {
 		return nil, nil
 	}

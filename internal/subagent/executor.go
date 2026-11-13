@@ -80,6 +80,7 @@ type ExecutionProgress struct {
 	PromptTokens     int
 	CompletionTokens int
 	LastTool         string
+	Model            string
 }
 
 // NewSubAgentExecutor creates a SubAgentExecutor from the given config.
@@ -274,7 +275,8 @@ func (e *SubAgentExecutor) ExecuteWithCheckpoint(
 		}
 		if report != nil {
 			report(ExecutionProgress{Turn: turn + 1, ToolUseCount: checkpoint.ToolUseCount,
-				PromptTokens: checkpoint.PromptTokens, CompletionTokens: checkpoint.CompletionTokens})
+				PromptTokens: checkpoint.PromptTokens, CompletionTokens: checkpoint.CompletionTokens,
+				Model: e.resolveModel(ag)})
 		}
 		// Check context cancellation.
 		if err := ctx.Err(); err != nil {
@@ -324,9 +326,14 @@ func (e *SubAgentExecutor) ExecuteWithCheckpoint(
 		checkpoint.PromptTokens += resp.Usage.PromptTokens
 		checkpoint.CompletionTokens += resp.Usage.CompletionTokens
 		checkpoint.Turn++
+		usedModel := resp.Model
+		if usedModel == "" {
+			usedModel = e.resolveModel(ag)
+		}
 		if report != nil {
 			report(ExecutionProgress{Turn: checkpoint.Turn, ToolUseCount: checkpoint.ToolUseCount,
-				PromptTokens: checkpoint.PromptTokens, CompletionTokens: checkpoint.CompletionTokens})
+				PromptTokens: checkpoint.PromptTokens, CompletionTokens: checkpoint.CompletionTokens,
+				Model: usedModel})
 		}
 
 		choice := resp.Choices[0]
@@ -425,7 +432,7 @@ func (e *SubAgentExecutor) completeCheckpointTools(
 		if report != nil {
 			report(ExecutionProgress{Turn: checkpoint.Turn, ToolUseCount: checkpoint.ToolUseCount,
 				PromptTokens: checkpoint.PromptTokens, CompletionTokens: checkpoint.CompletionTokens,
-				LastTool: call.Function.Name})
+				LastTool: call.Function.Name, Model: e.resolveModel(ag)})
 		}
 		result := e.executeTool(ctx, ag, allowedNames, call)
 		*messages = append(*messages, openai.ChatCompletionMessage{

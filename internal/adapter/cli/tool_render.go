@@ -377,7 +377,7 @@ func DefaultRenderers() *ToolRendererRegistry {
 			b.WriteString("  ")
 			b.WriteString(toolResultHeaderStyle.Render("✓ " + toolName))
 			b.WriteString(" ")
-			b.WriteString(toolRenderMetaStyle.Render(fmt.Sprintf("(%d matches)", count)))
+			b.WriteString(toolRenderMetaStyle.Render(fmt.Sprintf("(%d resultados)", count)))
 			b.WriteString("\n")
 			return b.String()
 		},
@@ -406,7 +406,7 @@ func DefaultRenderers() *ToolRendererRegistry {
 			b.WriteString("  ")
 			b.WriteString(toolResultHeaderStyle.Render("✓ " + toolName))
 			b.WriteString(" ")
-			b.WriteString(toolRenderMetaStyle.Render(fmt.Sprintf("(%d matches)", count)))
+			b.WriteString(toolRenderMetaStyle.Render(fmt.Sprintf("(%d resultados)", count)))
 			b.WriteString("\n")
 			return b.String()
 		},

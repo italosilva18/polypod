@@ -254,8 +254,15 @@ func (pm *PluginManager) validateStagedPlugin(stage string, defaultEnabled bool)
 		}
 		manifest.Enabled = defaultEnabled
 	}
-	if strings.TrimSpace(manifest.Name) == "" || len(manifest.Skills) == 0 || len(manifest.Skills) > 128 {
-		return PluginManifest{}, errors.New("plugin.json requer nome e entre 1 e 128 skills")
+	if manifest.SchemaVersion != 0 && manifest.SchemaVersion != 1 {
+		return PluginManifest{}, fmt.Errorf("schema_version de plugin incompatível: %d", manifest.SchemaVersion)
+	}
+	if len(manifest.Hooks)+len(manifest.MCPServers) > 0 && strings.TrimSpace(manifest.Version) == "" {
+		return PluginManifest{}, errors.New("plugin com hooks/MCP requer version")
+	}
+	resourceCount := len(manifest.Skills) + len(manifest.Hooks) + len(manifest.MCPServers)
+	if strings.TrimSpace(manifest.Name) == "" || resourceCount == 0 || resourceCount > 128 {
+		return PluginManifest{}, errors.New("plugin.json requer nome e entre 1 e 128 recursos")
 	}
 	seenPaths := make(map[string]struct{}, len(manifest.Skills))
 	seenNames := make(map[string]struct{}, len(manifest.Skills))
@@ -283,6 +290,9 @@ func (pm *PluginManager) validateStagedPlugin(stage string, defaultEnabled bool)
 			return PluginManifest{}, fmt.Errorf("nome de skill duplicado: %q", s.Name)
 		}
 		seenNames[s.Name] = struct{}{}
+	}
+	if _, err := ReadPluginAssets(PluginInfo{Path: stage, HookFiles: manifest.Hooks, MCPFiles: manifest.MCPServers}); err != nil {
+		return PluginManifest{}, fmt.Errorf("recursos do plugin: %w", err)
 	}
 	manifest.dir = stage
 	return manifest, nil

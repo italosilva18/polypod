@@ -2,6 +2,7 @@ package tool
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/costa/polypod/internal/lsp"
+	"github.com/costa/polypod/internal/projectchecks"
 	"github.com/costa/polypod/internal/types"
 )
 
@@ -17,6 +19,7 @@ import (
 type fileReadTracker struct {
 	mu       sync.Mutex
 	versions map[fileReadKey][32]byte
+	preWrite map[string][]byte
 }
 
 type fileReadKey struct {
@@ -25,7 +28,43 @@ type fileReadKey struct {
 }
 
 func newFileReadTracker() *fileReadTracker {
-	return &fileReadTracker{versions: make(map[fileReadKey][32]byte)}
+	return &fileReadTracker{
+		versions: make(map[fileReadKey][32]byte),
+		preWrite: make(map[string][]byte),
+	}
+}
+
+func (r *Registry) stashPreWrite(path string, original []byte, existed bool) {
+	if r == nil || r.fileReads == nil {
+		return
+	}
+	tracker := r.fileReads
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	if len(tracker.preWrite) >= 256 {
+		clear(tracker.preWrite)
+	}
+	id := fileIdentity(path)
+	if !existed || len(original) == 0 {
+		delete(tracker.preWrite, id)
+		return
+	}
+	cp := make([]byte, len(original))
+	copy(cp, original)
+	tracker.preWrite[id] = cp
+}
+
+func (r *Registry) popPreWrite(path string) []byte {
+	if r == nil || r.fileReads == nil {
+		return nil
+	}
+	tracker := r.fileReads
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	id := fileIdentity(path)
+	prev := tracker.preWrite[id]
+	delete(tracker.preWrite, id)
+	return prev
 }
 
 func fileIdentity(path string) string {
@@ -128,7 +167,15 @@ func (r *Registry) SetBeforeFileWrite(hook func(types.ToolContext, string, []byt
 	r.mu.Unlock()
 }
 
+// SetAfterFileWrite installs an optional formatter and verifier callback.
+func (r *Registry) SetAfterFileWrite(hook func(context.Context, string) (string, error)) {
+	r.mu.Lock()
+	r.afterFileWriteHook = hook
+	r.mu.Unlock()
+}
+
 func (r *Registry) runBeforeFileWrite(ctx types.ToolContext, path string, original []byte, existed bool) error {
+	r.stashPreWrite(path, original, existed)
 	r.mu.RLock()
 	hook := r.beforeFileWrite
 	r.mu.RUnlock()
@@ -169,6 +216,29 @@ func (r *Registry) notifyFileWritten(path, content string) string {
 }
 
 func (r *Registry) afterFileWrite(ctx types.ToolContext, path, content string, result types.ToolResult) types.ToolResult {
+	prevOriginal := r.popPreWrite(path)
+	r.mu.RLock()
+	hook := r.afterFileWriteHook
+	r.mu.RUnlock()
+	if hook != nil {
+		notice, err := hook(ctx.Context, path)
+		if err != nil {
+			result.Content += "\n\nAviso de verificação: " + err.Error()
+		} else if notice != "" {
+			result.Content += "\n\n" + notice
+		}
+		if updated, readErr := os.ReadFile(path); readErr == nil {
+			content = string(updated)
+		}
+	}
+	if fastDiag := projectchecks.FastDiagnoseFile(ctx.Context, path); fastDiag != "" {
+		result.Content += "\n\n" + fastDiag
+	}
+	if len(prevOriginal) > 0 {
+		if impact := projectchecks.AnalyzeEditImpact(ctx.Context, path, prevOriginal, []byte(content)); impact != "" {
+			result.Content += "\n\n" + impact
+		}
+	}
 	r.recordFileVersion(ctx.SessionID, path, []byte(content))
 	if notice := r.notifyFileWritten(path, content); notice != "" {
 		result.Content += "\n\n" + notice

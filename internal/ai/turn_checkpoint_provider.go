@@ -40,34 +40,70 @@ func (c *Client) completeWithCheckpointedProvider(ctx context.Context, initial [
 	catalog := c.catalogFor(ctx)
 	replayProviderCatalog(catalog, msgs)
 	limit := c.toolIterationLimit()
+	guard := newCognitiveGuard()
 	for limit < 0 || cp.Iteration < limit {
 		if cp.Phase == turncheckpoint.AIPhaseModel {
+			for _, guidance := range takeSteering(ctx) {
+				msgs = append(msgs, providerapi.Message{Role: "user", Content: guidance})
+			}
+			if err := saveAICheckpoint(scope, cp, msgs); err != nil {
+				return nil, err
+			}
 			req := providerapi.ChatRequest{Model: cp.Model, MaxTokens: c.maxTok, Temperature: c.temp, Messages: msgs}
+			c.applyReasoningToProviderReq(ctx, &req, guard.boostedReasoning)
 			if c.toolsOn {
 				req.Tools = catalog.providerDefinitions()
 			}
 			var resp *providerapi.ChatResponse
+			started := time.Now()
+			prov := c.activeResponseProviderFor(ctx)
 			if callback == nil {
-				resp, err = c.responseProvider.Chat(ctx, req)
+				resp, err = prov.Chat(ctx, req)
 			} else {
-				resp, err = c.responseProvider.ChatStream(ctx, req, func(delta providerapi.StreamDelta) {
+				resp, err = prov.ChatStream(ctx, req, func(delta providerapi.StreamDelta) {
 					if delta.Content != "" {
 						callback(delta.Content)
 					}
 				})
 			}
 			if err != nil {
+				c.Waterfall().RecordModelSpan(cp.Model, started, time.Since(started), 0, 0, true)
 				return nil, err
 			}
+			c.Waterfall().RecordModelSpan(cp.Model, started, time.Since(started), resp.PromptTokens, resp.CompletionTokens, false)
 			cp.PromptTokens += resp.PromptTokens
 			cp.CompletionTokens += resp.CompletionTokens
 			c.recordProviderUsage(resp, cp.Model)
 			if len(resp.ToolCalls) == 0 {
+				var guidance []string
+				if limit < 0 || cp.Iteration+1 < limit {
+					guidance = takeSteering(ctx)
+					if len(guidance) == 0 {
+						if gate := guard.checkCompletionGate(ctx); gate != "" {
+							guidance = append(guidance, gate)
+						}
+					}
+				}
+				if len(guidance) > 0 {
+					msgs = append(msgs, providerapi.Message{Role: "assistant", Content: resp.Content})
+					for _, message := range guidance {
+						msgs = append(msgs, providerapi.Message{Role: "user", Content: message})
+					}
+					cp.Iteration++
+					if err := saveAICheckpoint(scope, cp, msgs); err != nil {
+						return nil, err
+					}
+					if callback != nil {
+						callback("\n")
+					}
+					continue
+				}
 				cp.Phase = turncheckpoint.AIPhaseDone
 				cp.FinalContent = resp.Content
 				if err := saveAICheckpoint(scope, cp, msgs); err != nil {
 					return nil, err
 				}
+				c.recordTurnPlaybook(ctx, guard, resp.Content)
 				return responseFromCheckpoint(cp), nil
 			}
 			msgs = append(msgs, providerapi.Message{Role: "assistant", Content: resp.Content, ToolCalls: resp.ToolCalls})
@@ -106,7 +142,7 @@ func (c *Client) completeWithCheckpointedProvider(ctx context.Context, initial [
 			observation := ToolCallResult{ID: tc.ID, Name: tc.Name, Content: result, Images: rich.Images, IsError: rich.IsError || execErr != nil}
 			c.fireResponseToolDone(ctx, observation, time.Since(started))
 			msgs = append(msgs, providerapi.Message{Role: "tool", Content: result, ToolCallID: tc.ID, Name: tc.Name})
-			if c.responseProvider.SupportsVision() {
+			if c.activeResponseProviderFor(ctx).SupportsVision() {
 				deferredImages = append(deferredImages, imageObservations([]ToolCallResult{observation})...)
 				cp.DeferredImages, err = json.Marshal(deferredImages)
 				if err != nil {
@@ -114,6 +150,13 @@ func (c *Client) completeWithCheckpointedProvider(ctx context.Context, initial [
 				}
 			}
 			catalog.observe([]ToolCallResult{observation})
+			if replan, _ := guard.observe(ctx, []guardedCall{{Name: tc.Name, Arguments: tc.Arguments}}, []ToolCallResult{observation}); replan != "" && (limit < 0 || cp.Iteration+1 < limit) {
+				deferredImages = append(deferredImages, providerapi.Message{Role: "user", Content: replan})
+				cp.DeferredImages, err = json.Marshal(deferredImages)
+				if err != nil {
+					return nil, err
+				}
+			}
 			cp.PendingToolCallID = ""
 			cp.NextToolIndex = i + 1
 			if err := saveAICheckpoint(scope, cp, msgs); err != nil {
@@ -134,7 +177,31 @@ func (c *Client) completeWithCheckpointedProvider(ctx context.Context, initial [
 		}
 	}
 	logger.Debug("checkpointed provider tool loop reached limit", "iterations", cp.Iteration)
-	return nil, fmt.Errorf("chamadas de ferramentas atingiram ai.max_tool_iterations (%d)", limit)
+	if cp.Phase != turncheckpoint.AIPhaseModel {
+		return nil, fmt.Errorf("fase de checkpoint %q não permite resumo final", cp.Phase)
+	}
+	// The limit caps tool rounds, not the final answer. Asking once without
+	// tools lets the agent report what it actually did and preserves usage.
+	if len(msgs) == 0 || msgs[len(msgs)-1].Role != "user" || msgs[len(msgs)-1].Content != toolLimitSummaryPrompt {
+		msgs = append(msgs, providerapi.Message{Role: "user", Content: toolLimitSummaryPrompt})
+	}
+	if err := saveAICheckpoint(scope, cp, msgs); err != nil {
+		return nil, err
+	}
+	req := providerapi.ChatRequest{Model: cp.Model, MaxTokens: c.maxTok, Temperature: c.temp, Messages: msgs}
+	resp, err := c.finalProviderSummary(ctx, req, callback)
+	if err != nil {
+		return nil, err
+	}
+	cp.PromptTokens += resp.PromptTokens
+	cp.CompletionTokens += resp.CompletionTokens
+	c.recordProviderUsage(resp, cp.Model)
+	cp.Phase = turncheckpoint.AIPhaseDone
+	cp.FinalContent = resp.Content
+	if err := saveAICheckpoint(scope, cp, msgs); err != nil {
+		return nil, err
+	}
+	return responseFromCheckpoint(cp), nil
 }
 
 func pendingProviderTools(messages []providerapi.Message, next int) ([]providerapi.ToolCall, error) {

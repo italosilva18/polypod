@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -50,16 +51,21 @@ type FileState struct {
 
 // Watcher monitors files for changes and AI comment triggers.
 type Watcher struct {
+	mu           sync.Mutex
 	config       WatchConfig
 	states       map[string]FileState
 	seenTriggers map[string]map[string]int
 	onTrigger    func(Trigger)
 	onChange     func(path string)
+	onEvent      func(FileChangeEvent)
 	logger       *slog.Logger
 }
 
 // New creates a file watcher.
 func New(cfg WatchConfig, logger *slog.Logger) *Watcher {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &Watcher{
 		config:       cfg,
 		states:       make(map[string]FileState),
@@ -73,6 +79,9 @@ func (w *Watcher) OnTrigger(fn func(Trigger)) { w.onTrigger = fn }
 
 // OnChange sets the callback for any file change.
 func (w *Watcher) OnChange(fn func(string)) { w.onChange = fn }
+
+// OnEvent sets the rich callback receiving Added, Modified, and Removed file events.
+func (w *Watcher) OnEvent(fn func(FileChangeEvent)) { w.onEvent = fn }
 
 // Watch starts the polling loop. Blocks until ctx is done.
 func (w *Watcher) Watch(ctx context.Context) error {
@@ -95,6 +104,8 @@ func (w *Watcher) Watch(ctx context.Context) error {
 }
 
 func (w *Watcher) scan() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	for _, root := range w.config.Paths {
 		filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
@@ -118,6 +129,11 @@ func (w *Watcher) scan() {
 }
 
 func (w *Watcher) poll() {
+	seenInPoll := make(map[string]bool)
+	var events []FileChangeEvent
+	var changedPaths []string
+
+	w.mu.Lock()
 	for _, root := range w.config.Paths {
 		filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
@@ -134,19 +150,50 @@ func (w *Watcher) poll() {
 			if !w.matchesExtension(path) {
 				return nil
 			}
+			seenInPoll[path] = true
 
 			prev, known := w.states[path]
 			if !known || info.ModTime().After(prev.ModTime) {
 				w.states[path] = FileState{ModTime: info.ModTime()}
-
-				if w.onChange != nil {
-					w.onChange(path)
+				op := FileOpModified
+				if !known {
+					op = FileOpAdded
 				}
-				// A file created after startup can also contain a new AI! action.
-				w.checkTriggers(path)
+				events = append(events, FileChangeEvent{
+					Path:      path,
+					Op:        op,
+					Timestamp: time.Now(),
+				})
+				changedPaths = append(changedPaths, path)
 			}
 			return nil
 		})
+	}
+
+	for trackedPath := range w.states {
+		if !seenInPoll[trackedPath] {
+			delete(w.states, trackedPath)
+			delete(w.seenTriggers, trackedPath)
+			events = append(events, FileChangeEvent{
+				Path:      trackedPath,
+				Op:        FileOpRemoved,
+				Timestamp: time.Now(),
+			})
+		}
+	}
+	w.mu.Unlock()
+
+	for _, ev := range events {
+		if w.onEvent != nil {
+			w.onEvent(ev)
+		}
+	}
+	for _, path := range changedPaths {
+		if w.onChange != nil {
+			w.onChange(path)
+		}
+		// A file created after startup can also contain a new AI! action.
+		w.checkTriggers(path)
 	}
 }
 

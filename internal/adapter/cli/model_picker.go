@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/costa/polypod/internal/accountauth"
 	"github.com/costa/polypod/internal/models"
 )
 
@@ -35,15 +36,33 @@ type ModelInfo struct {
 	Speed         string // "fast", "medium", "slow"
 }
 
+// ProviderOption describes an available backend without exposing credentials.
+type ProviderOption struct {
+	Name      string
+	Model     string
+	Available bool
+	Detail    string
+	BaseURL   string
+}
+
 // modelPickerModel holds picker state.
 type modelPickerModel struct {
-	query        string
-	models       []ModelInfo
-	matches      []ModelInfo
-	selected     int
-	width        int
-	height       int
-	currentModel string
+	query           string
+	models          []ModelInfo
+	matches         []ModelInfo
+	selected        int
+	width           int
+	height          int
+	currentModel    string
+	currentProvider string
+	providers       []ProviderOption
+	providerStage   bool
+	providerName    string
+	connectMode     bool
+	keyEntry        bool
+	keyValue        string
+	catalogLoading  bool
+	catalogOffline  bool
 }
 
 // modelPickerCancelSentinel is returned by Update when the user presses
@@ -52,11 +71,27 @@ const modelPickerCancelSentinel = "\x00cancel"
 
 // newModelPicker builds a picker, marking the given currentModel so it
 // can be displayed in the footer.
-func newModelPicker(currentModel string) *modelPickerModel {
+func newModelPicker(currentModel string, providers ...ProviderOption) *modelPickerModel {
 	p := &modelPickerModel{
-		currentModel: currentModel,
+		currentModel:  currentModel,
+		providers:     providers,
+		providerStage: len(providers) > 0,
 	}
 	p.models = p.loadModels()
+	for _, option := range providers {
+		if option.Model != "" {
+			found := false
+			for _, candidate := range p.models {
+				if candidate.Provider == option.Name && candidate.ID == option.Model {
+					found = true
+					break
+				}
+			}
+			if !found {
+				p.models = append(p.models, ModelInfo{ID: option.Model, Provider: option.Name, Display: option.Model, SupportsTools: true})
+			}
+		}
+	}
 	p.matches = p.filter("")
 	return p
 }
@@ -135,11 +170,84 @@ func (m *modelPickerModel) Update(msg tea.Msg) (*modelPickerModel, tea.Cmd, stri
 		return m, nil, ""
 
 	case tea.KeyMsg:
+		if m.keyEntry {
+			switch msg.Type {
+			case tea.KeyEsc:
+				m.keyEntry = false
+				m.keyValue = ""
+				return m, nil, ""
+			case tea.KeyCtrlO:
+				if accountauth.IsOAuthProvider(m.providerName) {
+					m.keyEntry = false
+					m.keyValue = ""
+					return m, nil, "\x1eoauth\x1f" + m.providerName
+				}
+				return m, nil, ""
+			case tea.KeyEnter:
+				if strings.TrimSpace(m.keyValue) == "" {
+					if m.providerName == "openrouter" {
+						m.keyEntry = false
+						return m, nil, "\x1eoauth\x1fopenrouter"
+					}
+					return m, nil, ""
+				}
+				value := "\x1econnect\x1f" + m.providerName + "\x1f" + m.keyValue
+				m.keyValue = ""
+				return m, nil, value
+			case tea.KeyBackspace:
+				if len(m.keyValue) > 0 {
+					runes := []rune(m.keyValue)
+					m.keyValue = string(runes[:len(runes)-1])
+				}
+				return m, nil, ""
+			case tea.KeyRunes, tea.KeySpace:
+				if msg.Type == tea.KeySpace {
+					m.keyValue += " "
+				} else {
+					m.keyValue += string(msg.Runes)
+				}
+				return m, nil, ""
+			}
+			return m, nil, ""
+		}
 		switch msg.Type {
 		case tea.KeyEsc, tea.KeyCtrlC:
+			if m.providerName != "" && msg.Type == tea.KeyEsc {
+				m.providerName = ""
+				m.providerStage = true
+				m.query = ""
+				m.selected = 0
+				return m, nil, ""
+			}
 			return m, nil, modelPickerCancelSentinel
 		case tea.KeyEnter:
+			if m.providerStage {
+				options := m.filteredProviders()
+				if m.selected >= 0 && m.selected < len(options) {
+					m.providerName = options[m.selected].Name
+					if m.connectMode || !options[m.selected].Available {
+						if m.providerName == "chatgpt" {
+							return m, nil, "\x1eoauth"
+						}
+						if m.providerName == "ollama" {
+							return m, nil, "\x1eollama"
+						}
+						m.providerStage = false
+						m.keyEntry = true
+						m.query = ""
+						return m, nil, ""
+					}
+					m.providerStage = false
+					m.query = ""
+					m.selected = 0
+					m.matches = m.filter("")
+				}
+				return m, nil, ""
+			}
 			if m.selected >= 0 && m.selected < len(m.matches) {
+				if m.providerName != "" {
+					return m, nil, m.providerName + "\x1f" + m.matches[m.selected].ID
+				}
 				return m, nil, m.matches[m.selected].ID
 			}
 			return m, nil, ""
@@ -149,7 +257,11 @@ func (m *modelPickerModel) Update(msg tea.Msg) (*modelPickerModel, tea.Cmd, stri
 			}
 			return m, nil, ""
 		case tea.KeyDown, tea.KeyCtrlN:
-			if m.selected < len(m.matches)-1 {
+			count := len(m.matches)
+			if m.providerStage {
+				count = len(m.filteredProviders())
+			}
+			if m.selected < count-1 {
 				m.selected++
 			}
 			return m, nil, ""
@@ -157,7 +269,9 @@ func (m *modelPickerModel) Update(msg tea.Msg) (*modelPickerModel, tea.Cmd, stri
 			if len(m.query) > 0 {
 				r := []rune(m.query)
 				m.query = string(r[:len(r)-1])
-				m.matches = m.filter(m.query)
+				if !m.providerStage {
+					m.matches = m.filter(m.query)
+				}
 				m.selected = 0
 			}
 			return m, nil, ""
@@ -170,7 +284,9 @@ func (m *modelPickerModel) Update(msg tea.Msg) (*modelPickerModel, tea.Cmd, stri
 			}
 			if s != "" {
 				m.query += s
-				m.matches = m.filter(m.query)
+				if !m.providerStage {
+					m.matches = m.filter(m.query)
+				}
 				m.selected = 0
 			}
 			return m, nil, ""
@@ -184,15 +300,29 @@ func (m *modelPickerModel) Update(msg tea.Msg) (*modelPickerModel, tea.Cmd, stri
 // query is empty all models are returned.
 func (m *modelPickerModel) filter(query string) []ModelInfo {
 	query = strings.ToLower(strings.TrimSpace(query))
-	if query == "" {
+	if query == "" && m.providerName == "" {
 		return append([]ModelInfo(nil), m.models...)
 	}
 	var out []ModelInfo
 	for _, mi := range m.models {
+		if m.providerName != "" && mi.Provider != m.providerName {
+			continue
+		}
 		if strings.Contains(strings.ToLower(mi.ID), query) ||
 			strings.Contains(strings.ToLower(mi.Display), query) ||
 			strings.Contains(strings.ToLower(mi.Provider), query) {
 			out = append(out, mi)
+		}
+	}
+	return out
+}
+
+func (m *modelPickerModel) filteredProviders() []ProviderOption {
+	query := strings.ToLower(strings.TrimSpace(m.query))
+	var out []ProviderOption
+	for _, option := range m.providers {
+		if query == "" || strings.Contains(strings.ToLower(option.Name), query) {
+			out = append(out, option)
 		}
 	}
 	return out
@@ -234,26 +364,71 @@ func (m *modelPickerModel) View() string {
 	}
 
 	var b strings.Builder
+	if m.keyEntry {
+		b.WriteString(modelPickerHeaderStyle.Render("Conectar " + m.providerName))
+		b.WriteString("\n\n  Chave de API: " + strings.Repeat("•", len([]rune(m.keyValue))) + "▍")
+		if accountauth.IsOAuthProvider(m.providerName) {
+			b.WriteString("\n\n  Enter salvar chave  Ctrl+O conectar conta OAuth  Esc voltar")
+		} else {
+			b.WriteString("\n\n  Enter salvar com segurança  Esc voltar")
+		}
+		return modelPickerBoxStyle.Width(boxWidth).Render(b.String())
+	}
 
 	// Header.
-	header := fmt.Sprintf("🤖 Model Picker: %s", m.query)
+	header := fmt.Sprintf("Escolher modelo: %s", m.query)
+	if m.providerStage {
+		header = fmt.Sprintf("Escolher provedor: %s", m.query)
+		if m.connectMode {
+			header = fmt.Sprintf("Conectar provedor: %s", m.query)
+		}
+	}
 	b.WriteString(modelPickerHeaderStyle.Render(header))
 	b.WriteString(modelPickerCursorStyle.Render("▍"))
 	b.WriteString("\n")
 	b.WriteString(modelPickerSepStyle.Render(strings.Repeat("─", boxWidth-4)))
 	b.WriteString("\n\n")
 
+	// Provider list.
+	if m.providerStage {
+		options := m.filteredProviders()
+		if len(options) == 0 {
+			b.WriteString("  Nenhum provedor encontrado\n")
+		}
+		for i, option := range options {
+			marker := "  "
+			if i == m.selected {
+				marker = "► "
+			}
+			status := "pronto"
+			if !option.Available {
+				status = "configuração necessária"
+			}
+			b.WriteString(marker + option.Name + "  [" + status + "]\n")
+			if option.Detail != "" {
+				b.WriteString("    " + option.Detail + "\n")
+			}
+		}
+		b.WriteString("\n  Atual: " + m.currentProvider + " / " + m.currentModel)
+		b.WriteString("\n  ↑↓ navegar  Enter escolher  Esc cancelar")
+		return modelPickerBoxStyle.Width(boxWidth).Render(b.String())
+	}
+
 	// Match list.
 	if len(m.matches) == 0 {
 		b.WriteString("  ")
-		b.WriteString(modelPickerDimStyle.Render("(no matches)"))
+		b.WriteString(modelPickerDimStyle.Render("(nenhum modelo)"))
 		b.WriteString("\n")
 	} else {
 		shown := len(m.matches)
 		if shown > modelPickerMaxResults {
 			shown = modelPickerMaxResults
 		}
-		for i := 0; i < shown; i++ {
+		start := 0
+		if m.selected >= shown {
+			start = m.selected - shown + 1
+		}
+		for i := start; i < start+shown; i++ {
 			b.WriteString(m.renderModelLine(m.matches[i], i == m.selected))
 			b.WriteString("\n")
 		}
@@ -262,12 +437,17 @@ func (m *modelPickerModel) View() string {
 	// Footer with current model and key hints.
 	b.WriteString("\n")
 	if m.currentModel != "" {
-		b.WriteString(modelPickerCurrentLabelStyle.Render("  CURRENT: "))
+		b.WriteString(modelPickerCurrentLabelStyle.Render("  ATUAL: "))
 		b.WriteString(modelPickerCurrentValueStyle.Render(m.currentModel))
 		b.WriteString("\n")
 	}
-	b.WriteString(modelPickerFooterStyle.Render(
-		"  ↑↓ navigate  Enter select  Esc cancel"))
+	footer := "  ↑↓ navegar  Enter escolher  Esc voltar\n  Catálogo público; acesso depende da conta conectada"
+	if m.catalogLoading {
+		footer = "  ↑↓ navegar  Enter escolher  Esc voltar\n  Atualizando o catálogo em segundo plano..."
+	} else if m.catalogOffline {
+		footer = "  ↑↓ navegar  Enter escolher  Esc voltar\n  Catálogo indisponível; mostrando a lista local"
+	}
+	b.WriteString(modelPickerFooterStyle.Render(footer))
 
 	return modelPickerBoxStyle.Width(boxWidth).Render(b.String())
 }
@@ -292,23 +472,28 @@ func (m *modelPickerModel) renderModelLine(mi ModelInfo, selected bool) string {
 	b.WriteString(" ")
 	b.WriteString(modelPickerProviderStyle.Render("[" + mi.Provider + "]"))
 	b.WriteString(" ")
-	b.WriteString(qualityStyleFor(mi.Quality).Render(mi.Quality))
+	b.WriteString(qualityStyleFor(mi.Quality).Render(qualityLabel(mi.Quality)))
 	b.WriteString(" ")
 	b.WriteString(modelPickerSpeedStyle.Render(speedIconFor(mi.Speed)))
 
 	if mi.ID == m.currentModel {
 		b.WriteString(" ")
-		b.WriteString(modelPickerCurrentBadgeStyle.Render("(active)"))
+		b.WriteString(modelPickerCurrentBadgeStyle.Render("(ativo)"))
 	}
 
 	// Line 2: indented details
 	b.WriteString("\n    ")
-	b.WriteString(modelPickerDetailLabelStyle.Render(formatTokenContext(mi.MaxContext) + " ctx"))
-	b.WriteString("  ")
-	b.WriteString(modelPickerDetailValueStyle.Render(
-		fmt.Sprintf("$%.2f/$%.2f per 1M", mi.InputCost, mi.OutputCost)))
+	if mi.MaxContext > 0 {
+		b.WriteString(modelPickerDetailLabelStyle.Render(formatTokenContext(mi.MaxContext) + " contexto"))
+		b.WriteString("  ")
+	}
+	if mi.InputCost > 0 || mi.OutputCost > 0 {
+		b.WriteString(modelPickerDetailValueStyle.Render(fmt.Sprintf("$%.2f/$%.2f por 1M", mi.InputCost, mi.OutputCost)))
+	} else {
+		b.WriteString(modelPickerDimStyle.Render("preço não informado"))
+	}
 	b.WriteString("    ")
-	b.WriteString(modelPickerDetailLabelStyle.Render("Tools: "))
+	b.WriteString(modelPickerDetailLabelStyle.Render("Ferramentas: "))
 	if mi.SupportsTools {
 		b.WriteString(modelPickerOkStyle.Render("✓"))
 	} else {
@@ -354,6 +539,21 @@ func qualityStyleFor(quality string) lipgloss.Style {
 		return modelPickerLowStyle
 	}
 	return modelPickerLowStyle
+}
+
+func qualityLabel(quality string) string {
+	switch strings.ToLower(quality) {
+	case "frontier":
+		return "avançado"
+	case "high":
+		return "alta"
+	case "medium":
+		return "média"
+	case "low":
+		return "baixa"
+	default:
+		return quality
+	}
 }
 
 // ── Styles ──────────────────────────────────────────────────────────────────

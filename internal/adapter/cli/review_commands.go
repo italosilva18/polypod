@@ -75,12 +75,12 @@ func handleReview(parts []string, deps commandDeps) commandResult {
 	result, err := deps.generateText(prompt)
 	if err != nil {
 		return commandResult{
-			output:  errorStyle.Render("review failed: ") + cmdLabelStyle.Render(err.Error()),
+			output:  errorStyle.Render("falha na revisão: ") + cmdLabelStyle.Render(err.Error()),
 			handled: true,
 		}
 	}
 
-	header := formatReviewHeader("CODE REVIEW", label, files, added, removed, truncated)
+	header := formatReviewHeader("REVISÃO DE CÓDIGO", label, files, added, removed, truncated)
 	body := formatAIBlock(result)
 	return commandResult{output: header + "\n\n" + body, handled: true}
 }
@@ -233,7 +233,7 @@ func handleSecurityReview(parts []string, deps commandDeps) commandResult {
 	result, err := deps.generateText(prompt)
 	if err != nil {
 		return commandResult{
-			output:  errorStyle.Render("security review failed: ") + cmdLabelStyle.Render(err.Error()),
+			output:  errorStyle.Render("falha na revisão de segurança: ") + cmdLabelStyle.Render(err.Error()),
 			handled: true,
 		}
 	}

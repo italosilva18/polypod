@@ -92,8 +92,12 @@ func randomURLSafe(size int) (string, error) {
 }
 
 func (m *Manager) Login(ctx context.Context) (*Credential, error) {
+	return m.LoginAccount(ctx, "")
+}
+
+func (m *Manager) LoginAccount(ctx context.Context, accountID string) (*Credential, error) {
 	registrationClientID := dynamicClientID
-	if existing, loadErr := m.store.Load(); loadErr == nil && existing != nil && strings.HasPrefix(existing.ClientID, "oaiapp_") {
+	if existing, loadErr := m.store.LoadAccount(accountID); loadErr == nil && existing != nil && strings.HasPrefix(existing.ClientID, "oaiapp_") {
 		registrationClientID = existing.ClientID
 	}
 	hostID, err := m.store.HostID()
@@ -180,7 +184,6 @@ func (m *Manager) Login(ctx context.Context) (*Credential, error) {
 	if err := openBrowser(loginURL); err != nil {
 		return nil, fmt.Errorf("abrindo navegador: %w", err)
 	}
-	fmt.Println("Navegador aberto. Autorize o Polypod na sua conta ChatGPT...")
 
 	var result callbackResult
 	select {
@@ -216,12 +219,13 @@ func (m *Manager) Login(ctx context.Context) (*Credential, error) {
 		return nil, fmt.Errorf("a conta nao concedeu o escopo obrigatorio %q", requiredScope)
 	}
 	cred := &Credential{
-		Email: claims.Email, Issuer: claims.Issuer, Subject: claims.Subject,
+		AccountID: strings.TrimSpace(accountID),
+		Email:     claims.Email, Issuer: claims.Issuer, Subject: claims.Subject,
 		ClientID: result.clientID, HostID: hostID, IDToken: tr.IDToken,
 		AccessToken: tr.AccessToken, RefreshToken: tr.RefreshToken, Scopes: granted,
 		ExpiresAt: time.Now().Add(time.Duration(tr.ExpiresIn) * time.Second),
 	}
-	if err := m.store.Save(cred); err != nil {
+	if err := m.store.SaveAccount(accountID, cred); err != nil {
 		return nil, err
 	}
 	return cred, nil
@@ -311,8 +315,13 @@ func (m *Manager) AccessToken(ctx context.Context) (string, error) {
 	return cred.AccessToken, nil
 }
 
-func (m *Manager) Status() (*Credential, error) { return m.store.Load() }
-func (m *Manager) Logout() error                { return m.store.Delete() }
+func (m *Manager) Status() (*Credential, error)                     { return m.store.Load() }
+func (m *Manager) StatusAccount(id string) (*Credential, error)    { return m.store.LoadAccount(id) }
+func (m *Manager) ListAccounts() ([]AccountSummary, error)         { return m.store.ListAccounts() }
+func (m *Manager) UseAccount(accountID string) error               { return m.store.SetActiveAccount(accountID) }
+func (m *Manager) Logout() error                                   { return m.store.Delete() }
+func (m *Manager) LogoutAccount(accountID string) error            { return m.store.DeleteAccount(accountID) }
+func (m *Manager) LogoutAll() error                                { return m.store.DeleteAll() }
 
 func (m *Manager) Models(ctx context.Context) ([]Model, error) {
 	token, err := m.AccessToken(ctx)

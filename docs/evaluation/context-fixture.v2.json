@@ -1,0 +1,20 @@
+{
+  "cases": [
+    {"query": "keep each chat session in its own working directory", "relevant": ["internal/workdir/store.go"]},
+    {"query": "show progress and token counts from a running background agent", "relevant": ["internal/tasks/agent.go"]},
+    {"query": "compare files in a turn checkpoint against their previous versions", "relevant": ["internal/turncheckpoint/diff.go"]},
+    {"query": "expose bounded repository context lookup as a callable agent tool", "relevant": ["internal/tool/codesearch.go"]},
+    {"query": "provide terminal commands to install enable and reload local extensions", "relevant": ["internal/commands/plugin_runtime.go"]},
+    {"query": "reconcile discovered extension manifests with the live skill registry", "relevant": ["internal/skill/plugin_manager.go"]},
+    {"query": "combine symbol names edited files and embeddings when selecting source snippets", "relevant": ["internal/codesearch/hybrid.go"]},
+    {"query": "cancel an in flight ACP prompt from an editor", "relevant": ["internal/acp/server.go"]},
+    {"query": "execute a coding agent as a subprocess then verify the resulting patch", "relevant": ["internal/evaluation/command.go"]},
+    {"query": "score evaluated task outcomes and enforce a time budget", "relevant": ["internal/evaluation/runner.go"]},
+    {"query": "roll back a failed update of a locally installed plugin", "relevant": ["internal/skill/plugin_install.go"]},
+    {"query": "paginate GitHub pull request review comments and changed files", "relevant": ["internal/commands/pr_comments_native.go"]},
+    {"query": "detect files changed in two concurrent Git worktrees", "relevant": ["internal/commands/work_overview.go"]},
+    {"query": "emit a JSON result for noninteractive agent execution", "relevant": ["internal/headless/headless.go"]},
+    {"query": "establish a connection to a Model Context Protocol server", "relevant": ["internal/mcp/client.go"]},
+    {"query": "search Git tracked code by semantic vector similarity", "relevant": ["internal/codesearch/search.go"]}
+  ]
+}

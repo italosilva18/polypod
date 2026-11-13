@@ -118,7 +118,7 @@ func (a *ToolRegistryAdapter) ExecuteResultContext(ctx context.Context, name str
 	if err != nil {
 		return types.ToolResult{Content: fmt.Sprintf("Erro: %v", err), IsError: true}, nil
 	}
-	result.Content = truncateToolResult(result.Content)
+	result.Content = truncateToolResultForTool(name, result.Content)
 	result.Content = appendProjectInstructions(ctx, name, args, result.Content, nil)
 	if result.IsError {
 		result.Content = "Erro: " + result.Content
@@ -130,6 +130,10 @@ func (a *ToolRegistryAdapter) ExecuteResultContext(ctx context.Context, name str
 // for retrieval through the normal tool permission path.
 func truncateToolResult(s string) string {
 	return tooloutput.Preview(s)
+}
+
+func truncateToolResultForTool(toolName, s string) string {
+	return tooloutput.CompressForModel(toolName, s)
 }
 
 // Ensure ToolRegistryAdapter implements SkillRegistry

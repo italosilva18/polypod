@@ -24,6 +24,56 @@ type resumeTestProvider struct {
 	answer   *provider.ChatResponse
 }
 
+type limitSummaryProvider struct {
+	provider.Provider
+	requests []provider.ChatRequest
+}
+
+func (p *limitSummaryProvider) Chat(_ context.Context, req provider.ChatRequest) (*provider.ChatResponse, error) {
+	p.requests = append(p.requests, req)
+	if len(p.requests) == 1 {
+		return &provider.ChatResponse{ToolCalls: []provider.ToolCall{{ID: "call-1", Name: "first", Arguments: "{}"}}, PromptTokens: 5, CompletionTokens: 2}, nil
+	}
+	return &provider.ChatResponse{Content: "resumo final", PromptTokens: 7, CompletionTokens: 3}, nil
+}
+
+func (p *limitSummaryProvider) SupportsVision() bool { return false }
+
+func TestCheckpointedProviderSummarizesAfterToolLimit(t *testing.T) {
+	manager := turncheckpoint.New(t.TempDir(), nil)
+	backend := &limitSummaryProvider{}
+	skills := &resumeTestSkills{}
+	client := &Client{responseProvider: backend, model: "model", skills: skills, toolsOn: true, maxToolIter: 1}
+	ctx := WithTurnCheckpoint(context.Background(), manager, "branch", "turn")
+	response, err := client.CompleteWithTools(ctx, []ChatMessage{{Role: "user", Content: "work"}}, slog.Default())
+	if err != nil || response.Content != "resumo final" || response.TotalTokens != 17 {
+		t.Fatalf("limit should yield a final answer: %+v, %v", response, err)
+	}
+	if len(backend.requests) != 2 {
+		t.Fatalf("expected initial call and tool-free summary, got %d", len(backend.requests))
+	}
+	if len(backend.requests[1].Tools) != 0 || len(skills.called) != 1 {
+		t.Fatalf("unexpected extra tool call: tools=%d executed=%v", len(backend.requests[1].Tools), skills.called)
+	}
+	cp, err := manager.LoadAI("branch", "turn")
+	if err != nil || cp.Phase != turncheckpoint.AIPhaseDone || cp.FinalContent != "resumo final" {
+		t.Fatalf("final answer not checkpointed: %+v, %v", cp, err)
+	}
+}
+
+func TestProviderSummarizesAfterToolLimitWithoutCheckpoint(t *testing.T) {
+	backend := &limitSummaryProvider{}
+	skills := &resumeTestSkills{}
+	client := &Client{responseProvider: backend, model: "model", skills: skills, toolsOn: true, maxToolIter: 1}
+	response, err := client.CompleteWithTools(context.Background(), []ChatMessage{{Role: "user", Content: "work"}}, slog.Default())
+	if err != nil || response.Content != "resumo final" || response.TotalTokens != 17 {
+		t.Fatalf("limit should yield a final answer: %+v, %v", response, err)
+	}
+	if len(backend.requests) != 2 || len(skills.called) != 1 {
+		t.Fatalf("tool loop not bounded: requests=%d tools=%v", len(backend.requests), skills.called)
+	}
+}
+
 func (p *resumeTestProvider) Chat(_ context.Context, req provider.ChatRequest) (*provider.ChatResponse, error) {
 	p.requests = append(p.requests, req)
 	return p.answer, nil

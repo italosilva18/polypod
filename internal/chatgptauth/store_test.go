@@ -57,3 +57,70 @@ func TestModelNamePrefersSlug(t *testing.T) {
 		t.Fatalf("Name() = %q", got)
 	}
 }
+
+func TestMultiAccountSaveSwitchAndFallback(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chatgpt-auth.enc")
+	store := NewStore(path)
+
+	acc1 := &Credential{
+		Email:        "personal@example.test",
+		Issuer:       issuerURL,
+		ClientID:     "oaiapp_1",
+		AccessToken:  "tok-personal",
+		RefreshToken: "ref-personal",
+		ExpiresAt:    time.Now().Add(time.Hour).UTC(),
+	}
+	acc2 := &Credential{
+		Email:        "work@example.test",
+		Issuer:       issuerURL,
+		ClientID:     "oaiapp_2",
+		AccessToken:  "tok-work",
+		RefreshToken: "ref-work",
+		ExpiresAt:    time.Now().Add(time.Hour).UTC(),
+	}
+
+	if err := store.SaveAccount("pessoal", acc1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAccount("trabalho", acc2); err != nil {
+		t.Fatal(err)
+	}
+
+	accounts, err := store.ListAccounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 2 {
+		t.Fatalf("len(accounts) = %d, esperado 2", len(accounts))
+	}
+
+	active, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.AccessToken != "tok-work" {
+		t.Fatalf("esperava conta mais recente ativa (tok-work), obteve %q", active.AccessToken)
+	}
+
+	if err := store.SetActiveAccount("pessoal"); err != nil {
+		t.Fatal(err)
+	}
+	active, err = store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.AccessToken != "tok-personal" {
+		t.Fatalf("SetActiveAccount nao trocou a sessao ativa: %q", active.AccessToken)
+	}
+
+	if err := store.DeleteAccount("pessoal"); err != nil {
+		t.Fatal(err)
+	}
+	active, err = store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active == nil || active.AccessToken != "tok-work" {
+		t.Fatalf("apos remover conta ativa, deveria promover a conta restante; obteve %+v", active)
+	}
+}

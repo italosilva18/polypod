@@ -1,16 +1,45 @@
 # Plugins locais
 
 O Polypod encontra diretórios com `plugin.json` dentro das raízes de skills.
-Cada manifesto declara `name`, `skills` e, opcionalmente, `version`, `author`
-e `enabled`. As skills podem ser arquivos YAML ou Markdown com frontmatter.
+Cada manifesto declara `name` e pelo menos um recurso em `skills`, `hooks` ou
+`mcp_servers`. `schema_version: 1` fixa o contrato; a ausência do campo mantém
+compatibilidade com manifestos antigos. Pacotes com hooks ou MCP exigem
+`version`. As skills podem ser arquivos YAML ou Markdown com frontmatter.
 
 ```json
 {"name":"meu-plugin","version":"1.0.0","skills":["skills/exemplo.yaml"]}
 ```
 
+Um pacote pode incluir os três tipos de recurso:
+
+```json
+{
+  "schema_version": 1,
+  "name": "meu-plugin",
+  "version": "1.0.0",
+  "skills": ["skills/exemplo.yaml"],
+  "hooks": ["hooks.yaml"],
+  "mcp_servers": ["mcp.json"]
+}
+```
+
+`hooks.yaml` contém uma lista de hooks no formato `name`, `event`, `type`
+(`shell` ou `http`) e `command` ou `url`. `mcp.json` contém um objeto
+`mcpServers` com as definições de servidores; YAML também é aceito. O
+instalador valida esses arquivos antes de publicar a versão. Hooks e servidores
+ativos recebem um prefixo exclusivo do plugin e são atualizados ou removidos
+quando o plugin muda de estado. Uma falha de conexão MCP é registrada e tentada
+novamente no próximo ciclo; ela não desfaz skills já instaladas. O teste local
+cobre carregamento, descarregamento e chamada de um servidor MCP empacotado.
+
 O agente padrão dispõe das ferramentas `list_local_plugins`, `install_local_plugin`,
 `update_local_plugin`, `remove_local_plugin`, `set_local_plugin_enabled` e
 `reload_local_plugins`.
+Na interface do terminal, os mesmos recursos estão em `/plugin list`,
+`/plugin info <id>`, `/plugin install <pasta-ou-URL-Git>`,
+`/plugin update <id> <pasta-ou-URL-Git>`, `/plugin enable <id>`,
+`/plugin disable <id>`, `/plugin remove <id>` e `/plugin reload [id]`.
+`/reload-plugins` recarrega todos os plugins.
 Para instalar, passe `source` como caminho de uma pasta local ou URL Git HTTPS/SSH
 explícita. O manifesto deve estar na raiz da pasta ou do repositório. Para
 atualizar, passe também o `id` devolvido por `list_local_plugins`:
@@ -39,8 +68,8 @@ do Git. Os plugins do projeto são publicados em `.polypod/skills`; o serviço
 root e o CLI do usuário compartilham o diretório com acesso de grupo.
 
 Instalação e atualização não instalam dependências externas declaradas pela
-skill. Os testes de comportamento desse fluxo foram adiados nesta rodada;
-compilação, análise estática e inspeção do diff verificam a integração básica.
+skill. Um teste de ponta a ponta cobre a instalação, consulta, ativação,
+desativação, recarga e remoção pelo comando `/plugin`.
 
 Não há índice remoto embutido. Para publicar ou consultar uma lista HTTPS
 opcional de metadados e URLs `source`, sem instalar nada nessa consulta, veja

@@ -138,6 +138,8 @@ type TaskState struct {
 	OutputOffset int              `json:"output_offset"`
 	Notified     bool             `json:"notified"`
 	AgentName    string           `json:"agent_name,omitempty"`
+	Workspace    string           `json:"workspace,omitempty"`
+	CostUSD      *float64         `json:"cost_usd,omitempty"`
 	Progress     *AgentProgress   `json:"progress,omitempty"`
 	Checkpoint   *AgentCheckpoint `json:"checkpoint,omitempty"`
 	Result       string           `json:"result,omitempty"`
@@ -230,8 +232,16 @@ func snapshotTaskState(state *TaskState) *TaskState {
 		exitCode := *state.ExitCode
 		snapshot.ExitCode = &exitCode
 	}
+	if state.CostUSD != nil {
+		cost := *state.CostUSD
+		snapshot.CostUSD = &cost
+	}
 	if state.Progress != nil {
 		progress := *state.Progress
+		if state.Progress.CostUSD != nil {
+			cost := *state.Progress.CostUSD
+			progress.CostUSD = &cost
+		}
 		progress.RecentActivities = append([]ToolActivity(nil), progress.RecentActivities...)
 		snapshot.Progress = &progress
 	}
