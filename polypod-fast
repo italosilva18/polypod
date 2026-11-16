@@ -1,0 +1,9 @@
+#!/bin/bash
+# PolyPod Fast Startup Wrapper
+
+export POLYPOD_LAZY_LOAD=true
+export POLYPOD_AUTO_CONSOLIDATE=false
+export POLYPOD_CODEBASE_INDEX=on-demand
+export POLYPOD_COMMAND_CACHE=true
+
+exec ./polypod "$@"

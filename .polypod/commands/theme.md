@@ -1,14 +1,13 @@
 #!/bin/bash
-# /theme - Theme Management
+# /theme-picker - Theme Picker
 set -e
+
 echo "🎨 **Theme Picker**"
 echo ""
-echo "**Temas disponíveis:**"
-echo "  - default"
-echo "  - dark"
-echo "  - light"
-echo "  - monokai"
-echo "  - dracula"
-echo "  - nord"
+echo "**Themes disponíveis:**"
+echo "  1. Default (dark)"
+echo "  2. Dark"
+echo "  3. Light"
+echo "  4. Monokai"
 echo ""
-echo "⏳ Implementação em andamento..."
+echo "Use /theme <name> para aplicar"
