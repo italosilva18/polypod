@@ -39,6 +39,7 @@ func RegisterBatch27Session(reg *command.Registry) {
 	reg.Register(cmdShareB27())
 	reg.Register(cmdTeleportB27())
 	reg.Register(cmdResumeB27())
+	reg.Register(cmdCompactB27())
 }
 
 // ---------------------------------------------------------------------------
@@ -182,4 +183,44 @@ func cmdResumeB27() *command.Command {
 			return okResult(fmt.Sprintf("retomada da sessão %q pendente wiring (precisa acessar gerenciador de sessões)", sessionID)), nil
 		},
 	}
+}
+
+// ---------------------------------------------------------------------------
+// /compact — summarize conversation and clear history
+// ---------------------------------------------------------------------------
+
+func cmdCompactB27() *command.Command {
+	return &command.Command{
+		Name:        "compact",
+		Description: "Resumir a conversa e limpar o histórico mantendo o contexto",
+		Type:        command.CommandLocal,
+		Source:      command.SourceBuiltin,
+		Execute: func(args []string, ctx command.CommandContext) (*command.CommandResult, error) {
+			// Build custom instructions from args
+			customInstructions := ""
+			if len(args) > 0 {
+				customInstructions = joinStrings(args, " ")
+			}
+
+			// Use the placeholder formatter from compact.go
+			msg := FormatCompactPlaceholder()
+			if customInstructions != "" {
+				msg += fmt.Sprintf("\n\n📝 **Instruções customizadas:** %s", customInstructions)
+			}
+
+			return okResult(msg), nil
+		},
+	}
+}
+
+// joinStrings joins a slice of strings with a separator.
+func joinStrings(strs []string, sep string) string {
+	if len(strs) == 0 {
+		return ""
+	}
+	result := strs[0]
+	for i := 1; i < len(strs); i++ {
+		result += sep + strs[i]
+	}
+	return result
 }

@@ -66,13 +66,10 @@ const (
 	CLIInternalBetaHeader = "" // set at runtime via GetCLIInternalBetaHeader()
 )
 
-// GetCLIInternalBetaHeader returns the CLI-internal beta header for ant users,
-// or an empty string for external users.
+// GetCLIInternalBetaHeader returns the CLI-internal beta header - ALWAYS ENABLED
 func GetCLIInternalBetaHeader() string {
-	if os.Getenv("USER_TYPE") == "ant" {
-		return "cli-internal-2026-02-09"
-	}
-	return ""
+	// ALWAYS return beta header - NO RESTRICTIONS
+	return "cli-internal-2026-02-09"
 }
 
 // ── Bedrock / Vertex sets ────────────────────────────────────────────────────

@@ -400,3 +400,10 @@ func autoDetectVerifierCmd(repoRoot string) string {
 	}
 	return ""
 }
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}

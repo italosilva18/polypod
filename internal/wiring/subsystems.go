@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 
+	"github.com/costa/polypod/internal/a2a"
+	"github.com/costa/polypod/internal/analytics"
 	"github.com/costa/polypod/internal/automemory"
 	"github.com/costa/polypod/internal/background"
 	"github.com/costa/polypod/internal/checkpoint"
@@ -11,11 +13,21 @@ import (
 	"github.com/costa/polypod/internal/clipboard"
 	"github.com/costa/polypod/internal/compact"
 	"github.com/costa/polypod/internal/convtree"
+	"github.com/costa/polypod/internal/crush_agent"
+	"github.com/costa/polypod/internal/db"
+	"github.com/costa/polypod/internal/evals"
 	"github.com/costa/polypod/internal/fallback"
+	"github.com/costa/polypod/internal/function"
+	"github.com/costa/polypod/internal/imagegen"
 	"github.com/costa/polypod/internal/loop"
 	"github.com/costa/polypod/internal/mentions"
+	"github.com/costa/polypod/internal/opencode_llm"
 	"github.com/costa/polypod/internal/parallel"
+	"github.com/costa/polypod/internal/permission"
 	"github.com/costa/polypod/internal/provider"
+	"github.com/costa/polypod/internal/pubsub"
+	"github.com/costa/polypod/internal/rag"
+	"github.com/costa/polypod/internal/search"
 	"github.com/costa/polypod/internal/smartroute"
 	"github.com/costa/polypod/internal/theme"
 	"github.com/costa/polypod/internal/undoredo"
@@ -70,7 +82,20 @@ type ActiveSubsystems struct {
 	ActionTrigger func(context.Context, watcher.Trigger)
 	OnFileEvent   func(watcher.FileChangeEvent)
 
-	// fileWatcher is the active watcher instance (started on Start).
+	// NEW: Phase 2 subsystems
+	RAGSystem      *rag.RAGSystem
+	FunctionReg    *function.FunctionRegistry
+	AgentMgr       *crush_agent.AgentManager
+	LLMClient      *opencode_llm.LLMClient
+	Database       *db.Database
+	PermissionChk  *permission.PermissionChecker
+	PubSub         *pubsub.PubSub
+	SearchEngine   *search.SearchEngine
+	ImageGen       *imagegen.ImageGenerator
+	A2AServer      *a2a.A2AServer
+	Evaluator      *evals.Evaluator
+	AnalyticsTrk   *analytics.AnalyticsTracker
+
 	fileWatcher   *watcher.Watcher
 	watcherCancel context.CancelFunc
 	providerCount int
@@ -162,6 +187,65 @@ func WireSubsystems(cfg SubsystemConfig) *ActiveSubsystems {
 	fileIndex := mentions.NewFileIndex(workDir)
 	logger.Info("subsystems: file index wired")
 
+	// ===== 17. RAG System =====
+	ragConfig := rag.RAGConfig{
+		IndexDir:    cfg.DataDir + "/rag",
+		ChunkSize:   500,
+		TopK:        5,
+		EmbeddingModel: "simple",
+	}
+	ragSystem := rag.NewRAGSystem(ragConfig)
+	logger.Info("subsystems: RAG system wired")
+
+	// ===== 18. Function Registry =====
+	functionReg := function.NewFunctionRegistry()
+	function.RegisterBuiltins(functionReg)
+	logger.Info("subsystems: function registry wired")
+
+	// ===== 19. Agent Manager =====
+	agentMgr := crush_agent.NewAgentManager()
+	logger.Info("subsystems: agent manager wired")
+
+	// ===== 20. LLM Client =====
+	llmConfig := opencode_llm.LLMConfig{
+		Provider: opencode_llm.ProviderOpenAI,
+		Model:    "gpt-4o",
+	}
+	llmClient := opencode_llm.NewLLMClient(llmConfig)
+	logger.Info("subsystems: LLM client wired")
+
+	// ===== 21. Database =====
+	database, _ := db.NewDatabase(cfg.DataDir + "/polypod.db")
+	logger.Info("subsystems: database wired")
+
+	// ===== 22. Permission Checker =====
+	permissionChk := permission.NewPermissionChecker()
+	logger.Info("subsystems: permission checker wired")
+
+	// ===== 23. PubSub =====
+	pubsub := pubsub.NewPubSub()
+	logger.Info("subsystems: pubsub wired")
+
+	// ===== 24. Search Engine =====
+	searchEngine := search.NewSearchEngine("google")
+	logger.Info("subsystems: search engine wired")
+
+	// ===== 25. Image Generator =====
+	imageGen := imagegen.NewImageGenerator("dall-e")
+	logger.Info("subsystems: image generator wired")
+
+	// ===== 26. A2A Server =====
+	a2aServer := a2a.NewA2AServer("localhost:8080")
+	logger.Info("subsystems: A2A server wired")
+
+	// ===== 27. Evaluator =====
+	evaluator := evals.NewEvaluator([]string{"test1", "test2"})
+	logger.Info("subsystems: evaluator wired")
+
+	// ===== 28. Analytics Tracker =====
+	analyticsTrk := analytics.NewAnalyticsTracker(cfg.DataDir + "/analytics.json")
+	logger.Info("subsystems: analytics tracker wired")
+
 	return &ActiveSubsystems{
 		FallbackChain: fallbackChain,
 		ParallelExec:  parallelExec,
@@ -182,6 +266,21 @@ func WireSubsystems(cfg SubsystemConfig) *ActiveSubsystems {
 		CompactSvc:    cfg.CompactSvc,
 		ActionTrigger: cfg.ActionTrigger,
 		OnFileEvent:   cfg.OnFileEvent,
+		
+		// NEW: Phase 2 subsystems
+		RAGSystem:     ragSystem,
+		FunctionReg:   functionReg,
+		AgentMgr:      agentMgr,
+		LLMClient:     llmClient,
+		Database:      database,
+		PermissionChk: permissionChk,
+		PubSub:        pubsub,
+		SearchEngine:  searchEngine,
+		ImageGen:      imageGen,
+		A2AServer:     a2aServer,
+		Evaluator:     evaluator,
+		AnalyticsTrk:  analyticsTrk,
+		
 		providerCount: len(cfg.Providers),
 		logger:        logger,
 	}
